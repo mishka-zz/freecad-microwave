@@ -1,0 +1,54 @@
+<!-- Microwave Workbench.
+
+     A two-lobe eigenmode surface, colour-mapped and lit, standing on the thing
+     that guides it: substrate, and a ground plane under that. The crest reads
+     as an M without ever being drawn as a letter - the workbench's initial and
+     a real mode profile at the same time - and the board makes it a microstrip
+     rather than a mode in free space.
+
+     The slab is extruded by the same offset as the mode, so the two are one
+     object seen from one place rather than a mark sitting on a plinth. Wide and
+     thin is what keeps it a board: narrower or thicker and it reads as a
+     pedestal, which is the one proportion here not to nudge.
+
+     The ramp is plasma (violet, magenta, amber, lemon) and the absence of green
+     is load-bearing rather than taste. FreeCAD's own FEM icon is a
+     rainbow-gradient cube in jet, whose signature is exactly that
+     green-through-yellow band; rendered side by side, a jet version of this
+     landed squarely in FEM's colour territory. Plasma is what keeps the two
+     apart while still being a rendered field rather than a diagram.
+
+     Straight segments with a sharp middle vertex, and that is not a style
+     choice either: the same M drawn with the cubic curves a standing wave
+     actually has renders as the McDonald's arches at every size. The vertex is
+     the whole design.
+
+     Two notes for whoever edits this file. XML forbids a double hyphen inside a
+     comment, and an unparsable icon is a workbench with no face. And keep it to
+     shapes and gradients: Qt's SVG module targets Tiny 1.2, so a filter renders
+     here differently from everywhere it was reviewed - see AGENT.md. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+ <defs>
+  <linearGradient id="modeFace" x1="0" y1="50" x2="0" y2="14" gradientUnits="userSpaceOnUse">
+   <stop offset="0" stop-color="#0d0887"/><stop offset="0.3" stop-color="#8f0da4"/>
+   <stop offset="0.6" stop-color="#d84a6b"/><stop offset="0.85" stop-color="#f89540"/>
+   <stop offset="1" stop-color="#f7f95c"/>
+  </linearGradient>
+  <linearGradient id="modeTop" x1="0" y1="44" x2="0" y2="8" gradientUnits="userSpaceOnUse">
+   <stop offset="0" stop-color="#a8248d"/><stop offset="0.4" stop-color="#ec744f"/>
+   <stop offset="0.75" stop-color="#fbc23d"/><stop offset="1" stop-color="#fdfdc0"/>
+  </linearGradient>
+ </defs>
+ <polygon points="4,50 57,50 63,44 10,44" fill="#4a239b"/>
+ <polygon points="4,50 57,50 57,53.5 4,53.5" fill="#31136e"/>
+ <polygon points="57,50 63,44 63,47.5 57,53.5" fill="#250f57"/>
+ <polygon points="4,53.5 57,53.5 57,56 4,56" fill="#e79038"/>
+ <polygon points="57,53.5 63,47.5 63,50 57,56" fill="#a85f18"/>
+ <path d="M 11,50 L 18,14 L 32,34 L 46,14 L 53,50 Z" fill="url(#modeFace)"/>
+ <path d="M 11,50 L 18,14 L 32,34 L 46,14 L 53,50 L 59,44 L 52,8 L 38,28 L 24,8 L 17,44 Z"
+       fill="url(#modeTop)"/>
+ <path d="M 17,44 L 24,8 L 38,28 L 52,8 L 59,44" fill="none" stroke="#fffce8"
+       stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
+ <path d="M 11,50 L 18,14 L 32,34 L 46,14 L 53,50" fill="none" stroke="#ffd58a"
+       stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" opacity="0.7"/>
+</svg>

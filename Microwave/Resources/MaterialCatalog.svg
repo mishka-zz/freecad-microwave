@@ -1,0 +1,12 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Several catalogs, one of them open: the point of the feature is that a
+       board house's laminates sit beside the generic ones rather than
+       replacing them. -->
+  <rect x="10" y="12" width="34" height="44" rx="3" fill="#37474f" opacity="0.35"/>
+  <rect x="16" y="9" width="34" height="44" rx="3" fill="#37474f"/>
+  <path d="M24 20 H42 M24 28 H42 M24 36 H36" stroke="#b0bec5" stroke-width="4"
+        stroke-linecap="round"/>
+  <circle cx="46" cy="46" r="12" fill="#e8833a"/>
+  <path d="M46 40 V52 M40 46 H52" stroke="#ffffff" stroke-width="4"
+        stroke-linecap="round"/>
+</svg>

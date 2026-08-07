@@ -1,0 +1,63 @@
+[project]
+name = "freecad-microwave"
+# Restated from Microwave/__init__.py, which is the authority. A test asserts
+# they agree; nothing derives one from the other, because this file is read by
+# tooling that must not import the package and the package must not need a
+# TOML parser to know its own version.
+version = "0.0.1"
+license = "LGPL-2.1-or-later"
+license-files = ["LICENSE"]
+# tomllib, which the material catalogs read. FreeCAD 1.1.1 embeds 3.11 and
+# development runs 3.13, and CI covers both ends.
+requires-python = ">=3.11"
+# Nothing installs the workbench this way - FreeCAD loads it from `Mod/`, and
+# the interpreter it loads into is not ours to install into. This list is here
+# to be *stated*: `.github/workflows/tests.yml` installs it by hand, and
+# test_declared_dependencies.py asserts the two agree, so the declaration cannot
+# drift away from the environment the suite actually passes in.
+#
+# Only numpy is imported by this code. scikit-rf is absent because a copy is
+# vendored - and the other three are here because that copy imports them, which
+# is the whole point: vendoring pins the version and does nothing about presence.
+dependencies = ["numpy", "scipy", "pandas", "typing_extensions"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+# The chart, and only the chart. Everything else - modelling, meshing,
+# pre-flight, solving, Touchstone - runs without it, so a refusal at the plot
+# is the whole cost of not having it. Deliberately not in the CI install: the
+# fast suite has to keep passing on a machine that has no matplotlib, because
+# that is the machine `test_gui_without_qt.py` is written for.
+plot = ["matplotlib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "slow: runs a real solve; deselect with -m 'not slow'",
+]
+
+[tool.ruff]
+line-length = 100
+# Vendored scikit-rf. Upstream's style is upstream's business, and reformatting
+# it would make the next version bump unreadable. See Microwave/_vendor/README.
+extend-exclude = ["Microwave/_vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = [
+    # zip() here is either a fixed-length tuple against a fixed-length tuple or
+    # the pairwise idiom, and one site handles a short sequence deliberately.
+    "B905",
+    # Every try/except/pass in this tree carries a comment saying which failure
+    # it is absorbing and why that is safe. contextlib.suppress would move the
+    # exception into a `with` header and leave the comment pointing at nothing.
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# FreeCAD execs this with Workbench and Gui injected into its globals, which is
+# also why it cannot use __file__.
+"InitGui.py" = ["F821"]
+# The document layer's public surface. Every name is re-exported on purpose.
+"Microwave/Objects/__init__.py" = ["F401"]

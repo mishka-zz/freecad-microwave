@@ -1,0 +1,96 @@
+# The fast suite, on every push.
+#
+# It needs neither FreeCAD nor openEMS. That is the point of the layering rule,
+# and test_the_freecad_side_imports_neither_engine_nor_cad enforces it in a
+# clean interpreter.
+#
+# It does need scipy, pandas and typing_extensions, which nothing here imports:
+# vendored scikit-rf's package `__init__` pulls in `networkSet` and `circuit`,
+# which want them. FreeCAD 1.1.1 ships all three (measured: scipy 1.16.3, pandas
+# 2.3.3), which is why vendoring skrf works at all - so this line installs what
+# FreeCAD happens to bundle, and a re-vendor has to re-measure it.
+#
+# The install line below is one of two statements of that list; `pyproject.toml`
+# is the other, and `tests/test_declared_dependencies.py` fails if they differ.
+# Edit one and you edit both. Nothing derives either from the code, because a
+# dependency that arrives through the vendored library cannot be found by
+# grepping for `import`.
+#
+# The list is a requirement and not a precaution: install `numpy pytest` alone
+# and much of the suite fails, one library revealed at a time.
+#
+# The real solves are marked `slow` and are NOT run here, on any schedule. They
+# need the openEMS bindings, which mean building openEMS and CSXCAD on the
+# runner; until someone does that work, the four physics gates run locally only
+# and this file cannot vouch for them. Do not read a green tick as "the numbers
+# are still right" - it means the adapter is still self-consistent.
+#
+# The nightly run is not for the code, which has not changed since the last push.
+# It is for everything underneath: nothing here pins a version, so `pip install
+# numpy pytest` floats, and a nightly failure is upstream drift rather than a
+# regression.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # 03:17 UTC. Off the hour because every other cron in the world is on it.
+    - cron: "17 3 * * *"
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what FreeCAD 1.1.1 embeds (measured: 3.11.14, conda-forge);
+        # 3.13 is what development runs. The workbench has to work on both, and
+        # the two ends moving together cover what is between them.
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install numpy scipy pandas typing_extensions pytest
+      - name: Fast suite
+        run: python -m pytest -q -m "not slow"
+
+  lint:
+    # Style, not correctness. The config, including the rules that are ignored
+    # and why, is in pyproject.toml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check .
+      - run: ruff format --check .
+
+  imports-stay-clean:
+    # Separate job on a deliberately bare environment. The test above already
+    # asserts this, but only about the modules it names - this one would also
+    # catch a new top-level import of something that merely happens to be
+    # installed alongside the test runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install numpy
+      - name: Every adapter module imports without FreeCAD or openEMS
+        # Discovered, not listed: a hand-maintained list silently skips whatever
+        # was added since someone last edited it. `driver` is excluded because it
+        # is the solver-side entry point and importing openEMS is its whole job.
+        run: |
+          for path in Microwave/Solvers/openems/*.py; do
+            module=$(basename "$path" .py)
+            case "$module" in __init__|driver) continue ;; esac
+            echo "-- $module"
+            python -c "import Microwave.Solvers.openems.$module" || exit 1
+          done

@@ -1,0 +1,10 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- The layer stack in elevation: ground plane, substrate, strip. That
+       sandwich is what makes it a microstrip and nothing else in the set looks
+       like it. The wave enters the strip's end face from the left. -->
+  <rect x="24" y="43" width="34" height="9" rx="2" fill="#37474f"/>
+  <rect x="24" y="28" width="34" height="15" fill="#37474f" opacity="0.35"/>
+  <rect x="24" y="21" width="34" height="7" rx="2" fill="#e8833a"/>
+  <path d="M6 24.5 H15" stroke="#e8833a" stroke-width="5.5" stroke-linecap="round"/>
+  <path d="M14 16 L24 24.5 L14 33 Z" fill="#e8833a"/>
+</svg>

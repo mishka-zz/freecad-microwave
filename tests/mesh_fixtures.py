@@ -73,6 +73,30 @@ def has_line(lines: np.ndarray, position: float, tol: float = 1e-9) -> bool:
     return bool(np.any(np.isclose(lines, position, rtol=0.0, atol=tol)))
 
 
+def resolved_as_an_edge(lines, dim: int, edge: float) -> tuple[float, float]:
+    """The pair of lines the thirds rule put around ``edge`` on ``dim``.
+
+    Asserts the mesher treated it as an isolated conductor edge: one line inside
+    the metal, one outside, and none on the edge itself.
+
+    Read off the provenance rather than recomputed from ``metal_res``. How far
+    out the pair sits is the size the mesher chose for that particular edge -
+    which is the conductor's width where that is the finer answer - and a test
+    about whether an edge was resolved at all has no business restating it.
+    """
+    inside = outside = None
+    for pin in lines.fixed[dim]:
+        if pin.source.endswith(f"edge at {edge:g}, inside"):
+            inside = pin.position
+        elif pin.source.endswith(f"edge at {edge:g}, outside"):
+            outside = pin.position
+    assert inside is not None and outside is not None, (
+        f"{edge} was not resolved as an edge: {sorted(pin.source for pin in lines.fixed[dim])}"
+    )
+    assert not has_line(lines[dim], edge), "a line sits on the edge itself"
+    return inside, outside
+
+
 def cell_at(lines: np.ndarray, position: float) -> float:
     """The width of the cell containing ``position``.
 
@@ -100,9 +124,16 @@ def pin_at(pins, position: float, tol: float = 1e-9):
     return found[0]
 
 
-def assert_graded_within(lines, ratio: float) -> None:
-    """No two adjacent cells on any axis differ by more than ``ratio``."""
+def assert_graded_within(lines, ratio) -> None:
+    """No two adjacent cells on any axis differ by more than ``ratio``.
+
+    One value for all three axes, or one per axis as ``MeshParams`` holds it.
+    Passing one number is what a caller wants when the ratio is the subject and
+    the axes are not; passing the policy itself is what says each axis obeys its
+    own, which one number cannot distinguish from an axis obeying the tightest.
+    """
+    ratios = (ratio,) * 3 if isinstance(ratio, (int, float)) else tuple(ratio)
     for dim in range(3):
         spacings = np.diff(lines[dim])
         observed = np.maximum(spacings[1:] / spacings[:-1], spacings[:-1] / spacings[1:])
-        assert np.max(observed) <= ratio * (1 + 1e-9)
+        assert np.max(observed) <= ratios[dim] * (1 + 1e-9)

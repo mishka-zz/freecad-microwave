@@ -41,12 +41,9 @@ class EMPortViewProvider(Provider):
                 # port that cannot be coloured must still be a port.
                 pass
 
-    # No attach, no getDisplayModes, no setDisplayMode. The object is a
-    # Part::FeaturePython, so FreeCAD derives its view provider from Part's own,
-    # which already knows how to draw a Shape, pick it and colour it - and
-    # implementing any of those three here takes that over and the geometry
-    # stops appearing. That is the usual way a Python view provider on a Part
-    # object ends up invisible; EMMeshPreviewViewProvider carries the same note.
+    # No attach, no getDisplayModes, no setDisplayMode: on a Part::FeaturePython
+    # each of those takes over from Part's own view provider and the geometry
+    # stops appearing. EMMeshPreviewViewProvider states the mechanism.
 
 
 class EMPortLumpedViewProvider(EMPortViewProvider):
@@ -59,3 +56,7 @@ class EMPortMicrostripViewProvider(EMPortViewProvider):
 
 class EMPortRectWaveguideViewProvider(EMPortViewProvider):
     ICON = "PortWaveguide.svg"
+
+
+class EMPortCoaxialViewProvider(EMPortViewProvider):
+    ICON = "PortCoaxial.svg"

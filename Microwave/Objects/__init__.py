@@ -42,9 +42,11 @@ from .mesh import (
 )
 from .ports import (
     EMPortBase,
+    EMPortCoaxial,
     EMPortLumped,
     EMPortMicrostrip,
     EMPortRectWaveguide,
+    createEMPortCoaxial,
     createEMPortLumped,
     createEMPortMicrostrip,
     createEMPortRectWaveguide,

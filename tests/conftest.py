@@ -435,3 +435,83 @@ def interpreter():
         return run.find_interpreter()
     except run.EngineNotFound as error:
         pytest.skip(str(error))
+
+
+# ---------------------------------------------------------------------------
+# The corpus of real CAD shapes
+# ---------------------------------------------------------------------------
+
+#: Where FreeCAD keeps its command-line binary on each platform. Discovery is by
+#: existence, so a machine without FreeCAD skips rather than fails.
+FREECAD_CANDIDATES = (
+    "/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd",
+    "/usr/bin/freecadcmd",
+    "/usr/local/bin/freecadcmd",
+)
+
+CORPUS_PROBE = os.path.join(os.path.dirname(__file__), "corpus_probe.py")
+
+
+def _freecadcmd():
+    import shutil
+
+    found = shutil.which("freecadcmd")
+    if found:
+        return found
+    for path in FREECAD_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+@pytest.fixture(scope="session")
+def artifacts(tmp_path_factory):
+    """Run the corpus under a real FreeCAD once, and hand back what it wrote.
+
+    Here rather than beside either file that reads it, because a session-scoped
+    fixture is cached per definition and importing one into a second module
+    defines it again - which would start a second FreeCAD and run the whole
+    corpus through it for no gain.
+
+    The exit status is not consulted. ``freecadcmd`` segfaults in Qt's teardown
+    once a main window has been shown, after the last statement has run and
+    everything has been written, so judging the run by its status would fail it
+    for finishing. What is judged is the manifest.
+    """
+    import json
+    import subprocess
+
+    binary = _freecadcmd()
+    if binary is None:
+        pytest.skip("no freecadcmd on this machine, so the CAD kernel is unreachable")
+
+    out = tmp_path_factory.mktemp("corpus")
+    result = subprocess.run(
+        [binary, CORPUS_PROBE],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CORPUS_OUT": str(out)},
+        cwd=os.path.dirname(os.path.dirname(CORPUS_PROBE)),
+    )
+
+    manifest = out / "manifest.json"
+    if not manifest.exists():
+        raise AssertionError(
+            "the corpus probe wrote no manifest, so it died before it finished.\n"
+            f"stdout:\n{result.stdout[-4000:]}\n\nstderr:\n{result.stderr[-4000:]}"
+        )
+
+    written = json.loads(manifest.read_text())["specimens"]
+    return {name: json.loads((out / f"{name}.json").read_text()) for name in written}
+
+
+def corpus_record(artifacts, name):
+    """One specimen's artifact, or a skip where the machine could not draw it."""
+    assert name in artifacts, (
+        f"{name!r} produced no artifact at all, so the probe stopped before "
+        "reaching it. A specimen that is not run is not a specimen that passed"
+    )
+    record = artifacts[name]
+    if record["status"] == "unavailable":
+        pytest.skip(f"{name} needs something this machine has not got: {record['reason']}")
+    return record

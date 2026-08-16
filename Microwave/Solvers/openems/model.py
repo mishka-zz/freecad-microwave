@@ -39,6 +39,9 @@ from typing import Any
 
 import numpy as np
 
+from ... import units
+from .surface import sheet_fault, surface_fault
+
 #: Bump whenever :meth:`Problem.to_dict` changes shape. The digest is computed
 #: over the re-serialised form, so an envelope written under an older version
 #: comes back from this adapter carrying keys it was written without, and
@@ -46,13 +49,22 @@ import numpy as np
 #: ``results.json`` agree with each other would still have ``Results.matches()``
 #: deny that the results came from the envelope. Refusing an unknown version by
 #: name is the honest answer.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 AXIS_NAMES = ("x", "y", "z")
 
-#: Metres per second, exactly. Lives here because it is the one module every
-#: other one in the adapter already imports.
-SPEED_OF_LIGHT = 299_792_458.0
+#: How far off its own plane a sheet's vertex may sit, in millimetres. A drawing
+#: is flat to within a kernel tolerance rather than exactly, and this is three
+#: orders above FreeCAD's own 1e-7 mm - loose enough for anything the kernel
+#: calls planar, tight enough that a face which is genuinely not flat is caught
+#: rather than flattened.
+SHEET_FLATNESS = 1e-4
+
+#: Re-exported, not redefined: see :data:`Microwave.units.SPEED_OF_LIGHT`. The
+#: name is here because this is the one module every other one in the adapter
+#: already imports, and the figure is not, because a constant of the vacuum
+#: written down twice is a fact that can drift.
+SPEED_OF_LIGHT = units.SPEED_OF_LIGHT
 DIMENSIONS = len(AXIS_NAMES)
 
 #: Significant digits kept when the envelope is written.
@@ -120,7 +132,7 @@ def canonical(value: Any) -> Any:
 THROUGH = "through"
 
 MATERIAL_KINDS = frozenset({"dielectric", "lossy_dielectric", "pec", "conducting_sheet"})
-PORT_KINDS = frozenset({"microstrip", "lumped", "rect_waveguide"})
+PORT_KINDS = frozenset({"microstrip", "lumped", "rect_waveguide", "coaxial"})
 
 #: Material kinds openEMS models as conductors. ``driver.build_material`` hands
 #: a ``pec`` its name alone and a ``conducting_sheet`` its conductivity and
@@ -153,17 +165,39 @@ _LAYS_CONDUCTOR = frozenset({"microstrip"})
 #: Port kinds whose planes openEMS moves onto the grid rather than leaving where
 #: they were asked for. ``MSLPort`` takes an ``argmin`` over the propagation
 #: lines (ports.py:255, :296) and a lumped port is snapped by ``SnapBox2Mesh``.
-#: A ``rect_waveguide`` plane is not moved at all - with no line on it nothing
-#: is discretised, and the run returns 0/0 after its full time, which is why
-#: :meth:`required_lines` pins those two coordinates instead.
-_SNAPS_TO_THE_GRID = frozenset({"microstrip", "lumped"})
+#: A coaxial port snaps the same way this adapter's builder does it, by an
+#: ``argmin`` over the same lines. A ``rect_waveguide`` plane is not moved at
+#: all - with no line on it nothing is discretised, and the run returns 0/0
+#: after its full time, which is why :meth:`required_lines` pins those two
+#: coordinates instead.
+_SNAPS_TO_THE_GRID = frozenset({"microstrip", "lumped", "coaxial"})
 
 #: Port kinds that extract by differencing three probes across the measurement
 #: plane. Others integrate a mode over one plane and have no difference to take.
 #: Here rather than in :mod:`.preflight` so that :meth:`Port.wanted_lines` can
 #: ask the same question - preflight imports this module, so the dependency
 #: only runs one way.
-_USES_PROBE_TRIPLET = frozenset({"microstrip"})
+_USES_PROBE_TRIPLET = frozenset({"microstrip", "coaxial"})
+
+#: Port kinds whose excitation is a uniform field imposed across the gap, so
+#: what it launches is the line's mode *plus* the evanescent content needed to
+#: square that shape with the real one - which the probes have to stand clear
+#: of. A coaxial port is not one: its excitation carries the ``1/r`` radial
+#: profile of the mode itself, so the shape it imposes is the shape it wants.
+_EXCITES_A_UNIFORM_GAP = frozenset({"microstrip"})
+
+#: Port kinds whose transverse cross-section is a circle rather than a
+#: rectangle, so the box corners bound a bore and the port carries a radius
+#: the box cannot express.
+_IS_ROUND = frozenset({"coaxial"})
+
+#: How far a round port's two transverse extents may disagree, relatively.
+#:
+#: They are one diameter read twice off one bounding box, so what separates
+#: them is that box's own rounding. A bore drawn oval by any amount a drawing
+#: can express is orders above this, which is what makes the test worth making:
+#: it says the box bounds a circle rather than merely a square.
+_ROUND_TOLERANCE = 1e-6
 
 
 class EnvelopeError(Exception):
@@ -219,6 +253,59 @@ def _point(value: Sequence[float], what: str) -> tuple[float, float, float]:
     if not all(np.isfinite(values)):
         raise EnvelopeError(f"{what}: coordinates must be finite, got {values}")
     return values  # type: ignore[return-value]
+
+
+def _shifted(
+    point: Sequence[float], offset: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    return tuple(float(p) + float(d) for p, d in zip(point, offset))  # type: ignore[return-value]
+
+
+def origin_offset(
+    solids: Sequence[Solid] = (),
+    ports: Sequence[Port] = (),
+    grid: MeshGrid | None = None,
+) -> tuple[float, float, float]:
+    """The translation that puts a structure's minimum corner at the origin.
+
+    **openEMS is only sound in non-negative coordinates.**
+    ``CSPrimPolyhedron::IsInside`` counts how many faces a segment crosses on
+    its way to a point it takes to be outside, and it builds that point by
+    scaling the primitive's own maximum corner away from the origin
+    (``CSXCAD/src/CSPrimPolyhedron.cpp:229``). Scaling a *negative* coordinate
+    moves it further from the origin too, which is toward the solid rather than
+    away from it - so for a solid whose every maximum is at or below the origin
+    the endpoint lands inside the shape, and the parity inverts: the object
+    reads as hollow, and the space around it as filled.
+
+    The engine is therefore handed a structure that has no negative coordinate
+    in it at all, rather than one checked for the corner where that particular
+    ray goes wrong. Unconditionally, so it is a placement and not a repair:
+    every structure is put in the same place, so the path is the one every run
+    takes and the property holds by construction. A conditional would be a
+    branch that encodes another project's defect, run on almost no model, and
+    trusted on all of them.
+
+    It costs nothing to be right about, because a translation is a symmetry of
+    Maxwell's equations: the whole structure moves together, so every length,
+    every gap and every cell is what it was. What it does *not* do is move one
+    solid to suit the engine - where a solid sits relative to the rest of the
+    model is the device itself.
+    """
+    # Every vertex, and not the box that is said to bound them: the ray endpoint
+    # is built from a bounding box openEMS recomputes from the vertices
+    # themselves, so a vertex outside the box it was given would be outside the
+    # guarantee too.
+    corners = [solid.lower for solid in solids]
+    corners += [vertex for solid in solids for vertex in solid.vertices]
+    corners += [port.start for port in ports] + [port.stop for port in ports]
+    if grid is not None:
+        corners.append(tuple(float(grid[dim][0]) for dim in range(DIMENSIONS)))
+    if not corners:
+        return (0.0, 0.0, 0.0)
+    return tuple(  # type: ignore[return-value]
+        -min(corner[dim] for corner in corners) for dim in range(DIMENSIONS)
+    )
 
 
 @dataclass(frozen=True)
@@ -285,7 +372,7 @@ class Material:
             #
             # Ignoring would be the worse fault: these two fields reach the
             # solver nowhere (``driver._add_material`` passes neither), but they
-            # do reach `document._wavelength`, which takes `max(epsilon * mu)`
+            # do reach `policy._wavelength`, which takes `max(epsilon * mu)`
             # over every material and sizes the whole grid from it, and two
             # pre-flight thresholds computed the same way. A permittivity left
             # on a conductor therefore moves the cell count and the clearance
@@ -302,7 +389,7 @@ class Material:
         # ``driver._add_material`` passes kappa in its ``lossy_dielectric``
         # branch and in no other, so anywhere else the loss is dropped between
         # here and the engine and the run comes back lossless - a plausible
-        # answer to a question nobody asked. Pre-flight reads this field to
+        # answer to a question that was not asked. Pre-flight reads this field to
         # decide whether a material's loss was quoted in this band, and that
         # reading is only about materials whose loss arrives.
         if self.kappa > 0 and self.kind != "lossy_dielectric":
@@ -347,36 +434,144 @@ class Material:
 
 @dataclass(frozen=True)
 class Solid:
-    """An axis-aligned box of one material. Equal corners give a sheet."""
+    """A region of one material, and how it is drawn.
+
+    Two shapes, both carrying ``lower`` and ``upper``, so that everything which
+    only wants to know *where* a solid is - the domain, the absorber's
+    reservation, a pre-flight check - reads one field and does not care which
+    kind it has.
+
+    Without ``faces`` it is an axis-aligned box, and equal corners give a sheet.
+    With them it is the triangulated boundary of whatever was drawn, and the
+    corners are that triangulation's own extent. The grid stays rectilinear
+    either way: what a triangulation buys is that the *shape* is held exactly,
+    so the staircase is the grid's and can be priced, rather than being
+    introduced silently by squaring the drawing off first.
+
+    A triangulation is checked here, on the way in, rather than trusted. See
+    :mod:`~.surface`: an open one is read by the engine as a sheet, contains no
+    point at all, and takes the object out of the simulation without any message
+    that can be told from a benign one.
+    """
 
     material: str
     lower: tuple[float, float, float]
     upper: tuple[float, float, float]
     priority: int = 0
     label: str = ""
+    #: The boundary as triangles, and the vertices they index. Empty for a box.
+    vertices: tuple[tuple[float, float, float], ...] = ()
+    faces: tuple[tuple[int, int, int], ...] = ()
+    #: The axis a *sheet* is flat on, or ``None`` for a solid. A sheet's
+    #: triangles cover its area rather than bounding a volume, so they are a
+    #: different kind of thing from the same fields on a solid: openEMS takes
+    #: them as flat polygons at one elevation, and the closedness a solid is
+    #: held to would refuse every one of them.
+    sheet_normal: int | None = None
+    #: The thickness this conductor was given because the drawing carried none,
+    #: in mm, or zero where the drawing carried its own. Nothing is built from
+    #: it - the vertices already bound the metal - and it crosses the envelope
+    #: only so that pre-flight can name a length the drawing did not carry.
+    thickened: float = 0.0
+    #: The finest cell this solid's own demands may ask the mesher for, in mm,
+    #: or zero to ask at the policy's sizes. A mesh region set to coarsen names
+    #: the object rather than a box, because the grid is separable and a box
+    #: spends itself on a slab through the model on each axis.
+    relaxed_to: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "lower", _point(self.lower, f"solid {self.name!r}"))
         object.__setattr__(self, "upper", _point(self.upper, f"solid {self.name!r}"))
+        object.__setattr__(
+            self, "vertices", tuple(tuple(float(v) for v in p) for p in self.vertices)
+        )
+        object.__setattr__(self, "faces", tuple(tuple(int(i) for i in f) for f in self.faces))
+        object.__setattr__(
+            self,
+            "thickened",
+            _finite(self.thickened, f"solid {self.name!r}: supplied thickness", low=0.0),
+        )
+        object.__setattr__(
+            self,
+            "relaxed_to",
+            _finite(self.relaxed_to, f"solid {self.name!r}: relaxed cell size", low=0.0),
+        )
         for dim in range(3):
             if self.upper[dim] < self.lower[dim]:
                 raise EnvelopeError(
                     f"solid {self.name!r}: upper corner is below lower corner in "
                     f"{AXIS_NAMES[dim]} ({self.upper[dim]} < {self.lower[dim]})"
                 )
+        if self.is_sheet:
+            axis = self.sheet_normal
+            if not 0 <= axis < 3:
+                raise EnvelopeError(f"solid {self.name!r}: {axis} is not an axis")
+            if self.lower[axis] != self.upper[axis]:
+                raise EnvelopeError(
+                    f"sheet {self.name!r} has thickness {self.upper[axis] - self.lower[axis]} "
+                    f"in {AXIS_NAMES[axis]}, the axis it is declared flat on. A sheet is "
+                    "modelled at one plane and would be laid at the wrong one"
+                )
+            fault = sheet_fault(self.vertices, self.faces, axis, self.lower[axis], SHEET_FLATNESS)
+            if fault is not None:
+                raise EnvelopeError(f"sheet {self.name!r} cannot be modelled: {fault}")
+        elif self.faces or self.vertices:
+            # Where a solid sits relative to the origin is not asked here. It
+            # decides whether openEMS reads the shape or its complement, and
+            # :func:`origin_offset` is what settles it - for the whole
+            # structure at once, which is the only level at which the answer is
+            # a translation rather than a distortion.
+            fault = surface_fault(self.vertices, self.faces)
+            if fault is not None:
+                raise EnvelopeError(
+                    f"solid {self.name!r} is not a closed surface: {fault}. Either "
+                    "way openEMS solves something that is not this shape and the "
+                    "run completes - a surface it cannot close holds no point at "
+                    "all, and one whose faces it rejects it keeps as a solid with "
+                    "holes in it"
+                )
 
     @property
     def name(self) -> str:
         return self.label or self.material
 
+    def moved(self, offset: tuple[float, float, float]) -> Solid:
+        """The same solid, translated. Every coordinate it carries, or none."""
+        return replace(
+            self,
+            lower=_shifted(self.lower, offset),
+            upper=_shifted(self.upper, offset),
+            vertices=tuple(_shifted(point, offset) for point in self.vertices),
+        )
+
+    @property
+    def is_mesh(self) -> bool:
+        """True where the shape is held as triangles rather than as its box."""
+        return bool(self.faces)
+
+    @property
+    def is_sheet(self) -> bool:
+        """True where the triangles cover an area rather than bound a volume."""
+        return self.sheet_normal is not None
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "material": self.material,
             "lower": list(self.lower),
             "upper": list(self.upper),
             "priority": self.priority,
             "label": self.label,
         }
+        if self.is_mesh:
+            data["vertices"] = [list(point) for point in self.vertices]
+            data["faces"] = [list(face) for face in self.faces]
+        if self.is_sheet:
+            data["sheet_normal"] = self.sheet_normal
+        if self.thickened:
+            data["thickened"] = self.thickened
+        if self.relaxed_to:
+            data["relaxed_to"] = self.relaxed_to
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Solid:
@@ -386,6 +581,11 @@ class Solid:
             upper=tuple(data["upper"]),
             priority=int(data.get("priority", 0)),
             label=data.get("label", ""),
+            vertices=tuple(tuple(p) for p in data.get("vertices", ())),
+            faces=tuple(tuple(f) for f in data.get("faces", ())),
+            sheet_normal=data.get("sheet_normal"),
+            thickened=float(data.get("thickened", 0.0)),
+            relaxed_to=float(data.get("relaxed_to", 0.0)),
         )
 
 
@@ -424,6 +624,12 @@ class Port:
     #: so ``TE10`` is the dominant mode however the guide is drawn.
     #: :meth:`waveguide_arguments` renumbers it onto openEMS' axes.
     mode: str = ""
+    #: The inner conductor's radius, for the kinds in :data:`_IS_ROUND` and
+    #: refused for every other. The *outer* radius is not a field: it is half
+    #: the box's transverse extent, so the bore the probes reach across cannot
+    #: disagree with the volume the port claims - the same reason a waveguide
+    #: port reads ``a`` and ``b`` off its box rather than carrying them.
+    inner_radius: float = 0.0
     excite: bool = False
     feed_shift: float = 0.0
     measurement_shift: float = 0.0
@@ -459,6 +665,7 @@ class Port:
         self._settle_excitation_axis()
         self._check_the_kind_has_what_it_needs()
         self._check_waveguide_box()
+        self._check_round_box()
         self._check_shifts()
         self._check_resistances()
 
@@ -553,6 +760,42 @@ class Port:
                     "whole guide cross-section"
                 )
 
+    def _check_round_box(self) -> None:
+        """A round port's box bounds its bore, and holds one radius inside it.
+
+        The box is the bore's bounding box, so its two transverse extents are
+        the same diameter read twice and :attr:`outer_radius` is half of it.
+        That is what makes the *outer* radius underivable from anything the user
+        can contradict; the inner one has nothing to be read off and is carried.
+
+        A kind that is not round is refused a radius rather than ignoring it,
+        for the reason :meth:`_settle_excitation_axis` refuses an axis: a field
+        that reaches the solver nowhere still reaches the editor.
+        """
+        if self.kind not in _IS_ROUND:
+            if self.inner_radius:
+                raise EnvelopeError(
+                    f"port {self.number}: a {self.kind} port has no bore, so "
+                    f"inner_radius {self.inner_radius:g} describes nothing; "
+                    "leave it unset"
+                )
+            return
+
+        first, second = (abs(self.stop[axis] - self.start[axis]) for axis in self.transverse_axes)
+        if not math.isclose(first, second, rel_tol=_ROUND_TOLERANCE, abs_tol=0.0):
+            raise EnvelopeError(
+                f"port {self.number}: the port box spans {first:g} by {second:g} "
+                f"across {AXIS_NAMES[self.propagation_axis]}, so it does not "
+                "bound a circle. A coaxial port is built on a round bore"
+            )
+        _finite(self.inner_radius, f"port {self.number}: inner_radius", low=0.0, strict=True)
+        if self.inner_radius >= self.outer_radius:
+            raise EnvelopeError(
+                f"port {self.number}: inner_radius {self.inner_radius:g} is not "
+                f"inside the bore, which has radius {self.outer_radius:g}. There "
+                "is no annulus between the conductors to drive across"
+            )
+
     def _check_shifts(self) -> None:
         """The feed and measurement planes lie within the port box.
 
@@ -626,6 +869,25 @@ class Port:
         a set.
         """
         return tuple(a for a in range(DIMENSIONS) if a != self.propagation_axis)
+
+    @property
+    def outer_radius(self) -> float:
+        """Half the bore's diameter, off the box rather than off a field.
+
+        The mean of the two transverse half-extents, so the answer does not
+        depend on which axis is asked first - :attr:`transverse_axes` and
+        :attr:`mode_axes` disagree about that order, and only one of them is
+        the pair openEMS binds.
+        """
+        extents = [abs(self.stop[axis] - self.start[axis]) for axis in self.transverse_axes]
+        return sum(extents) / (2 * len(extents))
+
+    @property
+    def bore_centre(self) -> tuple[float, float, float]:
+        """Where the line's axis runs, with the propagation coordinate at ``start``."""
+        centre = [(a + b) / 2.0 for a, b in zip(self.start, self.stop)]
+        centre[self.propagation_axis] = self.start[self.propagation_axis]
+        return (centre[0], centre[1], centre[2])
 
     @property
     def mode_axes(self) -> tuple[int, int]:
@@ -710,6 +972,11 @@ class Port:
             return self.stop[axis]
         return self.start[axis] + self.direction * self.measurement_shift
 
+    def moved(self, offset: tuple[float, float, float]) -> Port:
+        """The same port, translated. The shifts along the axes are lengths and
+        stay as they are; the corners are places and move."""
+        return replace(self, start=_shifted(self.start, offset), stop=_shifted(self.stop, offset))
+
     def lays_conductor(self) -> bool:
         """Whether this port adds metal the mesh has to resolve."""
         return self.kind in _LAYS_CONDUCTOR
@@ -739,6 +1006,11 @@ class Port:
         resistor and the probes both survive it, because openEMS snaps those.
         The excitation is the one primitive that does not, so a plane lying
         between two lines drives nothing at all.
+
+        An axis the box has *extent* on asks for nothing here, a line inside it
+        being the mesher's to place or not rather than a position anything can
+        name. Whether one landed there is a question about the grid, and
+        :mod:`.preflight` is where the grid exists to be asked.
 
         ``MSLPort`` is not a cliff - it snaps both planes to the nearest
         existing line rather than discretising nothing - so it asks through
@@ -802,6 +1074,7 @@ class Port:
             "kind": self.kind,
             "metal": self.metal,
             "mode": self.mode,
+            "inner_radius": self.inner_radius,
             "start": list(self.start),
             "stop": list(self.stop),
             "propagation_axis": self.propagation_axis,
@@ -822,6 +1095,7 @@ class Port:
             kind=data["kind"],
             metal=data.get("metal", ""),
             mode=data.get("mode", ""),
+            inner_radius=float(data.get("inner_radius", 0.0)),
             start=tuple(data["start"]),
             stop=tuple(data["stop"]),
             propagation_axis=data["propagation_axis"],
@@ -958,6 +1232,17 @@ class MeshGrid:
     def __getitem__(self, dim: int) -> np.ndarray:
         return (self.x, self.y, self.z)[dim]
 
+    def moved(self, offset: tuple[float, float, float]) -> MeshGrid:
+        """The same grid, translated. Every spacing in it is a difference and
+        so is untouched, which is what makes this a change of coordinates
+        rather than a different mesh."""
+        return replace(
+            self,
+            x=self.x + offset[0],
+            y=self.y + offset[1],
+            z=self.z + offset[2],
+        )
+
     @property
     def cell_count(self) -> int:
         """Lines, not intervals. See ``mesh.MeshLines.cell_count``."""
@@ -1073,6 +1358,14 @@ class Problem:
         untouched version 1 envelope digests to something its own
         ``envelope.sha256`` never said - and :meth:`Results.matches` then
         denies that a results file came from the envelope beside it.
+
+    :param smallest_response: The smallest magnitude in S this study reads, in
+        ``(0, 1]``, of which one is full scale. Nothing in the run is solved
+        differently for it: it is what ``residual.unfinished`` weighs the
+        leakage of a truncated record against, since a leak that is negligible
+        beside a response of one is the whole of a stopband. Declared and never
+        inferred - a sweep cannot tell a term that is the point of the exercise
+        from one that is a rounding error.
     """
 
     frequency: Frequency
@@ -1085,6 +1378,7 @@ class Problem:
     length_unit: float = 1e-3
     threads: int = 0
     timestep_factor: float = 1.0
+    smallest_response: float = 1.0
     title: str = ""
 
     def __post_init__(self) -> None:
@@ -1099,6 +1393,7 @@ class Problem:
         # numThreads. Both are scale factors on everything else in the file.
         _finite(self.length_unit, "length_unit", low=0.0, strict=True)
         _finite(self.threads, "threads", low=0.0)
+        _finite(self.smallest_response, "smallest_response", low=0.0, high=1.0, strict=True)
         if len(self.boundary) != 6:
             raise EnvelopeError(
                 f"boundary needs 6 entries (xmin xmax ymin ymax zmin zmax), "
@@ -1145,6 +1440,32 @@ class Problem:
             ports=tuple(replace(p, excite=(p.number == number)) for p in self.ports),
         )
 
+    def at_the_origin(self) -> tuple[Problem, tuple[float, float, float]]:
+        """This problem with its minimum corner at the origin, and the offset.
+
+        The offset comes back because the structure the engine is handed is
+        then not the one the user drew, and the XML beside it is in these
+        coordinates: a reader of that file has to be told, and anything
+        read back off the engine by *position* would have to subtract it.
+        Nothing this adapter reads back is a position - an S-matrix is not - so
+        it is provenance rather than a correction to apply.
+
+        Applied where the envelope is turned into a structure and nowhere
+        earlier, so what the user is shown - the mesh preview, a pre-flight
+        message, the envelope on disk - stays in the coordinates they drew in.
+        See :func:`origin_offset` for why the engine is given no other choice.
+        """
+        offset = origin_offset(self.solids, self.ports, self.grid)
+        return (
+            replace(
+                self,
+                grid=self.grid.moved(offset),
+                solids=tuple(solid.moved(offset) for solid in self.solids),
+                ports=tuple(port.moved(offset) for port in self.ports),
+            ),
+            offset,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -1152,6 +1473,7 @@ class Problem:
             "length_unit": self.length_unit,
             "threads": self.threads,
             "timestep_factor": self.timestep_factor,
+            "smallest_response": self.smallest_response,
             "frequency": self.frequency.to_dict(),
             "termination": self.termination.to_dict(),
             "boundary": list(self.boundary),
@@ -1180,6 +1502,7 @@ class Problem:
             length_unit=float(data.get("length_unit", 1e-3)),
             threads=int(data.get("threads", 0)),
             timestep_factor=float(data.get("timestep_factor", 1.0)),
+            smallest_response=float(data.get("smallest_response", 1.0)),
             title=data.get("title", ""),
         )
 

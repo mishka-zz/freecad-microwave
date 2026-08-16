@@ -58,5 +58,5 @@ def kind_of(obj):
 
 
 def is_ours(obj):
-    """True when this document object is one of ours."""
+    """True when this document object belongs to this workbench."""
     return kind_of(obj) in kinds()

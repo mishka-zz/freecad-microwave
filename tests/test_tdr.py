@@ -94,7 +94,9 @@ def reflected(network, reference=50.0, ports=(1, 2), driven=(1,)):
     size = (frequency.size, len(ports), len(ports))
     s = np.full(size, np.nan, dtype=complex)
     s[:, 0, 0] = np.asarray(network.s, dtype=complex).ravel()
-    z = np.full((frequency.size, len(ports)), reference, dtype=complex)
+    z = np.zeros((frequency.size, len(ports)), dtype=complex)
+    # A scalar, or one value per frequency for a reference that disperses.
+    z[:] = np.reshape(np.asarray(reference, dtype=complex), (-1, 1))
     return SParameters(
         frequency=frequency,
         s=s,
@@ -103,6 +105,30 @@ def reflected(network, reference=50.0, ports=(1, 2), driven=(1,)):
         measured_impedance=z,
         driven=tuple(driven),
     )
+
+
+def measured(points=POINTS, fmax=FMAX):
+    """A reference of the shape a microstrip port extracts from the field.
+
+    Complex, and drifting across the band. Nothing rests on the numbers beyond
+    their not being one real constant, which is the whole of what makes a
+    reference unusable until it is moved.
+    """
+    ramp = _frequency(points, fmax).f / fmax
+    return 47.0 + 4.0 * ramp + 1j * (0.9 - 1.6 * ramp)
+
+
+def against(network, reference):
+    """The same solve, stored against ``reference`` rather than against its own.
+
+    Which is the one thing :meth:`SParameters.from_runs` does differently for a
+    port reported against what it measured: the volts that came back are the
+    same and the reference they are renormalised onto is the choice. So a trace
+    taken from this and moved back must be the trace the other choice gives.
+    """
+    moved = network.copy()
+    moved.renormalize(np.asarray(reference, dtype=complex).reshape(-1, 1), s_def="power")
+    return reflected(moved, reference=reference)
 
 
 def _two_port(network):
@@ -433,10 +459,55 @@ class TestPaddingDrawsAndDoesNotResolve:
         assert edges[1] == pytest.approx(edges[0], abs=1e-3)
 
 
-class TestWhatItRefuses:
-    def test_a_self_referenced_port_is_refused_as_circular(self):
-        result = reflected(line([50.0, 75.0, 50.0]))
-        circular = SParameters(
+class TestAPortReferencedToWhatItMeasured:
+    """A microstrip port extracts its own Z_ref from the field, so it is complex
+    and dispersive and no one number states it. The transform needs one anyway,
+    and moving the reflection onto one is what it does about that."""
+
+    SECTIONS = [50.0, 75.0, 50.0]
+
+    def test_the_same_solve_gives_the_same_trace_whichever_it_was_stored_against(self):
+        """The renormalisation is the whole of what this does, so what it has to
+        return is the trace the solve gives when it was stored against the
+        number in the first place. Exact rather than close: the two differ by
+        one move and its inverse, over the same volts."""
+        declared = tdr.step_response(reflected(line(self.SECTIONS)), 1)
+        moved = tdr.step_response(against(line(self.SECTIONS), measured()), 1, reference=50.0)
+        assert moved.reference == declared.reference
+        assert moved.impedance == pytest.approx(declared.impedance, rel=1e-9, nan_ok=True)
+
+    def test_a_declared_section_is_recovered_through_the_move(self):
+        """The closed form, against the reference that has been moved rather
+        than the one that was stored: the middle section reads back at what it
+        was built from."""
+        trace = tdr.step_response(against(line(self.SECTIONS), measured()), 1, reference=50.0)
+        assert plateau(trace, 25.0, 35.0) == pytest.approx(75.0, rel=0.01)
+
+    def test_the_port_s_own_reference_is_taken_at_band_centre(self):
+        """A number is needed and the band holds a curve, so one point of it is
+        chosen - the middle, which is the convention the run panel already
+        reports a measured impedance at."""
+        z = measured()
+        trace = tdr.step_response(against(line(self.SECTIONS), z), 1)
+        assert trace.reference == pytest.approx(z[z.size // 2].real, abs=0.0)
+        assert trace.reference_measured
+
+    def test_a_number_that_was_asked_for_is_not_marked_as_measured(self):
+        trace = tdr.step_response(against(line(self.SECTIONS), measured()), 1, reference=50.0)
+        assert trace.reference == 50.0
+        assert not trace.reference_measured
+
+    def test_a_reference_that_is_already_one_real_number_is_left_alone(self):
+        trace = tdr.step_response(reflected(line(self.SECTIONS)), 1)
+        assert trace.reference == 50.0
+        assert not trace.reference_measured
+
+    def test_a_port_at_its_own_resistance_reads_as_that_resistance(self):
+        """A lumped port's own impedance is the number that was typed, so a
+        study referenced to it is referenced to a number and there is nothing to
+        move. What the array holds decides that, not what was declared."""
+        result = reflected(line(self.SECTIONS))
+        own = SParameters(
             frequency=result.frequency,
             s=result.s,
             port_numbers=result.port_numbers,
@@ -445,45 +516,22 @@ class TestWhatItRefuses:
             driven=result.driven,
             self_referenced=(1,),
         )
-        with pytest.raises(ResultError, match="own measured impedance"):
-            tdr.step_response(circular, 1)
+        trace = tdr.step_response(own, 1)
+        assert trace.reference == 50.0
+        assert not trace.reference_measured
+        assert trace.impedance == pytest.approx(tdr.step_response(result, 1).impedance, nan_ok=True)
 
-    def test_a_reference_that_varies_across_the_band_is_refused(self):
-        result = reflected(line([50.0, 75.0, 50.0]))
-        varying = np.asarray(result.reference, dtype=complex).copy()
-        varying[:, 0] = np.linspace(48.0, 52.0, varying.shape[0])
-        with pytest.raises(ResultError, match="one number for the whole trace"):
-            tdr.step_response(
-                SParameters(
-                    frequency=result.frequency,
-                    s=result.s,
-                    port_numbers=result.port_numbers,
-                    reference=varying,
-                    measured_impedance=result.measured_impedance,
-                    driven=result.driven,
-                ),
-                1,
-            )
+    def test_a_constant_complex_reference_is_moved_onto_its_real_part(self):
+        """Constant is not the condition - real is. An impedance read off a
+        reflection has nowhere to put an imaginary part, so a reference that
+        carries one is moved like any other."""
+        result = reflected(line(self.SECTIONS), reference=50.0 + 3.0j)
+        trace = tdr.step_response(result, 1)
+        assert trace.reference == 50.0
+        assert trace.reference_measured
 
-    def test_a_complex_reference_is_refused_for_being_complex(self):
-        """A constant complex reference is not a *varying* one, and telling that
-        user their reference moves across the band would quote them one number
-        twice and send them to a setting that is already fixed."""
-        result = reflected(line([50.0]))
-        reactive = np.full_like(np.asarray(result.reference, dtype=complex), 50.0 + 3.0j)
-        with pytest.raises(ResultError, match="real by construction"):
-            tdr.step_response(
-                SParameters(
-                    frequency=result.frequency,
-                    s=result.s,
-                    port_numbers=result.port_numbers,
-                    reference=reactive,
-                    measured_impedance=result.measured_impedance,
-                    driven=result.driven,
-                ),
-                1,
-            )
 
+class TestWhatItRefuses:
     def test_a_hole_in_the_band_is_refused_rather_than_transformed(self):
         result = reflected(line([50.0, 75.0, 50.0]))
         holed = np.asarray(result.s, dtype=complex).copy()
@@ -527,8 +575,14 @@ class TestWhatItRefuses:
 
     def test_a_reference_of_zero_is_refused(self):
         result = reflected(line([50.0, 75.0, 50.0]), reference=0.0)
-        with pytest.raises(ResultError, match="measured against a positive one"):
+        with pytest.raises(ResultError, match="needs a positive one"):
             tdr.step_response(result, 1)
+
+    def test_a_reference_asked_for_is_held_to_the_same_bar(self):
+        """Nothing about a number being typed rather than measured makes it an
+        impedance a reflection can be read against."""
+        with pytest.raises(ResultError, match="needs a positive one"):
+            tdr.step_response(reflected(line([50.0, 75.0, 50.0])), 1, reference=-50.0)
 
 
 class TestVelocity:

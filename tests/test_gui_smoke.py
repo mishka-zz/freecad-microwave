@@ -606,6 +606,7 @@ DOCUMENT_CLASSES = [
     ("EMMaterialBinding", "Microwave.Objects.materials"),
     ("EMMeshRegion", "Microwave.Objects.mesh"),
     ("EMMeshPreview", "Microwave.Objects.preview"),
+    ("EMPortCoaxial", "Microwave.Objects.ports"),
     ("EMPortLumped", "Microwave.Objects.ports"),
     ("EMPortMicrostrip", "Microwave.Objects.ports"),
     ("EMPortRectWaveguide", "Microwave.Objects.ports"),
@@ -625,6 +626,7 @@ FACTORIES = [
     ("Microwave.Objects.materials", "createEMMaterialBinding", "EMMaterialBinding"),
     ("Microwave.Objects.preview", "createEMMeshPreview", "EMMeshPreview"),
     ("Microwave.Objects.results", "createEMSParameters", "EMSParameters"),
+    ("Microwave.Objects.ports", "createEMPortCoaxial", "EMPortCoaxial"),
     ("Microwave.Objects.ports", "createEMPortLumped", "EMPortLumped"),
     ("Microwave.Objects.ports", "createEMPortMicrostrip", "EMPortMicrostrip"),
     ("Microwave.Objects.ports", "createEMPortRectWaveguide", "EMPortRectWaveguide"),
@@ -1356,6 +1358,34 @@ class TestTheToolbarsAndTheMenuAgree:
         from Microwave.Commands import COMMANDS
 
         assert self.registered() == {name for name, _, _ in COMMANDS}
+
+    def test_a_withheld_command_is_reachable_from_nowhere(self):
+        """A command not ready to be used has to be absent from all three
+        surfaces, and the three are derived from one table - so what this
+        asserts is that a withheld row was taken out of that table rather than
+        hidden on top of it.
+
+        It builds and it is scored against a closed form; what it is not is
+        ready. Moving a row back into ``COMMANDS`` is the whole of shipping it.
+        """
+        from Microwave.Commands import COMMANDS, WITHHELD, menu
+
+        withheld = {name for name, _, _ in WITHHELD}
+        assert withheld, "nothing is withheld, so this is asserting nothing"
+        assert withheld.isdisjoint({name for name, _, _ in COMMANDS})
+        assert withheld.isdisjoint(self.registered())
+        assert withheld.isdisjoint(self.on_toolbars())
+        assert withheld.isdisjoint(menu())
+
+    def test_a_withheld_command_is_still_a_command(self):
+        """Kept whole rather than commented out. A class nothing constructs is a
+        class that rots, and this one is three lines from being offered again."""
+        from Microwave.Commands import WITHHELD
+
+        for _, command, _ in WITHHELD:
+            resources = command().GetResources()
+            assert resources["MenuText"]
+            assert resources["ToolTip"]
 
     def test_no_command_is_listed_twice(self):
         names = self.on_toolbars()

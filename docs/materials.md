@@ -31,13 +31,31 @@ fixed conductivity gives a loss tangent that falls as 1/f, so the model is
 exact at band centre and drifts either side of it.
 
 `MeasuredAt` is the frequency the permittivity and loss tangent were quoted at.
-It is not decoration - it is the only number that says how good the
-approximation is, and pre-flight compares it against the band being solved.
-FR-4 characterised at 1 GHz and solved to 20 GHz gets a warning saying so.
+It is not decoration - nothing below the conversion can recover where the number
+was true, and pre-flight compares it against the band being solved. FR-4
+characterised at 1 GHz and solved to 20 GHz gets a warning saying so.
 
 A loss tangent without a `MeasuredAt` is not a physical quantity, it is a number
 somebody wrote down. Catalogs are required to state one wherever loss is
 nonzero.
+
+The band asks the same thing a second time, and `MeasuredAt` says nothing about
+it: however well the loss tangent was quoted, one conductivity is one loss
+tangent at one frequency. What the model carries is the declared figure scaled
+by `f_centre / f`, so the bottom of a wide band is that many times lossier than
+the material - a sweep from 50 MHz to 10 GHz is centred near 5 GHz and a
+hundredfold too lossy at its own bottom end. Pre-flight warns once that factor
+reaches four, which a band of 7:1 or wider does, and says what the factor is.
+
+Both ends are wrong, and only one of them looks it. A fixed conductivity
+attenuates the same at every frequency while a dielectric's loss rises with it,
+so the two ends are out by the same amount of loss in opposite directions: the
+bottom carries far more loss than it should, the top a little under half of
+what it should. The ratio is alarming at the bottom and the missing decibels
+are at the top.
+
+Nothing you can set fixes it: narrow the band, split the sweep into studies, or
+read the ends knowing which way each is wrong.
 
 ### Conducting sheets
 

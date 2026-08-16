@@ -16,9 +16,9 @@ a port that looks wrong is wrong.
 | **Rectangular waveguide** | A mode launched into a hollow guide | Analytic, from the guide and the mode |
 
 The distinction that matters most later is the third column. A microstrip port
-*discovers* its impedance; a lumped port *states* one. Which of the two is in use
-decides what a result can be referenced to, and whether an
-impedance-against-distance trace can be taken at all - see [Results](results.md).
+*discovers* its impedance; a lumped port *states* one. Which of the two is in
+use decides what a result can be referenced to, what can be exported, and how an
+impedance-against-distance trace must be read - see [Results](results.md).
 
 ## Creating one
 
@@ -60,6 +60,19 @@ drawn as a zero-thickness sheet. Both are correct, and every port takes either -
 which is why the properties are named `TraceEnd` and `CrossSection`, for what
 they mean rather than for a topology the name would be wrong about half the
 time.
+
+For a **lumped** port the two picks are not interchangeable, because they say
+different things about what the port covers. An edge encloses no area, so it is
+read as a cross-section: the port becomes a plane at the end of the conductor.
+A face is read as the area it covers, and the port spans all of it - which is
+what a lumped element under a pad wants and what a trace end does not. Pick the
+edge where the conductor ends, and the face where the port really is the pad.
+
+That distinction only shows on a trace running **off the grid axes**. openEMS
+has no rotated port, so the end of such a trace arrives as the bounding box of a
+diagonal, which reaches past where the copper stops. Read as a cross-section it
+is put back onto the end of the conductor; read as an area it is not. A layout
+drawn on the axes is unaffected either way.
 
 The **ground reference** is the whole conductor, not a cross-section of it. A
 face of the ground plane is the usual pick, and selecting the ground object in
@@ -142,7 +155,7 @@ or not the trace under it is that long.
 
 That is deliberate. A box derived from the copper always looks like it fits,
 which is exactly when it does not - and a feed line too short to measure on is
-something to be shown in the 3D view, before six minutes go into solving it.
+something to be shown in the 3D view, before a solve goes into it.
 
 ![A microstrip line in elevation, with the port box occupying the left quarter
 of the board](images/port-elevation.png)
@@ -283,12 +296,32 @@ Taking the source alone leaves an asymmetry, so picking the ground as the source
 brings the same fault straight back. An overlap has no preferred end.
 
 Fed from a trace end face against a ground plane, the overlap has zero extent
-across one axis and the box is a plane. That is legitimate and needs no grid
-line of its own - openEMS snaps a lumped element's box to the mesh either way.
+across one axis and the box is a plane. That is legitimate: openEMS snaps a
+lumped element's box to the mesh whatever shape it is, and a driven port's plane
+is given a grid line of its own so that the excitation, which is not snapped,
+has a coordinate to be laid on.
 
 What snapping does not survive is a **gap thinner than one cell** along the
 excitation axis: both ends land on the same grid line and openEMS drops the
-element silently. That is refused before the run.
+element silently.
+
+The excitation fails differently, being snapped nowhere. Its box has to hold a
+grid coordinate across each of the other axes, and a box that spans cells asks
+the mesher for no line of its own - so beside a **curved conductor**, where
+nothing else pins one either, it can come to rest between two lines and be laid
+nowhere at all. The run then takes its full time and reports zeros.
+
+Snapping has a third way of going wrong, and it is the element rather than the
+excitation. The conductor is rasterised on the same grid, out of the Yee edges
+whose own sample point it holds, so an element ending on a **conductor with no
+thickness** - a trace or a ground plane, as they are usually drawn - is bonded
+to it only on the line that conductor lies on. Where the grid has no line there,
+the element is laid with a live edge between it and the metal, in series with
+the resistance the port declares. A conductor with thickness has no such fault:
+the edge running out of the terminal into it is zeroed, and snapping cannot put
+that edge's midpoint further than half a cell past where the end was drawn.
+
+Each is refused before the run.
 
 ### Terminating a line with one
 
@@ -299,17 +332,19 @@ the end of the board, so the line sees its resistance rather than an open.
 What differs is what comes back. The microstrip port measures the line's own
 impedance and needs room downstream to do it; the lumped port declares one and
 needs no room at all. Reach for the lumped one where the line's impedance is not
-the question, or where the transform in [Results](results.md) needs a reference
-it can use.
+the question, or where the trace in [Results](results.md) is to be read at the
+launch rather than past it.
 
 ### When to reach for it
 
 - A load, a source resistance, or a series or shunt element.
 - Terminating a line of known impedance, where the reference should be a
   declared number rather than a measured one.
-- Any study that is to yield an **impedance-against-distance** trace. That
-  transform needs one real reference impedance across the band, and a measured
-  one is the line restating itself. See [Results](results.md).
+- Any study whose **impedance-against-distance** trace is to be read at the
+  launch. The transform runs off either kind of port, but a port that measured
+  its own reference reads that measurement back over the section it sits on. A
+  declared reference is an independent number, so the first plateau means
+  something. See [Results](results.md).
 
 ---
 
@@ -351,7 +386,6 @@ thing about a port that cannot be drawn before meshing.
 - **The mode must propagate.** A mode below cutoff over the band carries
   nothing, and a run that launches one reports nothing worth reading.
 
----
 
 ## What goes wrong, and where it is caught
 

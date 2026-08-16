@@ -55,40 +55,125 @@ box - volume for a solid, area for a flat one - and accepted when they agree.
 
 This is a test on the measurement, not on the feature type. A boolean result or
 an extruded rectangle that happens to be a box passes; a `Part::Box` rotated 30
-degrees does not.
+degrees does not, and takes the surface route below instead.
 
-**A flat shape may be any axis-aligned outline.** A shape flat in exactly one
-axis is cut into rectangles, exactly, and the cut is proved by area. An L, a
-notch, a whole filter layout, a compound of coplanar faces, and a hole - a
-clearance in a ground plane - all pass.
+A shape that does *not* fill its box is sent as its own surface instead, and
+openEMS holds that exactly - it answers "is this point inside?" against the
+triangles themselves. So a rotation, a curve, a taper, a fillet or a boolean cut
+is modelled rather than turned away, and what approximates the shape is the
+*grid*, which stays rectilinear.
+
+**A flat shape is held as the area it encloses.** Flat in exactly one axis, it is
+cut into rectangles where every edge is axis-aligned - exactly, and the cut is
+proved by area - and sent as coplanar polygons where they are not. A round pad, a
+curved taper and a letter with a counter in it all pass, holes included. The
+rectangles are tried first because they cost the grid the fewest planes.
+
+**A layout drawn in one operation is judged island by island.** Each separate
+region of it - a pad, a stub, a glyph - is held in whichever of those two forms
+suits it, so one curve somewhere on the sheet no longer decides the treatment of
+everything beside it. The clearances *between* the islands are measured off the
+drawing and the mesh is sized to hold them open, which is what a coupling gap
+and a gap-coupled resonator need and what nothing else in the model would ask
+for.
 
 So the shapes to draw are:
 
 | | |
 |---|---|
-| **A box** | Anything with thickness. A substrate, a plated trace, a metal wall |
-| **A flat sheet** | Any Manhattan outline. A layout, a ground plane, a zero-thickness trace |
+| **A box** | Anything with thickness, and the cheapest thing to mesh |
+| **A solid** | Any shape at all. A taper, a horn, a rod, a filleted block |
+| **A flat sheet** | Any outline at all. A layout, a ground plane, a round pad |
+| **A metal shell** | A conductor drawn as an open surface. A reflector, a horn, a pipe wall |
 
-A **solid** L or notch is refused, because it does not fill its box and it is
-not flat. Draw it as two boxes bound to one material, or as a flat sheet.
+## A conductor drawn as a surface is given a thickness
+
+Metal is the one material that can be handed a thickness nobody drew, because
+the field inside a conductor is zero: a skin and the slab behind it do the same
+thing to the problem. So a reflector or a horn drawn as a shell is offset into a
+solid and meshed as one, and the surface you drew stays exactly where it is, as
+one wall of the metal.
+
+The thickness is not a number anybody chose. It is the smallest one the grid
+will still resolve at the size the metal is already being meshed at, so it never
+becomes the finest thing in the model - which also means it moves when the band
+or the mesh policy moves, and it is nowhere in your document. Check therefore
+reports it, per object and in millimetres, and a headless run prints the same
+line.
+
+Read that line. A drawing that *meant* a solid and failed to close arrives here
+looking exactly like a shell somebody meant, and no measurement can separate the
+two. If the object named was meant to be solid, close it and give it the
+thickness you intended.
+
+Where the thickness has outgrown the drawing - wide against the surface, or
+tight against the radius it curves through - it is refused instead, and the
+message says which of the two it was.
 
 ## What is refused, and why by name
 
-A rotation, a curve, a taper or a solid boolean cut produces a message naming
-the object, stating its volume against its bounding box's, and saying what to
-draw instead.
+What is left is geometry that is not a shape openEMS can hold. Each refusal
+names the object and says what to do about it.
 
-The refusal is the point. openEMS would take the shape and staircase it without
-saying so, and a staircased shape is not a crash - it is a plausible number. A
-rotated line comes back with an impedance, and nothing anywhere says it is the
-impedance of a different line.
+| Refused | What it is | What to do |
+|---|---|---|
+| **Flat in two axes** | A line or a point. It has no area to model | Give it the extent it is meant to have |
+| **Part volume and part surface** | One object holding solids *and* faces that belong to none of them. Which of the two a loose face was meant to be cannot be read from the drawing | Split it, or knit the faces into the solid |
+| **Wound inside out** | A solid whose faces point inward. It describes everything *except* the space it appears to occupy, so it is not bounded. `Part > Check geometry` will not report this - the shape is valid, it is simply the complement | Reverse it |
+| **Two lumps meeting at a single point** | A surface that pinches to nothing. openEMS cannot decide what is inside it | Separate the lumps, or overlap them properly |
+| **A tilted or curved *dielectric* surface** | An area is laid at one elevation on one axis, and a surface tilted across all three has no elevation to take | Give it thickness. A dielectric's thickness is most of what the layer does, so nothing may supply one for you |
+| **A triangulation that lost the drawing** | The shape's own surface came back open, or came back enclosing measurably less than was drawn, and refining the triangulation did not close the gap | Check the shape for a self-intersection or a face the kernel could not triangulate |
 
-Curvature is caught by *measuring* each edge against its own chord rather than
-by asking the kernel what type it is. A semicircular edge whose two ends happen
-to be axis-aligned does not slip through as a straight one.
+A **flat** dielectric sheet is not on that list. It is modelled as the area it
+encloses, at the elevation it lies on, exactly as a flat conductor is. Only a
+dielectric surface with no elevation to take is refused.
 
-A shape flat in two axes is a line or a point, and is refused: a region needs
-area.
+A **conductor** drawn as an open surface is not on it either. It is given a
+thickness instead, as above - the field inside metal is zero, so a skin and the
+slab behind it do the same thing to the problem.
+
+Where a shape is drawn is not on that list and never will be. It is a real
+constraint of the engine - openEMS decides what is inside a solid held as its
+own surface by casting a ray from the point in question toward one it builds by
+scaling that solid's maximum corner away from the origin, which reaches outside
+the solid only while some part of it is above the origin - but it is one the
+adapter absorbs: every structure is handed to the engine translated until its
+minimum corner is at the origin, so a device drawn anywhere solves the same.
+
+The refusal is the point. openEMS would otherwise take the shape and solve
+*something*, and a wrong shape is not a crash but a plausible number. A
+conductor that vanished comes back with an S-matrix, and nothing anywhere says
+it is the S-matrix of a different device.
+
+What the grid costs you is reported rather than refused. A curve on a
+rectilinear grid is a staircase however the shape was described, so the mesh is
+sized against the drawing's own features and the mesh report says what that came
+to.
+
+One part of that cost is taken off for you. openEMS decides whether a metal edge
+conducts by sampling a single point on it, so only the grid lines *inside* a
+conductor conduct and the surface it builds lands at the last one still within
+the drawing - the metal loses, half a cell on average, and proportional to the
+cell, which means refining the mesh buys back only what it costs. A curved
+conductor is therefore handed over grown by half the cell it will be sampled on,
+and the last line still inside it is the one you drew. You see nothing of it: the
+geometry, the preview and every message stay as drawn.
+
+Two limits on that, both deliberate. It applies to **conductors**, because a
+dielectric boundary is averaged over the cell rather than point-sampled and
+carries no such rounding. And it applies to **solids**: a flat sheet has a grid
+line pinned at the plane it lies in, so nothing rounds it across its thickness,
+but a *curved outline* - a round pad, a spiral, a curved taper - is
+point-sampled and is not corrected.
+
+How much a curved outline gives up has not been measured, and the reason is
+worth knowing before you go looking for it. A flat conductor keeps its charge at
+its rim, where the field is singular, and a grid resolves that to a share of a
+cell however the rim is drawn - so a plate whose every edge lands on a grid line,
+with nothing sampled and nothing rounded, still reads as a conductor of a
+different size. That reading and a receded rim are the same size and point the
+same way. Nothing that measures a capacitance can separate them, so the workbench
+states neither a size nor a direction for this one.
 
 ## Zero-thickness copper
 

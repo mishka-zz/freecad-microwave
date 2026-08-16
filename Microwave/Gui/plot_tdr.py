@@ -19,6 +19,7 @@ from typing import NamedTuple
 import numpy as np
 
 from ..Results import tdr
+from ..units import MM_PER_M
 from . import charts
 
 #: The axes a trace can be drawn against, and what each is called. Distance
@@ -58,13 +59,12 @@ def axis_of(trace, axis: str, speed: float | None = None) -> Axis:
             "speed along the line. Draw against time, or measure a velocity from "
             "a transmission term over a known separation"
         )
-    return Axis(1e3 * tdr.distance(trace, speed), "Distance along the line (mm)", "mm")
+    return Axis(MM_PER_M * tdr.distance(trace, speed), "Distance along the line (mm)", "mm")
 
 
 class ChartText(NamedTuple):
-    """What a chart calls itself. Named for :mod:`.plot_s_params`' reason: two
-    strings of the same type are one transposition away from a heading in the
-    footnote's place with nothing to notice it."""
+    """What a chart calls itself. Named rather than a pair, for the reason
+    :class:`.plot_s_params.ChartText` gives."""
 
     heading: str
     footnote: str
@@ -77,13 +77,18 @@ def chart_text(
 
     The basis names what the reader cannot recover from the curve. The reference
     impedance always: a trace against 50 ohm and the same trace against 75 are
-    different charts of one solve. The velocity **only on the chart it acted
-    on** - it is what turned time into distance, so quoting it under a time axis
-    would name a basis that was not used, and a reader would take the horizontal
-    scale for something it is not.
+    different charts of one solve. Where the port measured that impedance rather
+    than being told it, that is said too - the number then came out of this
+    solve instead of being chosen, so the line under the port reads it back and
+    the first plateau is not evidence about the line. The velocity **only on the
+    chart it acted on** - it is what turned time into distance, so quoting it
+    under a time axis would name a basis that was not used, and a reader would
+    take the horizontal scale for something it is not.
     """
     where = f"port {trace.port}"
     basis = f"Reflection at {where}, referenced to {trace.reference:g} ohm"
+    if trace.reference_measured:
+        basis += ", which the port measured at band centre"
     if speed is not None and axis == DISTANCE:
         basis += f"; distance at {speed / 1e6:.1f} mm/ns, measured over the through path"
     return ChartText(f"{title} impedance along the line".strip(), basis)

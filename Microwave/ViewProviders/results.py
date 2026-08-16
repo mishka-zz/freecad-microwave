@@ -25,7 +25,7 @@ class EMSParametersViewProvider(HasDisplayMode):
 
         Not guarded on the active workbench, which those providers do guard on.
         Theirs are editing actions; these are "show me this object" and "give
-        me this object as a file", and the object is ours whoever is looking.
+        me this object as a file", and the object is the same whatever is looking.
 
         One impedance entry per port that can produce a trace - and **one
         anyway** when no port can, because a menu that goes quiet cannot be
@@ -43,7 +43,7 @@ class EMSParametersViewProvider(HasDisplayMode):
         self._add(menu, "Export Touchstone...", self.export_touchstone)
 
     def _add(self, menu, text, slot):
-        """One menu entry, owned by the menu and connected to something we own."""
+        """One menu entry, owned by the menu and connected to a slot in this module."""
         from PySide import QtGui
 
         action = QtGui.QAction(text, menu)
@@ -55,7 +55,7 @@ class EMSParametersViewProvider(HasDisplayMode):
 
         Every port that can produce a trace, or - when none can - the lowest
         port on its own, so there is something to press for the reason. The
-        label does not distinguish the two: somebody looking for a chart has to
+        label does not distinguish the two: a user looking for a chart has to
         find the entry that gets them one, and being told why they cannot have
         it is a better answer than an empty menu.
 
@@ -127,7 +127,7 @@ class EMSParametersViewProvider(HasDisplayMode):
         Deliberately *not* the analysis panel, which is what double-clicking the
         solver opens. A result is a thing to look at, and the numbers are
         already in the document - opening the panel would put a Run button in
-        front of someone who asked to see an answer they already have.
+        front of a user who asked to see an answer they already have.
         """
         self._acting_on = vobj.Object
         self.plot_matrix()

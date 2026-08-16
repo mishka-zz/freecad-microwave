@@ -65,6 +65,6 @@ def _box(title: str, text: str, *, refusal: bool) -> None:
     box.setStandardButtons(QtWidgets.QMessageBox.Ok)
     box.setAttribute(QtCore.Qt.WA_DeleteOnClose)
     # Shown, not executed. `exec_` and the `QMessageBox.warning` family run an
-    # event loop until somebody presses OK; modality is QMessageBox's own and
+    # event loop until OK is pressed; modality is QMessageBox's own and
     # survives this. The parent owns the widget, and closing it deletes it.
     box.show()

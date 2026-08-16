@@ -26,14 +26,14 @@ _BOUNDARY_WORDS = frozenset({"PEC", "PMC", "MUR"})
 
 #: Below this share of a drawn axis left as interior, say so. Not a tuned
 #: constant: at one half the absorber has taken more of the model than it left,
-#: which is the point past which "the domain is smaller than you drew" stops
+#: which is the point past which "the domain is smaller than drawn" stops
 #: being a detail. The microstrip example reads 0.76 and is silent; the same
 #: board over 2.4-2.5 GHz reads 0.04.
 _INTERIOR_SHARE_LIMIT = 0.5
 
 
 def _check_the_absorber_stands_on_the_structure(problem: Problem) -> list[Finding]:
-    """The overrun half of the THROUGH question, on an envelope nobody meshed.
+    """The overrun half of the THROUGH question, on an unmeshed envelope.
 
     ``write`` refuses this while meshing, which covers every route through the
     workbench. It does not cover the driver: ``python -m ...driver`` reads an

@@ -12,6 +12,8 @@ constant claims. Without those two the bar is a number somebody liked.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 
@@ -147,10 +149,67 @@ class TestWhatItSays:
     def test_it_names_every_port_that_is_still_going_and_what_it_costs(self):
         message = residual.unfinished({1: 0.125, 2: 1e-6, 3: 0.03})
         assert "12.5% at port 1" in message
-        assert "3.0% at port 3" in message
+        assert "3% at port 3" in message
         assert "port 2" not in message
 
     def test_it_says_what_to_do_about_it(self):
         """A warning nobody can act on is noise, and this one has exactly one
         remedy."""
         assert "max_timesteps" in residual.unfinished({1: 1.0})
+
+
+class TestTheBarFollowsWhatIsBeingRead:
+    """Leakage is only harmless beside the term it lands on.
+
+    A stopband of -40 dB *is* |S21| = 0.01, so a bar written against a response
+    of one calls a leak negligible that is the whole of the quantity the device
+    was built to deliver. What the study says it reads down to is what the bar
+    is a share of.
+    """
+
+    @pytest.mark.parametrize("floor", [1.0, 0.1, 0.01, 1e-3])
+    def test_the_bar_is_that_share_of_the_smallest_response_read(self, floor):
+        """The bar itself still counts as finished, and the next float up does
+        not - at every depth, so the scaling is the bar rather than a constant
+        with a floor stirred in near it."""
+        bar = residual.WANTED * floor
+        assert residual.unfinished({1: bar}, floor) is None
+        assert residual.unfinished({1: np.nextafter(bar, 1.0)}, floor) is not None
+
+    def test_a_study_that_declares_nothing_reads_down_to_full_scale(self):
+        """Full scale is what a study declaring nothing is held to, and there
+        the share is an absolute error in S - which is the bar every matched
+        structure in the acceptance gates is judged by."""
+        for share in (residual.WANTED, 0.5):
+            assert residual.unfinished({1: share}) == residual.unfinished({1: share}, 1.0)
+
+    def test_leakage_a_full_scale_run_carries_can_be_the_whole_of_a_stopband(self):
+        """The case the share exists for, and the one an absolute bar is blind
+        to: a fifth of the stopband, and silent."""
+        ringing = {1: 0.002}
+        assert residual.unfinished(ringing) is None
+        assert "port 1" in residual.unfinished(ringing, 0.01)
+
+    def test_it_says_how_far_down_the_study_reads(self):
+        """Otherwise the bar it quotes is a number with no argument behind it."""
+        assert "-40 dB" in residual.unfinished({1: 1.0}, 0.01)
+
+    def test_and_nothing_about_a_floor_when_there_is_none(self):
+        assert "dB" not in residual.unfinished({1: 1.0})
+
+    @pytest.mark.parametrize("declared", [-0.01, -33.5, -100.0])
+    def test_the_floor_it_names_is_the_one_that_was_asked_for(self, declared):
+        """Rounded to whole decibels, a fraction of one reads as "-0 dB" - the
+        depth of a study that declared nothing, quoted beside a bar that is not
+        the one such a study gets."""
+        message = residual.unfinished({1: 1.0}, 10.0 ** (declared / 20.0))
+        assert f"{declared:g} dB" in message
+
+    @pytest.mark.parametrize("floor", [1.0, 0.1, 0.01, 1e-3])
+    def test_the_bar_it_names_is_the_bar_it_kept(self, floor):
+        """A message quoting the constant while the check used a scaled bar
+        would send somebody after the wrong run length."""
+        message = residual.unfinished({1: 1.0}, floor)
+        quoted = re.search(r"against the ([0-9.]+)%", message)
+        assert quoted, message
+        assert float(quoted.group(1)) / 100 == pytest.approx(residual.WANTED * floor, rel=1e-6)

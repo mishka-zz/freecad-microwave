@@ -7,7 +7,7 @@ from ._vp_hook import ViewProviderRestored, preview_status, redraw_preview
 
 
 class EMMeshPreview(ViewProviderRestored):
-    """The generated grid, as geometry you can look at.
+    """The generated grid, as geometry that can be looked at.
 
     A ``Part::FeaturePython`` and not a view-only overlay, because restore-time
     ``Proxy`` attachment fails *partially and silently* for a workbench that is
@@ -132,7 +132,7 @@ class EMMeshPreview(ViewProviderRestored):
         """Redraw when a *display* property changes. Never remesh.
 
         A display property that needs a button press is not how FreeCAD behaves
-        anywhere else - nobody presses Apply after changing Transparency. Mesh
+        anywhere else - Apply is not pressed after changing Transparency. Mesh
         policy is the opposite: it can cost seconds on a real board, so it waits
         for Update Mesh.
 
@@ -206,7 +206,7 @@ def set_segments(obj, segments, digest="", cells=0):
     Degenerate segments are skipped rather than refused. ``Part.LineSegment``
     rejects coincident endpoints, and a legitimate grid can produce one: an axis
     whose absorber is disabled puts the domain box and the outer box in exactly
-    the same place. Dropping a zero-length edge loses nothing anybody could see.
+    the same place. Dropping a zero-length edge loses nothing visible.
     """
     import Part
 

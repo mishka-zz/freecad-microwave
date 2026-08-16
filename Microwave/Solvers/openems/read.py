@@ -100,6 +100,15 @@ class Results:
         found = self.provenance.get("tail_share") or {}
         return {int(number): float(value) for number, value in found.items()}
 
+    @property
+    def smallest_response(self) -> float:
+        """The smallest magnitude in S the study that ran this said it reads.
+
+        One is full scale, which is what a study declaring nothing was held to,
+        and what :attr:`tail_share` has to be weighed against to mean anything.
+        """
+        return float(self.provenance.get("smallest_response", 1.0))
+
     def matches(self, digest: str) -> bool:
         """Whether these results came from the envelope with this digest."""
         return self.provenance.get("envelope_digest") == digest

@@ -144,6 +144,13 @@ So it is measured afterwards: the transform of the record's last tenth, against
 the wave that drove the run, as an absolute error in S. A run that stopped early
 says so, naming the port, and the figure stays with the result.
 
+What counts as early depends on what is being read. The bar is a share of the
+smallest response the study says it reads, and full scale until one is named -
+so a leak that is nothing beside a response of one, and is judged so, is the
+whole of a -40 dB stopband. A study that reads that deep says so on the
+analysis, as `SmallestResponse`. See
+[The smallest response](model.md#the-smallest-response).
+
 Resonant structures are where this matters most. A high-Q device needs a long
 decay, and runtimes an order of magnitude above a matched line are normal for one.
 
@@ -154,10 +161,10 @@ instruction. For the reasoning behind one:
 
 | The finding is about | Read |
 |---|---|
-| A shape that is not an axis-aligned box, or one that cannot be cut into rectangles | [Drawing the device](geometry.md) |
-| A material openEMS cannot build, loss quoted outside the band, a sheet too thick for its cell, two solids in one place | [Materials](materials.md) |
+| A shape openEMS cannot hold - a tilted dielectric surface, one flat in two axes, a solid wound inside out - and a conductor given a thickness the drawing did not carry | [Drawing the device](geometry.md) |
+| A material openEMS cannot build, loss quoted outside the band, a band too wide for one conductivity, a sheet too thick for its cell, two solids in one place | [Materials](materials.md) |
 | A port's axes, its picks, its measurement plane, a mode below cutoff, a gap that snaps shut | [Ports](ports.md) |
-| Cells per wavelength, a grid too large to build, a plane with no line on it, the absorber eating the model | [Meshing](meshing.md) |
+| Cells per wavelength, a grid too large to build, a plane with no line on it, the absorber eating the model, a conductor the grid barely holds | [Meshing](meshing.md) |
 | Step count, energy termination, the timestep factor, a pulse that does not fit | this page |
 | A matrix that cannot be assembled or exported | [Results](results.md) |
 
@@ -168,6 +175,13 @@ finish and hand back something worthless:
   full wall time. See [Ports](ports.md).
 - **A run too short to carry its own excitation.** Refused up front, because
   openEMS truncates the source and returns a full matrix anyway.
+- **A conductor the grid barely holds.** The run completes and the matrix looks
+  ordinary; what was solved is a strip narrower than anything drawn, and
+  refining once to check does not settle it. The mesher sizes every conductor it
+  can measure so this cannot arise, and the warning is what says a shape was not
+  one of those - one held as triangles, or one whose demand `MinElementSize` cut
+  off. See
+  [Meshing](meshing.md#except-across-a-conductor-where-the-mesher-does-it-for-you).
 
 ## Running headlessly
 
@@ -187,7 +201,9 @@ parses:
 | `STARTED` | Process is alive, envelope not yet read |
 | `ENVELOPE digest=...` | Envelope parsed and hashed |
 | `CHECK severity=... ...` | One pre-flight finding |
+| `PLACED offset=...` | How far the structure was moved to be solved |
 | `GRID cells=... lines=...` | Grid installed |
+| `GROWN solids=... most=...` | Conductors fitted to where openEMS samples them |
 | `BUILT` | Geometry and ports constructed |
 | `SOLVER_STARTED` | Handed off to openEMS |
 | `SOLVER_FINISHED` | Time stepping done |
@@ -201,6 +217,50 @@ anything else.
 The driver runs pre-flight **itself** before building, and not only where the
 envelope was made. It is the one point every route passes through - the panel, a
 script, a bug report replayed by hand - so the guards are not opt-in.
+
+`PLACED` is the marker to know about if you ever open the `structure.xml` a run
+leaves behind. openEMS reads a solid held as its own surface by casting a ray
+from the query point toward a point built by scaling that solid's maximum corner
+away from the origin, which is only outward while some part of it is above the
+origin - so the driver moves every structure until its minimum corner sits
+there. That is a translation and changes nothing about the model, but the XML is
+in those coordinates and nothing else is. The offset relates the two.
+
+`GROWN` is the other one. openEMS decides whether a metal edge conducts by
+sampling a single point on it, so only the grid lines that fall *inside* a
+conductor conduct and it arrives smaller than you drew it - a solid comes back
+thin, a cavity's wall opens the cavity out. It costs half a cell on average, and
+no mesh removes it, because it is proportional to the cell. Where a grid line
+lies on the surface there is nothing to give up, which is why an axis-aligned
+conductor arrives exactly and only a curved one needs anything done about it.
+
+So a curved conductor is handed to openEMS grown by half the cell it will be
+sampled on, and the last line still inside it is the one you drew. It applies to
+conductors only - a dielectric boundary is averaged over the cell rather than
+point-sampled, and carries no such loss - and to curved solids only. A box has a
+line pinned to each of its faces. A flat sheet has one at the plane it lies in,
+so nothing eats it across its thickness, but a curved outline is point-sampled
+like any other conductor boundary and is not corrected - how much that costs
+cannot be read off a capacitance, and is stated nowhere for that reason. See
+[Drawing the device](geometry.md). Nothing you see is in those coordinates: the
+geometry, the preview and every message stay as drawn.
+
+The half is not exact, and it cannot be. A conductor in openEMS is only
+*electrically* perfect: the sampling above zeroes the electric field on an edge
+and leaves the magnetic one alone, so the field that is kept out of the metal and
+the field that is not sit against two different walls, a sixth of a cell or so
+apart. One drawing cannot be both.
+
+A half serves the wall a **resonance** sees, and that is the deliberate choice: a
+frequency in the wrong place detunes a filter, where an impedance slightly out
+merely mismatches a line. So a cutoff or a resonance off a curved conductor is
+the figure to trust here, and an **impedance** off one is the looser of the two -
+by about a factor of ten on the shapes both have been measured on.
+
+Both improve when the mesh is refined, and faster than the cell: what the growth
+leaves is not a fixed offset but a smaller error of the same kind. So refining is
+worth paying for on a curved conductor, which it is not when the rounding is left
+in place.
 
 The envelope is this adapter's private format. It is not an interchange format
 and nothing else reads it: the neutral layer of this workbench is the document,

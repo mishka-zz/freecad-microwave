@@ -22,6 +22,7 @@ import numpy as np
 
 from .mesh import (
     DIMENSIONS,
+    Feature,
     MaterialClass,
     MeshError,
     MeshLines,
@@ -102,34 +103,19 @@ def _coarsest_in(
 ) -> float:
     """The largest cell the mesher could lay anywhere in ``window`` on ``dim``.
 
-    A THROUGH wall lands somewhere in that window and we cannot know where
-    before meshing - the wall's position depends on the reservation, which
-    depends on the material at the wall. Taking the **coarsest** value over the
-    whole window removes the circularity: whatever material turns out to be at
-    the wall, its own size is no larger than this, and the pitch actually laid
-    is no larger than that again, because constraints only ever lower the
-    sizing field (:meth:`_SizingField.__call__` is a ``min``) and
-    ``_cell_count`` rounds up.
+    Taking the **coarsest** value over the whole window removes the circularity
+    between where a THROUGH wall lands and what is reserved for it: the pitch
+    actually laid is never larger, because constraints only lower the sizing
+    field (:meth:`_SizingField.__call__` is a ``min``) and ``_cell_count`` rounds
+    up. So the grid can end short of the structure but never past it, which
+    :func:`_check_through_faces_land_on_the_structure` is what refuses.
 
-    So the reservation is at-or-above what gets laid: the grid can end short of
-    the structure, never past it. Short is waste and is reported; past is a
-    reflector and is refused by
-    :func:`_check_through_faces_land_on_the_structure`.
-
-    Taking the *finest* value instead would be tighter and is wrong: a fine
-    region anywhere in the window would shrink the reservation below what a
-    coarse region at the wall actually lays. Air counts as ``ceiling``, and so
-    does a conductor - ``sizes`` holds none, because a conductor asks for no
-    bulk size and the sizing field relaxes to ``cap`` over one.
-
-    It is a bound and not an estimate: grading pulls the pitch down near any
-    finer region further in, so the mesher can lay considerably less than was
-    reserved.
+    Why the coarsest and not the finest, and why this is a bound rather than an
+    estimate, are in
+    docs/internals/domain-and-absorber.md#the-circularity-and-the-way-out-of-it.
 
     ``floor`` is the mesher's own cell floor, and it decides which faces are two
-    faces. Bands narrower than it are not places: the mesher would merge their
-    bounds, so a reservation that reads a gap there predicts a grid it will not
-    build.
+    faces - see that page's last section.
     """
     if not sizes:
         return ceiling
@@ -155,7 +141,7 @@ def _coarsest_in(
         # is a preference, and :func:`~.mesh._snap` drops a preference that
         # crowds an anchor within the floor. The substrate's own cells are what
         # gets laid at such a wall, so reading a gap there reserves a vacuum
-        # ceiling for a grid nobody builds. Two faces a drawing says are one
+        # ceiling for a grid that is never built. Two faces a drawing says are one
         # reach here slightly apart, from a geometry kernel that computed them
         # separately, and the sliver between them otherwise puts a station
         # outside every solid.
@@ -192,28 +178,16 @@ def domain(
       the domain is pulled *inward* by the absorber's depth and the absorber
       lands on the structure. This is what makes a transmission line infinite:
       substrate and trace run into the PML, so the line never sees an end. Give
-      a line air at its ends instead and it radiates off an open circuit, and
-      every impedance you extract is contaminated by the reflection.
+      a line air at its ends instead and it radiates off an open circuit,
+      contaminating every impedance extracted from it with the reflection.
 
     The two cases are counted in different cells, which is what
-    :func:`_coarsest_in` exists for. Outward padding is counted in
-    ``params.ceiling``, the bulk size in *vacuum*, because what is being padded
-    is air - and a clearance whose job is to let a wave in air decay must not
-    shrink as the substrate gets slower. :data:`DEFAULT_PADDING` says what the
-    count is in.
+    :func:`_coarsest_in` exists for: outward padding in ``params.ceiling``, the
+    bulk size in *vacuum*, and a ``THROUGH`` face in the size of the material
+    that will be at the wall. :data:`DEFAULT_PADDING` says what the count is in.
 
-    A ``THROUGH`` face is counted in the size of the material that will be at
-    the wall, because that is what the absorber is laid in. Counting it in a
-    vacuum cell over-reserves by the square root of the permittivity, and the
-    error compounds at low bands until the domain collapses; pulling in by the
-    smaller of the ceiling and ``dielectric_res`` lets the absorber overrun the
-    end of the structure whenever the wall is not crossed by the slowest
-    material, which puts the line inside its own PML.
-
-    The cost is that the structure overhangs the grid by
-    ``pml_cells * (ceiling - realized_pitch)`` wherever the wall material is
-    slower than vacuum. That is waste, not error - openEMS clips to the grid,
-    and pre-flight reports the band as a SUBSTITUTE finding.
+    Why each is counted where it is, and why the structure may overhang the grid
+    without that being an error, are in docs/internals/domain-and-absorber.md.
     """
     if len(padding) != 3:
         raise EnvelopeError(f"padding needs one entry per axis, got {len(padding)}")
@@ -292,11 +266,24 @@ def regions(
 
     A region that misses the domain entirely is refused rather than dropped: it
     is far more likely a modelling mistake than an intentional no-op.
+
+    A triangulated solid contributes no region at all, and :func:`features` is
+    what sizes it instead. Everything a :class:`Region` does - pinning its
+    faces, the thirds rule at an edge, counting elements across its thickness,
+    asking whether another conductor covers it - is reasoning about a box that
+    *is* the shape. Handed a box that merely bounds one, each of those is wrong
+    in a way that is quiet: a sphere's tangent plane pinned as a conductor face
+    puts the model's finest cells where the metal has no cross-section, and two
+    spheres whose boxes abut read as one continuous piece of metal.
     """
     lower_bound, upper_bound = bounds
-    boxes: list[tuple[tuple, tuple, MaterialClass, str, str, float | None, frozenset[int]]] = []
+    boxes: list[
+        tuple[tuple, tuple, MaterialClass, str, str, float | None, frozenset[int], float | None]
+    ] = []
 
     for solid in solids:
+        if solid.is_mesh:
+            continue
         kind = materials[solid.material]
         material = MaterialClass.METAL if kind in CONDUCTOR_KINDS else MaterialClass.DIELECTRIC
         boxes.append(
@@ -312,6 +299,7 @@ def regions(
                 # A solid the user drew ends where it ends: every face is an
                 # edge until they say otherwise.
                 frozenset(),
+                solid.relaxed_to or None,
             )
         )
 
@@ -337,11 +325,17 @@ def regions(
                 port.metal or "",
                 None,
                 frozenset({port.propagation_axis}),
+                # Never relaxed, even where the trace it hands over to is. A
+                # port is the instrument rather than the device: its impedance
+                # and its reference plane are read off the grid here, so
+                # coarsening it would move the measurement rather than the cost
+                # of making it.
+                None,
             )
         )
 
     out = []
-    for low, high, material, label, material_name, size, continuous in boxes:
+    for low, high, material, label, material_name, size, continuous, relaxed_to in boxes:
         clipped_low, clipped_high, missing = [], [], []
         for dim in range(3):
             a = max(float(low[dim]), lower_bound[dim])
@@ -366,11 +360,65 @@ def regions(
                 material_name=material_name,
                 size=size,
                 continuous=continuous,
+                relaxed_to=relaxed_to,
                 drawn=tuple(float(high[dim]) - float(low[dim]) for dim in range(3)),
             )
         )
 
     return out
+
+
+def features(solids: Sequence[Solid], sizes: dict[str, float] | None = None) -> list[Feature]:
+    """What the grid must resolve about the shapes a box cannot describe.
+
+    A triangulated solid contributes no :class:`Region`, so everything a region
+    would have asked for has to be asked elsewhere. What is asked *here*:
+
+    **The wave inside it**, and only that. A material's bulk cell size is an
+    argument about the wave's speed in that material and has nothing to do with
+    what shape the material is in - so a rotated board must be meshed as finely
+    inside as the same board drawn flat, and losing this would coarsen it by
+    sqrt(epsilon). It is isotropic, so it is asked omnidirectionally, over the
+    solid's own extent.
+
+    **What is deliberately not asked is the shape's own thickness.** The
+    tempting bound is the smallest bounding-box extent - nothing inside the
+    solid is thicker than that - fed to the connection criterion so that a cell
+    fits inside the conductor. It cannot be done from a box, because a box
+    states extents and no *direction*, while connection is omnidirectional by
+    definition. A 35 um foil then demands cells that fit inside its thickness
+    across the whole of its length and width, which is millions of lines from
+    one solid; and a thin shape lying diagonally, which is the case the demand
+    would exist for, has a bounding box that says almost nothing about it. Too
+    coarse where it matters and ruinous where it does not.
+
+    So what is asked here resolves a triangulated solid as a *material*, and its
+    own lengths are measured off the drawing rather than read off a box - which
+    is where the other thing a region does, counting cells across a dielectric's
+    thickness, is asked from. The same argument that rules a box out here rules
+    it out there: what has to be counted across is the layer, and the box that
+    bounds a bent board is as deep as the bend.
+    """
+    found = []
+    for solid in solids:
+        if not solid.is_mesh:
+            continue
+        bulk = (sizes or {}).get(solid.material)
+        if bulk is None:
+            continue
+        # A cell size, not a thickness, so it is handed to the criterion as the
+        # thickness a cubic cell of that size answers to.
+        found.append(
+            Feature(
+                thickness=bulk * math.sqrt(DIMENSIONS),
+                normal=None,
+                lower=solid.lower,
+                upper=solid.upper,
+                source=f"{solid.name!r} bulk",
+                relaxed_to=solid.relaxed_to or None,
+            )
+        )
+    return found
 
 
 def plan_mesh(
@@ -380,6 +428,7 @@ def plan_mesh(
     params: MeshParams,
     padding: Padding = DEFAULT_PADDING,
     sizing: Sequence[SizingRegion] = (),
+    measured: Sequence[Feature] = (),
 ) -> tuple[MeshLines, tuple[Region, ...], tuple]:
     """Mesh the problem, keeping everything the mesher produced.
 
@@ -455,8 +504,28 @@ def plan_mesh(
                 position for position in positions if bounds[0][dim] < position < bounds[1][dim]
             )
 
+    # A zero-thickness conductor exists only where a grid line falls exactly on
+    # it: openEMS applies the metal at E-field sample points, and for a sheet
+    # those sit on a main-grid line of its normal axis. Off the line the sheet is
+    # not modelled at all, and the run completes having simulated a board with
+    # no trace on it. A boxed sheet gets this from its own Region; a
+    # triangulated one has no Region, so it is required here.
+    for solid in solids:
+        if solid.is_sheet:
+            axis = solid.sheet_normal
+            plane = float(solid.lower[axis])
+            if bounds[0][axis] <= plane <= bounds[1][axis]:
+                forced[axis].append(plane)
+
     shapes = tuple(regions(solids, ports, kinds, bounds, sizes))
-    lines = generate_mesh_lines(shapes, bounds, params, forced, sizing)
+    lines = generate_mesh_lines(
+        shapes,
+        bounds,
+        params,
+        forced,
+        sizing,
+        [*features(solids, sizes), *measured],
+    )
     _check_through_faces_land_on_the_structure(lines, solids, ports, padding)
     return lines, shapes, bounds
 
@@ -545,9 +614,10 @@ def plan_grid(
     params: MeshParams,
     padding: Padding = DEFAULT_PADDING,
     sizing: Sequence[SizingRegion] = (),
+    measured: Sequence[Feature] = (),
 ) -> MeshGrid:
     """Mesh the problem. The result is what gets solved, verbatim."""
-    lines, _, bounds = plan_mesh(solids, ports, materials, params, padding, sizing)
+    lines, _, bounds = plan_mesh(solids, ports, materials, params, padding, sizing, measured)
     return grid_from(lines, params, bounds, padding)
 
 

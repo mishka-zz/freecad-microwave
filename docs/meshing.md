@@ -57,6 +57,62 @@ number.
 Values below 1 are refused, because they would mesh conductor edges more coarsely
 than open space. Use 1 for no refinement.
 
+It is a ceiling on the element at a conductor's face rather than the whole
+answer. A narrow conductor asks for a finer one on its own account, so that
+enough of the metal still conducts - see
+[across a conductor](#except-across-a-conductor-where-the-mesher-does-it-for-you)
+- and coarsening this cannot take that away.
+
+What an edge gets is elements across each of the two faces that meet at it.
+Neither of those is across the direction *between* the two faces, so what that
+direction gets is only what the two leave it - which comes out near the element
+size at an ordinary corner however the corner is turned, and is the usual cost
+of holding anything diagonal on a rectilinear grid. As the two faces close on
+each other it stops being reliable. On a **knife** - a blade, a wall run out to
+a feather edge - both elements go across metal that is barely there, and the way
+out of the tip, which is where the field is, comes out fine or hopeless
+depending on how the part happens to sit on the grid. So an edge that narrow is
+refined once more, along that way out. An edge that is not a knife asks only for
+the two.
+
+`EdgeRefinement` also governs how finely a **curved** conductor is followed. A
+rectilinear grid holds a flat face exactly, by putting a line on it; a round one
+it can only sample, so the surface lands within about half an element of where
+you drew it. That is why a sphere or a rod costs elements even though nothing
+about it is thin: what is being resolved is where its surface is, and it is held
+to a fraction of the radius it curves through. A gentle curve is followed
+coarsely and a tight one finely, down to the size a conductor edge asks for - so
+rounding a corner off costs no more than the corner did. Below that a curve is
+followed finer still, but only once the metal is thinner than an edge, where
+what is being kept is a conductor that still conducts.
+
+A conductor the grid cannot hold exactly is also measured **across its own
+thickness**, and that is a different question from how curved it is: a shell
+carries the radius of the shell and the thickness of its wall, and a curvature
+cannot tell you the second. So the wall is measured directly and the grid is
+asked for an element that fits inside it, at whatever size that turns out to be
+- a cross-section is not a refinement to be traded away, because metal the grid
+puts no element inside is metal openEMS can sample into pieces that carry no
+current between them.
+
+A conductor's **edges** were already asking for something, and near one they ask
+for more: the two cross at `EdgeRefinement`'s own size, so metal thinner than
+that asks for more than its edges do and metal thicker asks for less. But an
+edge's demand is made *at* the edge and eases away from it, so in the middle of
+a wide plate the thickness is the only thing speaking. Those are the shapes this
+reaches: a wall smooth enough to have no edges at all, metal finer than the
+elements an edge asks for, and the inside of anything broad.
+
+Metal that runs out to a **tip** - a knife edge, a shallow draft - is thinner
+the closer you look, so it asks for elements without limit. What stops it is
+`MinElementSize`, and that is the knob to reach for if a tapering solid makes a
+run far slower than you expected.
+
+A long thin body is sampled at a bounded number of places along itself, so a
+conductor much finer than the elements around it can still come out in pieces
+between those places. That one is reported before the solve rather than left in
+the result.
+
 #### MinElementsAcross
 
 Dielectrics only. A thin substrate carries the whole field, so one element
@@ -68,6 +124,14 @@ sample, and spanning a foil with this count would set the smallest element in
 the model and the timestep with it. Where a conductor genuinely wants a count,
 give it a refinement region.
 
+A substrate that is **not** a box - anything bent, rolled or hollow - is counted
+too, and its thickness is measured off the drawing rather than read off the box
+it sits in, which for a bent board is as deep as the bend. What that delivers is
+the element spacing across the layer, along the layer's own normal. Where the
+layer lies square to the grid that is the same count a flat board gets; where it
+does not, the grid is not free to put its lines on the layer's faces, so a line
+drawn through it can cross one element fewer per axis than the spacing implies.
+
 #### MinElementSize
 
 A guard against degenerate geometry, and nothing else. A 1 µm sliver left by a
@@ -77,6 +141,12 @@ anywhere in the domain.
 
 Leave it at 0. Set anywhere near the real element sizes it starts refusing
 features that are legitimate to mesh.
+
+Bear in mind what the real element size at a conductor's face is. A narrow trace
+asks for one far finer than `EdgeRefinement` alone would give it, so a floor
+chosen by looking at the bulk size can sit right on top of that demand. It is
+not refused when it does: the demand is dropped and pre-flight says what the
+grid then left of the conductor.
 
 ### The domain
 
@@ -163,30 +233,85 @@ coupling gap, a narrow slot, the spacing of a tight pair.
 <!-- defaults: EMMeshRegion -->
 | Property | Default | Meaning |
 |---|---|---|
-| `References` | selection | The geometry this refinement is aimed at |
-| `ElementSize` | 0 | Target element size inside the region |
-| `MinElementsAcross` | 0 | Fewest elements across the region. 0 inherits the global count |
-| `Enabled` | true | Uncheck to leave the region in the tree but out of the mesh |
+| `References` | selection | The geometry this is aimed at |
+| `Mode` | Refine | Whether to make the elements finer, or let this geometry settle for coarser ones |
+| `ElementSize` | 0 | Target element size |
+| `MinElementsAcross` | 0 | Fewest elements across the region, on every axis it has extent on. 0 inherits the global count |
+| `Enabled` | true | Uncheck to leave this in the tree but out of the mesh |
 
 Sizes here are **absolute lengths**, where the policy is per wavelength. The
 difference is deliberate and it is not an inconsistency: global sizing resolves
-the *wave*, whose scale is a wavelength; a refinement region resolves a
-*feature*, whose scale is millimetres.
+the *wave*, whose scale is a wavelength; a region resolves a *feature*, whose
+scale is millimetres.
 
 `ElementSize` has no honest default without knowing the model, so a new region
 starts at zero and the next mesh refuses it by name, saying which property to
 set.
 
-A region **refines only**. One coarser than the coarsest element the mesher
-would produce anyway is refused, because coarsening past the bulk target is
-numerical dispersion - an error that shows up as a wrong answer rather than as a
-visibly bad grid. A region between that ceiling and the local material's own
-size is accepted and simply does not bite; the sizing field takes the finer of
-the two.
+### Refine
 
 The region's **bounding box** is what gets refined. On a rectilinear grid each
 axis is refined as a slab through the whole model, which is worth knowing before
 drawing a small box in the middle of a large board.
+
+Refining **only**. An `ElementSize` coarser than the coarsest element the mesher
+would produce anyway is refused by name: because the box is really three slabs,
+a box that coarsened would take resolution off whatever else happened to lie
+level with it, anywhere in the model. `Coarsen` is how to ask for that, and it
+names the object instead.
+
+An `ElementSize` between that ceiling and the size the geometry there already
+gets is accepted and does not bite. It is an upper bound on the element size,
+and one that is already met asks for nothing.
+
+### Coarsen
+
+The opposite direction, and deliberately not the opposite shape. It attaches to
+the **object**, not to a box, and lets that object's own demands settle for
+`ElementSize` instead of the size they would otherwise ask for. Naming the
+object is what keeps it from reaching past it.
+
+Use it where the drawing carries detail the answer does not depend on - a
+connector shell, a bracket, a filleted housing - and the mesher is spending
+elements following it.
+
+What it does not do:
+
+- It does not move the geometry. Faces, port planes and sheets are pinned
+  whatever the sizing says, so openEMS is handed the shape that was drawn. What
+  changes is how many elements are spent following it.
+- It does not reach the neighbours. Anything still asking for a fine element
+  beside a coarsened object gets it, and the grid grades between the two.
+- It does not coarsen past the global ceiling, which bounds every element in the
+  model. To go beyond that, lower `ElementsPerWavelength`.
+
+What it does give up is everything that geometry was asking for, which is more
+than the bulk size:
+
+- A coarsened conductor gives up the **thirds rule** at its edges. That
+  treatment *is* the resolution being declined, and keeping it would pin a fine
+  pair of lines around every edge the grid was told to let go. Its faces are
+  still pinned.
+- A coarsened dielectric gives up its `MinElementsAcross` count as well. The
+  count is a demand like any other, and the object was told to stop making
+  them. The mesh report is what says so afterwards, by counting the elements
+  the grid actually laid across it.
+- A coarsened object still measured off its own geometry - a curve, a wall
+  thickness - gives those up too. A **gap between it and something else** is
+  not given up: a separation belongs to both objects, and one of them settling
+  for less is not the other agreeing.
+
+A **port** is never coarsened, whatever is done to the trace it meets. It is the
+instrument rather than the device, and its impedance and reference plane are
+read off the grid where it sits.
+
+`MinElementsAcross` is refused here rather than ignored: a count asks for
+resolution, which is what this is giving up.
+
+Aim it at whatever a **material binding** names, which may be a face - a ground
+plane drawn as the top face of a board is its own conductor, and coarsening the
+board leaves it alone. Aimed anywhere else it is refused: only geometry a
+material has been bound to has an element size to settle for.
 
 ---
 
@@ -333,3 +458,83 @@ The test is the one any solver gets: raise `ElementsPerWavelength`,
 or `EdgeRefinement`, and solve again. If the answer does not move, the first
 grid was fine enough. Refine `EdgeRefinement` first - at equal cost it moves an
 extracted impedance further than anything else on the page.
+
+### Except across a conductor, where the mesher does it for you
+
+A conductor's width is the one place the convergence test above is unsound, and
+it is handled by the mesher rather than left to be checked.
+
+openEMS decides what an element is made of by sampling a single point in it, so
+a conductor arrives **inscribed** in what was drawn - it conducts over the grid
+lines the drawing contains, and the rest of its width is lost. The edge
+treatment lands a line a third of an element inside each face, so `2/3` of an
+element goes whatever the policy asked for: a rounding on a wide plane, and a
+large part of a narrow trace.
+
+What survives used not to approach the drawing smoothly as elements shrank; it
+**jumped**, a whole element at a time, as the lines crossed the two faces. Two
+nearby settings could agree with each other and both be wrong, and refining
+once proved nothing.
+
+So the element at a conductor's face is sized from the **width of the conductor
+itself**, and never only from `EdgeRefinement`. Each conductor keeps nineteen
+twentieths of every width it has, on every axis it spans more than one element
+of, and the figure is derived rather than aimed at: it comes out on the bar
+exactly, for any width, any policy and wherever the shape sits. Refining past
+that only ever raises it.
+
+A conductor is measured as the piece of **metal** it is part of, not as the
+rectangle it was drawn in. Two conductors that meet face to face are one piece,
+which matters because a drawn outline reaches the grid cut into rectangles;
+across a gap they are two, which matters to every coupled pair.
+
+The share and not a count of elements across, and that is a measured
+distinction rather than a stylistic one. Two grids putting the same number of
+elements across one strip can leave very different amounts of it conducting,
+depending on where the lines fell against the faces, and they return answers a
+factor of six apart - across the whole range measured, thirteen elements across
+a strip answered worse than eleven did.
+
+A conductor **thinner** than one element is left alone, and loses nothing by it:
+there is no room for the edge treatment, so both faces are pinned onto lines
+instead, and a face on a line conducts. That is what a foil gets across its
+thickness, deliberately - a single element, with the thickness itself handed to
+openEMS as a property of the metal.
+
+It is paid in the **timestep** rather than in elements. The fine elements sit at
+the two faces and grade away within a few of them, so what a narrow trace costs
+is run length. The cost is also a **step** rather than a slope: a conductor just
+wider than one element asks for one about thirteen times finer, and one just
+narrower asks for nothing at all, because at that width it is already arriving
+whole. Thirteen is `1 / (1.5 * (1 - 19/20))`, and it is the worst the demand can
+ever ask for.
+
+The one thing that stops it is `MinElementSize`, which is the finest element you
+have said you will pay for. A demand under that is one you have already refused,
+so it is dropped rather than clamped and the conductor is meshed at the size the
+policy asked for.
+
+Pre-flight still measures the share on the finished grid and warns under the
+bar, and what is left for it to catch is the conductors the mesher could not
+size: one held as **triangles**, which has no box to be sized from and is meshed
+off measured features instead, one whose demand `MinElementSize` cut off, and
+anything in an envelope this workbench did not mesh. The remedy is a refinement
+region naming the conductor with that region's own `MinElementsAcross` set, and
+that region's `ElementSize` at the global element size, which the warning quotes:
+a region with no size at all is refused, and a fine one refines the length too,
+which on a long line is the whole grid. That remedy raises the share rather than
+placing it.
+
+A conductor a refinement region **coarsened** is not measured at all, in either
+direction: it neither asks for a width nor is complained about for losing one.
+Coarsening is the answer to this question, and asking it again is how a warning
+somebody has already dealt with hides one they have not.
+
+The limits are worth knowing. Both the demand and the check are taken across the
+conductor's **bounding box**, so they are exact only for a conductor that fills
+its box. Anything drawn on the diagonal, along an arc, or meandering inside a
+single extrusion has a box wider than the metal: a warning about one of those is
+never wrong, but silence is not a clearance. And a region's count is spent
+across the box on *every* axis, so aiming one at a conductor drawn with a real
+thickness asks for elements across that thickness too, which is what sets the
+timestep. Where a conductor is drawn as a surface, that axis costs nothing.

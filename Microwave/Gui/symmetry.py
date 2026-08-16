@@ -21,7 +21,7 @@ import numpy as np
 
 #: Fractional slack when comparing two *lengths or impedances in the model* -
 #: are these two ports, boxes, grid lines the same? Loose on purpose: this is a
-#: nudge about a declaration, not a tolerance on a result, and a warning nobody
+#: nudge about a declaration, not a tolerance on a result, and a warning that is
 #: can silence teaches people to ignore warnings.
 TOLERANCE = 1e-3
 

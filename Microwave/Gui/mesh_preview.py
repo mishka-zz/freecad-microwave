@@ -192,7 +192,7 @@ def redraw(preview):
 
     For the display properties only. Changing ``Display`` or a slice position is
     a request to look at the same grid differently, and a display property that
-    needs a button press is not how FreeCAD behaves anywhere else - nobody
+    needs a button press is not how FreeCAD behaves anywhere else - a user does not
     presses Apply after changing Transparency.
 
     Meshing is still manual, and this does not change that: it re-runs the

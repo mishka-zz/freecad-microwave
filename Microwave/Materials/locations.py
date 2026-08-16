@@ -75,7 +75,7 @@ def freecad_user_dir() -> pathlib.Path | None:
 
     Version-scoped, as everything under that directory is, so catalogs put there
     are invisible after an upgrade exactly as ``Mod/`` is. Consistency with the
-    rest of FreeCAD is worth more than an unscoped directory nobody would think
+    rest of FreeCAD counts for more than an unscoped directory no one would think
     to look in, but it is why the empty-library message prints the absolute path
     it searched.
     """
@@ -93,7 +93,7 @@ def configured_paths() -> tuple[pathlib.Path, ...]:
     """Extra folders or files from the parameter store.
 
     A machine setting, so it lives in FreeCAD's parameters and never in the
-    document. A path to somebody's downloads folder inside a ``.FCStd`` is worse
+    document. A path to a user's downloads folder inside a ``.FCStd`` is worse
     than useless on the machine it is opened on: it is a dangling reference that
     changes what the materials in that document mean.
     """
@@ -113,7 +113,7 @@ def installed():
 
     Paths the user chose are passed as ``required`` so a typo in one is
     reported. The bundled and user directories are not: the first is always
-    present and the second is absent until somebody puts a catalog in it.
+    present and the second is absent until a catalog is put in it.
     """
     from .library import load_library
 

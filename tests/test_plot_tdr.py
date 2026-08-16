@@ -14,9 +14,10 @@ import pytest
 from Microwave.Gui import plot_tdr
 from Microwave.Results import tdr
 
-from .test_tdr import SECTION, V, line, reflected
+from .test_tdr import SECTION, V, against, line, measured, reflected
 
 TRACE = tdr.step_response(reflected(line([50.0, 75.0, 50.0])), 1)
+OWN = tdr.step_response(against(line([50.0, 75.0, 50.0]), measured()), 1)
 
 
 class TestTheAxisIsTheUsersChoice:
@@ -66,6 +67,13 @@ class TestWhatTheChartSaysItIs:
 
     def test_the_port_is_named(self):
         assert "port 1" in plot_tdr.chart_text(TRACE).footnote
+
+    def test_a_reference_the_port_measured_says_so(self):
+        """The number then came out of this solve rather than being chosen, so
+        the line under the port reads it back and the first plateau is not
+        evidence about the line. Nothing in the curve says which it was."""
+        assert "measured" in plot_tdr.chart_text(OWN).footnote
+        assert "measured" not in plot_tdr.chart_text(TRACE).footnote
 
     def test_the_velocity_is_named_only_when_it_was_used(self):
         assert "mm/ns" not in plot_tdr.chart_text(TRACE).footnote

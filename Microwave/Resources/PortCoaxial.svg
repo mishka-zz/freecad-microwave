@@ -1,0 +1,14 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- The coaxial line end-on: shield wall, dielectric annulus, inner conductor,
+       and the excitation crossing the annulus radially. Nothing else in the set
+       is circular, so the cross-section reads as coax at a glance. -->
+  <circle cx="32" cy="32" r="20.5" fill="#37474f" opacity="0.35"/>
+  <circle cx="32" cy="32" r="23" fill="none" stroke="#37474f" stroke-width="5"/>
+  <circle cx="32" cy="32" r="6.5" fill="#37474f"/>
+  <path d="M41 32 H42 M23 32 H22 M32 41 V42 M32 23 V22" stroke="#e8833a"
+        stroke-width="5" stroke-linecap="round"/>
+  <path d="M42 27 L50 32 L42 37 Z" fill="#e8833a"/>
+  <path d="M22 27 L14 32 L22 37 Z" fill="#e8833a"/>
+  <path d="M27 42 L32 50 L37 42 Z" fill="#e8833a"/>
+  <path d="M27 22 L32 14 L37 22 Z" fill="#e8833a"/>
+</svg>

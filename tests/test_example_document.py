@@ -3,23 +3,27 @@
 
 """The shipped examples, checked as files rather than as models.
 
-Pure zipfile and XML: no FreeCAD, no solver. These exist because an example is
-a *binary artefact* in the repository, and binary artefacts drift silently. One
-was committed with its solids saved hidden - swept up by `git add -A`, and
-visible only to a human who opens it - and nothing in the suite could tell.
+Mostly zipfile and XML: no solver, and no FreeCAD beyond the stub the suite
+already installs. These exist because an example is a *binary artefact* in the
+repository, and binary artefacts drift silently. One was committed with its
+solids saved hidden - swept up by `git add -A`, and visible only to a human who
+opens it - and nothing in the suite could tell.
 
 Every example, found by looking rather than by a list here. A list would be an
 inventory to keep in step, and the failure it invites is the one this file is
 about: a third example added, committed broken, and covered by nothing.
 """
 
+import importlib
 import math
+import pkgutil
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from pathlib import Path
 
 import pytest
 
+import Microwave.Objects
 from tests import published
 from tests.analytic import reference as analytic
 
@@ -72,6 +76,38 @@ def shapes(archive):
         for obj in root.iter("Object")
         if (obj.get("type") or "").startswith("Part::")
     ]
+
+
+def workbench_objects(archive):
+    """``{object name: (proxy class, the properties it was saved with)}``.
+
+    The document records the proxy's module and class beside the object, which
+    is the same thing ``Objects.kinds.kind_of`` reads at runtime and the only
+    thing that tells one ``App::FeaturePython`` from another.
+    """
+    root = ElementTree.fromstring(archive["Document.xml"])
+    found = {}
+    for obj in root.find("ObjectData"):
+        proxy = obj.find('.//Property[@name="Proxy"]/Python')
+        if proxy is None or not (proxy.get("module") or "").startswith("Microwave."):
+            continue
+        stored = {p.get("name") for p in obj.iter("Property")}
+        found[obj.get("name")] = (proxy.get("class"), stored)
+    return found
+
+
+def proxy_class(name):
+    """The document class of that name, found by looking through the package.
+
+    By search rather than by a table here, for the reason at the top of this
+    file: a table is an inventory, and the drift it invites is a class added
+    and silently left out of the check.
+    """
+    for module in pkgutil.iter_modules(Microwave.Objects.__path__):
+        found = getattr(importlib.import_module(f"Microwave.Objects.{module.name}"), name, None)
+        if isinstance(found, type) and found.__name__ == name:
+            return found
+    raise AssertionError(f"{name} is in a shipped document and in no Objects module")
 
 
 def recorded_visibility(archive):
@@ -153,6 +189,28 @@ def test_the_gui_state_ends_with_a_camera(archive):
 def test_the_geometry_is_still_there(archive):
     for name in shapes(archive):
         assert f"{name}.Shape.brp" in archive
+
+
+def test_every_object_carries_what_its_class_declares(archive, doc):
+    """A committed document is a snapshot of the classes as they stood.
+
+    FreeCAD stores the properties an object *had* and reconciles nothing against
+    the class on restore, so a property added to a document object leaves every
+    committed example without it - and the translation, which reads properties
+    directly, raises from inside the adapter rather than saying anything. The
+    script beside each document is what rebuilds it; this is what says one has
+    not been.
+
+    Against the classes rather than a list of names, so a property added
+    tomorrow is covered without anybody remembering to add it here. A subset
+    check, because a restored object also carries what FreeCAD gives every
+    object and a freshly built one does not.
+    """
+    for name, (class_name, stored) in workbench_objects(archive).items():
+        probe = doc.addObject("App::FeaturePython", f"probe{class_name}")
+        proxy_class(class_name)(probe)
+        missing = sorted(set(probe.PropertiesList) - stored)
+        assert not missing, f"{name} was saved without {missing}; rebuild it with its script"
 
 
 def test_the_mesh_policy_is_the_current_one(archive):
@@ -337,7 +395,7 @@ def test_the_excitation_offers_only_what_the_adapter_can_produce(archive):
     Whatever the choices are, an example offering one the translation refuses
     is a silent no-op with an audience.
     """
-    from Microwave.Solvers.openems.document import GAUSSIAN
+    from Microwave.Solvers.openems.policy import GAUSSIAN
 
     offered = choices_of(archive, "Waveform")
     assert offered, "no analysis in this document"
@@ -415,7 +473,7 @@ class TestTheStubExampleIsStillATwoPort:
         of the sweep then disagree about the ports' impedance by more than
         ``IMPEDANCE_TOLERANCE`` - so the assembled matrix comes back with the
         deepest point of the notch blanked. Measured on this geometry by taking
-        the loss out; the open question is `debt.md` R-1.
+        the loss out. Which of the two runs to believe at a resonance is open.
         """
         fr4 = properties_of(document, "FR4")
         assert float(fr4["LossTangent"]) > 0
@@ -488,9 +546,12 @@ class TestTheSteppedLineStillHasAProfileToRead:
 
         A lumped port *is* its resistance, so the reflection carries the line's
         impedance and no port has an opinion about it. Swap one for a microstrip
-        port and the reference becomes the line's own measured impedance, which
-        is the quantity being read - the trace flattens towards 50 ohm and the
-        step goes out of it.
+        port and the reference becomes what that port extracted from this very
+        line, so the section it sits on reads its own measurement back instead
+        of being checked against a number: that plateau flattens towards the
+        reference and stops being evidence. The steps past it stay genuine,
+        which is why the trace is still worth taking - but the quantity this
+        document is built to read is the one that goes.
         """
         ports = ports_of(document)
         assert set(ports.values()) == {"EMPortLumped"}

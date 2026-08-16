@@ -25,7 +25,7 @@ more honestly than a traceback in the report view.
 
 from __future__ import annotations
 
-from .. import portbox
+from .. import annulus, picks, portbox
 from .kinds import kind_of
 
 AXES = {"X": (0, 1), "Y": (1, 1), "Z": (2, 1), "-X": (0, -1), "-Y": (1, -1), "-Z": (2, -1)}
@@ -57,6 +57,17 @@ def _linked(link):
     return _box_of(obj), _box_of(obj, names[0] if names else "")
 
 
+def _element(link):
+    """The shape a ``PropertyLinkSub`` names, for what a box does not hold."""
+    if not link or link[0] is None:
+        return None
+    shape = getattr(link[0], "Shape", None)
+    names = [name for name in (link[1] or []) if name]
+    if shape is None or not names:
+        return shape
+    return shape.getElement(names[0])
+
+
 def port_box(obj):
     """The :class:`~Microwave.portbox.PortBox` for this port, or ``None``.
 
@@ -73,7 +84,9 @@ def port_box(obj):
             return _lumped(obj)
         if kind == "EMPortRectWaveguide":
             return _waveguide(obj)
-    except (portbox.BoxError, AttributeError, IndexError, TypeError):
+        if kind == "EMPortCoaxial":
+            return _coaxial(obj)
+    except (portbox.BoxError, annulus.AnnulusError, AttributeError, IndexError, TypeError):
         # An unfinished or contradictory port has no box. The adapter says why,
         # loudly, when the user asks it to; drawing is not the place for it.
         return None
@@ -108,11 +121,31 @@ def _microstrip(obj):
 
 def _lumped(obj):
     excitation = _axis(obj.ExcitationAxis)
-    _, source = _linked(obj.SourceEntity)
+    body, source = _linked(obj.SourceEntity)
     _, reference = _linked(obj.ReferenceEntity)
     if not excitation or source is None or reference is None:
         return None
-    return portbox.lumped(source, reference, excitation_axis=excitation[0])
+    return portbox.lumped(
+        source,
+        reference,
+        excitation_axis=excitation[0],
+        outline=body if picks.is_outline(obj.SourceEntity) else None,
+    )
+
+
+def _coaxial(obj):
+    propagation = _axis(obj.PropagationAxis)
+    _, face = _linked(obj.Annulus)
+    if not propagation or face is None:
+        return None
+    return portbox.coaxial(
+        face,
+        propagation_axis=propagation[0],
+        direction=propagation[1],
+        feed_offset=_length(obj.FeedOffset),
+        measurement_distance=_length(obj.MeasurementDistance),
+        stated_length=_length(obj.Length),
+    )
 
 
 def _waveguide(obj):
@@ -142,36 +175,88 @@ def _waveguide(obj):
 #: On FreeCAD 1.1.1, 1e-9 and 1e-8 raise ``ValueError``, 1e-7 raises
 #: ``OCCDomainError``, and 1.01e-7 builds. The bound is strictly above
 #: ``Precision::Confusion()``, so this sits a decade clear of it and is still a
-#: thousandth of the smallest cell anyone meshes.
+#: thousandth of the smallest cell ever meshed.
 _FLAT_BOX = 1e-6
 
 
 def build(obj):
     """This port's shape, or an empty compound when it has no box yet."""
-    import FreeCAD
     import Part
 
     box = port_box(obj)
     if box is None:
         return Part.Compound([])
 
+    ring = _ring_of(obj)
     lower, upper = box.corners()
-    extents = [high - low for low, high in zip(lower, upper)]
-    solid = Part.makeBox(*[max(extent, _FLAT_BOX) for extent in extents], FreeCAD.Vector(*lower))
 
-    # The planes span exactly the box's cross-section - no overhang. An
+    # The planes span exactly the port's cross-section - no overhang. An
     # overhanging marker is easier to see and makes the compound's bounding box
     # bigger than the port, so measuring the drawn port with FreeCAD's own tools
     # would give the wrong length. Being measurable is most of the point; the
-    # box is translucent, so an interior plane shows through it anyway.
-    pieces = [solid]
+    # body is translucent, so an interior plane shows through it anyway.
+    pieces = [_body(box, ring, lower, upper)]
     for distance in (box.feed, box.measurement):
         if distance <= 0:
             continue
-        plane = _plane(box.plane_at(distance), box.propagation_axis, lower, upper)
-        if plane is not None:
-            pieces.append(plane)
+        marker = _marker(box, ring, distance, lower, upper)
+        if marker is not None:
+            pieces.append(marker)
     return Part.Compound(pieces)
+
+
+def _ring_of(obj):
+    """The annulus a round port is built on, or ``None`` for a rectangular one.
+
+    ``build`` never raises, so a port whose pick has stopped being a ring falls
+    back to its bounding box rather than losing its shape entirely.
+    """
+    if kind_of(obj) != "EMPortCoaxial":
+        return None
+    try:
+        return annulus.read(_element(obj.Annulus))
+    except (annulus.AnnulusError, AttributeError, IndexError, TypeError):
+        return None
+
+
+def _body(box, ring, lower, upper):
+    """The volume the port occupies: a tube where it is round, a box otherwise."""
+    import FreeCAD
+    import Part
+
+    if ring is None:
+        extents = [high - low for low, high in zip(lower, upper)]
+        return Part.makeBox(*[max(extent, _FLAT_BOX) for extent in extents], FreeCAD.Vector(*lower))
+
+    base, along = _axis_frame(box, ring, box.start[box.propagation_axis])
+    outer = Part.makeCylinder(ring.outer, box.length, base, along)
+    return outer.cut(Part.makeCylinder(ring.inner, box.length, base, along))
+
+
+def _axis_frame(box, ring, position):
+    """``(point on the line, unit vector along it)`` at ``position``."""
+    import FreeCAD
+
+    axis = box.propagation_axis
+    base = list(ring.centre)
+    base[axis] = position
+    along = [0.0, 0.0, 0.0]
+    along[axis] = float(box.direction)
+    return FreeCAD.Vector(*base), FreeCAD.Vector(*along)
+
+
+def _marker(box, ring, distance, lower, upper):
+    """The plane across the port at ``distance``, shaped like its cross-section."""
+    import Part
+
+    position = box.plane_at(distance)
+    if ring is None:
+        return _plane(position, box.propagation_axis, lower, upper)
+    base, along = _axis_frame(box, ring, position)
+    try:
+        return Part.Face(Part.Wire(Part.makeCircle(ring.outer, base, along)))
+    except Exception:  # pragma: no cover - a degenerate ring has no disc
+        return None
 
 
 def _plane(position, axis, lower, upper):

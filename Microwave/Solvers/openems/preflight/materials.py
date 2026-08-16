@@ -4,8 +4,9 @@
 """Checks about what the model is made of.
 
 Whether a material is one this adapter can build, whether a loss figure quoted
-at one frequency still stands in over this band, and whether two solids claim
-the same space.
+at one frequency still stands in over this band, whether any one figure could,
+whether two solids claim the same space, and whether a conductor is standing on
+a thickness the drawing never carried.
 
 A conducting sheet is asked two separate questions, and the pair is easy to read
 as one: whether it is thin against the *cell* that has to hold it, and whether
@@ -19,9 +20,10 @@ import math
 
 import numpy as np
 
+from ....units import VACUUM_PERMEABILITY
 from ..capabilities import Capabilities
 from ..model import Problem, Solid
-from .finding import _ON_THE_GRID, REFUSE, WARN, Finding, hz
+from .finding import _ON_THE_GRID, REFUSE, SUBSTITUTE, WARN, Finding, hz
 
 
 def _check_materials(problem: Problem, caps: Capabilities) -> list[Finding]:
@@ -94,6 +96,54 @@ def _check_the_loss_was_measured_in_this_band(problem: Problem) -> list[Finding]
     return findings
 
 
+def _check_the_band_fits_one_conductivity(problem: Problem) -> list[Finding]:
+    """A band no single conductivity covers, however well the number was quoted.
+
+    The check above asks whether a loss tangent was quoted where it is being
+    used. This asks the question that survives a yes: ``kappa`` is fixed for the
+    run, so the loss tangent it amounts to is the declared one scaled by
+    ``f_centre / f``, and a band wide enough sets its own ends far from centre.
+
+    The scaling is that frequency ratio and nothing else - the permittivity and
+    the loss tangent both divide out - so every lossy material in a model is off
+    by the same factor, and one sentence merges to name all of them.
+
+    Only the bottom is looked at, and only the bottom can be. The centre is the
+    mean of the two ends, so the top is never a factor of two from it and
+    ``FAR`` is out of its reach; the bottom has no such bound and runs away as
+    the band widens.
+
+    That is a bound on the *ratio* and not on the damage. Attenuation from a
+    fixed conductivity does not vary with frequency at all, while a low-loss
+    dielectric's rises in proportion to it, and the two are made equal at the
+    centre - so the band's two ends are wrong by the same amount of loss,
+    over-stated below the centre and under-stated above it. The message says
+    both, because the top is where a dielectric's loss is largest and so where
+    that same amount is the smaller share of the answer.
+
+    Warns, never refuses. Narrowing the band changes the question being asked
+    rather than answering it, and what would answer it - a Debye fit, whose
+    poles openEMS integrates itself - is not something this adapter writes.
+    """
+    frequency = problem.frequency
+    overstated = frequency.center / frequency.start
+    if overstated < FAR:
+        return []
+    message = (
+        f"a fixed conductivity is the loss tangent it was built from at "
+        f"{hz(frequency.center)} alone, and models one that goes as 1/f either "
+        f"side. This study runs down to {hz(frequency.start)}, where the "
+        f"modelled loss tangent is {overstated:.3g} times the declared one - "
+        f"and roughly half the declared one at the top of the band. Solve a "
+        f"narrower band, or split this one into studies"
+    )
+    return [
+        Finding(WARN, material.name, message)
+        for material in problem.materials
+        if material.kappa > 0
+    ]
+
+
 def _same_space(one: Solid, other: Solid) -> bool:
     """Whether two boxes stand in the same place, to ``_ON_THE_GRID``.
 
@@ -103,7 +153,15 @@ def _same_space(one: Solid, other: Solid) -> bool:
     cell centre inside one box is inside the other. A tolerance below any
     length this workbench meshes is what makes the check about the structure
     rather than about the arithmetic that reached it.
+
+    A triangulated solid answers no: its corners bound the shape rather than
+    being it, so equal corners are not two objects in one place. A coil and the
+    former it is wound on share a bounding box exactly and touch nowhere, and
+    refusing that pair - which is what this finding does for two materials -
+    would refuse an ordinary model to catch a fault it has no evidence of.
     """
+    if one.is_mesh or other.is_mesh:
+        return False
     return all(
         abs(a - b) <= _ON_THE_GRID
         for corners in ((one.lower, other.lower), (one.upper, other.upper))
@@ -187,6 +245,29 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
     return findings
 
 
+def _check_a_thickness_was_invented(problem: Problem) -> list[Finding]:
+    """A conductor drawn as a surface, and the metal built off it.
+
+    Said even where the drawing meant a surface, because the thickness follows
+    the cell the metal is meshed at and so moves with the band and the mesh
+    policy - a length the document does not carry anywhere a reader could look.
+    """
+    return [
+        Finding(
+            SUBSTITUTE,
+            solid.name,
+            f"it is drawn as a surface carrying no thickness, and {solid.thickened:.4g} "
+            "mm of metal has been built off it. The field inside a conductor is "
+            "zero, so a skin and a slab solve alike and the length is free - but "
+            "a surface that was meant to close and did not looks exactly the "
+            "same here. If this one was meant as a solid, close it and give it "
+            "the thickness you drew",
+        )
+        for solid in problem.solids
+        if solid.thickened
+    ]
+
+
 def _check_sheet_thickness(problem: Problem) -> list[Finding]:
     """A conducting sheet thicker than a cell is not a sheet.
 
@@ -226,12 +307,26 @@ def _check_sheet_thickness(problem: Problem) -> list[Finding]:
     return findings
 
 
-#: How far a loss tangent's quoted frequency may sit from band centre, as a
-#: ratio either way, before the fixed conductivity built from it stops standing
-#: in for it. Two octaves: inside that, this approximation's error and the
-#: laminate's own drift are both small next to the spread between one sheet of
-#: FR-4 and the next - and a warning that fires on ordinary models is one
-#: people learn to ignore.
+#: How far a frequency may sit from band centre before the fixed conductivity
+#: built from a loss tangent stops standing in for it. Two octaves.
+#:
+#: Two frequencies are held to it, for reasons that are not the same size. The
+#: frequency the loss tangent was **quoted** at is a question about the
+#: material: two octaves away, its own drift is small next to the spread between
+#: one sheet of FR-4 and the next, so inside that the number still describes the
+#: laminate. The **bottom of the band** is a question about the conversion, and
+#: there the ratio is the error itself - at this threshold the model carries
+#: four times the declared loss tangent, which no laminate's spread excuses.
+#:
+#: So the band question is the loosely held one, and it is held here anyway:
+#: a second constant would be a second thing to tune with no better argument
+#: behind its value, and one number that moves both is the honest way to say
+#: that this is a judgement about how far is too far. Below it the band check
+#: is silent while the model runs up to fourfold lossy at the bottom.
+#:
+#: It is also what lets that check look only downwards - the top of a band is
+#: never a factor of two from centre, which a threshold of two octaves is out of
+#: reach of.
 #:
 #: Read by ``Gui.material_picker`` too, which shows the same thing about a
 #: catalog entry before there is a model to translate.
@@ -242,10 +337,6 @@ FAR = 4.0
 #: entry of ``omega_stop`` in ``FDTD/extensions/cond_sheet_parameter.h``, a
 #: generated file its own header marks *"Do not change"*.
 _SHEET_OMEGA_MAX = 2556680.79
-
-
-#: Vacuum permeability, for the skin depth. SI, unlike everything around it.
-_MU0 = 4.0e-7 * math.pi
 
 
 def _check_sheet_fits_the_surface_impedance_model(problem: Problem) -> list[Finding]:
@@ -277,11 +368,13 @@ def _check_sheet_fits_the_surface_impedance_model(problem: Problem) -> list[Find
             continue
 
         thickness = material.thickness * problem.length_unit
-        omega = 2.0 * math.pi * top * _MU0 * material.conductivity * thickness**2 / 8.0
+        omega = (
+            2.0 * math.pi * top * VACUUM_PERMEABILITY * material.conductivity * thickness**2 / 8.0
+        )
         if omega <= _SHEET_OMEGA_MAX:
             continue
 
-        skin = math.sqrt(2.0 / (2.0 * math.pi * top * _MU0 * material.conductivity))
+        skin = math.sqrt(2.0 / (2.0 * math.pi * top * VACUUM_PERMEABILITY * material.conductivity))
         limit = 2.0 * skin * math.sqrt(_SHEET_OMEGA_MAX) / problem.length_unit
         findings.append(
             Finding(

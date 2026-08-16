@@ -8,13 +8,27 @@ the measurement plane, and the differences telescope, so the extraction is exact
 on a matched line at any grading. Both checks here are about what breaks that
 match: an uneven pair of cells matters only against a reflection at the plane,
 and a plane too close to the feed is still in the feed's evanescent field.
+
+Every kind that differences a triplet is subject to the first. The second is
+asked of every such kind too, but against a *different length*, because what has
+to have decayed is not the same thing: a source imposing a uniform field across
+a gap launches content whose scale is the wavelength, while a coaxial port's
+source already carries the mode's radial profile and what is left over is the
+higher-order modes of the line, whose scale is its own circumference.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from ..model import _USES_PROBE_TRIPLET, SPEED_OF_LIGHT, Problem
+from ....portbox import CLEARANCE
+from ..model import (
+    _EXCITES_A_UNIFORM_GAP,
+    _IS_ROUND,
+    _USES_PROBE_TRIPLET,
+    SPEED_OF_LIGHT,
+    Problem,
+)
 from .finding import WARN, Finding
 
 #: Fractional difference between the two cells flanking a measurement plane
@@ -31,10 +45,14 @@ from .finding import WARN, Finding
 _PROBE_ASYMMETRY_LIMIT = 0.02
 
 
-#: Fraction of the longest wavelength in the band that the measurement plane
-#: should stand clear of the feed by. Bracketed by two measurements on the
-#: acceptance line rather than derived - see :func:`_check_probes_clear_of_the_feed`.
-_FEED_CLEARANCE = 0.1
+#: Mean circumferences a round port's probes should stand clear of its source
+#: by. A coaxial line's first mode that is not TEM cannot propagate until its
+#: mean circumference is about a wavelength, so below that it decays over a
+#: length of that order rather than over a fraction of the band's wavelength -
+#: which for a line a few millimetres across and a band reaching down towards DC
+#: is a completely different number, and the wavelength one would fire on every
+#: model ever drawn.
+_BORE_CLEARANCE = 1.0
 
 
 def _check_probes_clear_of_the_feed(problem: Problem) -> list[Finding]:
@@ -46,32 +64,39 @@ def _check_probes_clear_of_the_feed(problem: Problem) -> list[Finding]:
     impedance comes out high. Nothing downstream can see this: the curve is
     smooth, the run is converged, and the number is simply wrong.
 
-    The threshold is bracketed by two solves on the microstrip acceptance line,
-    changing nothing but where the feed and the probes sit; the pair is tabulated
-    once, at :data:`portbox.CLEARANCE`. It sits between them and is not otherwise
-    derived, which is why this warns rather than refuses: the boundary is
-    bracketed, not known.
+    The threshold is :data:`Microwave.portbox.CLEARANCE`, the fraction that
+    places the probes as well - one bracket, read in both places. It is
+    bracketed by two solves on the microstrip acceptance line, changing nothing
+    but where the feed and the probes sit; that pair is the one quoted in the
+    message below. It sits between them and is not otherwise derived, which is
+    why this warns rather than refuses: the boundary is bracketed, not known.
+
+    Sharing the fraction with the placement stops the two drifting apart, at the
+    cost that this cannot judge the placement default itself - lower that and the
+    threshold follows it down. What it judges is a port as it now stands, which
+    is what a translated problem can show and what a user can change. The default
+    is judged by the microstrip acceptance gate, against a closed form.
+
     The wavelength is taken at the *bottom* of the band, where it is longest and
-    the constraint is tightest, and in the slowest material in the model.
+    the constraint tightest, and in the slowest material in the model.
 
     **The slowest material here and free space in ``portbox.CLEARANCE``, and the
-    difference is what each one knows.** The quantity that governs the decay is
-    the line's own eps_eff. This runs against a translated problem, so its
-    materials are the ones the study actually binds and sqrt(eps_r) is a usable
-    proxy for sqrt(eps_eff); ``portbox.clearance`` runs when a port is created,
-    before there is a line, a substrate or a binding, so it has no material to
-    be a proxy for and takes the conservative bound instead. A default port
-    therefore clears this threshold by sqrt(eps_r) - never less than once, and
-    exactly once for a model with no dielectric in it, which is the one case
-    where the two rules are the same rule.
+    difference is what each one knows.** The decay is governed by the line's own
+    eps_eff. This runs against a translated problem, whose materials are the ones
+    the study binds, so sqrt(eps_r) is a usable proxy; ``portbox.clearance`` runs
+    when a port is created, before there is a line, a substrate or a binding, so
+    it has nothing to be a proxy for and takes the conservative bound. A default
+    port therefore clears this threshold by sqrt(eps_r) - never less than once,
+    and exactly once for a model with no dielectric, the one case where the two
+    rules coincide.
     """
     epsilon = max([material.epsilon for material in problem.materials] or [1.0])
     wavelength = SPEED_OF_LIGHT / problem.frequency.start / np.sqrt(epsilon) / problem.length_unit
-    limit = _FEED_CLEARANCE * wavelength
+    limit = CLEARANCE * wavelength
 
     findings = []
     for port in problem.ports:
-        if port.kind not in _USES_PROBE_TRIPLET:
+        if port.kind not in _EXCITES_A_UNIFORM_GAP:
             continue
         dim = port.propagation_axis
         feed = port.start[dim] + port.direction * port.feed_shift
@@ -91,6 +116,47 @@ def _check_probes_clear_of_the_feed(problem: Problem) -> list[Finding]:
                     f"measurement shift away from the feed shift",
                 )
             )
+    return findings + _check_probes_clear_of_the_bore(problem)
+
+
+def _check_probes_clear_of_the_bore(problem: Problem) -> list[Finding]:
+    """The same requirement on a round port, against the length that governs it.
+
+    A coaxial port's source carries the mode's own radial profile, so what it
+    launches beside the mode is not a wavelength-scale near field - it is the
+    line's higher-order modes, and one cell of source along the line is enough
+    to excite a little of them. The first of those is TE11, which cannot
+    propagate until the mean circumference is about a wavelength; below its
+    cutoff it decays over a length of that order.
+
+    So the clearance a round port needs is set by its own cross-section and not
+    by the band, which is the whole reason this is a separate check rather than
+    one more kind in the list above. On a line a few millimetres across, over a
+    band reaching down towards DC, the wavelength rule asks for metres.
+    """
+    findings = []
+    for port in problem.ports:
+        if port.kind not in _IS_ROUND:
+            continue
+        circumference = np.pi * (port.inner_radius + port.outer_radius)
+        dim = port.propagation_axis
+        feed = port.start[dim] + port.direction * port.feed_shift
+        separation = abs(port.measurement_position() - feed)
+        if separation >= _BORE_CLEARANCE * circumference:
+            continue
+        findings.append(
+            Finding(
+                WARN,
+                port.name,
+                f"its measurement plane is {separation:.4g} from its feed, and "
+                f"the mean circumference of its bore is {circumference:.4g}. A "
+                f"mode that is not TEM is cut off below about that length and "
+                f"decays over it, so some of what the probes difference there "
+                f"is not the line's own wave and the impedance will read high. "
+                f"Increase the port's length, or move the measurement shift "
+                f"away from the feed shift",
+            )
+        )
     return findings
 
 

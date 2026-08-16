@@ -62,7 +62,7 @@ SLICES = "Slices"
 ANCHORS = "Anchors"
 
 #: The order the document object offers them in. ``Outline`` first because it is
-#: the cheapest and the one that orients you.
+#: the cheapest, and the one that orients the view.
 DISPLAY_MODES = (OUTLINE, SLICES, ANCHORS)
 
 #: Which two axes span the plane normal to each axis.

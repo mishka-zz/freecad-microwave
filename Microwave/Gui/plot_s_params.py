@@ -37,7 +37,7 @@ def matrix_db(result):
     """``(frequency in GHz, [(label, dB, derived), ...])`` for an S-matrix.
 
     ``derived`` is True for a term filled from a declared symmetry rather than
-    measured. Those are drawn dashed - a curve nobody solved for must not be
+    measured. Those are drawn dashed - a curve no solve produced must not be
     indistinguishable from one that cost minutes of FDTD.
 
     Takes a :class:`~..Results.sparameters.SParameters` - the neutral result
@@ -49,9 +49,9 @@ def matrix_db(result):
 
     Reflections first, then transmissions, each in port order. That is the order
     a return loss and an insertion loss are read in, and it puts the two curves
-    anyone actually looks at - S11 and S21 - at the top of the legend.
+    is actually read - S11 and S21 - at the top of the legend.
 
-    Terms nobody measured are dropped rather than drawn. A column of ``nan``
+    Unmeasured terms are dropped rather than drawn. A column of ``nan``
     plots as a gap, which is honest but reads as a failed run; leaving it out of
     the legend as well says the same thing without the alarm. A one-path
     two-port therefore draws exactly S11 and S21, which is what was measured.
@@ -70,7 +70,7 @@ def matrix_db(result):
         term = np.asarray(result.parameter(receiving, driving))
         if not np.any(np.isfinite(term)):
             continue
-        # By *column*: a symmetry fills the column of the port nobody drove.
+        # By *column*: a symmetry fills the column of the undriven port.
         traces.append((f"S{receiving}{driving}", db(term), driving in derived))
     return frequency, traces
 

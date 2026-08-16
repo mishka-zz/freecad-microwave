@@ -85,12 +85,15 @@ jobs:
       - run: pip install numpy
       - name: Every adapter module imports without FreeCAD or openEMS
         # Discovered, not listed: a hand-maintained list silently skips whatever
-        # was added since someone last edited it. `driver` is excluded because it
-        # is the solver-side entry point and importing openEMS is its whole job.
+        # was added since someone last edited it. The exclusions are the two
+        # solver-side modules, which exist to load the engine: `driver` is the
+        # entry point, and `coaxial` is a port class built out of openEMS' own.
+        # They are named in `tests/test_adapter_openems.py` as well, and a test
+        # there fails if the two lists disagree.
         run: |
           for path in Microwave/Solvers/openems/*.py; do
             module=$(basename "$path" .py)
-            case "$module" in __init__|driver) continue ;; esac
+            case "$module" in __init__|driver|coaxial) continue ;; esac
             echo "-- $module"
             python -c "import Microwave.Solvers.openems.$module" || exit 1
           done

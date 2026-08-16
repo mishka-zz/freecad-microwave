@@ -241,7 +241,7 @@ def touchstone_export(holder) -> TouchstoneExport:
 
     The ways a matrix can fall short have different fixes:
 
-    * **Columns nobody drove.** No file: a ``.sNp`` has a column for every term
+    * **Undriven columns.** No file: a ``.sNp`` has a column for every term
       and no way to mark one as invented. Another solve, or a symmetry.
     * **A reference the format cannot hold.** No file: Touchstone states one
       real impedance per port per frequency, and a port reported against its

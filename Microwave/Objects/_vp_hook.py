@@ -88,7 +88,7 @@ def restore_view_provider(obj, kind):
     #
     # By suffix, not by prefix. The question is "is there a provider here at
     # all?", and a provider from another workbench is just as much a reason to
-    # leave the object alone as one of ours - replacing a live one mid-session
+    # leave the object alone as this workbench's - replacing a live one mid-session
     # drops whatever display state it holds.
     if type(getattr(view_object, "Proxy", None)).__name__.endswith("ViewProvider"):
         return False

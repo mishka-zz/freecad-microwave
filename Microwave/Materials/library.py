@@ -14,7 +14,7 @@ other catalog, so failures are collected and reported alongside what did load.
 That is the opposite of the rule inside a single file, where one bad entry
 refuses the whole thing - and deliberately so: a silently missing *material*
 is indistinguishable from one the vendor never shipped, while a missing
-*catalog* is obvious the moment you look for it.
+*catalog* is obvious on sight.
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def load_library(
     one with the same id is a *failure* naming both files. Not last-wins -
     that lets a forgotten copy in a downloads folder redefine what FR4 means
     with nothing said, and "why did my permittivity change?" becomes
-    unanswerable. Someone who really wants their own generics changes one line,
+    unanswerable. A user who really wants their own generics changes one line,
     ``id = "generic-mine"``, and then both are in the picker, which is honest.
     """
     catalogs: list[Catalog] = []
@@ -110,10 +110,10 @@ def load_library(
 
     # A path the user typed and got wrong must say so. The bundled directory
     # and the FreeCAD user directory are *not* in ``required``: the first is
-    # always there and the second legitimately does not exist until somebody
+    # always there and the second legitimately does not exist until a user
     # puts a catalog in it, so complaining about them would be noise. A path
     # from $MICROWAVE_MATERIAL_PATH or the parameter store is different - it
-    # exists because somebody meant it to.
+    # exists because a user meant it to.
     for path in required:
         if not pathlib.Path(path).exists():
             failures.append(
@@ -124,7 +124,7 @@ def load_library(
 
     for path in paths:
         # ``_files`` reads the directory, and a directory can refuse to be read
-        # - a mode nobody meant to set, a network share that went away. That
+        # - a mode set by accident, a network share that went away. That
         # is a failure about one path, which is what this function returns;
         # letting it out would take the whole picker down, against a docstring
         # promising it never raises.

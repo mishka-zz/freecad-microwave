@@ -59,7 +59,7 @@ def _target_analysis(doc, title):
 def _add(doc, label, make):
     """Create an object inside the active analysis, undoably.
 
-    FreeCAD does not wrap a Python command in a transaction for you. Without
+    FreeCAD does not wrap a Python command in a transaction. Without
     one, Ctrl-Z does nothing and the object stays - measured on 1.1.1,
     UndoCount stays 0. The user then adds a second one, and refusals name the
     first, which reads as naming the wrong object.
@@ -280,12 +280,24 @@ class EMPortWaveguideCommand(_PortCommand):
     )
 
 
+class EMPortCoaxialCommand(_PortCommand):
+    kind = (
+        "PortCoaxial.svg",
+        "Add Coaxial Port",
+        "Add a coaxial port. Select the ring between the inner conductor and "
+        "the shield, at the end of the line",
+        Objects.createEMPortCoaxial,
+        port_setup.fill_coaxial,
+    )
+
+
 class EMMeshRegionCommand(_Command):
     def GetResources(self):
         return {
             "Pixmap": get_icon_path("MeshRegion.svg"),
             "MenuText": "Add Mesh Refinement",
-            "ToolTip": "Make the elements around some geometry smaller",
+            "ToolTip": "Set the element size around some geometry: finer than "
+            "the policy, or coarser where the detail does not matter",
         }
 
     def Activated(self):
@@ -309,7 +321,7 @@ class EMMeshRegionCommand(_Command):
                 # object added several actions ago.
                 notes.append(
                     f"{obj.Label}: nothing was selected for References, so this "
-                    "region refines nothing; pick the geometry in the property editor"
+                    "region is aimed at nothing; pick the geometry in the property editor"
                 )
             return obj
 
@@ -321,8 +333,8 @@ class UpdateMeshCommand(_Command):
     """Mesh the study and draw the grid, without opening the panel.
 
     The same action the panel's button runs. On the toolbar because inspecting
-    a mesh is something you do repeatedly while modelling, and going through a
-    modal task dialog to do it would make it something you stop doing.
+    meshing is done repeatedly while modelling, and going through a modal task
+    dialog for it would make it something a user stops doing.
     """
 
     def GetResources(self):
@@ -371,7 +383,7 @@ class ExportTouchstoneCommand(_Command):
     """Write the study's S-matrix as a Touchstone file.
 
     The one way a result leaves the document. A matrix is stored *in* the
-    document and overwritten by the next run, so exporting is how you keep one
+    document and overwritten by the next run, so exporting is how one is kept
     - and it is what hands the numbers to everything else in the field, since
     ``.sNp`` is the one format every simulator and VNA reads.
 
@@ -414,8 +426,8 @@ class PlotSParametersCommand(_Command):
     """Draw the study's S-matrix.
 
     The same chart the result's own double-click opens, reached from the
-    toolbar instead - which is where somebody who has just pressed Run is
-    already looking, and where a result nobody has found in the tree can still
+    toolbar instead, which is where a user who has just pressed Run is already
+    looking, and where a result not yet found in the tree can still
     be got at.
     """
 
@@ -560,7 +572,7 @@ def _start_directory(doc) -> str:
 #:
 #: Typing the id twice - once to register, once in a toolbar tuple - admits
 #: a command that is registered and reachable from nowhere, or on a toolbar and
-#: registered by nobody. One table makes both unrepresentable, which is better
+#: registered nowhere. One table makes both unrepresentable, which is better
 #: than caught by a test.
 COMMANDS = (
     ("Microwave_Analysis", EMAnalysisCommand, "Microwave"),
@@ -578,13 +590,24 @@ COMMANDS = (
     ("Microwave_UpdateMesh", UpdateMeshCommand, "Microwave Mesh"),
 )
 
+#: Commands that exist and are deliberately not registered, in the same shape as
+#: :data:`COMMANDS` so one can be moved between the two.
+#:
+#: The coaxial port translates, solves and is scored against a closed form, so
+#: none of it is deleted or allowed to rot - but it is not ready to be put in
+#: front of somebody, and a command that is registered is a command a user finds.
+#: Nothing here reaches the toolbars or the menu, which both read ``COMMANDS``
+#: alone. The document object, its view provider and the adapter's support for it
+#: all stay, so a document that holds one still opens and still solves.
+WITHHELD = (("Microwave_PortCoaxial", EMPortCoaxialCommand, "Microwave Ports"),)
+
 
 def _toolbars():
     """One toolbar per group, in table order, every command its own button.
 
-    There are few enough that they all fit, and a button you can see beats one
+    There are few enough that they all fit, and a visible button beats one
     behind a dropdown - a dropdown shows whichever command was used last, so
-    the other two stop existing until somebody goes looking. FreeCAD makes each
+    the other two stop existing until a user goes looking. FreeCAD makes each
     of these a separate dockable toolbar the user can move or hide; Assembly, CAM
     and BIM all split themselves this way.
 

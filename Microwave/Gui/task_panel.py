@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 _PROGRESS = {
     "STARTED": "Solver process started",
     "ENVELOPE": "Envelope loaded",
+    "PLACED": "Structure placed",
+    "GROWN": "Conductors fitted to the grid",
     "GRID": "Grid installed",
     "BUILT": "Structure built",
     "SOLVER_STARTED": "Solving...",
@@ -83,7 +85,7 @@ def _solving_line(detail: str) -> str:
     try:
         cells = f"{int(fields['cells']):,}"
     except (KeyError, ValueError):
-        # A marker we cannot read is shown rather than swallowed, as an unknown
+        # An unreadable marker is shown rather than swallowed, as an unknown
         # marker name is.
         return f"Solving {detail}..."
     shape = fields.get("lines")
@@ -325,8 +327,8 @@ class SimulationTaskPanel:
         A run's log is the long one, the one a user copies into a bug report,
         and the one where a build number earns its line. Meshing and checking
         clear the same widget and do not stamp it: a banner on every press is a
-        banner nobody reads, and the panel's footer already says the version to
-        anyone looking for it.
+        banner that goes unread, and the panel's footer already carries the
+        version.
         """
         self.log_view.clear()
         self.log(f"FreeCAD Microwave {__version__}")
@@ -441,11 +443,11 @@ class SimulationTaskPanel:
     def report_coverage(self):
         """Say what the sweep will cost and what it will cover.
 
-        Returns the port numbers nobody drives. Column *j* of an S-matrix comes
+        Returns the undriven port numbers. Column *j* of an S-matrix comes
         from the run that drives port *j*, so a port left unmarked is a column
         that will not be measured - which is a normal and usually deliberate
         choice, not a fault. Driving one port of a two-port gives S11 and S21,
-        which is most of what anyone asks a two-port for, and it halves the
+        which is most of what a two-port is asked for, and it halves the
         solve time. Said here, on Check, so the trade is visible before the
         minutes are spent rather than after.
         """
@@ -669,7 +671,7 @@ class SimulationTaskPanel:
         """Read the sweep back, store the matrix, and show it.
 
         The document object is written *before* anything is plotted. A plot is a
-        window someone closes; the matrix is the answer, and losing it because a
+        window that gets closed; the matrix is the answer, and losing it because a
         matplotlib backend misbehaved would mean re-running the solve.
         """
         if not results_paths:
@@ -805,7 +807,7 @@ class SimulationTaskPanel:
         """Say whether each run is what it claims to be, before trusting it.
 
         Per run, and matched by the port each one drove rather than by
-        position: a sweep whose runs came back in an order nobody expected is
+        position: a sweep whose runs came back in an unexpected order is
         exactly the case this exists to catch, and a positional check would
         quietly compare the wrong pair.
         """
@@ -821,7 +823,7 @@ class SimulationTaskPanel:
             # The driver says this too, on a CHECK marker, and on_marker shows
             # only a marker's name - so the message reaches the log from here
             # and from nowhere else.
-            still_ringing = residual.unfinished(result.tail_share)
+            still_ringing = residual.unfinished(result.tail_share, result.smallest_response)
             if still_ringing:
                 self.log(f"WARNING: run {result.excited_port}: {still_ringing}.")
 
@@ -864,7 +866,7 @@ class SimulationTaskPanel:
         return QtWidgets.QDialogButtonBox.Close
 
     def _exit_edit_mode(self):
-        """Let the ViewProvider close us.
+        """Let the ViewProvider close this panel.
 
         Closing the widget directly leaves the document edit-locked and freezes
         tree interaction on every other object; ``resetEdit`` runs ``unsetEdit``,

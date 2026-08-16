@@ -8,7 +8,7 @@ produced, sitting in the analysis group beside the ports it describes.
 
 Stored **in the document**, as flat lists of floats, and not as a path to a
 file beside it. A ``.s2p`` beside the document is a dangling reference the
-moment anyone moves, renames or emails the ``.FCStd``, and it fails silently by
+moment the ``.FCStd`` is moved, renamed or emailed, and it fails silently by
 showing the previous run's numbers. ``App::PropertyFloatList`` is what
 FreeCAD's own FEM result objects use for bulk numbers, saves and restores with
 everything else, and compresses down to tens of kilobytes.
@@ -140,7 +140,7 @@ class EMSParameters(ViewProviderRestored):
         )
         # Complex, and split like every other complex array here. An undriven
         # port keeps its own measured impedance as its reference - moving it
-        # needs the column nobody measured - and a microstrip's is genuinely
+        # needs the unmeasured column - and a microstrip's is genuinely
         # complex, so a float list would quietly discard the imaginary part.
         obj.addProperty(
             "App::PropertyFloatList",

@@ -347,7 +347,7 @@ def draw(window, chart: Chart) -> None:
     window.grid = True
 
     # No legend for a single curve, on axes that are already labelled. Drawn on
-    # our own axes rather than through ``Plot.legend``, which acts on whichever
+    # this chart's own axes rather than through ``Plot.legend``, which acts on whichever
     # tab is active; the flag is what ``Plot.update`` reads, and is assigned in
     # both directions so that a later update does not rebuild a legend this
     # chart decided against.
@@ -373,7 +373,7 @@ def draw(window, chart: Chart) -> None:
 
 #: How close a click has to land, in points, to take a marker off rather than
 #: put another one on. Comfortably wider than the marker's own dot, so that
-#: clicking what you can see works.
+#: clicking what is visible works.
 _MARKER_REACH = 12.0
 
 

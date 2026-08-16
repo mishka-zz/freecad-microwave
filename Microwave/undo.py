@@ -3,7 +3,7 @@
 
 """One undo step per user action.
 
-FreeCAD does not wrap anything in a transaction for you. A command that changes
+FreeCAD does not wrap anything in a transaction. A command that changes
 the document without opening one is not merely un-undoable - Ctrl-Z then
 reverses whatever *did* open one, which is the edit before it. Untransacted,
 Update Mesh followed by Ctrl-Z leaves the mesh on screen and deletes the

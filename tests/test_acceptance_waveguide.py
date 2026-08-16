@@ -336,8 +336,8 @@ def test_the_response_had_finished_when_the_run_stopped(solved, orientation):
 
 
 class TestWhatTheGuideIsReportedAgainst:
-    """The gate for D-3: one solve, two references, and only one of them is a
-    picture of the guide.
+    """One solve, two references, and only one of them is a picture of the
+    guide.
 
     A guide has no reference impedance to type in. At 23 GHz WR-42 is 475.0 ohm
     by wave impedance, 381.8 by power-voltage and 471.0 by power-current, and

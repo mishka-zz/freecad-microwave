@@ -29,6 +29,7 @@ import Microwave
 from Microwave.Objects.analysis import createEMAnalysis
 from Microwave.Objects.mesh import createEMMeshPolicy, createEMMeshRegion
 from Microwave.Objects.ports import (
+    createEMPortCoaxial,
     createEMPortLumped,
     createEMPortMicrostrip,
     createEMPortRectWaveguide,
@@ -46,6 +47,7 @@ FACTORIES = {
     "EMPortMicrostrip": lambda doc: createEMPortMicrostrip(doc=doc),
     "EMPortLumped": lambda doc: createEMPortLumped(doc=doc),
     "EMPortRectWaveguide": lambda doc: createEMPortRectWaveguide(doc=doc),
+    "EMPortCoaxial": lambda doc: createEMPortCoaxial(doc=doc),
 }
 
 #: The comment that ties a table to an object, invisible where the page renders.

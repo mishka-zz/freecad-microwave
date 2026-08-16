@@ -131,6 +131,7 @@ import pytest
 
 from Microwave.Results.sparameters import SParameters
 from Microwave.Solvers.openems import preflight, read, residual, run, write
+from Microwave.Solvers.openems.materials import VACUUM_PERMITTIVITY
 from Microwave.Solvers.openems.mesh import MeshParams
 from Microwave.Solvers.openems.model import (
     Frequency,
@@ -146,7 +147,6 @@ from tests.analytic import reference
 pytestmark = pytest.mark.slow
 
 SPEED_OF_LIGHT = 299792458.0
-VACUUM_PERMITTIVITY = 8.8541878128e-12
 
 #: Everything the paper states, transcribed once - see ``tests/published.py``.
 #: Nothing below re-spells any of it.
@@ -184,7 +184,7 @@ FREQ_MIN = FREQ_MAX / POINTS
 #: ringing rather than the transit.
 #: :func:`test_the_response_had_finished_when_the_run_stopped` is what says
 #: whether this is enough, and is where it is set from.
-TIMESTEPS = 45000
+TIMESTEPS = 100000
 
 #: Argued in the module docstring, from the reference and not from the answer.
 CORNER_TOLERANCE = 0.05
@@ -407,8 +407,8 @@ def test_the_fixture_is_not_vacuous(matrix):
 
     Asserted as the *contrast* between the two bands rather than as a floor
     under the passband, because a floor is a tolerance on insertion loss and
-    this is not one: the modelled dissipation is a known defect (C-5) that
-    moves the passband on its own, and a guard that moves with it guards
+    this is not one: the modelled dissipation is known to be wrong here, and it
+    moves the passband on its own, so a guard that moves with it guards
     nothing. A filter is a thing that passes one band and stops another,
     whatever either costs in absolute terms.
     """

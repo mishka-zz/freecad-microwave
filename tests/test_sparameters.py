@@ -937,6 +937,19 @@ class TestWhatItCarries:
             2: {"1": 1e-4, "2": 0.2},
         }
 
+    def test_what_the_tails_were_judged_against_stays_one_number(self):
+        """The other direction from the two above, and the one nothing else
+        asserts. How far down the study reads is a fact about the study, so
+        every run of a sweep carries the same figure - splitting it per run
+        would make the bar look like something a solve decides, and leave
+        anything reading it back with a dict where it expects a float."""
+        runs = series_resistor(50.0, 50.0, 10.0)
+        for run in runs:
+            run.provenance = dict(run.provenance, smallest_response=0.01)
+
+        result = SParameters.from_runs(runs)
+        assert result.provenance["smallest_response"] == 0.01
+
     def test_provenance_records_which_library_produced_it(self):
         result = SParameters.from_runs(series_resistor(50.0, 50.0, 10.0))
         assert result.provenance["result_library"].startswith("scikit-rf ")

@@ -75,15 +75,18 @@ diagram in picoseconds.
 port as an excitation source and solve again, or declare the study symmetric so
 its column can be derived.
 
-**One real reference impedance, constant across the band.** This is the
-condition most often missed, and it is not arbitrary: a step response is the
-inverse transform of S11 against a reference *the port did not measure*. A port
-referenced to its own measured impedance has already stated what the line is,
-and transforming that statement returns it unchanged - the trace would be flat
-at it by construction.
+**A reference impedance, and it need not be one you named.** A step response is
+read against one real impedance, and a port reported against its own measured
+`Z(f)` - a microstrip's, complex and rising across the band - is moved onto one
+before the transform: the impedance it measured at band centre, taken as real.
+That is what a bench does with a de-embedded measurement and it costs nothing -
+what comes back is the reflection an instrument calibrated to that number would
+have read.
 
-So drive the line from a port whose impedance is **declared** rather than
-measured. A lumped port states its resistance; that is the port to use.
+The chart says when the reference was measured rather than named, because a
+number that came out of this solve is not a number that was chosen. Read the
+first plateau accordingly: the line the port sits on reads its own measurement
+back, and everything beyond the first discontinuity is what the trace is for.
 
 **For a distance axis, two reference planes.** Distance costs a velocity,
 velocity is measured from the phase of a transmission term, and turning that

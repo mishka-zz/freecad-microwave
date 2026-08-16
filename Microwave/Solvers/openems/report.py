@@ -16,7 +16,7 @@ is recomputed and nothing can drift from what gets solved.
 Deliberately absent
 -------------------
 
-**A wall-clock estimate.** It needs a cells-per-second constant nobody here has
+**A wall-clock estimate.** It needs a cells-per-second constant not available here
 measured, and a guessed number sitting beside exact ones gets quoted. Add it
 when a run has been instrumented to yield it.
 
@@ -38,6 +38,7 @@ from typing import NamedTuple
 
 import numpy as np
 
+from ...units import MM_PER_M
 from .mesh import (
     BYTES_PER_CELL,
     DIMENSIONS,
@@ -47,6 +48,7 @@ from .mesh import (
     MeshLines,
     MeshParams,
     Region,
+    cells_across,
 )
 from .model import AXIS_NAMES, SPEED_OF_LIGHT
 
@@ -59,9 +61,6 @@ __all__ = [
     "mesh_report",
     "timestep_bound",
 ]
-
-#: Millimetres per metre. Grids are in mm; the Courant condition is in SI.
-_MM_PER_M = 1e3
 
 
 @dataclass(frozen=True)
@@ -227,7 +226,7 @@ class MeshReport:
 
     @property
     def oversized(self) -> str | None:
-        """What to say about a grid larger than anyone meant, or ``None``.
+        """What to say about a grid larger than intended, or ``None``.
 
         Every measured way into one was a single mistyped property on a model
         that meshes fine otherwise, and the worst of them is the one that costs
@@ -406,7 +405,8 @@ def extents(lines: MeshLines, params: MeshParams) -> tuple[Extent, Extent]:
 
 
 def timestep_bound(lines: MeshLines, factor: float) -> float:
-    """An upper bound on the timestep, in seconds. Not openEMS' own number.
+    """An upper bound on the timestep a vacuum grid allows, in seconds. Not
+    openEMS' own number, which for ordinary materials is longer.
 
     ``dt <= 1 / (c * sqrt(1/dx^2 + 1/dy^2 + 1/dz^2))``, minimised over every
     cell. The three terms are separable and each decreasing in its own spacing,
@@ -430,7 +430,7 @@ def timestep_bound(lines: MeshLines, factor: float) -> float:
     every other cell pays. A couple of percent does not change that reading.
     """
     inverse_squares = sum(
-        1.0 / (float(np.min(np.diff(lines[dim]))) / _MM_PER_M) ** 2 for dim in range(DIMENSIONS)
+        1.0 / (float(np.min(np.diff(lines[dim]))) / MM_PER_M) ** 2 for dim in range(DIMENSIONS)
     )
     return factor / (SPEED_OF_LIGHT * float(np.sqrt(inverse_squares)))
 
@@ -495,13 +495,7 @@ def _resolution(region: Region, lines: MeshLines) -> FeatureResolution:
         if region.is_sheet(dim):
             across.append(0)
             continue
-        axis = lines[dim]
-        low = int(np.searchsorted(axis, region.lower[dim], side="right"))
-        high = int(np.searchsorted(axis, region.upper[dim], side="left"))
-        # Lines strictly inside the object cut it into (n + 1) pieces; an object
-        # sitting exactly between two adjacent lines is spanned by one cell, not
-        # by zero.
-        across.append(max(high - low + 1, 1))
+        across.append(cells_across(lines[dim], region.lower[dim], region.upper[dim]))
 
     extents = [n for dim, n in enumerate(across) if not region.is_sheet(dim)]
     return FeatureResolution(

@@ -38,7 +38,7 @@ class EMMaterial(ViewProviderRestored):
         obj.Color = (0.8, 0.8, 0.8)
 
         # The frequency Permittivity and LossTangent are quoted at. Editable,
-        # because typing your own measured permittivity means saying where you
+        # because typing a measured permittivity of one's own means saying where it
         # measured it. Zero means unstated, which is what a hand-made material
         # starts as.
         obj.addProperty(

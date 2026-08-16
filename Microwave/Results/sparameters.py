@@ -85,7 +85,7 @@ def _engineering_hz(hz: float) -> str:
     """One frequency, in the unit an engineer would have said it in.
 
     A Touchstone body is in hertz because the format says so. A header is read
-    by a person, and 1e+10 is not how anyone describes 10 GHz.
+    by a person, and 1e+10 is not how 10 GHz is written.
     """
     for scale, unit in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")):
         if abs(hz) >= scale:
@@ -124,7 +124,7 @@ _CAPTION_LIMIT = 60
 
 
 def _comment_text(value: object) -> str:
-    """One line of somebody else's text, made safe to put in a comment.
+    """One line of external text, made safe to put in a comment.
 
     A Touchstone comment is not inert. The reader dispatches on what follows
     the ``!`` - ``! gamma`` and ``! port impedance`` are HFSS extensions that
@@ -164,7 +164,7 @@ def describe_reference(reference: np.ndarray, port_numbers, at_own=()) -> str:
     varies with frequency says so rather than quietly reporting its first bin.
 
     ``at_own`` names the ports referenced to their own impedance: a port the
-    user pointed at itself, and a column nobody drove. It decides only what to
+    user pointed at itself, and an undriven column. It decides only what to
     say where there is **no** number - see :func:`_own_or`. A port at its own
     50 ohm reads as 50 ohm; a guide at its own dispersive impedance reads as
     its own impedance, because folding that together with a requested 50 would
@@ -284,10 +284,10 @@ class SParameters:
     column *j* exists only if port *j* was driven; ``driven`` names the ones
     that were, and every other column is ``nan``. That is not a degraded
     result - it is what a time-domain solve produces, and it is the same
-    thing a one-path VNA (a LiteVNA has one source and two receivers) gives
-    you: S11 and S21, exactly, with S12 and S22 simply not measured. Marking
+    thing a one-path VNA (a LiteVNA has one source and two receivers)
+    returns: S11 and S21, exactly, with S12 and S22 simply not measured. Marking
     the gap as ``nan`` rather than zero is the whole point: a zero is a number
-    somebody will plot.
+    that will be plotted.
     """
 
     frequency: np.ndarray
@@ -299,7 +299,7 @@ class SParameters:
     #: exist. ``None`` means all of them, which is what a full sweep produces
     #: and what any caller building a complete matrix by hand means.
     driven: tuple[int, ...] | None = None
-    #: Columns nobody drove that were filled from a symmetry the *user*
+    #: Undriven columns that were filled from a symmetry the *user*
     #: declared. Present in the matrix, never confusable with measured: the
     #: plot draws them dashed and labels them, a Touchstone header names them
     #: and quotes the error the copy carries, the document stores them apart,
@@ -316,7 +316,7 @@ class SParameters:
     #: gap into one smooth curve, which is the same failure as writing a zero.
     discarded: tuple[int, ...] = ()
     #: Ports referenced to their own impedance rather than to a number: the ones
-    #: the caller asked for nothing at, and the columns nobody drove.
+    #: the caller asked for nothing at, and the undriven columns.
     #:
     #: Recorded rather than re-derived. :attr:`reference` and
     #: :attr:`measured_impedance` agree at such a port, but they also agree at a
@@ -333,7 +333,7 @@ class SParameters:
             object.__setattr__(self, "driven", tuple(sorted(self.driven)))
         object.__setattr__(self, "derived", tuple(sorted(self.derived)))
         object.__setattr__(self, "discarded", tuple(sorted({int(i) for i in self.discarded})))
-        # A column nobody drove is at its own impedance whatever the caller
+        # An undriven column is at its own impedance whatever the caller
         # asked for, so it belongs here however this object was built. That is
         # not the inference this field exists to avoid - it is a rule
         # :meth:`from_runs` states and enforces, restated where it cannot be
@@ -381,7 +381,7 @@ class SParameters:
         the points the impedance comparison blanked, which is not the whole test
         - a run can come back all ``nan`` with nothing having disagreed. A
         waveguide port whose plane misses the grid excites nothing, ``|uf_inc|``
-        is zero, every term is ``nan``, and a single run has nobody to disagree
+        is zero, every term is ``nan``, and a single run has nothing to disagree
         with, so ``discarded`` stays empty. Such a result passes every refusal
         here and writes a Touchstone file of ``nan`` tokens.
 
@@ -648,7 +648,7 @@ class SParameters:
 
         Refuses on an incomplete matrix, and that is deliberate. A ``.sNp`` has
         a column for every term, so writing one from a one-path measurement
-        means inventing the terms nobody measured - which is exactly why
+        means inventing the unmeasured terms - which is exactly why
         Touchstone files exported from one-path VNAs are hazardous downstream:
         an assumed S12 and a fabricated S22 look identical to measured ones, and
         the file carries no way to tell. The workbench will grow explicit export
@@ -686,7 +686,7 @@ class SParameters:
         size, span, reference.
 
         Both versions, and they answer different questions: the simulator's is
-        what produced the numbers, ours is what arranged them. Reproducing a
+        what produced the numbers, this workbench is what arranged them. Reproducing a
         result wants the first the way reproducing a bench measurement wants
         the firmware revision, and the second is what a bug report has to name.
 
@@ -727,7 +727,7 @@ class SParameters:
         from a declared symmetry is *complete*, so it passes the refusal, and
         it would carry exactly that anonymity if it went out unannotated. It
         does not: the assumption is stated in the file, in Touchstone's own
-        comment syntax, so the file can be handed to anyone.
+        comment syntax, so the file can be handed on.
         """
         lines: list[str] = self._identification()
         # A band with a hole in it, written by usable(). The frequency list in
@@ -778,24 +778,20 @@ class SParameters:
         translation, and the cell-count check below is what refuses a list
         assembled by hand from two different solves.
 
-        **Fewer runs than ports is allowed**, and produces an honest partial
-        matrix rather than a refusal - driving one port of a two-port measures
-        S11 and S21 exactly, as a one-path VNA does. The undriven columns come
-        back ``nan`` and :attr:`driven` says which those are.
+        **Fewer runs than ports is allowed**, and produces a partial matrix
+        rather than a refusal - driving one port of a two-port measures S11 and
+        S21 exactly, as a one-path VNA does. The undriven columns come back
+        ``nan`` and :attr:`driven` says which those are.
 
         ``symmetry`` is the user's declaration about the structure.
-        :data:`MIRROR` on a two-port with one run fills the missing column -
-        S22 from S11, S12 from S21 - at half the solve time. The identities
-        need both ports at **one** reference, so the driven port is
-        renormalised to the other port's measured impedance, the copy is made
-        there, and the result is renormalised to what the caller asked for. See
-        :func:`_derive_mirror`.
+        :data:`MIRROR` on a two-port with one run fills the missing column at
+        half the solve time; :func:`_derive_mirror` does it, and
+        docs/internals/s-matrix-from-runs.md says what it rests on.
 
         A frequency point where the runs disagree about a port's reference
         impedance by more than :data:`IMPEDANCE_TOLERANCE` comes back ``nan``
         and is named in :attr:`discarded`. That is a *point* failing and not
-        the sweep: the extraction goes indeterminate near a standing-wave null
-        and nowhere else.
+        the sweep.
 
         ``reference`` may be a scalar or one value per port, and applies to the
         ports whose columns are known. ``None`` references that port to **its
@@ -803,7 +799,7 @@ class SParameters:
         guide - a bench measures one by TRL against standards cut from the same
         guide, and no single number is entered anywhere. A column that is
         neither driven nor derived gets the same treatment whatever was asked
-        for, because moving it needs numbers nobody has.
+        for, because moving it needs numbers no run measured.
         """
         if not runs:
             raise ResultError("no runs to assemble")
@@ -1026,16 +1022,12 @@ def _disagreement(
 def _volts(runs: Sequence[Any], numbers: tuple[int, ...], frequency: np.ndarray) -> np.ndarray:
     """The raw wave-amplitude ratios, column *j* from the run that drove port *j*.
 
-    Columns nobody drove are filled with **zero, not nan**; the caller blanks
-    them again after the renormalisation. A nan does not stay where it is put: it
-    reaches
-    the inverse inside ``s2z`` and comes back as ``LinAlgError: Array must not
-    contain infs or NaNs`` - minutes after the solve, from inside a library,
-    naming nothing about the model. So a nan among the columns somebody *did*
-    drive is refused here instead, by name and by how many points it spoiled.
-
-    What licenses the zero is that the driven columns come out identical whatever
-    sits in the undriven ones - see :func:`_wanted_reference`.
+    Undriven columns are filled with **zero, not nan**; the caller blanks them
+    again after the renormalisation. What licenses the zero is that the driven
+    columns come out identical whatever sits in the undriven ones - see
+    :func:`_wanted_reference`. A nan among the columns that *were* driven is a
+    real fault and is refused here by name, and by how many points it spoiled,
+    rather than reaching the inverse inside ``s2z``.
     """
     by_excitation = {int(run.excited_port): run for run in runs}
     volts = np.zeros((frequency.size, len(numbers), len(numbers)), dtype=complex)
@@ -1069,7 +1061,7 @@ def _wanted_reference(
 
     One rule: a port is referenced to the number the caller asked for, and to its
     own impedance when the caller asked for nothing. Collapsed into it are a port
-    the user pointed at itself, a column nobody drove, and both ports of a
+    the user pointed at itself, an undriven column, and both ports of a
     derived mirror, which share one impedance by the user's declaration.
 
     ``own`` rather than each port's own measurement, for the mirror's sake:
@@ -1077,19 +1069,11 @@ def _wanted_reference(
     basis, and asking for the measurements here would renormalise the two
     diagonal terms by different amounts and undo the copy it just made exact.
 
-    **A port nobody drove keeps its own impedance whatever was asked for**, which
-    makes its renormalisation the identity. That is not a convenience, it is the
-    only honest option, and it is exact: with ``G = diag(g1, 0)``, column 1 of
-    ``A^-1 (S - G*)(I - GS)^-1 A*`` needs only column 1 of ``S``, so the driven
-    columns of an incomplete matrix are exactly referenced to what the caller
-    asked for and nothing is faked. Renormalising the undriven port as well would
-    move them and would genuinely need S22.
-
-    That is the derivation, not the implementation - scikit-rf renormalises
-    through Z-parameters (``z2s(s2z(...))``), reaching the same answer by another
-    route, so the independence was confirmed against *it* rather than against the
-    algebra, by filling the unmeasured column with zeros, with random values and
-    with 1e3.
+    **An undriven port keeps its own impedance whatever was asked for**, which
+    makes its renormalisation the identity and leaves the driven columns exactly
+    referenced to what the caller asked for. The algebra, and how the
+    independence was confirmed against scikit-rf rather than against it, are in
+    docs/internals/s-matrix-from-runs.md#an-undriven-port-keeps-its-own-impedance.
     """
     # ``dtype=object`` because ``None`` is one of the values and a complex array
     # cannot hold it. A scalar broadcasts across the ports, which is what a
@@ -1165,28 +1149,16 @@ def _derive_mirror(
     impedance and the gap between their two measurements is noise.
 
     Reciprocity does the off-diagonal (S12 = S21) and the mirror does the
-    diagonal (S22 = S11). It is the mirror that is the user's claim -
-    reciprocity alone leaves S22 unknown and completes nothing.
+    diagonal (S22 = S11). **Both identities need the two ports at one
+    reference**, and a microstrip port measures ``sqrt(Et*dEt / (Ht*dHt))`` from
+    its own probe fields rather than being told, so two of them disagree. The
+    common basis is therefore *made*: the driven port is renormalised to the
+    undriven port's measured impedance before the copy.
 
-    **Both identities need the two ports at one reference.** A lumped port's
-    Z_ref is the resistance the user typed and two of them agree exactly; a
-    microstrip port *measures* ``sqrt(Et*dEt / (Ht*dHt))`` from its own probe
-    fields, so the two ends of a genuinely symmetric line come back slightly
-    different. Copy in that measured basis and the renormalisation afterwards
-    moves the two diagonal terms by different amounts and undoes the copy - a
-    small absolute perturbation, which hides in the passband and dominates in a
-    reflection null.
-
-    So a common basis is *made* rather than assumed. The driven port is
-    renormalised to the undriven port's measured impedance, which is the one
-    move the missing column cannot affect: with ``G = diag(g, 0)`` the driven
-    column of ``A^-1 (S - G*)(I - GS)^-1 A*`` needs only the driven column, and
-    the caller's renormalisation afterwards moves both columns together.
-
-    The gap between the two measurements is still returned, as evidence about
-    whether the *declaration* is credible. It is not an error bar on S: two
-    ports of a true mirror have one Z0, and the gap is two noisy estimates of
-    it rather than a real asymmetry.
+    Why that basis and not the measured one, why this particular move is the only
+    one the missing column cannot affect, and why the returned gap is evidence
+    about the declaration rather than an error bar on S, are in
+    docs/internals/s-matrix-from-runs.md.
     """
     if not symmetry:
         return (), 0.0, measured
@@ -1210,7 +1182,7 @@ def _derive_mirror(
     mismatch = float(np.max(np.abs(measured[:, a] - measured[:, b]) / scale))
 
     # Into a common basis, and it has to be the *undriven* port's: port a is the
-    # only one whose reference can be moved without the column nobody measured.
+    # only one whose reference can be moved without the unmeasured column.
     # For a true mirror the answer does not depend on which - a symmetric
     # matrix renormalised by a common factor stays symmetric - so nothing is
     # chosen here that the physics does not already fix.

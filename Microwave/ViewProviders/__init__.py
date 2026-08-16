@@ -45,7 +45,7 @@ class Provider:
     """
 
     #: Icon file in ``Resources``. Set per subclass, with no default on purpose:
-    #: a default would silently give a new kind somebody else's picture, and the
+    #: a default would silently give a new kind another kind's picture, and the
     #: tree is where a user tells one port from another at a glance.
     ICON = ""
 
@@ -131,6 +131,7 @@ _PROVIDER_MODULES = {
     "EMMeshRegion": "mesh",
     "EMMaterial": "materials",
     "EMMaterialBinding": "materials",
+    "EMPortCoaxial": "ports",
     "EMPortLumped": "ports",
     "EMPortMicrostrip": "ports",
     "EMPortRectWaveguide": "ports",
@@ -140,10 +141,10 @@ _PROVIDER_MODULES = {
 
 
 def provider_class(kind):
-    """The view provider class for a document kind, or ``None`` if we own none.
+    """The view provider class for a document kind, or ``None`` where there is none.
 
     Imported on demand, as the ladder did: these modules reach for ``PySide`` and
-    ``pivy`` and must not be imported when nobody is drawing anything.
+    ``pivy`` and must not be imported when nothing is drawing.
     """
     module = _PROVIDER_MODULES.get(kind)
     if module is None:
@@ -184,15 +185,11 @@ def inject_vp(obj, kind):
 def restore_view_providers(doc):
     """Give every object in one document its ViewProvider back. Returns the count.
 
-    A document written headlessly - by a script, or by ``freecadcmd`` - was
-    never given a ViewObject, so opening it in the GUI leaves each object on
-    FreeCAD's default view provider: no icon, no display mode, and no
-    ``doubleClicked``, which is the only thing that opens the simulation panel.
-    The document is intact and translates fine. It just looks broken, and the
-    one action that would prove otherwise is the action that is missing.
-
-    Objects that already carry a view provider are skipped, so this only ever
-    fills gaps and can be run as often as it likes.
+    The sweep over a whole document;
+    :func:`~..Objects._vp_hook.restore_view_provider` does one object and says
+    what a headlessly written document is missing. Objects that already carry a
+    view provider are skipped, so this only fills gaps and can be run as often
+    as it likes.
     """
     from ..Objects._vp_hook import restore_view_provider
     from ..Objects.kinds import kind_of, kinds

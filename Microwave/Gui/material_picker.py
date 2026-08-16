@@ -188,7 +188,7 @@ class MaterialPicker(QtWidgets.QDialog):
             where = "bundled" if catalog.bundled else catalog.origin
             # Name only. The version is provenance - it is recorded on the
             # material as SourceCatalog - and this header is read twenty
-            # times a session by someone looking for a laminate.
+            # times a session while looking for a laminate.
             parent = QtWidgets.QTreeWidgetItem(self.tree, [catalog.name])
             parent.setToolTip(0, f"{catalog.description}\nversion {catalog.version}\n{where}")
             parent.setFlags(QtCore.Qt.ItemIsEnabled)

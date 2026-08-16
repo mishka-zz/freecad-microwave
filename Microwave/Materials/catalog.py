@@ -4,7 +4,7 @@
 """Reading one catalog file, and refusing it by name when it is wrong.
 
 The refusals here are the point of the module. A catalog is written by hand, by
-somebody who is not us, and the difference between a library an engineer trusts
+a third party, and the difference between a library an engineer trusts
 and one they retype is whether a typo comes back as *"line 41: 'epsilon' is not
 a key; did you mean 'epsilon_r'?"* or as a permittivity of 1.
 

@@ -30,3 +30,7 @@ htmlcov/
 # writes beside itself; this is the second lock on the same door, so that a
 # stray copy at the root cannot reach a `git add -A`.
 /microstrip_50ohm.FCStd
+
+# What the corpus probe writes when no destination is given. It is rewritten
+# from the CAD kernel on every run, and is megabytes of triangles.
+tests/_corpus/

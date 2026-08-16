@@ -21,7 +21,9 @@ Marker                       Meaning
 ``STARTED``                  process is alive, envelope not yet read
 ``ENVELOPE digest=…``        envelope parsed and hashed
 ``CHECK severity=… …``       a pre-flight finding, or one about the solve
+``PLACED offset=…``          where the structure was put, against the drawing
 ``GRID cells=… lines=…``     grid installed
+``GROWN solids=… most=…``    conductors grown for where openEMS samples them
 ``BUILT``                    geometry and ports constructed
 ``SOLVER_STARTED``           handed off to openEMS
 ``SOLVER_FINISHED``          time stepping done
@@ -37,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
 import sys
 import time
@@ -45,9 +48,9 @@ from typing import Any
 
 import numpy as np
 
-from . import residual
+from . import residual, staircase
 from .capabilities import ADAPTER_VERSION
-from .model import AXIS_NAMES, EnvelopeError, Problem
+from .model import AXIS_NAMES, CONDUCTOR_KINDS, EnvelopeError, Problem
 from .preflight.finding import WARN
 from .write import read_envelope
 
@@ -67,6 +70,22 @@ def _sanitise(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def everything_wrong(problem: Problem) -> list:
+    """Both checks a run makes, in the order their findings are reported.
+
+    Two of them because they ask different questions. Pre-flight asks whether
+    this adapter can do what the envelope describes, and is cheap enough for the
+    task panel to run on every keystroke. The second asks whether the grid in the
+    envelope still holds the conductors it was built for, which is a question
+    about the finished grid and costs a triangle for every point it samples -
+    affordable beside a solve and not beside a keystroke, so this is the only
+    place it runs.
+    """
+    from . import conductors, preflight
+
+    return preflight.check(problem) + conductors.check(problem)
+
+
 def build(problem: Problem, sim_dir: Path):
     """Construct the CSX structure and the FDTD object. No solving.
 
@@ -76,6 +95,13 @@ def build(problem: Problem, sim_dir: Path):
     """
     from CSXCAD import ContinuousStructure
     from openEMS import openEMS
+
+    # Before anything is placed, so every coordinate below is in the one system
+    # and none of them is negative. The offset is reported rather than hidden:
+    # the XML written at the end of this function is in these coordinates, and
+    # nothing else the user sees is.
+    problem, offset = problem.at_the_origin()
+    marker("PLACED", "offset=" + ",".join(f"{d:.6g}" for d in offset))
 
     csx = ContinuousStructure()
     grid = csx.GetGrid()
@@ -90,7 +116,7 @@ def build(problem: Problem, sim_dir: Path):
 
     # ``TimeStepFactor`` is passed unconditionally, including at 1.0. openEMS
     # applies it only when it is below one (``openEMS::SetupFDTD``), so one is
-    # the engine's own step by the engine's own arithmetic, not by ours skipping
+    # the engine's own step by the engine's own arithmetic, not by this adapter skipping
     # the call.
     #
     # It is also the one setting here that leaves no usable trace in any file
@@ -112,19 +138,134 @@ def build(problem: Problem, sim_dir: Path):
         for material in problem.materials
     }
 
+    # Which materials openEMS will point-sample rather than average, so that
+    # only those are handed a surface corrected for it. A conducting sheet is
+    # sampled the same way a perfect conductor is - by its own extension rather
+    # than by CalcPEC_Range, which tests the property type for equality and so
+    # does not match one - and it rounds the same way. See staircase.py.
+    rounded = {m.name for m in problem.materials if m.kind in CONDUCTOR_KINDS}
+    lines = tuple(problem.grid[dim] for dim in range(len(AXIS_NAMES)))
+    grew = []
     for solid in problem.solids:
-        properties[solid.material].AddBox(
-            list(solid.lower), list(solid.upper), priority=solid.priority
+        moved = add_solid(
+            properties[solid.material],
+            solid,
+            grid=lines,
+            rounded=solid.material in rounded,
         )
+        if moved is not None:
+            grew.append(moved)
+    if grew:
+        marker("GROWN", f"solids={len(grew)} most={max(grew):.6g}")
 
     ports = {}
     for port in problem.ports:
         metal = properties[port.metal] if port.metal else None
-        ports[port.number] = _add_port(fdtd, metal, port, problem.length_unit)
+        ports[port.number] = _add_port(fdtd, csx, metal, port, problem.length_unit)
 
     csx.Write2XML(str(sim_dir / STRUCTURE_NAME))
     marker("BUILT")
     return fdtd, csx, ports
+
+
+def add_solid(prop, solid, grid=None, rounded: bool = False) -> float | None:
+    """One envelope solid as whichever primitive holds it.
+
+    The forms a solid arrives in and the primitive each becomes, in one place -
+    so that anything wanting to know what openEMS will hold asks this rather
+    than reproducing the choice.
+
+    :param grid: The three lists of grid lines, or ``None`` to hand the surface
+        over as drawn.
+    :param rounded: Whether openEMS decides this material by sampling a point
+        rather than by averaging a cell, which is what makes its surface land a
+        rounding away from where it was drawn.
+    :returns: How far the surface was grown to answer for that, or ``None``
+        where nothing was.
+
+    Only a triangulated solid is corrected. A box arrives exactly, because the
+    mesher pins a line to each of its faces and there is nothing left to round.
+
+    A sheet is not corrected, and that is a narrower claim: the mesher pins a
+    line at the plane it lies in, so nothing rounds it *across* its thickness -
+    but its outline is sampled like any other conductor boundary and is cut back
+    like one. What that is worth has not been measured on anything that solves
+    Maxwell, and correcting it is a different operation from this, since a sheet
+    arrives as a triangulation of its area and its interior points have no
+    outward direction in the plane to be moved along.
+    """
+    if solid.is_sheet:
+        _add_sheet(prop, solid)
+        return None
+    if solid.is_mesh:
+        vertices = solid.vertices
+        if rounded and grid is not None:
+            vertices = staircase.grown(vertices, solid.faces, grid)
+        _add_polyhedron(prop, solid, vertices)
+        return (
+            max(math.dist(was, now) for was, now in zip(solid.vertices, vertices))
+            if vertices is not solid.vertices
+            else None
+        )
+    prop.AddBox(list(solid.lower), list(solid.upper), priority=solid.priority)
+    return None
+
+
+def _add_sheet(prop, solid) -> None:
+    """One flat outline as coplanar polygons, a triangle each.
+
+    CSXCAD's polygon takes a single closed contour, so it cannot state a hole -
+    and a letter with a counter, a clearance in a plane, or an annulus is
+    exactly a hole. Its own triangles can: they are what the outline encloses,
+    with the holes already left out, and each is convex and unambiguous.
+
+    A polygon is the right primitive rather than a flattened solid. A sheet has
+    no volume to bound, so a closed surface cannot describe it, and openEMS
+    models a zero-thickness conductor by finding it at one plane - which is what
+    ``elevation`` here says, and why the mesher pins a line there.
+    """
+    axis = solid.sheet_normal
+    # CSXCAD reads the first coordinate list as axis (n+1)%3 and the second as
+    # (n+2)%3, which is a *cycle* and not the remaining axes in order. They
+    # agree for a sheet normal to x or z and swap for one normal to y, so a
+    # vertical sheet laid the obvious way arrives mirrored about x = z - and
+    # says nothing, because the primitive is used either way.
+    across = [(axis + 1) % 3, (axis + 2) % 3]
+    for first, second, third in solid.faces:
+        corners = [solid.vertices[index] for index in (first, second, third)]
+        prop.AddPolygon(
+            [[corner[across[0]] for corner in corners], [corner[across[1]] for corner in corners]],
+            norm_dir=axis,
+            elevation=solid.lower[axis],
+            priority=solid.priority,
+        )
+
+
+def _add_polyhedron(prop, solid, vertices) -> None:
+    """One triangulated solid as a CSXCAD polyhedron.
+
+    The vertices are passed rather than read off the solid, because what reaches
+    the engine may have been grown to answer for where openEMS puts a
+    conductor's surface - see :mod:`staircase`. The faces are the same either
+    way: growing a surface moves its points and not how they are joined.
+
+    The primitive takes no geometry when it is created: vertices and faces are
+    added to it one call at a time. That is cheap enough not to need the
+    file-reading variant - a surface of eight thousand triangles is a few
+    milliseconds either way.
+
+    Nothing is read back. CSXCAD's per-face verdict is written by CGAL's builder
+    and the builder stops at the first construction error, leaving every later
+    face's flag at whatever the memory held - so on exactly the path a check
+    would be for, the flags are indeterminate. What the surface is has already
+    been settled combinatorially on the way into the envelope, where it is
+    deterministic and where a refusal can still name the object.
+    """
+    primitive = prop.AddPolyhedron(priority=solid.priority)
+    for point in vertices:
+        primitive.AddVertex(*point)
+    for face in solid.faces:
+        primitive.AddFace(list(face))
 
 
 def _add_material(csx, material, length_unit: float):
@@ -158,11 +299,15 @@ def _add_material(csx, material, length_unit: float):
     raise EnvelopeError(f"{material.name}: no builder for material kind {material.kind!r}")
 
 
-def _add_port(fdtd, metal_prop, port, length_unit: float):
-    """One envelope port to one upstream openEMS port object.
+def _add_port(fdtd, csx, metal_prop, port, length_unit: float):
+    """One envelope port to one openEMS port object.
 
-    Upstream port classes are used rather than reimplemented. The impedance an ``MSLPort`` extracts,
-    ``sqrt(Et*dEt / (Ht*dHt))``, is the definition this adapter reports.
+    Upstream port classes are used rather than reimplemented wherever one
+    exists. The impedance an ``MSLPort`` extracts, ``sqrt(Et*dEt / (Ht*dHt))``,
+    is the definition this adapter reports. The coaxial kind is the exception,
+    and :mod:`.coaxial` says why - in short, the bindings carry no such class
+    and the one upstream is growing draws the line it measures, which here is
+    already drawn.
 
     A ``RectWGPort`` is different in kind and worth knowing about before
     trusting its numbers: it *computes* its reference impedance analytically
@@ -207,6 +352,32 @@ def _add_port(fdtd, metal_prop, port, length_unit: float):
             priority=port.priority,
         )
 
+    if port.kind == "coaxial":
+        # Imported here for the reason ``build`` imports the engine here: this
+        # module is reachable without openEMS installed, and only the paths that
+        # actually construct a structure may need it.
+        from .coaxial import CoaxialPort
+
+        # On the axis, not on the corners: a round port reaches out to its own
+        # radii from the line, and the box the envelope carries is what bounds
+        # that reach rather than what defines it.
+        axis_start = list(port.bore_centre)
+        axis_stop = list(port.bore_centre)
+        axis_stop[port.propagation_axis] = port.stop[port.propagation_axis]
+        return CoaxialPort(
+            csx,
+            port.number,
+            axis_start,
+            axis_stop,
+            port.propagation_axis,
+            port.inner_radius,
+            port.outer_radius,
+            excite=port.excite_sign,
+            FeedShift=port.feed_shift,
+            MeasPlaneShift=port.measurement_shift,
+            priority=port.priority,
+        )
+
     if port.kind == "lumped":
         return fdtd.AddLumpedPort(
             port.number,
@@ -239,10 +410,10 @@ def solve(problem: Problem, directory: Path, build_only: bool = False) -> Path |
     results = _extract(problem, ports, sim_dir, elapsed)
 
     # Said out loud as well as recorded, and here rather than in pre-flight:
-    # nobody can know a residual before the solve, and by the time one exists
+    # a residual is unknowable before the solve, and by the time one exists
     # the minutes are spent, so this is a warning and never a refusal. The
     # number is in the provenance either way.
-    warning = residual.unfinished(results["provenance"]["tail_share"])
+    warning = residual.unfinished(results["provenance"]["tail_share"], problem.smallest_response)
     if warning:
         marker("CHECK", f"severity={WARN} {_sanitise(warning)}")
 
@@ -267,7 +438,7 @@ def _extract(problem: Problem, ports: dict, sim_dir: Path, elapsed: float) -> di
 
     ``CalcPort`` is called without a reference impedance on purpose: for an
     ``MSLPort`` that would *overwrite* the impedance it just measured from the
-    field, which is the quantity we want. That measured impedance is also what a
+    field, which is the quantity wanted. That measured impedance is also what a
     truncated record corrupts, which is why each port's tail is weighed here,
     off the same arrays the transform was taken over.
     """
@@ -341,6 +512,11 @@ def _provenance(problem: Problem, elapsed: float, records: dict) -> dict:
         "adapter_version": ADAPTER_VERSION,
         "envelope_digest": problem.digest(),
         "wall_seconds": round(elapsed, 3),
+        # The bar the tail shares above were judged against, so that anything
+        # reading this file later judges them the same way rather than at full
+        # scale. The judgement is not stored - it is one line of arithmetic, and
+        # a stored verdict is the thing that goes stale when the bar moves.
+        "smallest_response": problem.smallest_response,
         "max_timesteps": problem.termination.max_timesteps,
         "end_criteria": problem.termination.end_criteria,
         "reproducible": problem.termination.reproducible,
@@ -379,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     # number rather than a crash is the same as not having it.
     from . import preflight
 
-    findings = preflight.check(problem)
+    findings = everything_wrong(problem)
     for finding in findings:
         marker("CHECK", f"severity={finding.severity} {_sanitise(finding)}")
     blocking = preflight.refusals(findings)

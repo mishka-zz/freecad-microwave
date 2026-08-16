@@ -20,6 +20,7 @@ import pytest
 
 import Microwave.Solvers.openems.mesh as mesh
 from Microwave.Solvers.openems.mesh import (
+    CONDUCTOR_WIDTH_KEPT,
     MaterialClass,
     MeshError,
     MeshLines,
@@ -27,6 +28,7 @@ from Microwave.Solvers.openems.mesh import (
     Region,
     SizingRegion,
     generate_mesh_lines,
+    width_spanned,
 )
 from tests.mesh_fixtures import (
     DOMAIN,
@@ -36,6 +38,7 @@ from tests.mesh_fixtures import (
     has_line,
     params,
     pin_at,
+    resolved_as_an_edge,
     stackup,
     substrate,
 )
@@ -126,6 +129,184 @@ class TestThirdsRule:
         assert has_line(lines.z, 1.6)
 
 
+class TestAConductorKeepsItsWidth:
+    """The grid holds a declared share of every conductor's width.
+
+    openEMS conducts over the grid lines a conductor contains, so what is
+    solved is the metal between the outermost of them. The thirds rule puts
+    those a third of a cell inside each face, which costs a fixed fraction of
+    a *cell* and therefore an unbounded fraction of a narrow trace. Sizing that
+    cell from the width is the only thing that bounds it: no count of elements
+    does, because where the lines fall against the two faces is what decides
+    the answer, and two policies putting the same count across one strip can
+    leave very different amounts of it.
+    """
+
+    def trace(self, width, at=0.0):
+        return Region(
+            lower=(-6.0, at, 1.6),
+            upper=(6.0, at + width, 1.6),
+            material=MaterialClass.METAL,
+            label="Trace",
+        )
+
+    def kept(self, width, res, at=0.0):
+        lines = generate_mesh_lines(
+            [substrate(), self.trace(width, at)], DOMAIN, params(metal_res=res)
+        )
+        return width_spanned(lines[1], at, at + width)
+
+    @pytest.mark.parametrize("width", [0.05, 0.15, 0.3, 0.4, 1.0, 2.0, 5.0])
+    @pytest.mark.parametrize("res", [0.05, 0.1, 0.2, 0.5])
+    @pytest.mark.parametrize("at", [0.0, 0.37, -1.13])
+    def test_the_share_is_held_whatever_the_width_the_policy_and_the_offset(self, width, res, at):
+        """The assertion the whole treatment exists for, and the one no count
+        of elements across could make. Offsets included because the fault it
+        replaces was decided by where the lines happened to land."""
+        assert self.kept(width, res, at) >= CONDUCTOR_WIDTH_KEPT - 1e-12
+
+    def test_the_policy_moves_the_share_only_where_the_rule_says_it_may(self):
+        """The aliasing this replaces. The share used to jump by a whole cell
+        as the lines crossed the faces, so two neighbouring policies could
+        agree and both be wrong, and refining could make it worse.
+
+        Now a conductor is in one of two states and the policy only says which:
+        too thin for the thirds rule, both faces pinned and all of it
+        conducting, or resolved as an edge and held on the bar exactly. Nothing
+        in between, and nothing below.
+        """
+        shares = [self.kept(0.4, res) for res in (0.5, 0.4, 0.3, 0.2, 0.1, 0.05)]
+        for share in shares:
+            assert share == pytest.approx(1.0, abs=1e-9) or share == pytest.approx(
+                CONDUCTOR_WIDTH_KEPT, abs=1e-9
+            )
+        # Both states are reached, or the loop above is agreeing with itself.
+        assert min(shares) < max(shares)
+
+    def test_refining_a_wide_conductor_only_ever_helps(self):
+        """Wide enough that the policy's own size is the finer answer, the bar
+        stops binding and the share is what the edge cell leaves. It rises with
+        every refinement, which is what makes refining and re-reading a sound
+        thing to do - and is exactly what it was not before."""
+        shares = [self.kept(5.0, res) for res in (0.5, 0.4, 0.3, 0.2, 0.1)]
+        assert shares == sorted(shares)
+        assert shares[0] < shares[-1], "the sweep never left the bar"
+
+    def test_a_conductor_thinner_than_a_cell_arrives_whole(self):
+        """The other way a conductor can be right. Below the size the policy
+        lays at metal there is no room for the thirds rule, so both faces are
+        pinned plainly - and a face on a line conducts, so nothing is lost at
+        all. That is why the demand is not spent on a foil's thickness."""
+        assert self.kept(0.05, res=0.5) == pytest.approx(1.0, abs=0.0)
+
+    def test_the_edge_constraint_asks_at_the_size_the_edge_is_resolved_at(self):
+        """Two things read the size chosen for a conductor's edge - the thirds
+        rule, which places the pair of lines around it, and the constraint,
+        which tells the sizing field how large a cell belongs there. They have
+        to be the same size or the field is asking for one cell while the
+        anchors force another, and each builds its probe for *whether* the edge
+        is an edge from it, so disagreeing they can answer that differently too.
+        """
+        narrow = self.trace(0.4)
+        policy = params(metal_res=0.2)
+        at_the_edge = [
+            constraint
+            for constraint in mesh._constraints([narrow], 1, policy, -10.0, 10.0)
+            if constraint.lower == constraint.upper == 0.4
+        ]
+        assert at_the_edge, "the trace's upper edge asked for nothing"
+        assert at_the_edge[0].size < policy.metal_res
+
+    def test_a_conductor_exactly_one_cell_wide_is_left_alone(self):
+        """The boundary between a width and a thickness, which is where the
+        cost of holding one is largest: just above it a conductor asks for a
+        cell thirteen times finer than the policy's, and just below it asks for
+        nothing. Which side the equal case falls on has to be decided rather
+        than left to a comparison nobody looked at - and it falls on the side
+        where the conductor already arrives whole."""
+        assert self.kept(0.2, res=0.2) == pytest.approx(1.0, abs=0.0)
+        assert self.kept(0.2 + 1e-9, res=0.2) == pytest.approx(CONDUCTOR_WIDTH_KEPT, abs=1e-9)
+
+    def test_a_demand_the_floor_would_swallow_is_not_made(self):
+        """``MinElementSize`` is the finest cell the user will pay for, so a
+        demand under it is one they have already refused. Asking anyway does not
+        get it: the floor holds the field flat while the thirds rule pins a pair
+        of lines that close together, and the two make a grid that cannot be
+        built - a refusal of geometry that is perfectly legal."""
+        floored = params(metal_res=0.2, min_cell=0.02)
+        for width in (0.24, 0.26, 0.28, 0.3):
+            trace = self.trace(width)
+            generate_mesh_lines([substrate(), trace], DOMAIN, floored)
+            assert mesh._edge_size(trace, 1, floored) == floored.metal_res
+
+    def test_a_piece_is_not_a_narrower_conductor(self):
+        """Every piece of one conductor asks the same thing of the grid, and it
+        is what the whole conductor asks. Sized per piece, five slices of one
+        strip would each be thinner than a cell, every one of them would be
+        taken for a thickness, and the strip would lose the edge treatment its
+        width entitles it to."""
+        copper = {"material": MaterialClass.METAL, "material_name": "Copper"}
+        slices = [
+            Region(
+                (-6.0, 0.15 * i, 1.6),
+                (6.0, 0.15 * (i + 1), 1.6),
+                label=f"slice {i}",
+                **copper,
+            )
+            for i in range(5)
+        ]
+        lines = generate_mesh_lines([substrate(), *slices], DOMAIN, params(metal_res=0.2))
+        assert width_spanned(lines.y, 0.0, 0.75) >= CONDUCTOR_WIDTH_KEPT - 1e-9
+        # The whole strip is what has faces, so those are what get the pair.
+        resolved_as_an_edge(lines, 1, 0.0)
+        resolved_as_an_edge(lines, 1, 0.75)
+
+    def test_a_gap_between_two_conductors_keeps_them_apart(self):
+        """Butted is one conductor; separated by a gap is two, and a coupled
+        pair is the shape that makes the difference matter. Reaching across the
+        gap would size both from the span of the pair, which is wide enough to
+        ask for nothing, and the coupling that is the whole point of the part is
+        carried by the two edges facing each other."""
+        copper = {"material": MaterialClass.METAL, "material_name": "Copper"}
+        near = Region((-6.0, 0.0, 1.6), (6.0, 0.4, 1.6), label="near", **copper)
+        far = Region((-6.0, 1.0, 1.6), (6.0, 1.4, 1.6), label="far", **copper)
+        lines = generate_mesh_lines([substrate(), near, far], DOMAIN, params())
+        for low, high in ((0.0, 0.4), (1.0, 1.4)):
+            assert width_spanned(lines.y, low, high) >= CONDUCTOR_WIDTH_KEPT - 1e-9
+        # And they are each held as the 0.4 mm they are, not as the 1.4 mm they
+        # span between them - which asks for cells three and a half times
+        # coarser, and is what reaching across the gap would have got.
+        merged = generate_mesh_lines(
+            [substrate(), Region((-6.0, 0.0, 1.6), (6.0, 1.4, 1.6), label="one", **copper)],
+            DOMAIN,
+            params(),
+        )
+        assert lines.smallest_cell() < merged.smallest_cell()
+
+    def test_a_shape_cut_up_keeps_what_the_whole_shape_kept(self):
+        """A width is a property of the metal, not of the pieces it was
+        expressed in. Sized per region, a piece would ask for cells the uncut
+        shape never wanted, and the translation cuts drawn outlines into
+        rectangles by itself."""
+        copper = {"material": MaterialClass.METAL, "material_name": "Copper"}
+        whole = generate_mesh_lines(
+            [substrate(), Region((-6.0, 0.0, 1.6), (6.0, 1.0, 1.6), label="Trace", **copper)],
+            DOMAIN,
+            params(),
+        )
+        pieces = generate_mesh_lines(
+            [
+                substrate(),
+                Region((-6.0, 0.0, 1.6), (6.0, 0.4, 1.6), label="near", **copper),
+                Region((-6.0, 0.4, 1.6), (6.0, 1.0, 1.6), label="far", **copper),
+            ],
+            DOMAIN,
+            params(),
+        )
+        assert np.array_equal(whole.y, pieces.y)
+        assert width_spanned(pieces.y, 0.0, 1.0) >= CONDUCTOR_WIDTH_KEPT - 1e-12
+
+
 class TestConductorJoins:
     """Two conductors sharing a face are one piece of metal, not two edges."""
 
@@ -174,12 +355,8 @@ class TestConductorJoins:
         # satisfied by equality, so if the via were dropped entirely the two
         # would collapse to the same trivial mesh and the comparison would pass
         # while proving nothing.
-        res = 0.2  # params() default metal_res
         for grid, dz in ((flush, 0.0), (apart, 0.05)):
-            face = 1 + dz
-            assert not has_line(grid.z, face), "a line sits on a conductor edge"
-            assert has_line(grid.z, face - res / 3), "the via's face was not meshed"
-            assert has_line(grid.z, face + 2 * res / 3)
+            resolved_as_an_edge(grid, 2, 1 + dz)
 
         assert flush.smallest_cell() >= apart.smallest_cell()
         assert flush.cell_count <= apart.cell_count
@@ -363,11 +540,7 @@ class TestMinLines:
 
         # The via's top face is a conductor edge, so the thirds rule straddles
         # it rather than landing on it, and the board's count must not reach it.
-        res = settings["metal_res"]
-        for grid in (loose, tight):
-            assert not has_line(grid.z, 1.0)
-            assert has_line(grid.z, 1.0 - res / 3), "the via's face was not meshed"
-            assert has_line(grid.z, 1.0 + 2 * res / 3)
+        assert resolved_as_an_edge(tight, 2, 1.0) == resolved_as_an_edge(loose, 2, 1.0)
 
     def test_does_not_force_lines_on_thick_regions(self):
         """min_lines is a floor for thin features, not a global multiplier.
@@ -628,7 +801,8 @@ class TestLocalRefinement:
         with pytest.raises(MeshError) as excinfo:
             generate_mesh_lines([substrate()], DOMAIN, params(), sizing=[coarse])
         assert "TooCoarse" in str(excinfo.value)
-        assert "refine only" in str(excinfo.value)
+        assert "refines only" in str(excinfo.value)
+        assert "Coarsen" in str(excinfo.value), "the refusal must name what to do instead"
 
     def test_a_region_below_the_cell_floor_is_refused_by_name(self):
         """Silently clamping would hand back a grid nobody asked for."""
@@ -699,6 +873,177 @@ class TestLocalRefinement:
         )
         assert list(inherited.z) == list(explicit.z)
 
+
+class TestRelaxedRegion:
+    """A region that has been told to stop asking for the size it would ask for.
+
+    The opposite direction from a :class:`SizingRegion`, and deliberately not
+    the opposite *shape*. A box coarsens a slab through the model on each axis
+    of a separable grid, so it would take resolution off geometry level with it
+    and nowhere near it; ``relaxed_to`` rides on the region instead, and cannot
+    reach past the object it belongs to.
+    """
+
+    #: A lump of metal on top of the board: an object with edges of its own,
+    #: clear of everything else, so what it costs the grid is its own doing.
+    LUMP = dict(
+        lower=(-2.0, -2.0, 1.6),
+        upper=(2.0, 2.0, 3.6),
+        material=MaterialClass.METAL,
+        label="Connector",
+    )
+
+    def lump(self, **overrides):
+        return Region(**{**self.LUMP, **overrides})
+
+    def test_relaxing_a_conductor_costs_fewer_cells(self):
+        drawn = generate_mesh_lines([substrate(), self.lump()], DOMAIN, params())
+        relaxed = generate_mesh_lines([substrate(), self.lump(relaxed_to=1.0)], DOMAIN, params())
+        assert relaxed.cell_count < drawn.cell_count
+
+    def test_it_takes_nothing_from_the_neighbour_still_asking(self):
+        """The safety property, and the whole reason this is not a box.
+
+        The substrate underneath keeps its own bulk size and its own element
+        count while the conductor above it is let go.
+        """
+        settings = params(min_lines=4)
+        relaxed = generate_mesh_lines([substrate(), self.lump(relaxed_to=4.0)], DOMAIN, settings)
+        through = relaxed.z[(relaxed.z >= 0.0) & (relaxed.z <= 1.6)]
+        assert len(through) - 1 >= settings.min_lines
+        assert np.max(np.diff(through)) <= settings.dielectric_res * (1 + 1e-9)
+
+    def test_the_faces_are_still_pinned(self):
+        """Sizing decides how many lines, never whether the geometry is held.
+
+        A relaxed conductor is still built where it was drawn: openEMS is handed
+        the same box, and a face falling between two lines would move it.
+        """
+        relaxed = generate_mesh_lines([substrate(), self.lump(relaxed_to=4.0)], DOMAIN, params())
+        for dim in range(3):
+            for face in (self.LUMP["lower"][dim], self.LUMP["upper"][dim]):
+                assert has_line(relaxed[dim], face), f"face {face} on axis {dim} lost its line"
+
+    def test_it_cannot_coarsen_past_the_global_ceiling(self):
+        """The cap bounds every cell, so an extravagant relaxation is bounded too."""
+        settings = params()
+        far = generate_mesh_lines([substrate(), self.lump(relaxed_to=1e3)], DOMAIN, settings)
+        assert np.max(np.diff(far.x)) <= settings.ceiling * (1 + 1e-9)
+
+    def test_a_relaxation_finer_than_the_policy_changes_nothing(self):
+        """It floors what the region asks; it never raises the field."""
+        plain = generate_mesh_lines([substrate(), self.lump()], DOMAIN, params())
+        fine = generate_mesh_lines(
+            [substrate(), self.lump(relaxed_to=params().metal_res / 10)], DOMAIN, params()
+        )
+        for dim in range(3):
+            assert list(plain[dim]) == list(fine[dim])
+
+    def test_it_still_grades_smoothly(self):
+        """A coarse island beside a fine board is where grading would fail."""
+        ratio = 1.3
+        lines = generate_mesh_lines(
+            [substrate(), self.lump(relaxed_to=4.0)],
+            DOMAIN,
+            params(max_ratio=(ratio,) * 3),
+        )
+        assert_graded_within(lines, ratio)
+
+    def test_asking_for_more_never_costs_more(self):
+        """Monotone, which a coarsening that only sized would not be.
+
+        Sizing a conductor coarsely while still pinning the thirds rule's pair
+        of lines around each of its edges spreads that pair as the size grows,
+        so the grid gets *larger* the more it is told to let go - measured, and
+        the reason a relaxed conductor declines the edge treatment outright
+        rather than scaling it.
+        """
+        counts = [
+            generate_mesh_lines(
+                [substrate(), self.lump(relaxed_to=size)], DOMAIN, params()
+            ).cell_count
+            for size in (None, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+        ]
+        assert counts == sorted(counts, reverse=True), counts
+        assert counts[-1] < counts[0], "the test would be vacuous"
+
+    def test_the_edge_demand_is_the_relaxed_size_and_not_the_edge_size(self):
+        """The largest part of what relaxing a conductor saves.
+
+        Declining the thirds rule stops the *lines* being pinned finely; this is
+        what stops the *field* being held down between them. Measured at the
+        edge itself and not across the lump: the middle of a four millimetre
+        conductor relaxes toward the cap on its own, so it reads the same either
+        way and would let the demand go back to ``metal_res`` unnoticed.
+        """
+        settings = params()
+        relaxed = generate_mesh_lines([substrate(), self.lump(relaxed_to=1.0)], DOMAIN, settings)
+        drawn = generate_mesh_lines([substrate(), self.lump()], DOMAIN, settings)
+        assert cell_at(drawn.x, -2.0) == pytest.approx(settings.metal_res, rel=0.1)
+        assert cell_at(relaxed.x, -2.0) == pytest.approx(1.0, rel=0.1)
+
+    def test_a_relaxed_dielectric_gives_up_its_bulk_size(self):
+        """Its own size, which is finer than the policy's, is what it gives up."""
+        settings = params()
+        tight = generate_mesh_lines([substrate(size=0.4)], DOMAIN, settings)
+        loose = generate_mesh_lines([substrate(size=0.4, relaxed_to=0.9)], DOMAIN, settings)
+        assert cell_at(loose.z, 0.8) > cell_at(tight.z, 0.8)
+
+    def test_a_relaxed_dielectric_gives_up_its_element_count(self):
+        """Stated rather than assumed: the count is a demand like any other.
+
+        `MinElementsAcross` is the policy's guard against one element through a
+        layer, and relaxing the object it belongs to gives it up along with
+        everything else that object asks. The report is what says so afterwards,
+        by counting what the grid laid.
+        """
+        settings = params(min_lines=8)
+        thin = dict(lower=(-8.0, -8.0, 0.0), upper=(8.0, 8.0, 1.6))
+        counted = generate_mesh_lines(
+            [Region(**thin, material=MaterialClass.DIELECTRIC, label="Board")], DOMAIN, settings
+        )
+        loose = generate_mesh_lines(
+            [
+                Region(
+                    **thin,
+                    material=MaterialClass.DIELECTRIC,
+                    label="Board",
+                    relaxed_to=settings.ceiling,
+                )
+            ],
+            DOMAIN,
+            settings,
+        )
+        through = [z for z in counted.z if -1e-9 <= z <= 1.6 + 1e-9]
+        after = [z for z in loose.z if -1e-9 <= z <= 1.6 + 1e-9]
+        assert len(through) - 1 >= settings.min_lines
+        assert len(after) < len(through)
+
+    def test_the_probe_for_an_isolated_edge_does_not_move_with_the_relaxation(self):
+        """Whether a face is an edge is geometry, not a resolution setting.
+
+        The probe reaches ``2 * res / 3`` outside the face, and
+        ``_edge_to_resolve`` refuses an edge whose probe leaves the domain. Read
+        from the relaxed size that reach grows without bound, so a face near the
+        wall would stop being an edge on a setting that says nothing about where
+        the metal is.
+        """
+        settings = params()
+        # Close enough to the wall that a relaxed probe leaves the domain and an
+        # unrelaxed one does not: the edge size reaches 0.133, four millimetres
+        # reaches 2.667, and the domain ends at 5.
+        near = dict(self.LUMP, lower=(-2.0, -2.0, 1.6), upper=(2.0, 2.0, 4.0))
+        sources = [
+            {
+                constraint.source
+                for constraint in mesh._constraints(
+                    [Region(**dict(near, relaxed_to=size))], 2, settings, -5.0, 5.0
+                )
+            }
+            for size in (None, 4.0)
+        ]
+        assert sources[0] == sources[1], sources
+
     @pytest.mark.parametrize(
         "kwargs, message",
         [
@@ -768,6 +1113,16 @@ class TestResolution:
         assert fine.cell_count > coarse.cell_count
 
 
+def pinned(positions, dim=0):
+    """A `_Sources` over bare coordinates, for calling `_validate` directly.
+
+    The sources it invents are what `_fixed_positions` would have written, so a
+    message built from one of these reads the way a real refusal does.
+    """
+    lines = [mesh.FixedLine(float(p), f"pinned line at {p:g}", True) for p in positions]
+    return mesh._Sources(lines, dim)
+
+
 class TestValidationRaises:
     """Requirement 4 is "raise, not warn" - so test the raising, not the grid.
 
@@ -778,7 +1133,7 @@ class TestValidationRaises:
 
     def _reject(self, lines, **overrides):
         settings = params(pml_cells=0, **overrides)
-        mesh._validate(lines, [lines[0], lines[-1]], 0, settings)
+        mesh._validate(lines, pinned([lines[0], lines[-1]]), settings)
 
     def test_smoothness_violation_raises(self):
         lines = [0.0, 1.0, 3.0]  # a 2:1 jump against a 1.3 limit
@@ -789,7 +1144,7 @@ class TestValidationRaises:
         settings = params(pml_cells=0)
         lines = [0.0, float(settings.min_cell) / 10.0, 1.0]
         with pytest.raises(MeshError, match="below the floor"):
-            mesh._validate(lines, [lines[0], lines[-1]], 0, settings)
+            mesh._validate(lines, pinned([lines[0], lines[-1]]), settings)
 
     def test_non_increasing_lines_raise(self):
         with pytest.raises(MeshError, match="non-increasing"):
@@ -803,7 +1158,7 @@ class TestValidationRaises:
         """The check that a sheet survived must itself be checked."""
         settings = params(pml_cells=0)
         with pytest.raises(MeshError, match="lost a required grid line"):
-            mesh._validate([0.0, 1.0, 2.0], [0.0, 0.5, 2.0], 0, settings)
+            mesh._validate([0.0, 1.0, 2.0], pinned([0.0, 0.5, 2.0]), settings)
 
     def test_non_uniform_absorber_raises(self):
         """Smooth everywhere, but the outer cells are not equal - a PML that
@@ -811,12 +1166,78 @@ class TestValidationRaises:
         smoothness check first and never reaches the absorber one."""
         lines = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.2]
         with pytest.raises(MeshError, match="absorber is not uniformly spaced"):
-            mesh._validate(lines, [lines[0], lines[-1]], 0, params(pml_cells=2))
+            mesh._validate(lines, pinned([lines[0], lines[-1]]), params(pml_cells=2))
 
     def test_a_good_grid_is_accepted(self):
         """Guard against a validator that rejects everything."""
         lines = [float(i) for i in range(12)]
-        mesh._validate(lines, [0.0, 11.0], 0, params(pml_cells=2))
+        mesh._validate(lines, pinned([0.0, 11.0]), params(pml_cells=2))
+
+
+class TestRefusalsNameTheGeometry:
+    """A refusal has to say which drawn object it is about.
+
+    The mesher works in coordinates below `_snap`, and a coordinate identifies
+    a feature only to somebody who already knows where that feature is - which
+    is what the user is trying to find out. Every assertion here matches on a
+    label that came from the model, never on the number beside it, so a message
+    that keeps the number and loses the name still fails.
+    """
+
+    def sources(self, entries, dim=0):
+        lines = [mesh.FixedLine(position, source, True) for position, source in entries]
+        return mesh._Sources(lines, dim)
+
+    def test_a_smoothness_violation_names_the_features_it_sits_between(self):
+        pins = self.sources([(0.0, "'GND' upper face"), (3.0, "'FR4' lower face")])
+        with pytest.raises(MeshError, match="between 'GND' upper face .* and 'FR4' lower face"):
+            mesh._validate([0.0, 1.0, 3.0], pins, params(pml_cells=0))
+
+    def test_a_cell_below_the_floor_names_the_features_it_sits_between(self):
+        settings = params(pml_cells=0)
+        pins = self.sources([(0.0, "'Trace' lower face"), (1.0, "'Trace' upper face")])
+        lines = [0.0, float(settings.min_cell) / 10.0, 1.0]
+        with pytest.raises(MeshError, match="between 'Trace' lower face .* and 'Trace' upper"):
+            mesh._validate(lines, pins, settings)
+
+    def test_a_lost_line_names_what_would_go_unmodelled(self):
+        pins = self.sources([(0.0, "domain lower bound"), (0.5, "conducting sheet 'Patch'")])
+        with pytest.raises(MeshError, match=r"conducting sheet 'Patch'"):
+            mesh._validate([0.0, 1.0, 2.0], pins, params(pml_cells=0))
+
+    def test_an_unfillable_span_names_both_of_its_ends(self):
+        """`_cell_count` sees only two floats; the names have to reach it."""
+        pins = self.sources([(0.0, "'Board' lower face"), (1.0, "'Board' upper face")])
+        with pytest.raises(MeshError, match="from 'Board' lower face .* to 'Board' upper face"):
+            mesh._cell_count(1.5, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, pins)
+
+    def test_an_oversized_span_names_both_of_its_ends(self):
+        pins = self.sources([(0.0, "domain lower bound"), (1.0, "domain upper bound")])
+        with pytest.raises(MeshError, match="from domain lower bound .* to domain upper bound"):
+            mesh._cell_count(1e6, 1.0, 1.0, 0.0, math.inf, 0.0, 1.0, pins)
+
+    def test_a_long_list_is_truncated_and_the_rest_counted(self):
+        """A crowded axis can implicate more features than a message can hold,
+        and the count is what carries the scale once the names stop."""
+        entries = [(float(n), f"'Pad{n}' lower face") for n in range(10)]
+        pins = self.sources(entries)
+        described = pins.describe_all([position for position, _ in entries])
+
+        assert described.count("Pad") == mesh._NAMES_PER_MESSAGE
+        assert f"and {10 - mesh._NAMES_PER_MESSAGE} more" in described
+
+    def test_a_short_list_is_named_in_full_and_counts_nothing(self):
+        pins = self.sources([(0.0, "'A' lower face"), (1.0, "'B' upper face")])
+        described = pins.describe_all([0.0, 1.0])
+
+        assert "'A' lower face" in described and "'B' upper face" in described
+        assert "more" not in described
+
+    def test_a_repeated_position_is_named_once(self):
+        """`_settle` collects a seam from each side of it, so duplicates arrive."""
+        pins = self.sources([(0.0, "'A' lower face"), (1.0, "'B' upper face")])
+
+        assert pins.describe_all([1.0, 1.0, 1.0]).count("'B' upper face") == 1
 
 
 class TestCellFloor:
@@ -941,12 +1362,15 @@ class TestSymmetry:
         unfolded, _ = residual()
 
         assert folded < unfolded, "the fold left the grid no more symmetric than it found it"
-        # And what is left is the arithmetic rather than a grid that drifted: a
-        # fold about a coordinate the mesh cannot represent exactly cannot do
-        # better than the last few bits of that coordinate. The budget has to
-        # be tighter than what the unfolded control already reaches, or the
-        # line above subsumes it and this one asserts nothing.
-        assert 8 * ulp < unfolded, "the budget is looser than an unfolded grid; it cannot bind"
+        # And it beats the control by a margin rather than tying with it. As a
+        # ratio and not as a count of ulps: both residuals scale with the cells
+        # the grid happens to be built from, so a fixed number of them stops
+        # binding the moment anything legitimately refines this geometry, and
+        # the line above then subsumes it.
+        assert folded * 1.5 <= unfolded, "the fold barely beat the placement it corrects"
+        # And what is left is arithmetic rather than a grid that drifted: a fold
+        # about a coordinate the mesh cannot represent exactly cannot do better
+        # than the last few bits of that coordinate.
         assert folded < 8 * ulp
 
 
@@ -1231,21 +1655,27 @@ class TestProvenance:
             material=MaterialClass.METAL,
             label="Trace",
         )
-        # Its face lands between the trace's inside and outside thirds lines.
+        settings = params(metal_res=metal_res, min_lines=1)
+        # Squarely between the trace's own pair, wherever the mesher put them.
+        # Derived rather than written down: how wide a thirds span is depends on
+        # the size chosen for that edge, and this test is about what happens to
+        # a preference landing in one, not about how wide one is.
+        inside, outside = resolved_as_an_edge(
+            generate_mesh_lines([trace], DOMAIN, settings), 0, -2.0
+        )
+        face = (inside + outside) / 2.0
         filler = Region(
-            lower=(-2.0 + metal_res / 6, -8.0, -1.0),
+            lower=(face, -8.0, -1.0),
             upper=(8.0, 8.0, -0.5),
             material=MaterialClass.DIELECTRIC,
             label="Filler",
         )
-        lines = generate_mesh_lines(
-            [trace, filler], DOMAIN, params(metal_res=metal_res, min_lines=1)
-        )
+        lines = generate_mesh_lines([trace, filler], DOMAIN, settings)
         # Only its lower face is in the span; the far one at x = 8 is legitimate.
         sources = [pin.source for pin in lines.fixed[0]]
         assert "'Filler' lower face" not in sources, sources
         assert "'Filler' upper face" in sources, "the test lost its own geometry"
-        assert not has_line(lines.x, -2.0 + metal_res / 6)
+        assert not has_line(lines.x, face)
 
     def test_provenance_does_not_disturb_the_grid(self):
         """Carrying names must not move a line. Guards the whole refactor."""
@@ -1377,12 +1807,10 @@ class TestButtedConductorsAreOnePieceOfMetal:
         bar = self.strip(-6.0, 6.0, "bar")
         stem = Region(lower=(-1.5, 1.5, 0.0), upper=(1.5, 8.0, 0.0), label="stem", **self.COPPER)
         lines = generate_mesh_lines([bar, stem], DOMAIN, params(metal_res=0.6))
-        # metal_res 0.6: a third inside the metal, two thirds outside.
-        assert has_line(lines.y, 1.5 - 0.2)
-        assert has_line(lines.y, 1.5 + 0.4)
-        # And nothing pinned at the seam itself, which is what a thirds pair
-        # exists to avoid.
-        assert not has_line(lines.y, 1.5)
+        # A pair straddling the bar's face, none on the face itself, and the
+        # inside one is the one in the metal.
+        inside, outside = resolved_as_an_edge(lines, 1, 1.5)
+        assert inside < 1.5 < outside
 
     def test_two_different_metals_still_pin_the_boundary_they_share(self):
         """No singularity, so no thirds - but a copper-to-PEC seam is a real

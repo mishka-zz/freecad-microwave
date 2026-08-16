@@ -20,7 +20,11 @@ from Microwave.Objects import port_shape
 from Microwave.Solvers.openems import document
 
 from .test_document_translation import (
+    LENGTH,
+    PICK_DEPTH,
+    coaxial_model,
     ground,
+    lumped_pick,
     lumped_port,
     mesh_settings,
     microstrip_port,
@@ -176,18 +180,93 @@ class TestTheLumpedBox:
     def test_it_spans_where_the_two_entities_overlap(self):
         """Not their union. A ground plane covering the whole board would make
         the port a sheet resistor spanning the model - and it would solve."""
-        box = portbox.lumped(self.SOURCE, ((-50, -25, 0), (50, 25, 0)), excitation_axis=2)
+        box = portbox.lumped(
+            self.SOURCE, ((-50, -25, 0), (50, 25, 0)), excitation_axis=2, outline=None
+        )
         lower, upper = box.corners()
         assert (lower[0], upper[0]) == (10, 12)
         assert (lower[1], upper[1]) == (-1.5, 1.5)
 
     def test_entities_that_do_not_face_each_other_are_refused(self):
         with pytest.raises(portbox.BoxError, match="do not overlap"):
-            portbox.lumped(self.SOURCE, ((90, -1.5, 0), (92, 1.5, 0)), excitation_axis=2)
+            portbox.lumped(
+                self.SOURCE, ((90, -1.5, 0), (92, 1.5, 0)), excitation_axis=2, outline=None
+            )
 
     def test_coplanar_entities_have_no_gap(self):
         with pytest.raises(portbox.BoxError, match="drives a voltage across a gap"):
-            portbox.lumped(self.SOURCE, ((10, -1.5, 1.5), (12, 1.5, 1.5)), excitation_axis=2)
+            portbox.lumped(
+                self.SOURCE, ((10, -1.5, 1.5), (12, 1.5, 1.5)), excitation_axis=2, outline=None
+            )
+
+
+class TestAnOutlineIsACrossSectionRatherThanAnArea:
+    """A trace running off a grid axis ends on a diagonal, and the bounding box
+    of that diagonal has depth along both transverse axes. openEMS has only
+    axis-aligned ports, so what the depth buys is element past the end of the
+    conductor - which is the box being the wrong shape rather than a coarse one,
+    and no cell size reaches it."""
+
+    GROUND = ((-50, -50, 0), (50, 50, 0))
+    #: The end of a strip running off the axes: three millimetres of it project
+    #: onto x and half a millimetre onto y, so which projection is the wider is
+    #: not a question about rounding.
+    TILTED = ((10, 20, 1.5), (13, 20.5, 1.5))
+    SPAN, TILT = 0, 1
+    #: The trace behind that end, reaching away along the tilt axis. The mirror
+    #: of it reaches the other way, and nothing else about the pick differs.
+    BELOW = ((10, 4, 1.5), (13, 20.5, 1.5))
+    ABOVE = ((10, 20, 1.5), (13, 36.5, 1.5))
+
+    def built(self, source, outline):
+        return portbox.lumped(source, self.GROUND, excitation_axis=2, outline=outline)
+
+    def test_an_outline_off_axis_is_flattened_onto_one_plane(self):
+        lower, upper = self.built(self.TILTED, self.BELOW).corners()
+        assert lower[self.TILT] == pytest.approx(upper[self.TILT], abs=0.0)
+
+    @pytest.mark.parametrize(
+        ("body", "end"), [("BELOW", 0), ("ABOVE", 1)], ids=["reaching down", "reaching up"]
+    )
+    def test_and_onto_the_end_the_conductor_is_behind(self, body, end):
+        """The middle would be the diagonal's own crossing, leaving half the
+        element off the metal - and once the conductor is rasterised it puts the
+        whole port on the staircase boundary, where rounding decides each cell.
+        The end the trace lies behind is a whole depth clear of it."""
+        lower, _ = self.built(self.TILTED, getattr(self, body)).corners()
+        assert lower[self.TILT] == pytest.approx(self.TILTED[end][self.TILT], abs=1e-12)
+
+    def test_and_it_keeps_the_axis_the_conductor_is_spanned_across(self):
+        """The wider projection is the one the current has to be encircled on;
+        the narrower is the tilt, and the tilt is what is given up."""
+        lower, upper = self.built(self.TILTED, self.BELOW).corners()
+        assert (lower[self.SPAN], upper[self.SPAN]) == pytest.approx(
+            (self.TILTED[0][self.SPAN], self.TILTED[1][self.SPAN]), abs=1e-12
+        )
+
+    def test_an_area_of_the_same_bounds_keeps_both(self):
+        """A pad driven across its own face genuinely spans both, so the same
+        six numbers have to be able to mean either. Only the caller knows."""
+        lower, upper = self.built(self.TILTED, None).corners()
+        assert (lower[self.TILT], upper[self.TILT]) == pytest.approx(
+            (self.TILTED[0][self.TILT], self.TILTED[1][self.TILT]), abs=1e-12
+        )
+
+    def test_an_outline_already_on_axis_is_left_alone(self):
+        """The flattening is the identity where there is no tilt, so a layout
+        drawn on the axes is unaffected by any of this."""
+        on_axis = ((10, -1.5, 1.5), (10, 1.5, 1.5))
+        body = ((10, -1.5, 1.5), (40, 1.5, 1.5))
+        assert self.built(on_axis, body).corners() == self.built(on_axis, None).corners()
+
+    def test_the_port_is_still_read_at_its_own_centre(self):
+        """``probe`` is half the box along the axis that survived, so flattening
+        the other one must not move where openEMS reads the port across it."""
+        point = self.built(self.TILTED, self.BELOW).probe_point()
+        assert point[self.TILT] == pytest.approx(self.TILTED[0][self.TILT], abs=1e-12)
+        assert point[self.SPAN] == pytest.approx(
+            (self.TILTED[0][self.SPAN] + self.TILTED[1][self.SPAN]) / 2.0, abs=1e-12
+        )
 
 
 class TestTheWaveguideBox:
@@ -214,6 +293,73 @@ class TestTheWaveguideBox:
                 stated_length=0.0,
                 fallback=0.0,
             )
+
+
+class TestTheCoaxialBox:
+    """The bore's bounding box, and the two planes the port reads along it."""
+
+    RING = ((-3.5, -3.5, 0.0), (3.5, 3.5, 0.0))
+
+    def built(self, **settings):
+        return portbox.coaxial(
+            self.RING,
+            propagation_axis=2,
+            direction=1,
+            **{
+                "feed_offset": 0.0,
+                "measurement_distance": 40.0,
+                "stated_length": 0.0,
+                **settings,
+            },
+        )
+
+    def test_the_box_spans_the_bore_across_the_line(self):
+        """The transverse corners are the picked ring's own, which for a ring
+        about the axis is the square circumscribing the shield's bore. That is
+        what carries the outer radius into the envelope."""
+        box = self.built()
+
+        assert box.start[:2] == (-3.5, -3.5)
+        assert box.stop[:2] == (3.5, 3.5)
+
+    def test_an_unset_length_ends_the_box_at_the_probes(self):
+        """Everything past the measurement plane is line no probe ever reads."""
+        box = self.built(measurement_distance=40.0)
+
+        assert (box.length, box.measurement, box.probe) == (40.0, 40.0, 40.0)
+
+    def test_the_feed_and_the_probes_are_measured_from_the_ring(self):
+        box = self.built(feed_offset=16.0, measurement_distance=24.0, stated_length=80.0)
+
+        assert box.feed == 16.0
+        assert box.plane_at(box.feed) == 16.0
+        assert box.plane_at(box.measurement) == 40.0
+
+    def test_a_negative_direction_reaches_the_other_way(self):
+        """The ring at the far end of a line points back down it, and the shifts
+        are lengths rather than places, so they follow."""
+        box = portbox.coaxial(
+            ((-3.5, -3.5, 80.0), (3.5, 3.5, 80.0)),
+            propagation_axis=2,
+            direction=-1,
+            feed_offset=16.0,
+            measurement_distance=24.0,
+            stated_length=80.0,
+        )
+
+        assert box.direction == -1
+        assert box.plane_at(box.feed) == 64.0
+        assert box.plane_at(box.measurement) == 40.0
+
+    def test_probes_on_the_source_are_refused(self):
+        """A coaxial port reads its impedance by differencing three probes
+        downstream of the source, so zero is not a shorter version of that."""
+        with pytest.raises(portbox.BoxError, match="probes would sit on the source"):
+            self.built(measurement_distance=0.0)
+
+    def test_a_box_stopping_short_of_its_own_probes_is_refused(self):
+        with pytest.raises(portbox.BoxError, match="stop short of it"):
+            self.built(measurement_distance=40.0, stated_length=10.0)
 
 
 class TestTheDrawingIsTheSolversBox:
@@ -244,6 +390,41 @@ class TestTheDrawingIsTheSolversBox:
         assert drawn.start == pytest.approx(solved.start, abs=1e-9)
         assert drawn.stop == pytest.approx(solved.stop, abs=1e-9)
         assert drawn.propagation_axis == solved.propagation_axis
+
+    @pytest.mark.parametrize(
+        ("area", "flattened"),
+        [(True, False), (False, True)],
+        ids=["a pad keeps its depth", "an outline is flattened"],
+    )
+    def test_a_lumped_port_draws_the_pick_the_adapter_built(self, area, flattened):
+        """Both sides have to read the same pick the same way. The drawing is
+        the only thing that shows a user where the element landed, so a picture
+        that flattened when the solver did not would show a plane of metal the
+        solver drives as a slab, and the other way round would hide it."""
+        port = lumped_pick(trace(), area=area)
+        drawn = port_shape.port_box(port)
+        solved = self.built(port, PaddingXMin="Air", PaddingXMax="Air")
+
+        assert drawn.start == pytest.approx(solved.start, abs=1e-9)
+        assert drawn.stop == pytest.approx(solved.stop, abs=1e-9)
+        assert (abs(drawn.stop[0] - drawn.start[0]) <= portbox.FLATNESS) is flattened
+        if flattened:
+            assert drawn.start[0] == pytest.approx(-LENGTH / 2 + PICK_DEPTH, abs=1e-12)
+
+    @pytest.mark.parametrize("length", [0.0, 80.0])
+    def test_a_coaxial_port_draws_what_the_adapter_builds(self, length):
+        """The one kind whose picture is not a box, so the one where the two
+        could most easily part company: what is drawn is a tube of the bore's
+        radius, and what the envelope carries is that bore's bounding box."""
+        document_ = coaxial_model(Length=length)
+        port = document_.Objects[4]
+        drawn = port_shape.port_box(port)
+        solved = document.problem(document_.Objects[0]).ports[0]
+
+        assert drawn.start == pytest.approx(solved.start, abs=1e-9)
+        assert drawn.stop == pytest.approx(solved.stop, abs=1e-9)
+        assert drawn.feed == pytest.approx(solved.feed_shift, abs=1e-9)
+        assert drawn.measurement == pytest.approx(solved.measurement_shift, abs=1e-9)
 
 
 class TestAPortThatIsFlatAcrossOneAxisCanStillBeDrawn:
@@ -293,6 +474,68 @@ class TestAPortThatIsFlatAcrossOneAxisCanStillBeDrawn:
         port = lumped_port(1, trace(), ground())
         drawn = sorted(self.made(port, monkeypatch))
         assert drawn[1:] == sorted(e for e in self.extents(port) if e > 0)
+
+
+class TestARoundPortIsDrawnRound:
+    """A coaxial port's volume is a tube, and drawing it as its bounding box
+    would show a square prism where the field is annular - a picture of a
+    different port. ``Part`` is not importable here, so what is asserted is the
+    cylinders it is built from.
+
+    Measured under FreeCAD 1.1.1 on a real tube: the compound that comes out
+    carries one solid whose volume is ``pi * (b^2 - a^2) * L`` to every digit.
+    """
+
+    def cylinders(self, port, monkeypatch):
+        import sys
+        import types
+
+        calls = []
+
+        class Solid:
+            def cut(self, other):
+                return "tube"
+
+        def make_cylinder(radius, height, base, direction):
+            calls.append((radius, height, tuple(base), tuple(direction)))
+            return Solid()
+
+        part = types.ModuleType("Part")
+        part.makeCylinder = make_cylinder
+        part.makeBox = lambda *arguments: "box"
+        part.makeCircle = lambda radius, base, direction: ("circle", radius)
+        part.Wire = lambda edge: edge
+        part.Face = lambda wire: "disc"
+        part.Compound = lambda pieces: pieces
+        freecad = types.ModuleType("FreeCAD")
+        freecad.Vector = lambda *values: values
+        monkeypatch.setitem(sys.modules, "Part", part)
+        monkeypatch.setitem(sys.modules, "FreeCAD", freecad)
+
+        pieces = port_shape.build(port)
+        return calls, pieces
+
+    def port(self, **overrides):
+        return coaxial_model(**overrides).Objects[4]
+
+    def test_it_is_cut_from_two_cylinders_on_the_two_radii(self, monkeypatch):
+        calls, _ = self.cylinders(self.port(), monkeypatch)
+
+        assert [radius for radius, *_ in calls] == [3.5, 1.0]
+
+    def test_both_cylinders_run_the_port_s_own_length_along_its_axis(self, monkeypatch):
+        calls, _ = self.cylinders(self.port(Length=80.0), monkeypatch)
+
+        assert {height for _, height, *_ in calls} == {80.0}
+        assert {direction for *_, direction in calls} == {(0.0, 0.0, 1.0)}
+
+    def test_the_marker_planes_are_discs_rather_than_rectangles(self, monkeypatch):
+        """A rectangle inside a tube is a picture of neither. Both planes are
+        drawn here - the fixture sets a feed offset as well as a measurement
+        distance - so this also holds that the port draws every plane it has."""
+        _, pieces = self.cylinders(self.port(), monkeypatch)
+
+        assert pieces == ["tube", "disc", "disc"]
 
 
 class TestAnUnfinishedPortHasNoBox:
@@ -398,7 +641,10 @@ class TestWhereAPortsNumbersAreRead:
         axis ``lumped`` picked, and which one that is depends on the geometry.
         """
         box = portbox.lumped(
-            ((10, -1.5, 1.5), (12, 1.5, 1.5)), ((-50, -25, 0), (50, 25, 0)), excitation_axis=2
+            ((10, -1.5, 1.5), (12, 1.5, 1.5)),
+            ((-50, -25, 0), (50, 25, 0)),
+            excitation_axis=2,
+            outline=None,
         )
         assert box.probe_point() == pytest.approx((11.0, 0.0, 0.75))
 
@@ -407,10 +653,16 @@ class TestWhereAPortsNumbersAreRead:
         says nothing measured depends on the choice. The centre is what makes
         that true, so a plane taken from ``start`` instead would make it false."""
         wide_in_x = portbox.lumped(
-            ((0, -1.0, 1.5), (8, 1.0, 1.5)), ((-50, -25, 0), (50, 25, 0)), excitation_axis=2
+            ((0, -1.0, 1.5), (8, 1.0, 1.5)),
+            ((-50, -25, 0), (50, 25, 0)),
+            excitation_axis=2,
+            outline=None,
         )
         wide_in_y = portbox.lumped(
-            ((0, -4.0, 1.5), (2, 4.0, 1.5)), ((-50, -25, 0), (50, 25, 0)), excitation_axis=2
+            ((0, -4.0, 1.5), (2, 4.0, 1.5)),
+            ((-50, -25, 0), (50, 25, 0)),
+            excitation_axis=2,
+            outline=None,
         )
         assert wide_in_x.propagation_axis == 0
         assert wide_in_y.propagation_axis == 1
@@ -437,10 +689,16 @@ class TestWhereAPortsNumbersAreRead:
         board, gap = 96.0, 0.4
         ground = ((-board / 2, -15, 0), (board / 2, 15, 0))
         left = portbox.lumped(
-            ((-board / 2, -1.5, 1.6), (-board / 2 + gap, 1.5, 1.6)), ground, excitation_axis=2
+            ((-board / 2, -1.5, 1.6), (-board / 2 + gap, 1.5, 1.6)),
+            ground,
+            excitation_axis=2,
+            outline=None,
         )
         right = portbox.lumped(
-            ((board / 2 - gap, -1.5, 1.6), (board / 2, 1.5, 1.6)), ground, excitation_axis=2
+            ((board / 2 - gap, -1.5, 1.6), (board / 2, 1.5, 1.6)),
+            ground,
+            excitation_axis=2,
+            outline=None,
         )
         separation = math.dist(left.probe_point(), right.probe_point())
         assert separation == pytest.approx(board - gap)
@@ -456,9 +714,9 @@ class TestTwoShapesThatMeetDoNotAgreeToTheLastBit:
     coin toss - on that board one end of the line came out inverted and the
     other did not, so the same port refused at x = -70 and built at x = +70.
 
-    ``debt.md`` T-6 is the general form: every fixture in the suite is
-    arithmetically exact, so a predicate comparing two coordinates for order is
-    otherwise only ever asked where the answer is not in doubt.
+    The general form is that every fixture in the suite is arithmetically exact,
+    so a predicate comparing two coordinates for order is otherwise only ever
+    asked where the answer is not in doubt.
     """
 
     #: The ulp gap the board actually produced, in millimetres.
@@ -471,7 +729,7 @@ class TestTwoShapesThatMeetDoNotAgreeToTheLastBit:
 
     def test_a_trace_end_a_hair_outside_the_ground_still_builds(self):
         source, ground = self.ends(-70.0 - self.SLIVER)
-        box = portbox.lumped(source, ground, excitation_axis=2)
+        box = portbox.lumped(source, ground, excitation_axis=2, outline=None)
         # Against the module's own declared tolerance rather than against the
         # ulp: what is promised is that the port lands where the drawing says,
         # to within the width this module calls flat.
@@ -481,14 +739,14 @@ class TestTwoShapesThatMeetDoNotAgreeToTheLastBit:
         """The end of the board where the ulp happened to fall inward. It built
         before this and must go on building."""
         source, ground = self.ends(-70.0 + self.SLIVER)
-        box = portbox.lumped(source, ground, excitation_axis=2)
+        box = portbox.lumped(source, ground, excitation_axis=2, outline=None)
         assert abs(box.start[0] + 70.0) <= portbox.FLATNESS
 
     def test_the_box_is_never_inverted(self):
         """A negative extent would reach ``length`` and ``corners`` as a
         silently backwards port rather than as a refusal."""
         source, ground = self.ends(-70.0 - self.SLIVER)
-        box = portbox.lumped(source, ground, excitation_axis=2)
+        box = portbox.lumped(source, ground, excitation_axis=2, outline=None)
         lower, upper = box.corners()
         assert all(high >= low for low, high in zip(lower, upper))
         assert box.stop[0] >= box.start[0]
@@ -498,12 +756,12 @@ class TestTwoShapesThatMeetDoNotAgreeToTheLastBit:
         micron is a thousand times the gap above and still refused."""
         source, ground = self.ends(-70.001)
         with pytest.raises(portbox.BoxError, match="do not overlap"):
-            portbox.lumped(source, ground, excitation_axis=2)
+            portbox.lumped(source, ground, excitation_axis=2, outline=None)
 
     def test_the_refusal_prints_enough_digits_to_be_read(self):
         """At four significant figures both spans print as ``-70`` and the
         message says two identical numbers do not overlap."""
         source, ground = self.ends(-70.0 - 1e-5)
         with pytest.raises(portbox.BoxError) as raised:
-            portbox.lumped(source, ground, excitation_axis=2)
+            portbox.lumped(source, ground, excitation_axis=2, outline=None)
         assert "-70.00001" in str(raised.value)

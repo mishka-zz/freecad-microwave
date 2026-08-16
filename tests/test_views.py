@@ -24,7 +24,7 @@ from Microwave.Gui import views
 from Microwave.Results.sparameters import ResultError, SParameters
 
 from .test_document_translation import Obj, Shape
-from .test_tdr import SECTION, V, line, reflected, through
+from .test_tdr import SECTION, V, against, line, measured, reflected, through
 
 #: The fixture line's length, in millimetres: three sections of the synthetic
 #: line, which is what :func:`~tests.test_tdr.through` builds.
@@ -122,6 +122,12 @@ class TestWhichPortsCanBeOffered:
     def test_a_port_nobody_drove_is_not_offered(self):
         """One solve drives one port, so this is the ordinary two-port sweep."""
         assert views.traceable_ports(reflected(line([50.0, 75.0, 50.0]))) == [1]
+
+    def test_a_port_reported_against_what_it_measured_is_offered(self):
+        """The microstrip-port study, which is the commonest thing to draw a
+        line's impedance from and had no entry to press at all."""
+        own = against(line([50.0, 75.0, 50.0]), measured())
+        assert views.traceable_ports(own) == [1]
 
     def test_it_asks_the_transform_rather_than_repeating_its_conditions(self, matrix):
         """Whatever is offered can be drawn. A second copy of the rule is the
@@ -233,8 +239,11 @@ class TestWhenThereIsNoTraceAtAll:
         with pytest.raises(ResultError, match="nobody drove it"):
             views.impedance_view(two_port(), 2)
 
-    def test_a_port_referenced_to_its_own_impedance(self, monkeypatch, matrix):
-        measured = np.full(matrix.reference.shape, np.nan, dtype=complex)
+    def test_a_reference_that_holds_no_number(self, monkeypatch, matrix):
+        """A dispersive reference is moved onto a real one; one that is not a
+        number has nothing to move onto, and would reach the transform as a
+        matrix of ``nan`` and come back as a chart of nothing."""
+        blank = np.full(matrix.reference.shape, np.nan, dtype=complex)
         monkeypatch.setattr(
             views,
             "load",
@@ -242,9 +251,9 @@ class TestWhenThereIsNoTraceAtAll:
                 frequency=matrix.frequency,
                 s=matrix.s,
                 port_numbers=matrix.port_numbers,
-                reference=measured,
+                reference=blank,
                 measured_impedance=matrix.measured_impedance,
             ),
         )
-        with pytest.raises(ResultError):
+        with pytest.raises(ResultError, match="needs a positive one"):
             views.impedance_view(two_port(), 1)

@@ -10,7 +10,7 @@ cannot be right for every model, so every port starts wrong and the first thing
 the panel says is that an axis disagrees with the shape.
 
 The adapter already derives the excitation direction from the geometry and
-*refuses* when the property disagrees (``document._microstrip``). This module is
+*refuses* when the property disagrees (``ports._microstrip``). This module is
 the other half of that: it derives the same thing at the moment the port is
 made, so there is nothing to disagree with. The refusal stays - a user is free
 to change an axis afterwards, and then the model is what decides.
@@ -170,6 +170,19 @@ def waveguide_axis(cross_section, body) -> str:
     return axis_label(axis, inward(cross_section, body, axis, "the cross-section"))
 
 
+def coaxial_axis(ring, body) -> str:
+    """``PropagationAxis`` for a TEM wave launched down a coaxial line.
+
+    The ring is a cross-section like a guide's, and the same two questions
+    answer it: which axis the face cuts across, and which way the solid it
+    belongs to lies from it. That the cross-section is annular rather than solid
+    changes nothing here - it is read where the radii are, in
+    :mod:`Microwave.annulus`.
+    """
+    axis = cross_section_axis(ring, body, "the annulus")
+    return axis_label(axis, inward(ring, body, axis, "the annulus"))
+
+
 # ---------------------------------------------------------------------------
 # The one place FreeCAD is touched
 # ---------------------------------------------------------------------------
@@ -287,3 +300,13 @@ def fill_waveguide(port, picks):
         return {"PropagationAxis": waveguide_axis(from_shape(obj, name), from_shape(obj))}
 
     return _fill(port, picks, ["CrossSection"], infer)
+
+
+def fill_coaxial(port, picks):
+    """Pick the ring between the conductors. Returns what it could not do."""
+
+    def infer(picks):
+        obj, name = picks[0]
+        return {"PropagationAxis": coaxial_axis(from_shape(obj, name), from_shape(obj))}
+
+    return _fill(port, picks, ["Annulus"], infer)

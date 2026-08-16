@@ -57,10 +57,13 @@ class Problem:
 class Run:
     """Enough of an adapter ``Results`` for the provenance report."""
 
-    def __init__(self, port, digest=None, reproducible=True, tail_share=None):
+    def __init__(
+        self, port, digest=None, reproducible=True, tail_share=None, smallest_response=1.0
+    ):
         self.excited_port = port
         self.reproducible = reproducible
         self.tail_share = {port: 1e-4} if tail_share is None else tail_share
+        self.smallest_response = smallest_response
         self._digest = digest if digest is not None else f"{port:064x}"
 
     def matches(self, digest):
@@ -845,7 +848,7 @@ class TestCheckingTheRunsCameBack:
 
         unfinished = [line for line in subject.logged if "stopped before the response" in line]
         assert len(unfinished) == 1
-        assert "run 1" in unfinished[0] and "6.0% at port 2" in unfinished[0]
+        assert "run 1" in unfinished[0] and "6% at port 2" in unfinished[0]
 
     def test_a_sweep_that_finished_says_nothing_about_it(self, panel_module):
         """Otherwise the line is in every log and stops being read."""
@@ -854,6 +857,21 @@ class TestCheckingTheRunsCameBack:
         panel_module.SimulationTaskPanel.report_provenance(subject, [Run(1), Run(2)])
 
         assert not any("stopped before the response" in line for line in subject.logged)
+
+    def test_each_run_is_judged_against_the_response_its_study_reads(self, panel_module):
+        """Off the result rather than off the panel's own copy of the study.
+        A result opened here is judged the way the driver judged it, and a run
+        far under the bar at full scale is nowhere near one at a stopband."""
+        subject = panel(panel_module, problems=[Problem(1), Problem(2)])
+
+        panel_module.SimulationTaskPanel.report_provenance(
+            subject,
+            [Run(1, tail_share={1: 1e-3}), Run(2, tail_share={2: 1e-3}, smallest_response=0.01)],
+        )
+
+        unfinished = [line for line in subject.logged if "stopped before the response" in line]
+        assert len(unfinished) == 1
+        assert "run 2" in unfinished[0] and "-40 dB" in unfinished[0]
 
 
 class TestWhatHappensToTheMatrix:

@@ -38,12 +38,22 @@ SELF = pathlib.Path(__file__).resolve()
 #: so does a bare ``M2``, which names one of that document's milestones. Where a
 #: milestone carried a fact, say the fact: "a second solver in one document" is
 #: what the reader needed, and it goes on being true after the schedule moves.
+#: The harness's own documents are named here without their directory too. A
+#: bare ``debt.md`` reaches just as far outside as ``plans/debt.md`` does, and
+#: reads as a file the workbench ships - which is worse, since a reader will
+#: look for it here first. So does an item's bare identifier: ``D-17`` names a
+#: line of a list this repository does not have, and the fix is the same one -
+#: say what the item said. A part number keeps its letter, because the boundary
+#: on the left refuses a citation that follows one, as ``WR-42`` does.
 OUTSIDE = re.compile(
     r"""
       (?<![\w/])(?:specification|AGENT|CLAUDE|GEMINI)\.md
+    | (?<![\w/])(?:debt|status|decisions|ideas|use_cases|ui_ux_strategy)\.md
+    | (?<![\w/])(?:engine-quirks|literature)\.md
     | (?<![\w/])(?:plans|notes|archive|references)/
     | §\s*\d
     | (?<![\w.])M[0-9](?![\w.])
+    | (?<![\w-])[A-Z]-\d+(?![\w-])
     """,
     re.VERBOSE,
 )
@@ -73,7 +83,8 @@ def test_the_check_knows_a_citation_from_a_dangling_pointer(tmp_path):
         "# openEMS `FDTD/operator.cpp:517`, and `openEMS/ports.py`:355.\n"
         "# A FreeCAD path like Mod/Plot, and a parameter group Mod/Microwave.\n"
         "# Section 4.2 spelled out in words is prose, not a pointer.\n"
-        "# A mode name carries one: TM01.\n",
+        "# A mode name carries one: TM01.\n"
+        "# A part number is not an item: WR-42, and a coax type RG-58.\n",
         encoding="utf-8",
     )
     assert offences(kept) == []
@@ -83,7 +94,21 @@ def test_the_check_knows_a_citation_from_a_dangling_pointer(tmp_path):
         "# See specification.md and ``AGENT.md``.\n"
         "# ``plans/debt.md`` M-2, notes/engine-quirks.md, references/openEMS/x.\n"
         "# What §4.2 forbids.\n"
-        "# What M2 wanted, and what M1 was reviewed for.\n",
+        "# What M2 wanted, and what M1 was reviewed for.\n"
+        "# ``debt.md`` T-6 names it without the directory, and so does status.md.\n"
+        "# ui_ux_strategy.md is one of them too.\n"
+        "# D-17, which names a line of a list this repository does not ship.\n",
         encoding="utf-8",
     )
-    assert len(offences(caught)) == 4
+    # By line, rather than by how many there are: a count says nothing about
+    # *which* rule stopped working, and the line a rule is on is what a change
+    # to the pattern moves.
+    assert [offence.split(":")[1] for offence in offences(caught)] == [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+    ]

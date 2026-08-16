@@ -6,9 +6,11 @@ import pytest
 from Microwave.Objects.ports import (
     FIXED_IMPEDANCE,
     PORT_IMPEDANCE,
+    EMPortCoaxial,
     EMPortLumped,
     EMPortMicrostrip,
     EMPortRectWaveguide,
+    createEMPortCoaxial,
     createEMPortLumped,
     createEMPortMicrostrip,
     createEMPortRectWaveguide,
@@ -29,7 +31,12 @@ class TestTheReferenceImpedanceIsShownOnlyWhenItIsRead:
 
     factories = pytest.mark.parametrize(
         "factory",
-        [createEMPortLumped, createEMPortMicrostrip, createEMPortRectWaveguide],
+        [
+            createEMPortLumped,
+            createEMPortMicrostrip,
+            createEMPortRectWaveguide,
+            createEMPortCoaxial,
+        ],
         ids=lambda f: f.__name__,
     )
 
@@ -77,6 +84,7 @@ class TestEveryPortArrivesNumbered:
             createEMPortLumped,
             createEMPortMicrostrip,
             createEMPortRectWaveguide,
+            createEMPortCoaxial,
         ],
         ids=lambda f: f.__name__,
     )
@@ -101,33 +109,34 @@ class TestEveryPortArrivesNumbered:
 
     def test_the_translation_accepts_what_the_factories_produce(self, doc):
         """The whole point: these numbers have to satisfy the layer that reads them."""
-        from Microwave.Solvers.openems.document import _port_numbers
+        from Microwave.Solvers.openems.ports import _port_numbers
 
         made = [createEMPortLumped(f"P{n}", doc=doc) for n in range(2)]
         assert _port_numbers(made) == [1, 2]
 
 
 class TestOneNameForOneThing:
-    """Facts stored twice, which then diverged.
+    """Facts stored twice, held here to one value.
 
-    A duplicated *fact* is worse than duplicated code: it drifts in silence.
-    Both of these did, and neither had a test, because in both cases the two
-    copies agreed about every model anyone had actually built.
+    A duplicated *fact* is worse than duplicated code, because it drifts in
+    silence: two copies go on agreeing about every model anyone has actually
+    built right up until the model that tells them apart is drawn.
     """
 
     def test_the_translation_spells_an_axis_the_way_the_document_does(self, doc):
-        """``document`` imported the *envelope's* lowercase axis names and used
-        them in nine messages about uppercase document properties. Eight said
-        "x" for a property whose value the user sees as "X"; three other sites
-        had grown a local ``.upper()`` patching the symptom. One assertion here
-        covers every message, because they all read the same tuple."""
-        from Microwave.Solvers.openems import document
+        """The document's spelling of an axis, and the translation's.
+
+        Every refusal naming an axis is about a document property, whose value
+        the user sees as "X" - so the translation has to spell it that way and
+        not in the envelope's lowercase. One assertion covers all of them,
+        because they read the same tuple."""
+        from Microwave.Solvers.openems import properties
 
         port = createEMPortMicrostrip("P", doc=doc)
         offered = set(port.getEnumerationsOfProperty("PropagationAxis"))
 
         assert offered, "the enumeration is empty; this test would prove nothing"
-        assert set(document.AXIS_NAMES) <= offered
+        assert set(properties.AXIS_NAMES) <= offered
 
     def test_the_air_padding_default_is_one_number(self, doc):
         """``write.DEFAULT_PADDING`` and ``EMMeshPolicy.AirCells*`` are the same
@@ -159,19 +168,18 @@ class TestOneNameForOneThing:
         assert int(solver.MaxTimesteps) == DEFAULT_TIMESTEPS
 
     def test_flatness_is_one_number(self):
-        """Three definitions at two values (1e-6, 1e-6, 1e-7), each with its own
-        justifying comment, in modules that already imported each other. No real
-        geometry occupies the band between them, which is why nothing caught it
-        and why the value is not what matters here - the agreement is.
+        """One flatness, in the modules that all have to agree about it.
 
-        Both other copies are now assignments from ``portbox``, so what this pins
-        is that they stay derived: write a literal back into either and it fails.
+        The value is not what matters here - no real geometry occupies the band
+        a disagreement would open, which is why a disagreement goes unnoticed.
+        Both copies are assignments from ``portbox``, so what this pins is that
+        they stay derived: write a literal back into either and it fails.
         """
         from Microwave import portbox
         from Microwave.Objects import port_setup
-        from Microwave.Solvers.openems import document
+        from Microwave.Solvers.openems import geometry
 
-        assert document.FLATNESS == portbox.FLATNESS == port_setup.FLATNESS
+        assert geometry.FLATNESS == portbox.FLATNESS == port_setup.FLATNESS
 
 
 def test_every_waveguide_mode_the_gui_offers_can_actually_be_built(doc):
@@ -272,6 +280,18 @@ class TestEachKindDeclaresItsOwnSurface:
             {"Mode": "TE10"},
             {"SourceEntity", "TraceEnd"},
         ),
+        (
+            createEMPortCoaxial,
+            EMPortCoaxial,
+            {"Annulus"},
+            # The microstrip's three distances, meaning the same three things.
+            # No excitation axis: the field is radial, so there is none to name.
+            # No feed resistance either - one would be metal laid across the
+            # line's mouth, and every conductor here is one the user drew.
+            {"FeedOffset": 0.0, "MeasurementDistance": 0.0, "Length": 0.0},
+            {"PropagationAxis": "X"},
+            {"ExcitationAxis", "FeedResistance", "Resistance", "TraceEnd", "CrossSection"},
+        ),
     ]
 
     kinds = pytest.mark.parametrize(
@@ -340,9 +360,9 @@ class TestNoPortPropertyIsANoOp:
     def read_by_the_adapter():
         """Every ``something.Name`` the adapter reads, as a set of names.
 
-        Parsed, not grepped. Asking whether the name appears
-        anywhere in ``document.py`` as a *substring*, which passes on prose and
-        on any identifier that merely contains it.
+        Parsed, not grepped. Asking whether the name appears anywhere in the
+        translation as a *substring* passes on prose, and on any identifier that
+        merely contains it.
 
         **What this still cannot see** is *which kind* reaches a read. ``Length``
         is read as ``obj.Length`` - but only the microstrip and waveguide
@@ -356,8 +376,16 @@ class TestNoPortPropertyIsANoOp:
         import ast
         from pathlib import Path
 
-        root = Path(__file__).resolve().parents[1]
-        tree = ast.parse((root / "Microwave" / "Solvers" / "openems" / "document.py").read_text())
+        root = Path(__file__).resolve().parents[1] / "Microwave" / "Solvers" / "openems"
+        # Every module the translation is spread across, rather than whichever
+        # one holds the port builders today. A property moving to a new module
+        # is not a property nobody reads, and this net is coarse enough already.
+        tree = ast.parse(
+            "\n".join(
+                (root / f"{name}.py").read_text()
+                for name in ("document", "properties", "geometry", "materials", "ports", "policy")
+            )
+        )
         return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)} | {
             # Exact string literals too, because the adapter reads the two
             # resistances through a helper - ``_resistance(obj, "Resistance")``
@@ -369,7 +397,9 @@ class TestNoPortPropertyIsANoOp:
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
 
-    @pytest.mark.parametrize("make", [EMPortMicrostrip, EMPortLumped, EMPortRectWaveguide])
+    @pytest.mark.parametrize(
+        "make", [EMPortMicrostrip, EMPortLumped, EMPortRectWaveguide, EMPortCoaxial]
+    )
     def test_the_adapter_reads_all_of_them(self, doc, make):
         obj = doc.addObject("App::FeaturePython", "Port")
         make(obj)

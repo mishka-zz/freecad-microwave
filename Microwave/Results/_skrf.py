@@ -5,12 +5,12 @@
 
 Everything S-parameter-shaped rests on ``skrf.Network``, and every module that
 needs it asks here rather than importing it directly. That buys: the import is
-deferred until results are actually wanted, the choice between the user's copy
-and our vendored one is made once, and provenance can say which copy produced a
-number.
+deferred until results are actually wanted, the choice between the installed
+copy and the vendored one is made once, and provenance can say which copy
+produced a number.
 
-Nothing below this line knows about scikit-rf. The adapter, the mesher,
-``document.py`` and pre-flight are numpy and stdlib, and a test enforces that.
+Nothing below this line knows about scikit-rf. The adapter, the mesher, the
+translation and pre-flight are numpy and stdlib, and a test enforces that.
 """
 
 from __future__ import annotations
@@ -36,10 +36,10 @@ def _import_vendored():
     """Import the copy in ``_vendor``, in preference to whatever else is found.
 
     ``Microwave/__init__.py`` *appends* ``_vendor`` to ``sys.path``, so a plain
-    ``import skrf`` finds the interpreter's own copy first - which is what we
-    want, right up until that copy is one that does not work. Putting the
+    ``import skrf`` finds the interpreter's own copy first, which is the wanted
+    order right up until that copy is one that does not work. Putting the
     vendored directory in front for the duration of one import is the narrowest
-    way to say "no, this one".
+    way to override it.
 
     The partially-imported modules from the failed attempt have to go first:
     a failure part-way through leaves ``skrf`` and some of its submodules in
@@ -57,17 +57,17 @@ def _import_vendored():
         return skrf
     finally:
         # By value, and deliberately: ``remove`` takes the *earliest* match,
-        # which is the entry inserted above - the copy this module appended at
-        # startup is at the far end. A positional check (``sys.path[0] is ours``)
-        # is wrong, because the import below takes over a second and anything
-        # inserting a path meanwhile shifts ours off index zero. The guard would
-        # then decline, stranding ``_vendor`` ahead of
-        # site-packages for the life of the session: precisely the hijack that
-        # appending rather than inserting exists to prevent.
+        # which is the entry inserted above - the one appended at startup is at
+        # the far end. A positional check (``sys.path[0] is VENDOR``) is wrong,
+        # because the import below takes over a second and anything inserting a
+        # path meanwhile shifts the entry off index zero. The guard would then
+        # decline, stranding ``_vendor`` ahead of site-packages for the life of
+        # the session: precisely the hijack that appending rather than inserting
+        # exists to prevent.
         #
-        # The failure this trades into is benign by comparison - if ours has
-        # already gone, ``remove`` takes the appended entry and we lose a
-        # fallback path that the next ``import Microwave`` puts back.
+        # The failure this trades into is benign by comparison: if the inserted
+        # entry has already gone, ``remove`` takes the appended one and the
+        # fallback path is restored by the next ``import Microwave``.
         try:
             sys.path.remove(VENDOR)
         except ValueError:
@@ -79,15 +79,16 @@ def _whose(found):
 
     Asked by looking at where the module actually is, not at which import
     attempt succeeded - ``_vendor`` is on ``sys.path``, so a plain
-    ``import skrf`` finds our copy whenever nothing else provides one. Labelling
-    that "installed" would put a false claim in every result's provenance.
+    ``import skrf`` finds the vendored copy whenever nothing else provides one.
+    Labelling that "installed" would put a false claim in every result's
+    provenance.
     """
     from .. import VENDOR
 
     origin = getattr(found, "__file__", None)
     if not origin:
-        # A namespace package, or something synthesised onto sys.meta_path. We
-        # cannot tell whose it is, and provenance should not guess.
+        # A namespace package, or something synthesised onto sys.meta_path.
+        # Its origin is unknowable here, and provenance should not guess.
         return "unknown"
     root = os.path.realpath(VENDOR) + os.sep
     return "vendored" if os.path.realpath(origin).startswith(root) else "installed"
@@ -100,13 +101,13 @@ def module():
     vendored copy, because "their copy wins" is only the right rule while their
     copy works. scikit-rf 2.0.x - the current release - raises
     ``AttributeError`` on numpy 1.x, which is what the official FreeCAD build
-    ships, so a user with their own up-to-date install is a case we expect to
-    hit rather than a hypothetical. See ``_vendor/README.md``.
+    ships, so a user with an up-to-date install of their own is an expected case
+    rather than a hypothetical. See ``_vendor/README.md``.
 
-    Any failure of the interpreter's copy sends us to ours: an ImportError
-    because it is absent, an AttributeError because it is 2.0.x on numpy 1.x,
-    or something we have not seen yet. A failure of *our* copy is not caught -
-    that is our bug, and it should be loud.
+    Any failure of the interpreter's copy falls through to the vendored one: an
+    ImportError because it is absent, an AttributeError because it is 2.0.x on
+    numpy 1.x, or something not yet seen. A failure of the *vendored* copy is
+    not caught - that is a bug in this workbench, and it should be loud.
     """
     global _module, _source
     if _module is not None:
@@ -116,7 +117,7 @@ def module():
         import skrf
 
         _module, _source = skrf, _whose(skrf)
-    except Exception as theirs:
+    except Exception as installed:
         try:
             found = _import_vendored()
             # Asked, not assumed. ``sys.meta_path`` outranks ``sys.path``, so an
@@ -124,22 +125,22 @@ def module():
             # calling whatever comes back "vendored" would be the same false
             # claim in provenance that _whose exists to prevent.
             _module, _source = found, _whose(found)
-        except Exception as ours:
-            # Pointing at the two reprs rather than naming libraries. Our copy
-            # is always on disk, so a failure of *both* is nearly always
-            # something scikit-rf imports rather than scikit-rf itself - and
-            # which library that is belongs to the vendored version, not to this
-            # message. Telling the user to install scikit-rf would be the one
-            # instruction that is actively wrong: they have it, and the copy pip
-            # would fetch is the release ``_vendor/README.md`` exists to avoid.
+        except Exception as vendored:
+            # Pointing at the two reprs rather than naming libraries. The
+            # vendored copy is always on disk, so a failure of *both* is nearly
+            # always something scikit-rf imports rather than scikit-rf itself,
+            # and which library that is belongs to the vendored version rather
+            # than to this message. Telling the user to install scikit-rf would
+            # be actively wrong: they have it, and the copy pip would fetch is
+            # the release ``_vendor/README.md`` exists to avoid.
             raise NoResultLibrary(
                 "S-parameter results need scikit-rf, and neither copy could be "
-                f"loaded. This interpreter's: {theirs!r}. The one bundled with "
-                f"the workbench: {ours!r}. A copy travels with the workbench, so "
+                f"loaded. This interpreter's: {installed!r}. The one bundled with "
+                f"the workbench: {vendored!r}. A copy travels with the workbench, so "
                 "what is missing is usually something scikit-rf itself imports: "
                 "install whatever those two errors name into the Python that "
                 "runs FreeCAD."
-            ) from ours
+            ) from vendored
     return _module
 
 

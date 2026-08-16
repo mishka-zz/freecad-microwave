@@ -11,19 +11,19 @@ adapter.
 Import discipline
 -----------------
 
-The adapter straddles a process boundary. openEMS runs in a *different* Python
-than FreeCAD does, so modules here fall into two groups:
+The adapter straddles a process boundary: openEMS runs in a *different* Python
+than FreeCAD does, so modules here fall into two groups.
 
-* **In-process** (runs inside FreeCAD): capability declaration, pre-flight
-  checks, writing the input, reading results back into document objects. May
-  import FreeCAD, must never import openEMS or CSXCAD.
-* **Subprocess** (runs under the openEMS interpreter): everything that touches
-  the solver. May import openEMS and CSXCAD, must never import FreeCAD.
+* **In-process** (inside FreeCAD): capability declaration, pre-flight checks,
+  writing the input, reading results back into document objects. May import
+  FreeCAD, must never import openEMS or CSXCAD.
+* **Subprocess** (under the openEMS interpreter): everything that touches the
+  solver. May import openEMS and CSXCAD, must never import FreeCAD.
 
-:mod:`.mesh` and :mod:`.model` belong to *neither*. They import nothing but
-numpy, so they run on both sides - which is what lets the workbench show a mesh
-preview before openEMS is installed, and lets the driver read the same envelope
-the workbench wrote.
+:mod:`.mesh` and :mod:`.model` belong to *neither*, importing nothing but numpy
+so they run on both sides. That is what lets the workbench show a mesh preview
+before openEMS is installed, and lets the driver read the envelope the workbench
+wrote.
 
 The pieces
 ----------

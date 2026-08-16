@@ -203,7 +203,8 @@ def test_every_boundary_the_dropdown_offers_is_translated_or_refused_by_name():
 
     Replaces a test whose own comment said it verified the conftest stub.
     """
-    from Microwave.Solvers.openems.document import TranslationError, _boundary
+    from Microwave.Solvers.openems.policy import _boundary
+    from Microwave.Solvers.openems.properties import TranslationError
 
     sim = solver()
     offered = sim.getEnumerationsOfProperty("BoundaryXMin")

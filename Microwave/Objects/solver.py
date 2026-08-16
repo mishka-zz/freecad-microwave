@@ -46,10 +46,8 @@ class EMSolverOpenEMS(ViewProviderRestored):
         # ceiling: every step is taken. Also openems.model.DEFAULT_TIMESTEPS,
         # which carries what the number rests on; a test keeps the two equal.
         obj.MaxTimesteps = 30000
-        # Zero (or any value at or above it) disables energy termination, and
-        # that is the only reproducible setting: openEMS re-checks the energy
-        # criterion on a four-second wall-clock timer, so an energy-terminated
-        # run stops at a step count that depends on machine load.
+        # Zero disables energy termination, which is the only reproducible
+        # setting; openems.policy._termination carries why.
         obj.addProperty(
             "App::PropertyFloat",
             "EnergyDecay",

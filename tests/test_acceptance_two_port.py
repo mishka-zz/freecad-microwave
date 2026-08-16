@@ -173,9 +173,9 @@ def _problem(z1: float = Z_PORT_1, z2: float = Z_PORT_2) -> Problem:
     # and the two runs share a sign convention. Each is one metal cell long
     # along x, because a lumped port is a box and the envelope refuses a zero
     # extent along the propagation axis. The two boxes extend inward from
-    # opposite ends of the line; ``AddLumpedPort`` is never given the
-    # propagation axis (``driver.py:190``), so that ordering places the box and
-    # nothing more.
+    # opposite ends of the line; the driver hands ``AddLumpedPort`` the
+    # excitation axis and never the propagation one, so that ordering places the
+    # box and nothing more.
     gap = METAL_RES
     ports = (
         Port(

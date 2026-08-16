@@ -138,6 +138,36 @@ class TestTheSymmetryDeclaration:
         assert declared_symmetry(analysis) == MIRROR
 
 
+class TestTheSmallestResponseDeclaration:
+    """How far down the response is read, which is a statement about the study.
+
+    It sits beside the band for the same reason the symmetry does: nothing in a
+    solved sweep distinguishes a term that is the point of the exercise from a
+    matched line's own reflection, so it is declared and never inferred. What it
+    reaches is the bar a truncated run is judged against, and nothing else.
+    """
+
+    def test_it_defaults_to_full_scale(self, doc):
+        """Full scale is what a study that declares nothing is held to, and a
+        study nobody has thought about declares nothing."""
+        analysis = createEMAnalysis(doc)
+        assert analysis.SmallestResponse == 0.0
+
+    def test_the_default_reaches_the_envelope_as_what_it_calls_full_scale(self, doc):
+        """A study declaring nothing spells it zero dB on the property and a
+        magnitude of one in the envelope, and only the translation between them
+        holds the two spellings together."""
+        from dataclasses import fields
+
+        from Microwave.Solvers.openems import document
+        from Microwave.Solvers.openems.model import Problem
+
+        undeclared = {field.name: field.default for field in fields(Problem)}
+        assert document._smallest_response(createEMAnalysis(doc)) == pytest.approx(
+            undeclared["smallest_response"]
+        )
+
+
 class TestTheExcitationDeclaration:
     """An enumeration of one, and the one is what the engine is driven with.
 
@@ -161,9 +191,9 @@ class TestTheExcitationDeclaration:
         together, and a document offering a waveform the translation refuses is
         a workbench that cannot solve its own default.
         """
-        from Microwave.Solvers.openems import document
+        from Microwave.Solvers.openems import policy
 
-        assert document.GAUSSIAN == GAUSSIAN
+        assert policy.GAUSSIAN == GAUSSIAN
 
 
 class TestWalkingAGroup:
@@ -340,6 +370,7 @@ class TestWhatTheWorkbenchRecognisesAsItsOwn:
             "EMMeshPreview",
             "EMMaterial",
             "EMMaterialBinding",
+            "EMPortCoaxial",
             "EMPortLumped",
             "EMPortMicrostrip",
             "EMPortRectWaveguide",
@@ -354,7 +385,7 @@ class TestWhatTheWorkbenchRecognisesAsItsOwn:
 
         assert "ViewProviderRestored" not in kinds()
 
-    def test_it_does_not_name_the_base_the_five_port_kinds_share(self):
+    def test_it_does_not_name_the_base_the_port_kinds_share(self):
         """``EMPortBase`` is shared behaviour, not a kind: no document object
         ever carries it as a ``Proxy``.
 

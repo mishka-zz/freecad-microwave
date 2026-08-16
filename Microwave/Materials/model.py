@@ -4,9 +4,9 @@
 """What a materials catalog holds, as plain data.
 
 Standard library only - no FreeCAD, no numpy, no Qt. A catalog is something a
-third party writes and emails you, so reading one has to be possible, and
+third party writes and sends, so reading one has to be possible, and
 testable, without any of that. It is also why a catalog is *data* and not a
-Python module: a format executed on load means opening somebody's materials
+Python module: a format executed on load means opening a stranger's materials
 file runs their code.
 
 Units are millimetres, hertz and S/m, matching the document layer, because a
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 #: already exists, and guessing would be worse than saying no.
 SCHEMA = 1
 
-#: Exactly the kinds ``Solvers/openems/document.py`` can translate. There is
+#: Exactly the kinds ``Solvers/openems/materials.py`` can translate. There is
 #: deliberately no dispersive kind: the openEMS adapter refuses one, no other
 #: adapter builds one, so offering it in a catalog would be a silent no-op.
 #: Dispersion is *data about* a dielectric, below, not a kind.
@@ -97,7 +97,7 @@ class MaterialEntry:
     thickness: float = 0.0
     #: Hz. The frequency ``epsilon_r`` and ``loss_tangent`` are quoted at. A
     #: loss tangent without one is not a physical quantity - it is a number
-    #: somebody wrote down - so the parser requires it wherever loss is
+    #: was written down - so the parser requires it wherever loss is
     #: nonzero.
     measured_at: float = 0.0
     dispersion: tuple[DispersionPoint, ...] = ()
@@ -116,7 +116,7 @@ class MaterialEntry:
         """This entry with the dispersion row nearest ``frequency`` applied.
 
         Never interpolates. A row is something a laboratory measured; a point
-        between two rows is something we made up, and a made-up permittivity
+        between two rows is invented, and an invented permittivity
         that looks measured is exactly what this whole layer exists to avoid.
         Returns ``self`` when there is no table to choose from.
 

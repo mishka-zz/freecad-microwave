@@ -34,7 +34,7 @@ plot = ["matplotlib"]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
-    "slow: runs a real solve; deselect with -m 'not slow'",
+    "slow: runs a real solve or a real FreeCAD; deselect with -m 'not slow'",
 ]
 
 [tool.ruff]

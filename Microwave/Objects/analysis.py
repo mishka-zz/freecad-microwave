@@ -41,7 +41,7 @@ from .kinds import kind_of
 
 #: The whole of ``EMAnalysis.Waveform``. openEMS is driven by ``SetGaussExcite``
 #: and the adapter offers no other call, so this is the one excitation any of
-#: this can produce; ``Solvers/openems/document._waveform`` refuses anything
+#: this can produce; ``Solvers/openems/policy._waveform`` refuses anything
 #: else by name, and repeats the string because it may not import this module.
 GAUSSIAN = "Gaussian"
 
@@ -108,7 +108,7 @@ class EMAnalysis(ViewProviderRestored):
         # A statement about the *device*, which is why it is here beside the
         # band and not on a solver: what the structure is cannot depend on which
         # backend looks at it. It is also a statement no geometry check can
-        # make for you - a board symmetric to within a via's placement is
+        # make on a user's behalf - a board symmetric to within a via's placement is
         # symmetric for this purpose - so it is declared, never inferred.
         #
         # What it buys: a time-domain solver drives one port per run, so a
@@ -128,6 +128,30 @@ class EMAnalysis(ViewProviderRestored):
             " solve cannot measure",
         )
         obj.Symmetry = [NO_SYMMETRY, MIRROR_SYMMETRY]
+
+        # How far down the response is read, which decides how much leakage a
+        # truncated run may leave in it: a stopband of -40 dB *is* |S21| = 0.01,
+        # so leakage that is nothing beside a response of one is the whole of
+        # that. Zero asks for full scale, and holds the run to the same share of
+        # unity every matched structure is held to.
+        #
+        # Declared rather than measured off the sweep, and that is what puts it
+        # on the study. A solved response has small terms in it either way, and
+        # nothing in the numbers says whether a -40 dB term is the point of the
+        # exercise or a rounding error beneath a matched line - only whoever
+        # asked for the run knows. Reading it off the answer would also be
+        # circular: leakage fills a null in, so the run that most needs the bar
+        # is the one that reports the shallowest notch to set it from.
+        #
+        # It reaches the residual check and nothing else - no run is solved
+        # differently for it. See ``Solvers/openems/residual.WANTED``.
+        obj.addProperty(
+            "App::PropertyFloat",
+            "SmallestResponse",
+            "Analysis",
+            "Smallest response this study reads, in dB (0 = full scale)",
+        )
+        obj.SmallestResponse = 0.0
 
         obj.Proxy = self
 
@@ -207,14 +231,11 @@ def analysis_of(obj):
 def members(group, seen=None):
     """Everything in a group, following nested groups once each.
 
-    One definition, because there were three: ``Gui/mesh_preview.py`` and
-    ``Gui/results.py`` each carried a copy, and neither had the cycle guard that
-    the adapter's own walk has had since it was written. A document is a file a
-    user can edit, and a cycle here is an infinite loop inside a GUI callback -
-    FreeCAD hangs with nothing in the log to say why.
-
-    ``seen`` is by identity, not by name: two documents may hold objects called
-    ``EMPortLumped`` and neither should hide the other.
+    The one definition for the GUI layer. ``seen`` guards against a cycle: a
+    document is a file a user can edit, and a cycle here is an infinite loop
+    inside a GUI callback, which hangs FreeCAD with nothing in the log to say
+    why. It is kept by identity rather than by name, since two documents may
+    hold objects called ``EMPortLumped`` and neither should hide the other.
     """
     seen = set() if seen is None else seen
     found = []
@@ -235,8 +256,8 @@ def _holds(group, obj):
 def find_analysis(doc, selection=()):
     """The analysis a newly created object should join.
 
-    Chosen from the selection first - if you had a port of one study picked
-    when you added another, that is the study you meant - then from the
+    Chosen from the selection first - a port of one study picked while another was
+    added names the study meant - then from the
     document when it holds exactly one. Anything else raises
     :class:`NoAnalysis` naming the problem, rather than picking one and putting
     the user's new port in a study they were not looking at.

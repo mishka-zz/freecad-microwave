@@ -20,7 +20,7 @@ PORT_IMPEDANCE = "Port impedance"
 
 
 def is_port(obj):
-    """True when this document object is one of our ports.
+    """True when this document object is one of this workbench's ports.
 
     By the proxy's class, not by its name - see ``kinds.py`` for why a prefix
     test is the wrong question.
@@ -32,7 +32,7 @@ def next_port_number(doc):
     """The lowest port number this document is not already using.
 
     Every port is numbered when it is made, because a port without one is
-    refused by the translation - ``document._port_numbers`` needs it to index
+    refused by the translation - ``ports._port_numbers`` needs it to index
     the S-matrix.
 
     Renumbering an existing port is deliberately not offered. The S-matrix a
@@ -189,7 +189,7 @@ class EMPortMicrostrip(EMPortBase):
         # where the picked face is. Together they are
         # the port's *requirement*: the box is drawn at this size whether or not
         # the trace under it is that long, so a feed line that is too short is
-        # something you can see. A box derived from the trace always looks like
+        # something visible. A box derived from the trace always looks like
         # it fits, which is exactly when it does not.
         #
         # Distances in millimetres, not fractions of the box length; see
@@ -217,14 +217,9 @@ class EMPortMicrostrip(EMPortBase):
             "Extent along the propagation axis (0 = end at the measurement plane)",
         )
         obj.Length = 0.0
-        # A series resistance at the feed damps the reflection off the source,
-        # so the port settles in fewer timesteps. Zero - a bare voltage source
-        # - is the default because it is the configuration the microstrip
-        # acceptance gate runs: with the line run out through the absorber there
-        # is nothing to reflect off, and the undamped source gives a cleaner
-        # incident wave. openEMS spells "no resistor" as an infinite Feed_R and
-        # reserves zero for a short, so the adapter omits the keyword rather
-        # than passing a zero through.
+        # Zero is a bare voltage source, which is what the microstrip acceptance
+        # gate runs. What the resistance does and how openEMS spells its absence
+        # is in openems.ports._feed_resistance.
         obj.addProperty(
             "App::PropertyFloat",
             "FeedResistance",
@@ -304,6 +299,58 @@ class EMPortRectWaveguide(EMPortBase):
         obj.Proxy = self
 
 
+class EMPortCoaxial(EMPortBase):
+    """Coaxial port on a line drawn as two concentric conductors."""
+
+    def __init__(self, obj):
+        super().__init__(obj)
+        # One pick, and it carries everything: the ring between the inner
+        # conductor and the shield's bore gives both radii and the axis they are
+        # about. Neither radius is a property, because a radius that could be
+        # typed is a radius that could disagree with the drawing - and the
+        # impedance of a coaxial line is nothing but their ratio.
+        obj.addProperty(
+            "App::PropertyLinkSub",
+            "Annulus",
+            "Coaxial",
+            "The ring between the inner conductor and the shield, at the line's end",
+        )
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "PropagationAxis",
+            "Coaxial",
+            "Direction of wave propagation, into the structure",
+        )
+        obj.PropagationAxis = ["X", "Y", "Z", "-X", "-Y", "-Z"]
+        # The same three distances a microstrip port carries, measured the same
+        # way and for the same reason: the source is a sheet across the annulus
+        # and the probes have to be clear of its near field before the impedance
+        # they difference is the line's.
+        obj.addProperty(
+            "App::PropertyLength",
+            "FeedOffset",
+            "Coaxial",
+            "How far in from the picked ring the source sits (0 = on the ring)",
+        )
+        obj.FeedOffset = 0.0
+        obj.addProperty(
+            "App::PropertyLength",
+            "MeasurementDistance",
+            "Coaxial",
+            "How far downstream of the source the probes sit; filled in from the"
+            " study's band when the port is made",
+        )
+        obj.MeasurementDistance = 0.0
+        obj.addProperty(
+            "App::PropertyLength",
+            "Length",
+            "Coaxial",
+            "Extent along the propagation axis (0 = end at the measurement plane)",
+        )
+        obj.Length = 0.0
+        obj.Proxy = self
+
+
 def _create(proxy, feature, name, doc):
     """Make one port: the object, its proxy, its number, its view provider.
 
@@ -361,3 +408,9 @@ def createEMPortMicrostrip(name="MicrostripPort", doc=None):
 
 def createEMPortRectWaveguide(name="WaveguidePort", doc=None):
     return _create(EMPortRectWaveguide, "Part::FeaturePython", name, doc)
+
+
+def createEMPortCoaxial(name="CoaxialPort", doc=None):
+    obj = _create(EMPortCoaxial, "Part::FeaturePython", name, doc)
+    obj.MeasurementDistance = required_clearance(obj.Document)
+    return obj

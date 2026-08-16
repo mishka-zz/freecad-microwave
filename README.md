@@ -81,17 +81,24 @@ input is not evidence of anything.
 
 | | works | TODO |
 |---|---|---|
-| **Ports** | microstrip, lumped, rectangular waveguide | coax; differential, for mixed-mode S-parameters |
+| **Ports** | microstrip, lumped, rectangular waveguide | differential, for mixed-mode S-parameters |
 | **Materials** | dielectric, lossy dielectric, PEC, conducting sheet, from editable catalogs | dispersive (Debye/Drude/Lorentz), anisotropic |
 | **Boundaries** | absorbing (PML) or conducting wall, per face | periodic / Floquet, for surfaces and arrays |
 | **Excitation** | port-driven; one Gaussian pulse covers the band | plane wave, and with it RCS |
-| **Geometry** | axis-aligned boxes, and flat sheets of any Manhattan outline, cut into rectangles exactly | curved and off-axis metal - a taper, a bend, a helix. Next, and refused by name until then. A limit of this adapter, not of the method |
+| **Geometry** | any solid and any flat outline - a box, a taper, a fillet, a round pad, a curve. A shape that fills its box is sent as one; anything else as its own surface, which openEMS holds exactly. A curved *solid* conductor is corrected for where openEMS reads its surface, so it lands where you drew it, and is sized across its own wall as well as by how sharply it curves | a curved conductor drawn as a flat *sheet* gets no such correction on its outline, and how much that costs has not been measured - the instruments that could ask cannot separate it from the discretisation beside it |
 | **Studies** | one run at a time | parametric sweeps driven from FreeCAD expressions and spreadsheets, then local optimisation |
 
 The "works" column has an authoritative version, and it is not this page:
 `Microwave/Solvers/openems/capabilities.py` is what a model is actually checked
-against. A diagonal or a curve is refused by name - never staircased into
+against. A diagonal or a curve is meshed and priced - never staircased into
 something that would have solved and been wrong.
+
+One thing is in neither column. A **coaxial** port is built, translated, solved
+and scored against a closed form, and it is *withheld*: its command is not
+registered, so nothing in the GUI offers it. That is not a doubt about the
+answer - it is that no example document reaches it, so the route a user would
+take to one has never been walked. A document that already holds one opens and
+solves.
 
 ## How you know it's right
 
@@ -99,10 +106,20 @@ The physics is gated against closed forms rather than against this code's own
 earlier output: microstrip impedance against Hammerstad, a WR-42 guide against
 exact waveguide theory and against the same guide drawn on a second axis, a
 mismatched load against |(R-Z₀)/(R+Z₀)|, a stepped line read back as impedance
-against distance. One further gate scores a stepped-impedance low-pass that
-somebody else etched and measured, against the two figures their paper states.
-Every gate prints what it achieved, so a pass is never mistaken for a number
-that has not moved. [Tests](#tests) says how to run them.
+against distance, a coaxial line's impedance against Laplace's equation in one
+variable. One further gate scores a stepped-impedance low-pass that somebody
+else etched and measured, against the two figures their paper states. Every gate
+prints what it achieved, so a pass is never mistaken for a number that has not
+moved. [Tests](#tests) says how to run them.
+
+Two gates solve shapes a rectilinear grid cannot hold - a spherical cavity,
+whose resonances are exact, and the coaxial line above. Each scores the answer
+at every cell it solves, and also the *rate*: how fast the error falls as the
+mesh is refined. That second figure is what says a curved shape is converging on
+the drawing rather than merely sitting near it, and no single solve of a curved
+shape can say it. The coaxial gate carries an error bar on its own rate, got by
+solving one mesh several times with the grid slid under the drawing - because a
+wall placed by sampling moves when the lines move under it.
 
 One thing no check can settle before a solve: whether the run was long enough
 for the field to decay. A run that stops while the device is still ringing says
@@ -203,8 +220,13 @@ naming the version it found and the one it wants.
 ## Quick start
 
 Open `examples/stub_notch.FCStd`. Double-click **EM Analysis** in the tree,
-press **Run**, and the plot appears when it finishes - around five minutes,
-because a two-port is one solve per port.
+press **Run**, and the plot appears when it finishes.
+
+Expect tens of minutes for any of the examples below, on a desktop of the day.
+How long is a property of the machine rather than of the board, so no figure
+here is one to plan against - what is worth knowing is the *ratio*: this first
+one is two solves, because a two-port is one solve per driven port, and every
+other example is one.
 
 It is a 50 Ω microstrip line on FR-4 with an open stub hanging off the middle
 of it. A quarter wavelength of open line is a short circuit at its root, so
@@ -225,7 +247,7 @@ right-clicking its result offers **Plot impedance along the line**: the
 reflection read back as impedance against distance along the board, with the
 middle section standing up out of it where the line narrows. That is what a
 bench reflectometer shows, and it says *where* on a board a mismatch is rather
-than only that there is one. One solve, about five minutes.
+than only that there is one. One solve.
 
 `examples/stepped_lowpass_synthesised.FCStd` is the one that argues for a
 solver. It is a five-section stepped-impedance low-pass with its corner placed
@@ -239,8 +261,7 @@ it to know that - the design equations claim tens of dB of rejection at a
 frequency where the board passes nearly everything.
 
 Trying harder with the equations does not find that, because the equations are
-what got it wrong. This is what a broadband time-domain run is for. One solve,
-about six and a half minutes.
+what got it wrong. This is what a broadband time-domain run is for. One solve.
 
 Beside it, `examples/stepped_lowpass_measured.FCStd` is the same kind of filter
 and the opposite kind of example. Nothing in it is synthesised here: every
@@ -248,8 +269,7 @@ dimension is Table 1 of Chen, Chen and Wang, *Progress In Electromagnetics
 Research C* **157**, 239-246 (2025) - a board those authors etched and put on a
 network analyser. With the design equations out of the loop, what is left to
 check is the solver, and `tests/test_acceptance_lowpass.py` checks it against
-the two figures that paper states for the board it measured. One solve, about
-seven and a half minutes.
+the two figures that paper states for the board it measured. One solve.
 
 The last example, `examples/microstrip_50ohm.FCStd`, is a plain 50 Ω line with
 one port. It has nothing to show - S11 is a flat floor - because it exists to be
@@ -260,7 +280,7 @@ To build one from scratch:
 | | |
 |---|---|
 | 1 | **Create EM Analysis** - makes the study, an openEMS solver and a mesh policy. Set the frequency band on the analysis. |
-| 2 | Draw the device with `Part` boxes and planes, or draw a flat layout in the Sketcher - a sheet whose edges are all axis-aligned is cut into rectangles automatically. A *solid* still has to fill its own bounding box. |
+| 2 | Draw the device with `Part` boxes and planes, or draw a flat layout in the Sketcher. Any shape works: one that fills its bounding box is sent as a box, and anything else as its own surface. |
 | 3 | **Add Material from Catalog...** to pick materials. Then select a material and the solids it is made of, and press **Bind Material to Shape** - one binding per material. |
 | 4 | Select the faces a port needs, then press one of **Add Microstrip / Lumped / Waveguide Port**. The tooltip on each says which faces to pick and in what order. |
 | 5 | **Update Mesh** to see the grid before committing to a solve. |
@@ -278,9 +298,12 @@ python3 -m pytest -m "not slow"          # seconds; no FreeCAD or openEMS needed
 python3 -m pytest -m slow -s | grep GATE # real solves, and what they measured
 ```
 
-The slow ones are the gates named at the top, plus the WR-42 guide's power
-balance. They want an interpreter that has the openEMS bindings, and skip
-themselves where there is none. Each tolerance is the *reference's* own
+The slow selection is the gates named at the top, the WR-42 guide's power
+balance, and a corpus of shapes a CAD kernel actually produces, run through the
+geometry layer and back. The gates want an interpreter that has the openEMS
+bindings and the corpus wants a real FreeCAD; each skips itself where its own
+requirement is missing, so the selection runs wherever you are and tells you
+what it left out. Each tolerance is the *reference's* own
 accuracy - 1% for Hammerstad, because that is what Hammerstad is good to - so a
 green gate means "inside the reference", not "unchanged since last time". The
 `GATE` lines are where the achieved figures are, and the only place they are

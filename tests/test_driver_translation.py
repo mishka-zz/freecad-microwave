@@ -40,6 +40,7 @@ from Microwave.Solvers.openems.model import (
     THROUGH,
     Frequency,
     Material,
+    MeshGrid,
     Port,
     Problem,
     Solid,
@@ -47,17 +48,37 @@ from Microwave.Solvers.openems.model import (
 )
 
 
+class FakePolyhedron:
+    """A CSXCAD polyhedron. Records the points and triangles handed to it."""
+
+    def __init__(self, priority: int):
+        self.priority = priority
+        self.vertices: list[tuple] = []
+        self.faces: list[tuple] = []
+
+    def AddVertex(self, *point):
+        self.vertices.append(tuple(point))
+
+    def AddFace(self, indices):
+        self.faces.append(tuple(indices))
+
+
 class FakeProperty:
-    """A CSXCAD property. Records the boxes added to it."""
+    """A CSXCAD property. Records the primitives added to it."""
 
     def __init__(self, kind: str, name: str, **kw):
         self.kind = kind
         self.name = name
         self.kw = kw
         self.boxes: list[tuple] = []
+        self.polyhedra: list[FakePolyhedron] = []
 
     def AddBox(self, start, stop, priority=0, **kw):
         self.boxes.append((tuple(start), tuple(stop), priority))
+
+    def AddPolyhedron(self, priority=0, **kw):
+        self.polyhedra.append(FakePolyhedron(priority))
+        return self.polyhedra[-1]
 
 
 class FakeGrid:
@@ -364,15 +385,15 @@ class TestAKindWithNoBuilderIsRefused:
         # No excitation axis: the envelope asks for one only from the kinds that
         # integrate a voltage across a gap, and refuses it from the rest - so a
         # kind it has never heard of has to arrive without one to get this far.
-        self._grown(monkeypatch, "PORT_KINDS", "coaxial")
+        self._grown(monkeypatch, "PORT_KINDS", "differential")
         problem = _microstrip()
         grown = replace(
             problem,
-            ports=(replace(problem.ports[0], kind="coaxial", excitation_axis=None),)
+            ports=(replace(problem.ports[0], kind="differential", excitation_axis=None),)
             + problem.ports[1:],
         )
 
-        with pytest.raises(EnvelopeError, match="no builder for port kind 'coaxial'"):
+        with pytest.raises(EnvelopeError, match="no builder for port kind 'differential'"):
             _build(grown, tmp_path)
 
 
@@ -403,10 +424,19 @@ class TestUnitsCrossingTheBoundary:
         assert csx.grid.delta_unit == problem.length_unit
 
     def test_geometry_stays_in_grid_units(self, fake_engine, tmp_path):
-        """Boxes are millimetres; only the sheet thickness is not."""
-        _, csx, _ = _build(_microstrip(), tmp_path)
+        """Boxes are millimetres; only the sheet thickness is not.
+
+        Read as an extent, which the placement at the origin cannot change and
+        a conversion to metres could not survive.
+        """
+        problem = _microstrip()
+        _, csx, _ = _build(problem, tmp_path)
         substrate = next(p for p in csx.properties if p.name == "FR4")
-        assert substrate.boxes[0][0] == (-50.0, -10.0, 0.0)
+        drawn = next(solid for solid in problem.solids if solid.material == "FR4")
+        lower, upper, _ = substrate.boxes[0]
+        assert [b - a for a, b in zip(lower, upper)] == pytest.approx(
+            [b - a for a, b in zip(drawn.lower, drawn.upper)]
+        )
 
     def test_waveguide_dimensions_are_converted_to_metres(self, fake_engine, tmp_path):
         """a and b are SI while the box that defines them is in grid units."""
@@ -482,13 +512,62 @@ class TestNothingIsDroppedOnTheWay:
         fdtd, _, _ = _build(problem, tmp_path)
         assert fdtd.excite == pytest.approx((5.5e9, 4.5e9))
 
-    def test_the_grid_reaches_the_solver_unchanged(self, fake_engine, tmp_path):
+    def test_the_grid_reaches_the_solver_as_drawn_apart_from_where_it_is(self):
         """The envelope's lines are what gets solved - that is what makes a
-        mesh preview honest."""
+        mesh preview honest. The engine is handed them at the origin rather than
+        where they were drawn, and a translation is the one change that leaves
+        every spacing in a mesh alone.
+        """
         problem = _microstrip()
-        _, csx, _ = _build(problem, tmp_path)
-        for dim, axis in enumerate("xyz"):
-            assert csx.grid.lines[axis] == pytest.approx(problem.grid[dim].tolist())
+        placed, offset = problem.at_the_origin()
+        for dim in range(3):
+            assert placed.grid[dim].tolist() == pytest.approx(
+                (problem.grid[dim] + offset[dim]).tolist()
+            )
+            assert np.diff(placed.grid[dim]).tolist() == pytest.approx(
+                np.diff(problem.grid[dim]).tolist()
+            )
+
+    def test_and_the_grid_the_geometry_and_the_ports_are_in_one_system(self, fake_engine, tmp_path):
+        """The way a translation can go wrong that is worse than not doing one:
+        a structure part of which moved.
+
+        Read off what the engine was handed against what the envelope holds, and
+        never against what the placement says those should be - those two agree
+        by construction even when the placement is wrong, so a check made that
+        way passes on a model whose grid moved and whose metal stayed put.
+        """
+        problem = _microstrip()
+        fdtd, csx, _ = _build(problem, tmp_path)
+
+        moved: dict[str, tuple] = {
+            "the grid": tuple(
+                csx.grid.lines[axis][0] - float(problem.grid[dim][0])
+                for dim, axis in enumerate("xyz")
+            )
+        }
+        for material in {solid.material for solid in problem.solids}:
+            drawn = [solid for solid in problem.solids if solid.material == material]
+            boxes = next(p for p in csx.properties if p.name == material).boxes
+            assert len(boxes) == len(drawn), f"{material} reached the engine as other solids"
+            for solid, box in zip(drawn, boxes):
+                moved[f"solid {solid.name!r}"] = tuple(
+                    here - there for here, there in zip(box[0], solid.lower)
+                )
+        for number, port in enumerate(problem.ports):
+            moved[f"port {port.number}"] = tuple(
+                here - there
+                for here, there in zip(fdtd.ports[number].recorded["start"], port.start)
+            )
+
+        # Not equality: recovering an offset by subtraction lands on a different
+        # last bit for each pair of operands it is recovered from. A structure
+        # part of which did not move disagrees by the offset itself.
+        theirs = moved.pop("the grid")
+        for what, ours in moved.items():
+            assert ours == pytest.approx(theirs, rel=1e-9), (
+                f"{what} did not move with the grid, which went to {theirs}"
+            )
 
     def test_the_microstrip_excitation_sign_is_passed(self, fake_engine, tmp_path):
         """Trace-to-ground integration runs downward, so it must be negated."""
@@ -566,6 +645,14 @@ class TestTheRecordAResultCarries:
         problem = replace(_microstrip(), timestep_factor=0.5)
         assert self.provenance(problem)["timestep_factor"] == 0.5
 
+    def test_it_records_what_the_tail_shares_were_judged_against(self):
+        """They are shares of the drive, and what makes one of them a verdict
+        is the response the study said it reads. Anything reading this file
+        later has to be able to reach the same verdict, and the tail shares
+        alone do not say which one it was."""
+        problem = replace(_microstrip(), smallest_response=0.01)
+        assert self.provenance(problem)["smallest_response"] == 0.01
+
     def test_what_was_measured_off_the_records_goes_in_whole(self):
         """Per port, and under the names ``_extract`` gave them. A merge that
         renamed or flattened them would leave ``tail_share`` describing one port
@@ -619,3 +706,147 @@ class TestWhatASolveSaysAboutItsOwnRecords:
     def test_a_run_that_finished_says_nothing(self, fake_engine, tmp_path, capsys):
         self.solved(tmp_path)
         assert "CHECK" not in capsys.readouterr().out
+
+    def test_the_same_run_is_called_short_by_a_study_reading_deeper(
+        self, fake_engine, tmp_path, capsys
+    ):
+        """The one route with no human on it, so the declaration has to reach
+        the marker rather than only the panel: an unattended search over a
+        stopband would otherwise be handed leakage as a result."""
+        deeper = replace(_microstrip(), smallest_response=1e-4)
+        self.solved(tmp_path, deeper)
+
+        checks = [line for line in capsys.readouterr().out.splitlines() if "CHECK" in line]
+        assert len(checks) == 1
+        assert "severity=warn" in checks[0] and "-80 dB" in checks[0]
+
+
+# ---------------------------------------------------------------------------
+# Which surfaces are grown before the engine samples them
+# ---------------------------------------------------------------------------
+
+_OCTAHEDRON_FACES = (
+    (0, 1, 4),
+    (1, 2, 4),
+    (2, 3, 4),
+    (3, 0, 4),
+    (1, 0, 5),
+    (2, 1, 5),
+    (3, 2, 5),
+    (0, 3, 5),
+)
+
+
+def _octahedron(centre, radius):
+    """A closed surface wound outward, whose every vertex normal is an axis.
+
+    Which is what makes it worth the fixture: the step at each point is then one
+    axis's own cell rather than a mixture of three, so what reached the engine
+    can be read against the grid without trigonometry.
+    """
+    points = []
+    for axis in range(3):
+        for sign in (1.0, -1.0):
+            points.append(tuple(c + sign * radius * (dim == axis) for dim, c in enumerate(centre)))
+    order = (0, 2, 1, 3, 4, 5)
+    return tuple(points[index] for index in order), _OCTAHEDRON_FACES
+
+
+def _with_a_curved_solid(material_kind: str) -> Problem:
+    vertices, faces = _octahedron((10.0, 10.0, 10.0), 4.0)
+    lower = tuple(min(point[dim] for point in vertices) for dim in range(3))
+    upper = tuple(max(point[dim] for point in vertices) for dim in range(3))
+    return Problem(
+        title="one curved solid",
+        frequency=Frequency(start=1e9, stop=2e9, points=11),
+        grid=MeshGrid(
+            x=np.arange(0.0, 20.5, 0.5),
+            y=np.arange(0.0, 20.5, 0.5),
+            z=np.arange(0.0, 20.5, 0.5),
+        ),
+        materials=(
+            Material(name="Body", kind=material_kind, epsilon=2.0)
+            if material_kind == "dielectric"
+            else Material(name="Body", kind=material_kind),
+        ),
+        solids=(
+            Solid(
+                material="Body",
+                lower=lower,
+                upper=upper,
+                priority=10,
+                label="Ball",
+                vertices=vertices,
+                faces=faces,
+            ),
+        ),
+        ports=(
+            Port(
+                number=1,
+                kind="lumped",
+                start=(2.0, 2.0, 2.0),
+                stop=(3.0, 3.0, 3.0),
+                propagation_axis=1,
+                excitation_axis=2,
+                excite=True,
+                feed_resistance=50.0,
+                reference_impedance=50.0,
+                label="Probe",
+            ),
+        ),
+        boundary=("PEC",) * 6,
+        termination=Termination(max_timesteps=10, end_criteria=0.0),
+    )
+
+
+class TestAConductorIsGrownBeforeItIsSampled:
+    """openEMS decides a metal edge on one point and so builds a conductor's
+    surface at the last grid line still inside the drawing. The adapter answers for
+    that by handing over a surface grown by half a cell, and this is where that
+    decision is read off what the engine was actually given - the alternative
+    being a two-minute solve, which is where it was only covered before."""
+
+    def _handed(self, problem, tmp_path):
+        _, csx, _ = _build(problem, tmp_path)
+        primitive = next(p for p in csx.properties if p.polyhedra).polyhedra[0]
+        return np.asarray(primitive.vertices), primitive
+
+    def test_a_metal_surface_arrives_half_a_cell_out(self, fake_engine, tmp_path):
+        problem = _with_a_curved_solid("pec")
+        drawn = np.asarray(problem.solids[0].vertices)
+        handed, _ = self._handed(problem, tmp_path)
+        centre = drawn.mean(axis=0)
+        was = np.linalg.norm(drawn - centre, axis=1)
+        # Read against the placed drawing rather than the original: the
+        # structure is moved to the origin first, and both went together.
+        now = np.linalg.norm(handed - handed.mean(axis=0), axis=1)
+        assert now == pytest.approx(was + 0.25, rel=1e-9, abs=0.0), (
+            "a conductor did not reach the engine grown by half a cell"
+        )
+
+    def test_a_dielectric_surface_arrives_as_it_was_drawn(self, fake_engine, tmp_path):
+        """openEMS averages a dielectric over the cell rather than sampling a
+        point, so it carries no such rounding and growing it would introduce
+        one."""
+        problem = _with_a_curved_solid("dielectric")
+        drawn = np.asarray(problem.solids[0].vertices)
+        handed, _ = self._handed(problem, tmp_path)
+        was = np.linalg.norm(drawn - drawn.mean(axis=0), axis=1)
+        now = np.linalg.norm(handed - handed.mean(axis=0), axis=1)
+        assert now == pytest.approx(was, rel=1e-9, abs=0.0), (
+            "a dielectric was moved, and nothing rounds it"
+        )
+
+    def test_the_triangles_are_handed_over_unchanged(self, fake_engine, tmp_path):
+        """Growing a surface moves its points. How they are joined is what makes
+        it the same surface."""
+        problem = _with_a_curved_solid("pec")
+        _, primitive = self._handed(problem, tmp_path)
+        assert primitive.faces == [tuple(face) for face in problem.solids[0].faces]
+
+    def test_a_box_is_not_a_surface_and_is_not_moved(self, fake_engine, tmp_path):
+        """A box arrives exactly, because the mesher pins a line to each of its
+        faces - there is no rounding to answer for and moving it would be one."""
+        problem = _microstrip()
+        _, csx, _ = _build(problem, tmp_path)
+        assert not any(prop.polyhedra for prop in csx.properties)

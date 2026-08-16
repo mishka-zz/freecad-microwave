@@ -3,12 +3,17 @@
 
 """Impedance along a line, from one port's reflection - solver-neutral.
 
-A step response is the inverse transform of S11 against a reference the port
-did not measure. That last clause is the reason for the module's central
-refusal: a port referenced to *its own* measured impedance has already stated
-what the line is, and transforming that statement returns it unchanged. So
-:func:`step_response` insists on a reference that is one real constant across
-the band - a lumped port's declared resistance.
+A step response is the inverse transform of S11 against **one real impedance**,
+so a port reported against its own measured Z(f) - complex and dispersive,
+which is what a microstrip port extracts from the field - is renormalised onto
+a real constant first. That is what a bench does with a de-embedded
+measurement, and it costs nothing: what comes back is the reflection an
+instrument referenced to that number would have read.
+
+The number is the caller's where one is given, and the port's own at band
+centre where none is. :attr:`Trace.reference_measured` says which, because a
+number the port measured is not one the study named - and the section the port
+sits on then reads that measurement back rather than checking it.
 
 Reads a :class:`~.sparameters.SParameters` and nothing else. No FreeCAD, no Qt,
 and scikit-rf only through :mod:`._skrf`.
@@ -26,11 +31,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ..units import SPEED_OF_LIGHT
 from . import _skrf
 from .sparameters import ResultError
-
-#: Speed of light in vacuum, m/s. The bound a measured velocity is held to.
-LIGHT = 299792458.0
 
 #: How many frequency bins below the first measured point may be invented.
 #:
@@ -83,6 +86,11 @@ class Trace:
     port: int
     #: The real impedance the reflection is measured against, in ohms.
     reference: float
+    #: Whether :attr:`reference` is the port's own measurement rather than a
+    #: number the study named. True for a port reported against an impedance it
+    #: extracted from the field, which is dispersive and has no one number of
+    #: its own to state.
+    reference_measured: bool
     #: Round-trip time from the reference plane, in seconds.
     time: np.ndarray
     #: Reflection coefficient against time. Always defined.
@@ -99,7 +107,7 @@ def _ohms(reflection: np.ndarray, reference: float) -> np.ndarray:
     genuinely singular; away from one, the window's overshoot carries ``|rho|``
     a fraction past unity and the expression returns a large negative
     impedance, which no passive structure can take. ``nan`` covers both: a plot
-    breaks its line, and nothing downstream inherits a number nobody measured.
+    breaks its line, and nothing downstream inherits an unmeasured number.
     """
     reflection = np.asarray(reflection)
     singular = np.abs(reflection) >= 1.0
@@ -109,18 +117,23 @@ def _ohms(reflection: np.ndarray, reference: float) -> np.ndarray:
     return ohms
 
 
-def _reference_of(result, port: int) -> float:
-    """The one real impedance this port's terms are referenced to.
+def _reference_of(result, port: int, chosen: float | None) -> tuple[float, bool]:
+    """The real impedance the trace is measured against, and who chose it.
 
-    Each refusal names a different action: drive the port, declare its
-    impedance, fix the reference, or reference it to something real.
+    ``chosen`` wins wherever it is given. Otherwise the port's own reference
+    serves: as it stands where that is already one real constant, and as its
+    real part at band centre where it is not.
 
-    A port nobody drove is asked about first. ``SParameters`` folds every
-    undriven port into ``self_referenced``, which is true bookkeeping and the
-    wrong diagnosis here - nothing was restated, and the user would be sent to
-    a setting that cannot help.
+    The second value is true only in that last case. A port reported against
+    "its own" impedance that turns out to be a number is reported against that
+    number - a lumped port's own impedance is the resistance that was typed -
+    so what the array says decides, not what was declared. It is the judgement
+    :func:`~.sparameters._own_or` already makes to caption the same matrix.
+
+    An undriven port is refused rather than answered. Its column is ``nan``, so
+    there is nothing to renormalise and nothing to transform, and the fix is to
+    drive it rather than to change what it is measured against.
     """
-    column = np.asarray(result.reference, dtype=complex)[:, result.index_of(port)]
     if port in result.unmeasured:
         raise ResultError(
             f"cannot take a step response at port {port}: nobody drove it, so its "
@@ -129,40 +142,30 @@ def _reference_of(result, port: int) -> float:
             "solve again, or declare the study symmetric so its column can be "
             "derived from the port that was driven"
         )
-    if port in result.self_referenced:
-        raise ResultError(
-            f"cannot take a step response at port {port}: it is referenced to its "
-            "own measured impedance, so the reflection is that measurement "
-            "restated and the trace would be flat at it by construction. Drive "
-            "the line from a port whose impedance is declared rather than "
-            "measured - a lumped port states its resistance - and the reflection "
-            "then carries what the line actually is"
-        )
-    if column.size and not np.all(column == column.flat[0]):
-        raise ResultError(
-            f"cannot take a step response at port {port}: it is referenced to "
-            f"{column.flat[0]:.4g} at the bottom of the band and "
-            f"{column.flat[-1]:.4g} at the top, and the conversion from "
-            "reflection to impedance needs one number for the whole trace. "
-            "Reference the study to a fixed impedance"
-        )
-    if column.size and column.flat[0].imag != 0.0:
-        raise ResultError(
-            f"cannot take a step response at port {port}: it is referenced to "
-            f"{column.flat[0]:.4g}, and an impedance read off a reflection is "
-            "real by construction - a complex reference has no place to put its "
-            "imaginary part. Reference the study to a real impedance"
-        )
-    return float(column.flat[0].real) if column.size else 0.0
+    if chosen is not None:
+        return float(chosen), False
+    column = np.asarray(result.reference, dtype=complex)[:, result.index_of(port)]
+    if column.size == 0:
+        return 0.0, False
+    if np.all(column == column.flat[0]) and column.flat[0].imag == 0.0:
+        return float(column.flat[0].real), False
+    return float(column[column.size // 2].real), True
 
 
 def _one_port(result, port: int, reference: float):
-    """Port ``port``'s own reflection, as a one-port ``skrf.Network``.
+    """Port ``port``'s reflection against ``reference``, as a one-port ``skrf.Network``.
 
     Built term by term rather than through :meth:`SParameters.network`, which
     refuses a matrix with an undriven column. A time-domain solve drives one
     port per run, so the ordinary two-port study *has* an undriven column and
     would be refused for a term this transform never reads.
+
+    Moving one port's reference is the whole of the renormalisation, and it can
+    be done on the term alone: every other port stays terminated in whatever it
+    was, so the load this one looks into does not change and no term outside
+    S(p,p) enters the answer. What comes back is therefore this port's
+    reflection and says nothing about the terms left behind - which is all the
+    transform reads.
     """
     frequency = np.asarray(result.frequency, dtype=float)
     term = np.asarray(result.parameter(port, port), dtype=complex)
@@ -174,13 +177,16 @@ def _one_port(result, port: int, reference: float):
             "reads the whole band at once, so a hole in it spreads across the "
             "entire trace rather than staying where it is"
         )
+    stored = np.asarray(result.reference, dtype=complex)[:, result.index_of(port)]
     skrf = _skrf.module()
-    return skrf.Network(
+    network = skrf.Network(
         frequency=skrf.Frequency.from_f(frequency, unit="hz"),
         s=term.reshape(-1, 1, 1),
-        z0=reference,
+        z0=stored.reshape(-1, 1),
         s_def="power",
     )
+    network.renormalize(reference, s_def="power")
+    return network
 
 
 #: How far the frequency steps may vary before the sweep is not uniform.
@@ -235,8 +241,21 @@ def _check_the_sweep(result, port: int) -> None:
         )
 
 
-def step_response(result, port: int, *, window: str = WINDOW, spectrum: int = SPECTRUM) -> Trace:
+def step_response(
+    result,
+    port: int,
+    *,
+    reference: float | None = None,
+    window: str = WINDOW,
+    spectrum: int = SPECTRUM,
+) -> Trace:
     """The reflection at ``port`` against time, and the impedance it implies.
+
+    ``reference`` is the impedance to measure the reflection against, in ohms.
+    The port's own serves where none is given - at band centre where it
+    disperses - so a study referenced to nothing in particular still draws.
+    Naming one is what makes two studies comparable, and what puts a trace on
+    the number an instrument would have been calibrated to.
 
     The sweep is extrapolated to DC before transforming, which is what a
     reflectometer built on a swept measurement does and why nothing here asks
@@ -244,14 +263,14 @@ def step_response(result, port: int, *, window: str = WINDOW, spectrum: int = SP
     held to.
     """
     _check_the_sweep(result, port)
-    reference = _reference_of(result, port)
-    if reference <= 0.0:
+    ohms, measured = _reference_of(result, port, reference)
+    if not np.isfinite(ohms) or ohms <= 0.0:
         raise ResultError(
-            f"cannot take a step response at port {port}: its reference "
-            f"impedance is {reference:g} ohm, and a reflection coefficient is "
-            "measured against a positive one"
+            f"cannot take a step response at port {port}: it would be measured "
+            f"against {ohms:g} ohm, and a reflection coefficient needs a "
+            "positive one"
         )
-    network = _one_port(result, port, reference)
+    network = _one_port(result, port, ohms)
     extrapolated = network.extrapolate_to_dc(kind="linear")
     time, reflection = extrapolated.step_response(
         window=window, pad=max(0, spectrum - len(extrapolated))
@@ -259,10 +278,11 @@ def step_response(result, port: int, *, window: str = WINDOW, spectrum: int = SP
     reflection = np.asarray(reflection).ravel()
     return Trace(
         port=port,
-        reference=reference,
+        reference=ohms,
+        reference_measured=measured,
         time=np.asarray(time).ravel(),
         reflection=reflection,
-        impedance=_ohms(reflection, reference),
+        impedance=_ohms(reflection, ohms),
     )
 
 
@@ -275,26 +295,13 @@ def velocity(result, receiving: int, driving: int, separation: float) -> float:
     launches included - the right quantity for putting distance on an axis, and
     the wrong one for quoting a substrate's effective permittivity.
 
-    **Taken across the band, and not as an average of local group delays**,
-    which is the one decision here. A structure that reflects also stores, and
-    stored energy is delay with no distance in it. Storage is resonant, so it
-    gives the phase back where it borrowed it and cancels out of the phase
-    accumulated across a band wide enough to hold the ripple; it does not
-    cancel out of local slopes, which are dominated by wherever the structure
-    is ringing. A band narrower than that ripple is not checkable here, and
-    one absurd sample is carried rather than rejected.
-
-    **Do not centre the unwrapping on the band's own advance.** Either side of
-    a transmission zero a structure's phase runs backwards, so honest steps
-    span more than a whole turn; no centre is safe for all of them, and one
-    chosen from the middle relocates the outliers by a turn each.
-
-    **A sweep too coarse to unwrap cannot be caught from the phase**, which
-    stays perfectly straight and takes the wrong slope. What the fold leaves is
-    a delay too small for the distance it covers, so the check is on the
-    velocity against the speed of light: exact, needing no tuning, and
-    necessary rather than sufficient. The point count is the caller's to get
-    right.
+    Three decisions, each with a plausible alternative that fails:
+    the phase is taken **across the band** rather than as an average of local
+    group delays, the unwrapping is **not centred** on the band's own advance,
+    and a sweep too coarse to unwrap is caught on the resulting **velocity
+    against the speed of light** rather than from the phase, which stays
+    straight and simply takes the wrong slope. Why each, in
+    docs/internals/velocity-from-phase.md.
     """
     frequency = np.asarray(result.frequency, dtype=float)
     term = np.asarray(result.parameter(receiving, driving), dtype=complex)
@@ -321,7 +328,7 @@ def velocity(result, receiving: int, driving: int, separation: float) -> float:
 
     phase = np.unwrap(np.angle(term))
     delay = float(phase[0] - phase[-1]) / (2 * np.pi * band)
-    if delay <= 0.0 or separation / delay > LIGHT:
+    if delay <= 0.0 or separation / delay > SPEED_OF_LIGHT:
         raise ResultError(
             f"cannot measure a velocity: the phase of S{receiving}{driving} puts "
             f"{separation:g} m at {delay * 1e12:.1f} ps, which is not a speed "

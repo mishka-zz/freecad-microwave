@@ -190,7 +190,7 @@ def find_interpreter(
     """Locate a Python that owns the openEMS bindings.
 
     Order, and no other source: the caller's explicit setting, then
-    ``MICROWAVE_OPENEMS_PYTHON``, then the interpreter we are already running
+    ``MICROWAVE_OPENEMS_PYTHON``, then the interpreter already running
     in, then ``python3`` on ``PATH``. Each candidate is *verified* by importing
     the bindings, because a path that exists and cannot import openEMS fails
     later and much less clearly.

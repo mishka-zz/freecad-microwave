@@ -34,7 +34,7 @@ def _extend_path():
 
     **Appended, not inserted.** FreeCAD's own ``site-packages`` precedes it, so
     an interpreter that already provides one of these libraries keeps its copy
-    and we never hijack the name in the user's own scripts. We are the fallback.
+    and the name is never hijacked in the user's own scripts. This is the fallback.
 
     ``__file__`` is used rather than FreeCAD's resource directories because this
     runs during ``import Microwave``, which is ordinary module scope and has it.

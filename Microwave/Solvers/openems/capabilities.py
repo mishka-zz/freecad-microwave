@@ -59,21 +59,43 @@ def capabilities() -> Capabilities:
     """
     return Capabilities(
         solver="openEMS",
-        port_types=frozenset({"microstrip", "lumped", "rect_waveguide"}),
+        port_types=frozenset({"microstrip", "lumped", "rect_waveguide", "coaxial"}),
         materials=frozenset({"dielectric", "lossy_dielectric", "pec", "conducting_sheet"}),
         domains=frozenset({"open", "enclosed"}),
         outputs=frozenset({"s_parameters", "impedance"}),
         excitations=frozenset({"port"}),
-        geometry=frozenset({"box", "sheet", "rectilinear sheet"}),
+        geometry=frozenset(
+            {"box", "sheet", "rectilinear sheet", "arbitrary solid", "arbitrary sheet"}
+        ),
         notes={
             "high_q": "resonant structures need a long pulse decay; expect "
             "runtimes an order of magnitude above a matched line",
-            "axis_aligned": "a solid must fill its bounding box, and a flat "
-            "sheet must have every edge on an axis - the Yee grid is "
-            "rectilinear, so a rotation, a curve or a taper would be "
-            "staircased silently. A sheet short of its box is cut into "
-            "rectangles instead, exactly, so an L or a whole layout passes. "
-            "What drew it does not matter",
+            "staircasing": "a solid of any shape is held exactly - its own "
+            "surface is sent, and the engine answers containment against that "
+            "- so what approximates a curve is the grid rather than the "
+            "geometry. A solid that already fills its bounding box is sent as "
+            "a box, which is cheaper and identical",
+            "curved_conductor_thickness": "a solid held as a surface is "
+            "resolved by the wavelength in its material and by the lengths its "
+            "boundary carries - a gap to another body, how tightly a face "
+            "curves, a sharp edge - but not yet by its own thickness, which none "
+            "of those measures: the two faces bounding a foil belong to one "
+            "body, so no gap lies between them, and how tightly a bent foil "
+            "curves is a measure of the bend rather than of the wall. A thin "
+            "curved or diagonal conductor can therefore come out coarser than it "
+            "should; check the mesh over one before trusting a loss or an "
+            "impedance taken from it",
+            "flat_outlines": "a *flat* sheet of any outline is held too, as the "
+            "area it encloses rather than as a closed surface - which it has no "
+            "thickness to be. An outline made of axis-aligned edges is cut into "
+            "rectangles exactly and costs the grid the least; anything else - a "
+            "round pad, a curved taper, a letter with a counter in it - is sent "
+            "as coplanar polygons, holes included",
+            "coaxial_port": "a coaxial port measures a line the drawing "
+            "supplies - it lays no conductor and no fill of its own, so what "
+            "it reports is the line that was drawn rather than an ideal one "
+            "beside it. The annulus it reads across therefore has to be "
+            "resolved by the mesh like any other gap",
             "electrically_small": "a fine feature inside a large volume sets "
             "the timestep for the whole domain (CFL); consider a frequency-"
             "domain solver instead",

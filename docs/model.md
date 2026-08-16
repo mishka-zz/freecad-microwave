@@ -74,7 +74,7 @@ go stale.
 
 | Object | Label | What it holds | Solver |
 |---|---|---|---|
-| `EMAnalysis` | EM Analysis | Frequency band, points, waveform, declared symmetry | neutral |
+| `EMAnalysis` | EM Analysis | Frequency band, points, waveform, declared symmetry, how far down it is read | neutral |
 | `EMSolverOpenEMS` | openEMS | Boundaries, PML depth, timesteps, threads, interpreter | openEMS |
 | `EMMeshPolicy` | Mesh Policy | Sizing per wavelength, growth, domain padding | neutral |
 | `EMMeshRegion` | Mesh Refinement | Local element size over some geometry | neutral |
@@ -102,6 +102,7 @@ What is being measured, and with what.
 | `NumFrequencyPoints` | 501 | How many points results are reported at |
 | `Waveform` | Gaussian | The excitation the band is measured with |
 | `Symmetry` | None | Mirror symmetry declared about the device |
+| `SmallestResponse` | 0.0 | Smallest response this study reads, in dB (0 = full scale) |
 
 The band is not a sweep list. A time-domain run excites the whole band with one
 pulse and transforms the answer, so the point count costs nothing but the size
@@ -137,6 +138,40 @@ What it costs when the declaration is wrong: the derived half of the matrix is a
 claim, not a measurement. The run warns where the drawing, the ports or the grid
 do not look like the mirror declared, and it warns rather than refuses, because
 the engineer may know something the geometry does not say.
+
+### The smallest response
+
+`SmallestResponse` says how far down the response is going to be read, in dB,
+where 0 is full scale and a stopband is written the way it is plotted: `-40`.
+It changes nothing about the solve. What it changes is the bar a finished run is
+held to.
+
+A run stops at `MaxTimesteps` whether or not the device has, and what is left
+ringing shows up as leakage across the whole response - measured afterwards, and
+reported per port. Whether that leakage matters depends entirely on what it
+lands beside. Left at 0 the run is held to a leakage small beside a response of
+one, which is the right bar for a matched line or a length of guide.
+
+It is the wrong bar for a filter. A stopband of -40 dB *is* |S21| = 0.01, so a
+run leaking at that bar carries a 100% error in the only quantity the device
+exists to deliver, and says nothing. Set `SmallestResponse` to -40 and the bar
+moves down with it: the leakage is now weighed against the stopband rather than
+against unity, and a run too short to resolve it says so.
+
+Nothing measures this for you, and that is deliberate. Every solved response has
+small terms in it - a well-matched line's own reflection is one - and nothing in
+the numbers distinguishes a term that is the point of the exercise from one
+nobody will look at. Only whoever asked for the run knows which is which.
+
+Expect longer runs when you declare a deep one. Reading further down means
+waiting for the field to decay further, and that is real time rather than a
+setting.
+
+Declare it before the run. The bar is applied while the solve is being read, and
+the figure it reached is stored with the result - so changing `SmallestResponse`
+afterwards moves the envelope without re-judging anything already on disk. There
+is nothing to lose by setting it early: it changes no number the solver
+produces.
 
 ## Pre-flight
 

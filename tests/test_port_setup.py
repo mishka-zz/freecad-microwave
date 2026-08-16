@@ -3,7 +3,7 @@
 
 """Reading a port's axes off the geometry, and what happens when it cannot.
 
-The rules here are the mirror of the ones ``document._microstrip`` enforces: it
+The rules here are the mirror of the ones ``ports._microstrip`` enforces: it
 derives the excitation direction from the shapes and refuses when the property
 disagrees, so anything this module infers has to land on the value that refusal
 would accept. ``TestAgainstTheAdapter`` is the test that ties the two together
@@ -112,12 +112,20 @@ class TestOnePerPortKind:
         mouth = ((0, 0, 0), (10.7, 4.3, 0))
         assert port_setup.waveguide_axis(mouth, guide) == "Z"
 
+    def test_a_coaxial_line_reads_the_way_down_it(self):
+        """The ring is a cross-section like a guide's mouth, so the axis comes
+        off the same two questions. That it is annular matters where the radii
+        are read and nowhere here."""
+        line = ((-3.5, -3.5, 0), (3.5, 3.5, 80))
+        ring = ((-3.5, -3.5, 80), (3.5, 3.5, 80))
+        assert port_setup.coaxial_axis(ring, line) == "-Z"
+
 
 class TestAgainstTheAdapter:
     """What is inferred has to be what the adapter would accept.
 
     Two modules measure the same geometry: this one to set the property, and
-    ``document._microstrip`` to check it. If they ever disagree the port is
+    ``ports._microstrip`` to check it. If they ever disagree the port is
     created already refusing itself, which is the state this whole module exists
     to end.
     """
@@ -219,6 +227,15 @@ class TestFillingAPortIn:
         port = StubPort()
         assert port_setup.fill_waveguide(port, [(guide, "Face5")]) == []
         assert port.CrossSection == (guide, ["Face5"])
+        assert port.PropagationAxis == "Z"
+
+    def test_a_coaxial_port_needs_only_its_ring(self):
+        line = _shape(
+            ((-3.5, -3.5, 0), (3.5, 3.5, 80)), {"Face3": ((-3.5, -3.5, 0), (3.5, 3.5, 0))}
+        )
+        port = StubPort()
+        assert port_setup.fill_coaxial(port, [(line, "Face3")]) == []
+        assert port.Annulus == (line, ["Face3"])
         assert port.PropagationAxis == "Z"
 
 

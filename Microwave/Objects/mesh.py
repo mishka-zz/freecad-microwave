@@ -7,44 +7,80 @@ from ._vp_hook import ViewProviderRestored
 
 
 class EMMeshRegion(ViewProviderRestored):
-    """Local refinement: make the elements around this geometry smaller.
+    """Local sizing: change how big the elements around this geometry are.
 
     Absolute lengths, where ``EMMeshPolicy`` is per wavelength. Global
-    sizing resolves the *wave*, whose scale is lambda; a refinement region
-    resolves a *feature*, whose scale is millimetres. Upstream openEMS agrees:
-    every local override in its tutorials is a length or a divisor of the bulk,
-    never a cells-per-wavelength figure.
+    sizing resolves the *wave*, whose scale is lambda; a region resolves a
+    *feature*, whose scale is millimetres. Upstream openEMS agrees: every local
+    override in its tutorials is a length or a divisor of the bulk, never a
+    cells-per-wavelength figure.
 
-    It **refines only**. A region coarser than the coarsest cell the mesher
-    would produce anyway is refused by name when the mesh is built, because
-    coarsening past the bulk target is numerical dispersion - an error that
-    appears as a wrong answer rather than as a visibly bad grid. A region
-    between that ceiling and the local material's own size is accepted and
-    simply does not bite: the sizing field takes the finer of the two.
+    It points both ways, and the two directions are not mirror images.
+
+    ``Refine`` covers a **box** - the bounding box of what it names - and asks
+    for elements no larger than ``ElementSize`` anywhere inside it. Asking for
+    something coarser than the mesher's own ceiling is refused by name, because
+    a refinement that coarsens is a contradiction rather than a request.
+
+    ``MinElementsAcross`` beside it asks for a **count**, and a count is spent on
+    each axis against that axis' own span. So it costs nothing along a direction
+    the box is long in, and it is the way to resolve something narrow without
+    refining everything level with it. It reaches every axis the box has extent
+    on, a thickness included.
+
+    ``Coarsen`` attaches to the **object**, and lets that object's own demands
+    settle for ``ElementSize`` rather than the size they would otherwise ask
+    for. It is deliberately not a box. A rectilinear grid is separable, so a box
+    spends itself on a slab through the model along each axis: a refinement that
+    overshoots that way hands out elements nobody asked for, while the opposite
+    would take them away from whatever else happens to lie level with the box,
+    anywhere in the model. Naming the object cannot reach past it.
+
+    What ``Coarsen`` never moves is where the elements *are*. Faces, port planes
+    and sheets are pinned whatever the sizing says, so the geometry the solver
+    is given is the geometry that was drawn; what changes is how many elements
+    are spent following it. Nor can it coarsen past the global ceiling, which
+    bounds every element in the model.
+
+    What it gives up is everything that geometry was asking for, and not only
+    the bulk size: a conductor's edge treatment, a dielectric's own element
+    count, a curve's fidelity. A gap between the coarsened object and something
+    else is the exception and stays, because a separation belongs to both and
+    one of them settling for less is not the other agreeing.
 
     Neutral, like every object in this layer: "element" covers an FDTD cell, a
-    MoM segment and an FEM tetrahedron, and all three meshers have a local
-    refinement region. What each backend does with the box is its own business.
+    MoM segment and an FEM tetrahedron, and all three meshers size locally. What
+    each backend does with it is its own business.
     """
 
     def __init__(self, obj):
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "Mode",
+            "Refinement",
+            "Whether this makes the elements around its geometry finer, or lets"
+            " that geometry settle for coarser ones",
+        )
+        obj.Mode = ["Refine", "Coarsen"]
+
         # LinkSubList, matching EMMaterialBinding.References: a refinement
         # region is just as likely to be aimed at a face as at a whole solid.
         obj.addProperty(
             "App::PropertyLinkSubList",
             "References",
             "Refinement",
-            "The geometry this refinement is aimed at. Its bounding box is what"
-            " gets refined, and on a rectilinear grid each axis is refined as a"
-            " slab through the model",
+            "The geometry this is aimed at. Refining covers its bounding box,"
+            " and on a rectilinear grid each axis is refined as a slab through"
+            " the model; coarsening applies to the whole object instead",
         )
 
         obj.addProperty(
             "App::PropertyLength",
             "ElementSize",
             "Refinement",
-            "Target element size inside this region; must be finer than the"
-            " global size, which is set by ElementsPerWavelength",
+            "Target element size. Refining, it must be finer than the global"
+            " size set by ElementsPerWavelength; coarsening, it is the size"
+            " this geometry settles for",
         )
         obj.ElementSize = 0.0
 
@@ -57,7 +93,9 @@ class EMMeshRegion(ViewProviderRestored):
             "App::PropertyInteger",
             "MinElementsAcross",
             "Refinement",
-            "Fewest elements across this region (0 = inherit the global count)",
+            "Fewest elements across this region, on every axis it has extent on"
+            " (0 = inherit the global count). A count asks for resolution, so it"
+            " belongs to Refine only",
         )
         obj.MinElementsAcross = 0
 
@@ -65,7 +103,7 @@ class EMMeshRegion(ViewProviderRestored):
             "App::PropertyBool",
             "Enabled",
             "Refinement",
-            "Uncheck to leave the region in the tree but out of the mesh",
+            "Uncheck to leave this in the tree but out of the mesh",
         )
         obj.Enabled = True
 
@@ -92,7 +130,7 @@ class EMMeshPolicy(ViewProviderRestored):
 
     Sizing is **per wavelength, never in millimetres**, and that is load-
     bearing. A remembered millimetre value silently under-resolves the moment
-    anyone raises the permittivity or the frequency. Local refinement is the
+    the permittivity or the frequency is raised. Local refinement is the
     opposite - absolute - because it resolves a *feature*, whose scale is
     millimetres, rather than the *wave*, whose scale is lambda. See
     ``EMMeshRegion``.
@@ -178,12 +216,8 @@ class EMMeshPolicy(ViewProviderRestored):
                 )
                 setattr(obj, pname, 8)
 
-        # Per-face: does the model stop inside the domain with air around it, or
-        # run out *through* the absorber? "Through" pulls the domain in so the
-        # absorber lands on the structure, which is what makes a transmission
-        # line infinite. Give a line air at its ends instead and it radiates off
-        # an open circuit, and every impedance read from it is contaminated by
-        # the reflection - so this is a choice, not something to infer.
+        # Per-face, and deliberately not inferred: what Through does to the
+        # domain, and why a line needs it, is in openems.policy._padding.
         for axis in ["X", "Y", "Z"]:
             for side in ["Min", "Max"]:
                 pname = f"Padding{axis}{side}"

@@ -831,7 +831,7 @@ def _octahedron(centre, radius):
     return tuple(points[index] for index in order), _OCTAHEDRON_FACES
 
 
-def _prism(centre, radius, height, facets=12):
+def _prism(centre, radius, height, facets=16):
     """A closed prism on ``z``, capped by fans from its own rim.
 
     An octahedron cannot pose the question the clearance answers: every one of

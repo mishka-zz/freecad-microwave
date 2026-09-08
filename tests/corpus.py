@@ -23,6 +23,7 @@ Python there is none, and the names still have to be enumerable.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -44,6 +45,14 @@ __all__ = ["CELL_CAP", "EDGE_SIZE", "Specimen", "Unavailable", "round_trip", "sp
 #: specimens compare two empty sets.
 CELL_CAP = 5.0
 EDGE_SIZE = 0.25
+
+#: How many cells the corpus asks across a dielectric's own thickness. Not a
+#: policy either: what it has to be is more than one, since a count of one asks
+#: for the layer's whole extent and is the rule's own off switch, and small
+#: enough that the reach it buys - the count times the cap - still stops short
+#: of the specimens' other dimensions, or a substrate would be measured across
+#: its width as well as across its wall.
+ELEMENTS_ACROSS = 4
 
 #: The thickness a conductor drawn as a surface is given here, in mm. The edge
 #: size stands in for the cell the metal is meshed at, which is what the adapter
@@ -101,6 +110,20 @@ class Specimen:
         of material a surface carrying no thickness is given one. Off by
         default, so every specimen already here keeps being asked the question
         it was written to answer.
+    :param beside: A **second object**, drawn in the same document. Not part of
+        the specimen's own shape: what it is measured for is the gap to it, and
+        a compound would be one object however many lumps went into it. The
+        subject is what everything else here reads - its measures, its
+        containment, its round trip - and the companion joins it only where the
+        mesher is asked what the drawing carries.
+    :param dielectric: Whether to run this one as a dielectric. A conductor
+        measures the most and is what the corpus asks by default, but the two
+        materials are asked different questions - metal that a cell fit inside
+        it, a layer that several cells span it - so the second question needs a
+        specimen that reaches it.
+    :param tip: Whether the shape runs out to an edge its material thins to
+        nothing at. What a cross-section demand reads there is set by how near
+        the tip the sample landed rather than by any length the drawing carries.
     """
 
     name: str
@@ -111,6 +134,9 @@ class Specimen:
     wall: float | None = None
     gap: float | None = None
     skin: bool = False
+    beside: Callable[[Any], Any] | None = None
+    dielectric: bool = False
+    tip: bool = False
 
 
 def _vector(part: Any, x: float, y: float, z: float) -> Any:
@@ -155,6 +181,20 @@ def _torus(part: Any) -> Any:
     return part.makeTorus(6.0, 2.0)
 
 
+def _bored_torus(part: Any) -> Any:
+    """A torus with a bore through its side, so its one face is trimmed.
+
+    The torus beside it covers its whole parameter rectangle and says nothing
+    about a face that does not. This one's face is periodic in both directions
+    and carries a hole, so its boundary is a seam at each end of two periods
+    plus a loop inside them - which is the shape a station has to be placed
+    against rather than assumed onto.
+    """
+    import FreeCAD
+
+    return part.makeTorus(6.0, 2.0).cut(part.makeSphere(0.8, FreeCAD.Vector(0.0, 6.0, 2.0)))
+
+
 def _wedge(part: Any) -> Any:
     return part.makeWedge(0.0, 0.0, 0.0, 2.0, 2.0, 5.0, 4.0, 3.0, 3.0, 4.0)
 
@@ -185,6 +225,41 @@ def _fuse(part: Any) -> Any:
 
 def _common(part: Any) -> Any:
     return part.makeBox(6.0, 6.0, 6.0).common(part.makeSphere(4.0, _vector(part, 3.0, 3.0, 3.0)))
+
+
+def _fuse_to_a_false_prism(part: Any) -> Any:
+    """A step whose own base says the cut came out right when it did not.
+
+    Its cross-section changes along every axis, so no one sweep makes it - but
+    its base swept through the whole height covers exactly the volume the solid
+    has. A cut proved by volume alone would therefore accept a block holding the
+    drawing's own volume in the wrong place, part of it metal nowhere drawn and
+    part of the drawing missing, and prove itself right doing it. What refuses
+    that block is the surface: it is the boundary rather than the measure, and
+    the two disagree wherever the metal is.
+
+    It is also the shape a bounding box describes worst - half of that box is
+    space nobody drew - so what the width bar reads off it is the whole
+    difference between the box and the metal.
+    """
+    return part.makeBox(2.0, 2.0, 1.0).fuse(
+        part.makeBox(4.0, 1.0, 1.0, _vector(part, 0.0, 0.0, 1.0))
+    )
+
+
+def _fuse_to_a_stack(part: Any) -> Any:
+    """A via between two pads, which is a boundary each plane above draws again.
+
+    The pads share their outline, and each plane the via stands between carries
+    it again - as a frame, the via's own footprint being interior there. So a
+    cut of it is exercised on a boundary the drawing has more than once.
+    """
+    return (
+        part.makeBox(4.0, 4.0, 1.0)
+        .fuse(part.makeBox(2.0, 2.0, 1.0, _vector(part, 1.0, 1.0, 1.0)))
+        .fuse(part.makeBox(4.0, 4.0, 1.0, _vector(part, 0.0, 0.0, 2.0)))
+        .removeSplitter()
+    )
 
 
 def _cut_to_a_box(part: Any) -> Any:
@@ -244,6 +319,50 @@ def _hollow_sphere(part: Any) -> Any:
 
 def _extrude(part: Any) -> Any:
     return part.Face(part.Wire(part.makeCircle(3.0).Edges)).extrude(_vector(part, 0.0, 0.0, 5.0))
+
+
+#: One trace folded back on itself, closed, in mm: long arms joined alternately
+#: at their ends, each one narrow against the box around the whole of it. That
+#: disparity is the point of the specimen - a bounding box is a useless answer to
+#: how wide this conductor is, and the pieces it cuts into sit at different
+#: places on both axes, so no one span describes them either. Drawn both flat and
+#: extruded, because the cut has to reach the same rectangles either way.
+MEANDER = (
+    (0.0, 0.0),
+    (10.0, 0.0),
+    (10.0, 3.0),
+    (1.0, 3.0),
+    (1.0, 4.0),
+    (10.0, 4.0),
+    (10.0, 7.0),
+    (0.0, 7.0),
+    (0.0, 6.0),
+    (9.0, 6.0),
+    (9.0, 5.0),
+    (0.0, 5.0),
+    (0.0, 2.0),
+    (9.0, 2.0),
+    (9.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 0.0),
+)
+
+#: What :func:`_extrude_meander` is drawn thick, in mm. A thickness is not what
+#: this specimen is about; it is here so the outline is a solid, and it is what
+#: the pieces cut from that solid have to stand through.
+MEANDER_THICKNESS = 0.5
+
+
+def _meander_outline(part: Any, elevation: float = 0.0) -> Any:
+    return part.Face(
+        part.Wire(part.makePolygon([_vector(part, x, y, elevation) for x, y in MEANDER]))
+    )
+
+
+def _extrude_meander(part: Any) -> Any:
+    """One Manhattan outline extruded to a thickness. A rectilinear grid holds it
+    exactly once it is cut, and its bounding box holds the bends as metal."""
+    return _meander_outline(part).extrude(_vector(part, 0.0, 0.0, MEANDER_THICKNESS))
 
 
 def _revolve(part: Any) -> Any:
@@ -327,6 +446,12 @@ def _rectangle(part: Any) -> Any:
     )
 
 
+def _sheet_meander(part: Any) -> Any:
+    """The same trace as :func:`_extrude_meander`, drawn with no thickness. The
+    twin that says the cut does not depend on which way it was drawn."""
+    return _meander_outline(part)
+
+
 def _disc(part: Any) -> Any:
     """A flat outline that is not rectangles, so it is held as triangles and its
     boundary is the only thing that can ask for a line near it."""
@@ -339,6 +464,66 @@ def _annulus(part: Any) -> Any:
     outer = part.Face(part.Wire(part.makeCircle(4.0).Edges))
     inner = part.Face(part.Wire(part.makeCircle(1.5).Edges))
     return outer.cut(inner)
+
+
+#: The radius of the clearance every ground plane below is drawn around, in mm.
+#: One hole and several planes, so what is compared across them is the plane and
+#: nothing else.
+CLEARANCE_RADIUS = 0.4
+
+
+def _ground_plane(part: Any, side: float) -> Any:
+    """A square ground plane of ``side``, with one round clearance cut in it."""
+    half = 0.5 * side
+    plane = part.Face(
+        part.makePolygon(
+            [
+                _vector(part, -half, -half, 0.0),
+                _vector(part, half, -half, 0.0),
+                _vector(part, half, half, 0.0),
+                _vector(part, -half, half, 0.0),
+                _vector(part, -half, -half, 0.0),
+            ]
+        )
+    )
+    return plane.cut(part.Face(part.Wire(part.makeCircle(CLEARANCE_RADIUS).Edges)))
+
+
+def _sheet_clearance(part: Any) -> Any:
+    """A small round clearance in a plane far larger than it.
+
+    The hole is a fixed size and the share of the plane it occupies falls as the
+    plane grows, so a request stated against the plane's extent asks for less of
+    the hole the more plane there is around it. Drawn far enough apart in size to
+    leave the band the kernel answers a request in, which the corpus's other
+    curved sheets stay inside.
+    """
+    return _ground_plane(part, 40.0)
+
+
+def _round_ground(part: Any, radius: float) -> Any:
+    """A round ground plane of ``radius``, with the same clearance cut in it."""
+    plane = part.Face(part.Wire(part.makeCircle(radius).Edges))
+    return plane.cut(part.Face(part.Wire(part.makeCircle(CLEARANCE_RADIUS).Edges)))
+
+
+def _sheet_clearance_round(part: Any) -> Any:
+    """The same clearance again, in a ground plane that is itself curved.
+
+    It separates a rule following the curve at hand from one following the widest
+    curve on the sheet: here there is a real radius at both ends, where a square
+    board offers only its own straight sides. Drawn to the span
+    :func:`_sheet_clearance_wide` has, so what differs between those two is the
+    ground's own curve and nothing else.
+    """
+    return _round_ground(part, 100.0)
+
+
+def _sheet_clearance_wide(part: Any) -> Any:
+    """The same clearance with far more plane around it. What reaches the engine
+    is the same hole, so anything about it that differs from
+    :func:`_sheet_clearance` was decided by the plane."""
+    return _ground_plane(part, 200.0)
 
 
 def _sheet_on_x(part: Any) -> Any:
@@ -446,6 +631,63 @@ def _near_flat(part: Any) -> Any:
     return part.makeBox(8.0, 6.0, 1e-6)
 
 
+#: The angle a blade closes to at its tip, in degrees. Its two faces then point
+#: ``180`` less this apart - the end of the dihedral no other specimen reaches,
+#: a corner being drawn everywhere in this corpus and a feather edge nowhere.
+BLADE_DEGREES = 2.0
+
+#: How far the blade runs back from its tip, and how deep it stands, in mm.
+#: Large enough against the metal edge size that the tip is followed along its
+#: length rather than sampled once, and small enough that the shape stays a
+#: millimetre-sized drawing like the rest of the corpus.
+BLADE_LENGTH = 10.0
+BLADE_HEIGHT = 6.0
+
+#: How the second blade is turned: about a line lying in no coordinate plane, by
+#: an angle that is not a quarter turn, so no edge and no face of the drawing
+#: comes to rest on an axis. What a join asks for across its edge has to come
+#: back the same from both blades.
+BLADE_TURN_ABOUT = (1.0, 2.0, 3.0)
+BLADE_TURN_DEGREES = 37.0
+
+
+def _blade(part: Any) -> Any:
+    """Metal run out to a feather edge, with the tip along an axis.
+
+    Its two faces have closed on each other until they nearly point opposite
+    ways, and the field escapes along the direction between them. A demand stated
+    per face holds each face's own normal and leaves that direction to whatever
+    the rest of the grid gave it, by more the nearer the faces come.
+
+    Planar throughout, so the triangulation is exact and nothing measured off it
+    is measuring a chord.
+    """
+    across = BLADE_LENGTH * math.tan(math.radians(BLADE_DEGREES))
+    outline = part.Face(
+        part.makePolygon(
+            [
+                _vector(part, 0.0, 0.0, 0.0),
+                _vector(part, BLADE_LENGTH, 0.0, 0.0),
+                _vector(part, BLADE_LENGTH, across, 0.0),
+                _vector(part, 0.0, 0.0, 0.0),
+            ]
+        )
+    )
+    return outline.extrude(_vector(part, 0.0, 0.0, BLADE_HEIGHT))
+
+
+def _blade_turned(part: Any) -> Any:
+    """The same blade, turned off every axis: the only thing that differs
+    between the two drawings is how the part was put down."""
+    shape = _blade(part)
+    shape.rotate(
+        _vector(part, 0.0, 0.0, 0.0),
+        _vector(part, *BLADE_TURN_ABOUT),
+        BLADE_TURN_DEGREES,
+    )
+    return shape
+
+
 def _two_disjoint(part: Any) -> Any:
     """One object, two pieces, and a bounding box holding the gap between them."""
     return part.makeCompound(
@@ -490,8 +732,8 @@ PAIR_GAP = 0.3
 PAIR_RADIUS = 5.0
 
 
-def _sphere_pair(part: Any) -> Any:
-    """A gap between two lumps of one object, with nothing else to measure it.
+def _one_lump(part: Any) -> Any:
+    """One of the pair, at the origin.
 
     The lumps are spheres for the reason :func:`_hollow_sphere` is one: a sphere
     carries no sharp join, and a radius this size asks for cells well coarser
@@ -500,16 +742,26 @@ def _sphere_pair(part: Any) -> Any:
     really about - would have their rims asking for the metal edge size all
     round the gap, and would pass whether or not anything measured it.
 
-    Both lumps are curved, so both reach the mesher as triangles. A pair of
-    boxes would not: each pins its own faces and the thirds rule sizes what is
-    between them, so nothing here would be exercised.
+    Curved, so it reaches the mesher as triangles. A box would not: it pins its
+    own faces and the thirds rule sizes what is beside it, so nothing here would
+    be exercised.
     """
-    return part.makeCompound(
-        [
-            part.makeSphere(PAIR_RADIUS),
-            part.makeSphere(PAIR_RADIUS, _vector(part, 2.0 * PAIR_RADIUS + PAIR_GAP, 0.0, 0.0)),
-        ]
-    )
+    return part.makeSphere(PAIR_RADIUS)
+
+
+def _the_other_lump(part: Any) -> Any:
+    """Its twin, a gap away along x."""
+    return part.makeSphere(PAIR_RADIUS, _vector(part, 2.0 * PAIR_RADIUS + PAIR_GAP, 0.0, 0.0))
+
+
+def _sphere_pair(part: Any) -> Any:
+    """A gap between two lumps of one object, with nothing else to measure it.
+
+    Built from the same two lumps the two-object specimen is drawn from, so the
+    pair of drawings differs in nothing but how many objects it took - which is
+    the whole of what comparing them says.
+    """
+    return part.makeCompound([_one_lump(part), _the_other_lump(part)])
 
 
 #: The gap :func:`_pad_pair` is drawn with, and the radius of each pad. Declared
@@ -620,6 +872,37 @@ def _reflector(part: Any) -> Any:
     ).Faces[0]
 
 
+def _warped_slab(part: Any) -> Any:
+    """A block whose top and bottom are a trapezoid with one corner half a
+    micron out of the plane of the other three.
+
+    A sketch that arrived from somewhere else is flat to whatever wrote it, and
+    the kernel answers such a face with a free-form surface rather than a plane.
+    It is here because ``isPlanar`` holds a face to a distance from a fitted
+    plane and not to a curvature, so this one is called planar and still carries
+    a radius - which is the case the curvature reading skips.
+
+    A solid rather than a sheet, because a sheet that flat is held as a
+    rectangle; and a trapezoid rather than a rectangle, because a block filling
+    its own bounding box is held as a box and neither reaches the reading.
+
+    The corner is out by less than the kernel's own confusion tolerance, which
+    is what makes the face free-form and still planar to it. Further out and the
+    surface is one the kernel reports curving, which the corpus already carries;
+    this specimen is here for the band between the two.
+    """
+    wire = part.makePolygon(
+        [
+            _vector(part, 0, 0, 0),
+            _vector(part, 10, 0, 0),
+            _vector(part, 10, 6, 5e-8),
+            _vector(part, 0, 3, 0),
+            _vector(part, 0, 0, 0),
+        ]
+    )
+    return part.makeFilledFace(wire.Edges).extrude(_vector(part, 0, 0, 3))
+
+
 def _creased_wall(part: Any) -> Any:
     """Three faces of a box: a shell with two right-angle creases, where an
     offset of one face runs into the offset of its neighbour."""
@@ -653,6 +936,43 @@ def _degenerate_line(part: Any) -> Any:
 def _tiny_against_the_domain(part: Any) -> Any:
     """Orders of magnitude smaller than the domain, and away from its walls."""
     return part.makeBox(0.01, 0.01, 0.01, _vector(part, 5.0, 5.0, 5.0))
+
+
+# --------------------------------------------------------------- dielectrics
+
+
+#: The wall the two substrate specimens are drawn with, and the radius each is
+#: drawn on. Named for the reason :data:`HOLLOW_WALL` is - the specimen declares
+#: the wall to the gate that reads it. The radius is an order above the wall, so
+#: nothing the surface curves through can stand in for it, and both shapes are
+#: wide enough across that every other length on them asks for coarser cells
+#: than the count across the wall does.
+SUBSTRATE_WALL = 0.6
+SUBSTRATE_RADIUS = 6.0
+
+
+def _substrate_flat(part: Any) -> Any:
+    """A layer of that wall lying on an axis, drawn with a curved outline.
+
+    Round rather than rectangular because a rectangular board is handed to the
+    engine as a box and never reaches the mesher as triangles at all, so nothing
+    would be measured off it. A disc arrives as triangles like the rolled one
+    and still has its wall on an axis.
+    """
+    return part.makeCylinder(SUBSTRATE_RADIUS, SUBSTRATE_WALL)
+
+
+def _substrate_rolled(part: Any) -> Any:
+    """The same layer wrapped round a cylinder, which is the drawing a count
+    along the layer's own normal exists for.
+
+    Its bounding box is the cylinder's, so a rule reading thickness off a box
+    reads this as the bore rather than as the wall - and the normal runs through
+    every direction in the plane, so a rule stated per axis has to compose.
+    """
+    return part.makeCylinder(SUBSTRATE_RADIUS, 10.0).cut(
+        part.makeCylinder(SUBSTRATE_RADIUS - SUBSTRATE_WALL, 10.0)
+    )
 
 
 # ------------------------------------------------------------------ round trip
@@ -717,6 +1037,12 @@ def specimens() -> tuple[Specimen, ...]:
         Specimen(
             "torus", _torus, "genus one, so containment has to find the hole", tags=("primitive",)
         ),
+        Specimen(
+            "bored_torus",
+            _bored_torus,
+            "a trimmed face on a surface periodic both ways",
+            tags=("primitive", "boolean"),
+        ),
         Specimen("wedge", _wedge, "planar faces on none of the axes", tags=("primitive",)),
         Specimen(
             "ellipsoid", _ellipsoid, "curvature that varies across a face", tags=("primitive",)
@@ -735,6 +1061,18 @@ def specimens() -> tuple[Specimen, ...]:
             tags=("boolean",),
         ),
         Specimen(
+            "boolean_to_a_false_prism",
+            _fuse_to_a_false_prism,
+            "a step whose base swept through it has the solid's own volume",
+            tags=("boolean",),
+        ),
+        Specimen(
+            "boolean_to_a_stack",
+            _fuse_to_a_stack,
+            "a pad's outline drawn again by every plane standing on it",
+            tags=("boolean",),
+        ),
+        Specimen(
             "fillet", _fillet, "small curvature as a detail on a thick body", tags=("feature",)
         ),
         Specimen("chamfer", _chamfer, "a sharp join replaced by two", tags=("feature",)),
@@ -749,6 +1087,12 @@ def specimens() -> tuple[Specimen, ...]:
             wall=HOLLOW_WALL,
         ),
         Specimen("extrude", _extrude, "a cylinder that was never the primitive", tags=("sweep",)),
+        Specimen(
+            "extrude_meander",
+            _extrude_meander,
+            "a conductor whose arms are a fraction of its box",
+            tags=("sweep",),
+        ),
         Specimen("revolve", _revolve, "a cone that was never the primitive", tags=("sweep",)),
         Specimen("loft", _loft, "a ruled surface between two circles", tags=("sweep",)),
         Specimen("pipe", _pipe, "a round conductor lying along no axis", tags=("sweep",)),
@@ -760,8 +1104,32 @@ def specimens() -> tuple[Specimen, ...]:
             tags=("primitive",),
         ),
         Specimen("sheet_rectangle", _rectangle, "a flat area held exactly", tags=("sheet",)),
+        Specimen(
+            "sheet_meander",
+            _sheet_meander,
+            "the same conductor with no thickness, cut where it lies",
+            tags=("sheet",),
+        ),
         Specimen("sheet_disc", _disc, "a flat area whose outline is curved", tags=("sheet",)),
         Specimen("sheet_annulus", _annulus, "a flat area with a hole in it", tags=("sheet",)),
+        Specimen(
+            "sheet_clearance",
+            _sheet_clearance,
+            "a curved feature far smaller than the sheet carrying it",
+            tags=("sheet",),
+        ),
+        Specimen(
+            "sheet_clearance_wide",
+            _sheet_clearance_wide,
+            "that same feature with far more sheet around it",
+            tags=("sheet",),
+        ),
+        Specimen(
+            "sheet_clearance_round",
+            _sheet_clearance_round,
+            "that same feature in a sheet that curves too, orders wider",
+            tags=("sheet",),
+        ),
         Specimen("sheet_on_x", _sheet_on_x, "a flat area normal to x", tags=("sheet",)),
         Specimen(
             "sheet_on_y",
@@ -823,6 +1191,20 @@ def specimens() -> tuple[Specimen, ...]:
             "too thin to be a solid, too thick to be a sheet",
             tags=("awkward",),
         ),
+        Specimen(
+            "blade",
+            _blade,
+            "a join closed to a feather edge, with its tip on an axis",
+            tags=("awkward",),
+            tip=True,
+        ),
+        Specimen(
+            "blade_turned",
+            _blade_turned,
+            "the same feather edge turned off every axis",
+            tags=("awkward",),
+            tip=True,
+        ),
         Specimen("two_disjoint", _two_disjoint, "one object in two pieces", tags=("awkward",)),
         Specimen(
             "touching_at_a_corner",
@@ -844,6 +1226,31 @@ def specimens() -> tuple[Specimen, ...]:
             "a gap between two sheets of one object, which holds no solid to split",
             tags=("awkward",),
             gap=PAD_GAP,
+        ),
+        Specimen(
+            "sphere_beside_sphere",
+            _one_lump,
+            "the same gap, to a second drawn object rather than to a second lump",
+            tags=("awkward",),
+            gap=PAIR_GAP,
+            beside=_the_other_lump,
+        ),
+        Specimen(
+            "substrate_flat",
+            _substrate_flat,
+            "a dielectric layer a box cannot describe, with its wall on an axis",
+            tags=("dielectric",),
+            wall=SUBSTRATE_WALL,
+            dielectric=True,
+        ),
+        Specimen(
+            "substrate_rolled",
+            _substrate_rolled,
+            "the same layer round a cylinder, so its wall lies along no axis and "
+            "its box is the bore",
+            tags=("dielectric",),
+            wall=SUBSTRATE_WALL,
+            dielectric=True,
         ),
         Specimen(
             "tiny_against_the_domain",
@@ -912,6 +1319,12 @@ def specimens() -> tuple[Specimen, ...]:
             "a skin open on three sides, with metal wanted on both of its faces",
             tags=("skin",),
             skin=True,
+        ),
+        Specimen(
+            "warped_slab",
+            _warped_slab,
+            "a free-form face the kernel calls planar and still curves",
+            tags=("sweep",),
         ),
         Specimen(
             "creased_wall",

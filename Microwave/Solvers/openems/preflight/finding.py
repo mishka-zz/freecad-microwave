@@ -3,13 +3,12 @@
 
 """What every check shares: how it reports, and when two coordinates are one place.
 
-A check decides and returns :class:`Finding` objects; it never prints, refuses
-or raises. :func:`~.check` collects them and the callers above render
-``str(finding)``.
+A check returns :class:`Finding` objects. It never prints, refuses or raises.
+:func:`~.check` collects them, and the callers above render ``str(finding)``.
 
-:data:`_ON_THE_GRID` is here for the same reason - it is the one tolerance
-several checks have to agree on, and a tolerance two modules define separately
-is one they will eventually disagree about.
+:data:`_ON_THE_GRID` is defined here because several checks have to agree on it.
+Two modules that define one tolerance separately will eventually disagree about
+it.
 """
 
 from __future__ import annotations
@@ -26,48 +25,62 @@ WARN = "warn"
 SUBSTITUTE = "substitute"
 
 
-#: How far off a grid line a coordinate may be and still count as on it, in mm,
-#: and by the same argument how far two coordinates may sit apart and still be
-#: one place. One picometre: far below any length this workbench meshes, and
-#: above the rounding a domain wall picks up passing through the mesher's
-#: arithmetic.
+#: How far off a grid line a coordinate may sit and still count as on it, in mm.
+#: By the same argument, two coordinates this far apart are one place. The value
+#: is one picometre, far below any length this workbench meshes.
+#:
+#: What it has to cover is the envelope's rounding rather than the mesher's. A
+#: pinned position is written back literally while an axis is meshed, and
+#: ``mesh._validate`` asks for it exactly. A stored envelope has been through
+#: :func:`~..model.canonical`, which keeps ``CANONICAL_DIGITS`` significant
+#: digits, so a coordinate is on disk to a part in 1e11 of itself and comes back
+#: half of that away from where it was meshed. That is under a picometre while
+#: the coordinate is under a metre, and over it above.
 _ON_THE_GRID = 1e-9
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Finding:
     """One thing wrong, or worth saying, about a problem.
 
-    ``subjects`` is **one entry per object**, and it is a tuple because one
-    sentence is routinely true of several. A check passes the single name it is
-    talking about and gets a one-tuple; only :func:`_grouped` builds a longer
-    one. Passing a bare string is a convenience for the thirty-odd call sites
-    and is the only coercion done - nothing else is validated, because every
-    caller is in this package.
+    ``subjects`` holds one entry per object. It is a tuple because one sentence
+    is routinely true of several objects. A check whose sentence is about one
+    object passes its name and gets a one-tuple; a check whose sentence is about
+    two passes both, and :func:`_grouped` builds the longer ones. Passing a bare
+    string is a convenience for the call sites, and it is the only coercion
+    done. Nothing else is validated, since every caller is in
+    this package.
 
-    A subject is a label to show the user, never a key to look an object up by:
-    after merging it names all of them.
+    A subject is a label to show the user rather than a key to look an object up
+    by. After merging, the subjects name every object the sentence was said of.
 
     Duplicates are kept. ``Solid.name`` falls back to the material when a solid
     has no label, so two objects can share a name, and dropping the repeat here
-    would make :func:`object_count` undercount the very case it exists for. The
-    repeat is collapsed for *display* instead, in :attr:`subject`.
+    would make :func:`object_count` undercount the case it exists for. The
+    repeat is collapsed for display instead, in :attr:`subject`.
     """
 
     severity: str
     subjects: tuple[str, ...]
     message: str
 
-    def __post_init__(self) -> None:
-        if isinstance(self.subjects, str):
-            object.__setattr__(self, "subjects", (self.subjects,))
+    # Written out rather than generated. A lone name is stored as a tuple, and a
+    # dataclass states one type for both the argument and the attribute. A
+    # generated signature would have to declare either the tuple, which is wrong
+    # at every call site passing a name, or the union, which then travels to
+    # every reader of `subjects`.
+    def __init__(self, severity: str, subjects: tuple[str, ...] | str, message: str) -> None:
+        object.__setattr__(self, "severity", severity)
+        object.__setattr__(self, "subjects", (subjects,) if isinstance(subjects, str) else subjects)
+        object.__setattr__(self, "message", message)
 
     @property
     def subject(self) -> str:
         """The subjects as a reader wants them: ``'A'``, ``'A and B'``, ``'A, B and C'``.
 
-        Each distinct name once. Two objects under one name are two objects and
-        one word, and "Copper and Copper" says nothing the singular does not.
+        Each distinct name appears once. Two objects under one name are two
+        objects and one word, since "Copper and Copper" says no more than the
+        singular.
         """
         names = list(dict.fromkeys(self.subjects))
         if len(names) == 1:
@@ -81,21 +94,20 @@ class Finding:
 def _grouped(findings: Sequence[Finding]) -> list[Finding]:
     """One finding per distinct thing said, naming every object it was said of.
 
-    A check that walks the model says its sentence once per object it holds
-    for, so the count of lines follows the size of the model rather than the
-    number of things wrong with it. Printing every copy is what trains a reader
-    to skip the section, and the section exists to be read.
+    A check that walks the model repeats its sentence once per object it holds
+    for, so the number of lines follows the size of the model rather than the
+    number of things wrong with it. A reader who meets every copy learns to skip
+    the section, and the section is there to be read.
 
-    Merging is on the **message**, so two objects are named together only when
-    the sentence is identical down to the coordinates in it. Two solids
-    overhanging the same wall at different distances have different sentences
-    and stay apart, because one line quoting one position for both would be
-    false. It follows that a message must carry no numeral counting its own
-    subjects - "both" is true when it is written and false after two more
-    objects say it.
+    Merging is on the message, so two objects are named together only when the
+    sentence is identical down to the coordinates in it. Two solids overhanging
+    the same wall at different distances have different sentences and stay
+    apart, because one line quoting one position for both would be false. A
+    message must therefore carry no numeral counting its own subjects: "both" is
+    true when it is written and false after two more objects say it.
 
-    Nothing is dropped: every subject that went in comes out, repeats included,
-    so ``len(finding.subjects)`` is how many objects a line stands for.
+    Nothing is dropped. Every subject that went in comes out, repeats included,
+    so ``len(finding.subjects)`` is the number of objects a line stands for.
     """
     merged: dict[tuple[str, str], list[str]] = {}
     for finding in findings:

@@ -3,105 +3,114 @@
 
 """Acceptance gate: impedance read *along* a line, not at its port.
 
-A microstrip of three sections - wide, narrow, wide - driven from a lumped port
-at each end, solved once, and turned into a step response. What is read off the
-trace is where each step sits, how flat the line is between the steps, how large
-each step is, and what impedance each section settles at.
+Three sections of symmetric stripline - wide, narrow, wide - inside a shield,
+driven from a lumped port at each end, solved once and turned into a step
+response. What is read off the trace is what impedance each section settles at,
+where each step sits, how flat the line is between the steps, and how large each
+step is.
 
 What this gate is for
 ---------------------
 
 It is the only gate here that reads a quantity **as a function of position**, so
 it is the only one that would notice a trace being right on average and wrong
-along its length. Where the transitions are, that each section is flat between
-them, and that the steps go the right way and are the right size are all
-properties of the trace's *shape*, and each is held to a bound that carries only
-as much of the instrument as it actually has to.
+along its length. The middle section is the only place in the project where an
+impedance is read somewhere the solver was never asked about directly.
 
-An impedance in ohms carries all of it, and is held accordingly. A lumped port is
-not a precision instrument for ohms - below - so holding one to a metrologist's
-bound would be gating what the method cannot keep. ``test_acceptance_microstrip``
-is where an absolute impedance is scored as tightly as the closed form allows,
-through a port that measures its own.
+Why the sections are stripline
+------------------------------
 
-What the port costs, and what it does not
------------------------------------------
+Because every one of them then has an **exact** reference.
+``tests/stepped_stripline`` sets that out; the short of it is that a
+homogeneously filled line is genuinely TEM, so conformal mapping gives its
+impedance in closed form and the fill gives its velocity exactly. Neither is a
+fit, so nothing printed below has a reference's own error inside it, and the
+bounds are ours to keep.
 
-``test_acceptance_microstrip`` asks an ``MSLPort`` what the line's impedance is;
-the port measures it from the field and reports it. This asks nothing: the ports
-here **declare** 50 ohm, a lumped port being a resistance whose ``Z_ref`` is the
-number in the envelope rather than anything extracted.
+What follows from the fill rather than from the formula, each of which keeps a
+term out of this measurement:
 
-Declaring it does not make it neutral. Put the two instruments on the same board,
-the same strip and the same mesh and they disagree, with the lumped port reading
-low, and it is not the port's own box that decides by how much. What differs is
-where each takes its voltage and its current. ``MSLPort`` space-averages its two
-current probes, with upstream's own comment saying why - *"space averaging: Ht is
-now defined at the same pos as Et"* (``openEMS/python/openEMS/ports.py:331``).
-``LumpedPort`` averages nothing: its voltage probe runs along the box's centre
-line (``ports.py:187-190``) and its current probe sits on a plane at the box's
-mid-height (``ports.py:196-199``), and every S-parameter off it is that pair's
-ratio.
+**The distance axis needs no measurement.** One velocity under all three
+sections, known exactly, so a transition's position is a statement about the
+drawing rather than about the drawing and a fitted speed together. What is left
+in it is the instrument: a lumped port is an inductive path between the strip
+and the plane rather than a plane of its own, so the trace begins a little
+before the port's box does. That displacement is left in and bounded against
+the resolution rather than corrected for, and the ``GATE`` lines are where its
+size is.
 
-So the two gates stay independent where it counts. They share the solver, the
-mesher and the material, and share nothing about how an impedance is arrived at:
-one is a field ratio at a plane, the other a reflection in time against a
-declared reference. Two closed-form comparisons that agree by different
-mechanisms are worth more than one repeated - but agreeing is not agreeing to the
-last digit, and :data:`PORT_BIAS` is what that costs.
+**A plateau is the impedance at every frequency.** A TEM line has no dispersion,
+so nothing has to be argued about which part of the sweep the comparison is
+entitled to use.
 
-It does not reach the shape. A bias near enough to a scale on the whole trace
-cancels out of the ratio between two plateaus, out of where the trace crosses the
-half-height between them, and out of how flat either one is.
+**Nothing radiates.** The four transverse walls are conductor, so no power
+leaves the structure and no absorber is in the signal path: the line ends in its
+two ports, and the ports are resistances.
 
-What the method cannot do, and how that is kept out of the gate
----------------------------------------------------------------
+What the ohms carry, and what the shape does not
+------------------------------------------------
 
-``Z = Z_ref (1 + rho) / (1 - rho)`` reads a reflection as though the wave had met
-nothing before it. That is exact at the first discontinuity and false after it,
-because what returns from beyond a second interface has crossed the first one
-twice and comes back scaled by its two-way transmission - and the conversion has
-no term to undo that scaling. Undoing it means peeling the discontinuities off
-one at a time, which this does not do.
+An absolute impedance carries everything between the line and the reading of it,
+and is held accordingly - :func:`tolerance` composes that bound per section, and
+every term in it is measured off the run rather than declared:
 
-The effect is *not* multiple reflections. Anything that rattles between two
-interfaces arrives two full section traversals late, which on this line puts it
-past the end of the board and outside every window read here.
+- **The mesh, arriving through the *reference*.** The closed form is of the line
+  that was drawn; the line the grid holds is a different one, and what that is
+  worth is arithmetic over the planned cross-section rather than a figure.
+  :func:`mesh_term` computes it and every absolute comparison carries it, so what
+  the drawn line is missed by is mostly not the solver getting it wrong.
+  :func:`test_each_section_reads_the_line_the_grid_holds` takes the same term out
+  of both sides instead, and what is left over there is :data:`INSTRUMENT`.
+- **The record.** A run stops after a fixed count of steps whether the field has
+  gone or not, and what is still in the port then is an error in S.
+  :func:`record_term` prices it through the derivative of the same expression the
+  trace is read with. The trace's own port and no other: a step response is built
+  from one reflection, so what the far end kept lands on a transmission no
+  impedance here is read off.
+- **The instrument**, which is :data:`INSTRUMENT`, and is what the first of these
+  leaves behind once it is taken out of both sides.
 
-So the **first two** sections are held to Hammerstad and the third is not; gating
-it against a closed form would be gating the method's bias. The third is instead
-held against an ideal line of the same three impedances put through the identical
-transform, which carries the same bias on both sides and cancels it - leaving the
-solver, which is what a gate is for.
+The strip's edge is in none of them, and deliberately: openEMS conducts on the
+lines *inside* a conductor, so the metal handed over is narrower than drawn - but
+that is the same difference the mesh term already carries, and charging it again
+would price one mechanism as two. It survives only in :func:`shape_tolerance`,
+where the mesh cancels between two plateaus and what is left is the *difference*
+between what one displacement is worth on two widths.
+
+A shape carries less. A bias near enough to a scale on the whole trace cancels
+out of the ratio between two plateaus, out of where the trace crosses the
+half-height between them, and out of how flat either one is - so those are held
+at bounds with no port term in them at all.
+
+What is not scored here
+-----------------------
+
+**The step's own reactance.** A junction between two widths stores energy and
+the ideal cascade has no term for it, so nothing below asks what a transition
+*looks* like - only where it is. Every window read stops short of a transition
+by more than the band can smear it, which
+``tests/test_stepped_stripline_fixture`` holds before a solver runs.
+
+**Whatever the reflectometry costs on its own.** ``Z = Z_ref (1 + rho) / (1 -
+rho)`` reads a reflection as though the wave had met nothing on the way, which
+is exact at the first discontinuity and false after it. That bias is established
+on a line built from closed forms with no solver anywhere in it - also on the
+fast side - and the third section is held against that line rather than against
+the closed form it misses. The comparison carries the same bias on both sides
+and cancels it, leaving the solver.
 
 What the sweep has to be
 ------------------------
 
-A step response is carried by its low frequencies, and everything below the first
-measured point is invented by the extrapolation rather than solved for. So the
-sweep starts one frequency step above DC - ``FREQ_MAX / POINTS`` - which is the
-shape ``Results.tdr`` insists on and refuses without.
+A step response is carried by its low frequencies, and everything below the
+first measured point is invented by the extrapolation rather than solved for. So
+the sweep starts one frequency step above DC, which is the shape ``Results.tdr``
+insists on and refuses without.
 
 The band's *top* buys resolution, and resolution is what decides whether a
-section reads as a plateau or as a bump: features closer together than roughly
-``v / (4 * B)`` arrive as one. :data:`SECTION_LENGTH` is set well clear of that
-and :data:`PLATEAU` reads only the middle of each section, so what is averaged is
-clear of both transitions by more than one resolution cell -
-:func:`test_the_window_read_is_clear_of_both_transitions` is what keeps that true
-as the band or the geometry moves.
-
-**Hammerstad is quasi-static, and a plateau is the right thing to compare to it.**
-``test_acceptance_microstrip`` has to restrict its comparison to the bottom of
-the band because it reads Z0 per frequency and the measured value climbs across
-the band. A step response does not have that problem: the plateau away from a
-transition is what the line looks like once the transients have passed, which is
-its low-frequency limit. The dispersion lives in the shape of the transitions,
-which is exactly the part not read here.
-
-Nothing here runs out through the absorber. The line ends at its ports, which
-are 50 ohm resistances and therefore terminate it at every frequency including
-the extrapolated DC - so there is no PML in the signal path and no low-frequency
-leakage for the trace to mistake for structure.
+section reads as a plateau or as a bump. It is bounded from above by the
+enclosure, whose own modes must stay cut off across the whole sweep - see the
+fixture, where that window is held from both sides.
 """
 
 from __future__ import annotations
@@ -112,222 +121,112 @@ import pytest
 from Microwave.Results import tdr
 from Microwave.Results.sparameters import SParameters
 from Microwave.Solvers.openems import preflight, read, residual, run, write
-from Microwave.Solvers.openems.mesh import MeshParams
-from Microwave.Solvers.openems.model import (
-    Frequency,
-    Material,
-    Port,
-    Problem,
-    Solid,
-    Termination,
-)
-from tests.analytic import reference
+from tests import fsv
+from tests import stepped_stripline as line
 
 pytestmark = pytest.mark.slow
 
-SPEED_OF_LIGHT = 299792458.0
+#: How far the width a section answers with may sit from the width it was drawn
+#: at, in cells - the thirds rule's own claim, and the same bound the uniform
+#: stripline gate keeps. It is half of the loss the placement introduces: a rule
+#: that recovered less than half of what it costs would not be worth the line it
+#: moves.
+STRIP_KEPT = 1.0 / 3.0
 
-EPS_R = 4.4
-SUBSTRATE_HEIGHT = 1.6
-SUBSTRATE_WIDTH = 30.0
-
-#: The two widths, in mm. Drawn first and compared against Hammerstad after -
-#: not solved for so that the reference lands on a round number, which would put
-#: the answer in the fixture.
+#: What is left of a section's impedance once the line the grid holds is taken
+#: out, as a share.
 #:
-#: Both are kept clear of ``W / h = 1``, where Hammerstad's two branches were fitted
-#: over separate ranges and never made to meet - ``analytic/reference.py`` records
-#: the step, and it is wider than the agreement claimed here.
-#: :func:`test_the_widths_are_clear_of_the_references_own_step` holds that, and
-#: :func:`test_the_fixture_is_not_vacuous` holds that they are far enough apart
-#: to give a reflection worth reading.
-WIDE = 3.0
-NARROW = 1.0
+#: The instrument, and on this gate that is the port and the junctions together -
+#: a step stores energy, an ideal cascade has no term for it, and nothing here
+#: separates the two. What can be said is the size and the direction, and the
+#: direction is asserted below because it is the part that would change meaning
+#: if it moved.
+#:
+#: Near enough a scale on the whole trace, so it cancels out of anything read as
+#: a ratio and appears in no shape bound below.
+INSTRUMENT = 0.002
 
-#: Each section, in mm. Long enough that the middle of one is clear of both its
-#: transitions - see the module docstring.
-SECTION_LENGTH = 32.0
-SUBSTRATE_LENGTH = 3 * SECTION_LENGTH
+#: How alike the measured trace and the ideal line have to be, as the worst
+#: categories the standard's scale admits - in level, and in the two together.
+#:
+#: Categories and not numbers, which is the point of scoring a curve this way:
+#: the six are fixed by the standard's own interpretation scale, so nobody can
+#: widen either of these by a decimal place. Widening one at all means writing
+#: down a worse word, which is a thing a reader notices.
+#:
+#: **They differ because the two measures answer different questions, and this
+#: gate is entitled to only one of them.** The amplitude measure is about level -
+#: whether the trace sits at the impedance the closed forms give, along its whole
+#: length rather than at three chosen windows - and that is the gate's substantive
+#: claim, so it is held a category tighter than what it achieves.
+#:
+#: The feature measure is about the wiggles, and the ideal line has none of the
+#: things that make them: no step reactance, no launch, no discretisation. All
+#: three are declared out of scope above, and the confidence histogram on the
+#: ``GATE`` line shows where they land - which is the launch. So the combined
+#: figure is allowed a category the level measure is not, and reading the two
+#: apart is what stops a launch this gate does not model from being scored as an
+#: impedance it does.
+TRACE_LEVEL_AT_LEAST = "good"
+TRACE_AT_LEAST = "fair"
 
-#: The sweep. ``FREQ_MIN`` is one step below the second point and one step above
-#: DC, which is what leaves a single invented bin: with ``N`` points from
-#: ``f_stop / N`` to ``f_stop``, the step is exactly ``f_stop / N``.
-FREQ_MAX = 10e9
-POINTS = 201
-FREQ_MIN = FREQ_MAX / POINTS
+#: How far the impedance may vary across a window, as a share of its mean. A TEM
+#: line has no dispersion and a plateau is a straight line, so this is a
+#: statement about the trace alone rather than about any reference: a window
+#: varying by more than this has no single impedance at the accuracy worth
+#: quoting, and the mean taken from it would be a reading of a slope.
+FLAT_ENOUGH = 0.005
 
-COPPER_CONDUCTIVITY = 5.8e7
-COPPER_THICKNESS = 0.035
+#: How far the two steps' positions may sit from the drawing, as a share of
+#: :func:`~tests.stepped_stripline.resolution` - the width a step arrives
+#: smeared over, which is the finest a band-limited edge can be placed at all.
+#:
+#: Below one, which is what the exact velocity buys: the axis carries no fitted
+#: speed, so what is left between a crossing and the drawing is the transform's
+#: own displacement and the port's, and neither is the resolution.
+PLACED_WITHIN = 0.6
 
-#: The impedance both ports declare. A lumped port *is* this resistance, so it
-#: is the structure as well as the reference - and it being declared rather than
-#: extracted is what makes this gate arrive at an impedance by a different route
-#: from the microstrip one.
-PORT_IMPEDANCE = 50.0
+#: The same for the distance *between* the two crossings, which is tighter by a
+#: long way and can be: there is no port in it. What the instrument adds to a
+#: position it adds to both crossings alike and subtracts out, leaving one
+#: section of uniform line, the exact velocity, and the drawing.
+SPACED_WITHIN = 0.1
 
-#: Mesh policy, following openEMS' own ``MSL_Losses.m`` exactly as
-#: ``test_acceptance_microstrip`` does: a twentieth of the wavelength in the
-#: dielectric in the bulk, and a sixth of that at the conductor edge, where a
-#: microstrip's impedance is actually set. Derived, never written as millimetres.
-WAVELENGTH_IN_DIELECTRIC = SPEED_OF_LIGHT / FREQ_MAX / np.sqrt(EPS_R) * 1e3
-DIELECTRIC_RES = WAVELENGTH_IN_DIELECTRIC / 20
-METAL_RES = DIELECTRIC_RES / 6
-CAP = SPEED_OF_LIGHT / FREQ_MAX * 1e3 / 20
+#: How far the power leaving may sit from the power going in, as a share, and
+#: it is a residual guard rather than a measurement.
+#:
+#: **Nothing in this structure dissipates.** Every conductor is perfect, the fill
+#: is lossless, and the four transverse walls are conductor - so unlike an open
+#: microstrip there is no radiation channel either, and a departure from unity is
+#: the instrument. What puts one there is the port's two probes not being one
+#: plane, which grows with frequency and with the standing wave and so dominates
+#: the top of the band.
+PASSIVE_WITHIN = 0.05
 
-TIMESTEPS = 20000
+#: Up to where a tighter bound is asked, in Hz.
+BOTTOM_OF_THE_BAND = 2e9
 
-#: Hammerstad's own quoted accuracy, and therefore as tight as a comparison
-#: against it can honestly be made. The same bar the microstrip gate uses.
-REFERENCE_ACCURACY = 0.01
+#: The same bound at the bottom of the band, written as the one above scaled by
+#: how much shorter that path is in wavelengths there - which is a conservative
+#: shape for it rather than a derivation, the departure being second order in a
+#: phase error and the standing wave entering it as well.
+#:
+#: What it is for is a departure that does *not* fall away with the path. A drive
+#: reaching down to DC leaves one, weighted to the bottom of the band and
+#: arriving through the transmission rather than the reflection, which is why the
+#: bottom is asked the tighter question.
+PASSIVE_AT_THE_BOTTOM = PASSIVE_WITHIN * BOTTOM_OF_THE_BAND / line.FREQ_MAX
 
-#: What the port costs, and it is not the solver getting the line wrong. A
-#: lumped port's reflection reads a microstrip low against a port that measures
-#: its own impedance from the fields, on the same board and the same mesh, and
-#: the size of the port's own box is not what decides it. Near enough a scale on
-#: the whole trace, so it cancels out of anything read as a ratio.
-PORT_BIAS = 0.005
-
-#: What the mesher's demand on a conductor's kept width costs. Sizing the face
-#: element from the width moves the element at the conductor's *edge*, and that
-#: is the quantity a microstrip's impedance follows -
-#: ``docs/internals/conductor-width.md`` is where the demand and its price are
-#: set out. It scales with the width, so the narrow section is charged more than
-#: the wide ones and it does **not** cancel out of a ratio between them.
-MESH_BIAS = 0.007
-
-#: What an absolute comparison against a closed form can claim here: the
-#: reference's own accuracy, and both of the things standing between the line and
-#: the reading of it.
-TOLERANCE = REFERENCE_ACCURACY + PORT_BIAS + MESH_BIAS
-
-#: What a comparison of two readings on one trace can claim - the port drops out
-#: of a ratio and the mesh does not.
-SHAPE_TOLERANCE = REFERENCE_ACCURACY + MESH_BIAS
-
-#: How far into a section to look, as a fraction of its length either side of
-#: its middle. What bounds it is the transition at each end, smeared over the
-#: resolution the bandwidth bought: the window has to stop more than one
-#: resolution cell short of the section's edge, which is
-#: :func:`test_the_window_read_is_clear_of_both_transitions`.
-PLATEAU = 0.15
-
-#: Fewest samples a section's window may be read from. The trace is interpolated
-#: onto whatever ``tdr.SPECTRUM`` asks for, which the geometry here does not
-#: constrain, so this is the floor that keeps a reading about the line.
-LEAST_SAMPLES = 8
-
-
-def _trace_sections():
-    """``(lower_x, upper_x, width)`` for each section, left to right."""
-    half = SUBSTRATE_LENGTH / 2
-    edges = [-half + index * SECTION_LENGTH for index in range(4)]
-    return tuple(
-        (edges[index], edges[index + 1], width) for index, width in enumerate((WIDE, NARROW, WIDE))
-    )
-
-
-def _problem() -> Problem:
-    half_length = SUBSTRATE_LENGTH / 2
-    half_width = SUBSTRATE_WIDTH / 2
-
-    materials = (
-        Material(name="FR4", kind="dielectric", epsilon=EPS_R),
-        Material(name="Ground", kind="pec"),
-        Material(
-            name="Trace",
-            kind="conducting_sheet",
-            conductivity=COPPER_CONDUCTIVITY,
-            thickness=COPPER_THICKNESS,
-        ),
-    )
-
-    solids = [
-        Solid(
-            material="FR4",
-            lower=(-half_length, -half_width, 0.0),
-            upper=(half_length, half_width, SUBSTRATE_HEIGHT),
-            priority=0,
-            label="Substrate",
-        ),
-        Solid(
-            material="Ground",
-            lower=(-half_length, -half_width, 0.0),
-            upper=(half_length, half_width, 0.0),
-            priority=1,
-            label="Ground",
-        ),
-    ]
-    for index, (start, stop, width) in enumerate(_trace_sections()):
-        solids.append(
-            Solid(
-                material="Trace",
-                lower=(start, -width / 2, SUBSTRATE_HEIGHT),
-                upper=(stop, width / 2, SUBSTRATE_HEIGHT),
-                priority=2,
-                label=f"Section {index + 1} ({width} mm)",
-            )
-        )
-
-    # A gap between trace and ground at each end, one metal cell along x because
-    # a lumped port is a box and the envelope refuses a zero extent along the
-    # propagation axis. start on the trace and stop on the ground, so both
-    # integrate downward and the two ends share a sign convention.
-    gap = METAL_RES
-    ports = (
-        Port(
-            number=1,
-            kind="lumped",
-            start=(-half_length, -WIDE / 2, SUBSTRATE_HEIGHT),
-            stop=(-half_length + gap, WIDE / 2, 0.0),
-            propagation_axis=0,
-            excitation_axis=2,
-            excite=True,
-            feed_resistance=PORT_IMPEDANCE,
-            reference_impedance=PORT_IMPEDANCE,
-            label="Port 1",
-        ),
-        Port(
-            number=2,
-            kind="lumped",
-            start=(half_length, -WIDE / 2, SUBSTRATE_HEIGHT),
-            stop=(half_length - gap, WIDE / 2, 0.0),
-            propagation_axis=0,
-            excitation_axis=2,
-            excite=False,
-            feed_resistance=PORT_IMPEDANCE,
-            reference_impedance=PORT_IMPEDANCE,
-            label="Port 2",
-        ),
-    )
-
-    params = MeshParams(
-        metal_res=METAL_RES,
-        dielectric_res=DIELECTRIC_RES,
-        max_ratio=(1.3, 1.3, 1.3),
-        min_lines=9,
-        pml_cells=8,
-        cap=CAP,
-    )
-    grid = write.plan_grid(solids, ports, materials, params, padding=((8, 8), (8, 8), (8, 8)))
-
-    return Problem(
-        title="stepped microstrip TDR acceptance line",
-        frequency=Frequency(start=FREQ_MIN, stop=FREQ_MAX, points=POINTS),
-        grid=grid,
-        materials=materials,
-        solids=solids,
-        ports=ports,
-        boundary=("PML_8",) * 6,
-        # Pinned, not energy-terminated: openEMS re-checks its energy criterion
-        # on a wall-clock timer, so an energy-terminated run stops at a
-        # machine-load-dependent step.
-        termination=Termination(max_timesteps=TIMESTEPS, end_criteria=0.0),
-    )
+#: How far a velocity measured off S21 may sit from the exact one, as a share.
+#: It carries both ports' launches - the delay divides into the whole path
+#: between the two reference planes - and the storage the steps put into the
+#: phase, which the fixture measures on a line with no solver in it.
+VELOCITY_WITHIN = 0.04
 
 
 @pytest.fixture(scope="module")
-def problem() -> Problem:
-    return _problem()
+def problem():
+    return line.problem()
 
 
 @pytest.fixture(scope="module")
@@ -342,24 +241,7 @@ def solved(problem, interpreter, tmp_path_factory):
 @pytest.fixture(scope="module")
 def matrix(solved) -> SParameters:
     """One driven column, referenced to the impedance the ports declare."""
-    return SParameters.from_runs([solved], reference=PORT_IMPEDANCE)
-
-
-@pytest.fixture(scope="module")
-def speed(matrix) -> float:
-    """Propagation velocity, measured from S21 over the port separation.
-
-    The separation is between the two ports' probe planes, and openEMS puts a
-    lumped port's voltage probe on the box's *centre* - ``u_start`` is the mean
-    of the box corners with only the excitation coordinate replaced
-    (``openEMS/python/openEMS/ports.py``). Each box reaches one cell inward from
-    the end of the board, so the two planes are half a cell inside each end and
-    one whole cell closer together than the board is long.
-
-    Nothing is typed by hand: the velocity that puts millimetres on the trace
-    comes out of the same solve.
-    """
-    return tdr.velocity(matrix, 2, 1, separation=(SUBSTRATE_LENGTH - METAL_RES) * 1e-3)
+    return SParameters.from_runs([solved], reference=line.PORT_IMPEDANCE)
 
 
 @pytest.fixture(scope="module")
@@ -367,437 +249,438 @@ def trace(matrix):
     return tdr.step_response(matrix, 1)
 
 
-def _along(trace, speed):
-    """Position along the board, in mm, for every sample of ``trace``.
-
-    Distance is measured from the port's reference plane at the left-hand end of
-    the board, so the board's own coordinates are shifted onto it.
-    """
-    return 1e3 * tdr.distance(trace, speed) - SUBSTRATE_LENGTH / 2
-
-
-def _section_middle(index) -> float:
-    start, stop, _ = _trace_sections()[index]
-    return 0.5 * (start + stop)
-
-
-def _readings(trace, speed, index):
-    """The impedances sampled across the flat middle of section ``index``.
-
-    How many samples that is follows ``tdr.SPECTRUM`` and nothing in the
-    geometry, so it is asserted rather than assumed: a mean and a spread taken
-    over a handful of points describe the sampling and not the line, and a
-    spread in particular reads *low* as the points thin out, which would quietly
-    disarm :func:`test_each_section_reads_as_a_plateau` rather than fail it.
-    """
-    reach = PLATEAU * SECTION_LENGTH
-    along = _along(trace, speed)
-    middle = _section_middle(index)
-    inside = (along > middle - reach) & (along < middle + reach)
-    assert inside.sum() >= LEAST_SAMPLES, (
-        f"section {index + 1} is read from {inside.sum()} samples, which is too "
-        "few for a mean or a spread over it to be about the line"
-    )
-    return trace.impedance[inside]
-
-
-def measured(trace, speed, index) -> float:
-    """The impedance read off the flat middle of section ``index``."""
-    return float(np.nanmean(_readings(trace, speed, index)))
-
-
-def transition(trace, speed, index) -> float:
-    """Where the step between sections ``index`` and ``index + 1`` sits, in mm.
-
-    Half-height: where the trace crosses the midpoint between the two plateaus it
-    separates, looking only between the two section middles. A *symmetric* smear
-    leaves that one point alone, which is what makes an edge readable at all off
-    a band-limited step - and the smear here is not symmetric, so what a reading
-    is left carrying is bounded by the smear's own width rather than zero.
-
-    It has to be crossed exactly once, or the step has no single position and
-    nothing downstream should pretend otherwise.
-    """
-    level = 0.5 * (measured(trace, speed, index) + measured(trace, speed, index + 1))
-    along = _along(trace, speed)
-    span = (along >= _section_middle(index)) & (along <= _section_middle(index + 1))
-    position = along[span]
-    impedance = trace.impedance[span]
-    crossed = np.nonzero(np.diff(np.sign(impedance - level)))[0]
-    assert crossed.size == 1, (
-        f"the trace crosses the half-height of step {index + 1} {crossed.size} "
-        "times between the two plateaus, so where that step is has no one answer"
-    )
-    at = crossed[0]
-    rise = impedance[at + 1] - impedance[at]
-    return float(position[at] + (position[at + 1] - position[at]) * (level - impedance[at]) / rise)
-
-
-def _resolution() -> float:
-    """How far either side of where it was drawn a step arrives smeared, in mm.
-
-    A step response cannot place a feature closer than about ``v / (4 B)``, and
-    two features closer together than that arrive as one.
-
-    Taken at the closed-form velocity, so it needs no solve - which is what lets
-    :func:`test_the_window_read_is_clear_of_both_transitions` fail before one.
-    """
-    return 1e3 * _quasi_static(WIDE) / (4 * FREQ_MAX)
-
-
-def hammerstad(index) -> float:
-    return reference.characteristic_impedance(_trace_sections()[index][2], SUBSTRATE_HEIGHT, EPS_R)
-
-
-def _quasi_static(width) -> float:
-    """Propagation velocity under a section of the given width, in m/s."""
-    return SPEED_OF_LIGHT / np.sqrt(
-        reference.effective_permittivity(width, SUBSTRATE_HEIGHT, EPS_R)
-    )
+@pytest.fixture(scope="module")
+def ideal():
+    """The same three sections as ideal lines, read through the same calls."""
+    return tdr.step_response(line.ideal_cascade(), 1)
 
 
 @pytest.fixture(scope="module")
-def ideal_result() -> SParameters:
-    """The same three sections as ideal transmission lines, as a two-port.
+def held(problem):
+    """The same cascade at the impedances the grid holds rather than the drawn ones.
 
-    Each section's impedance is Hammerstad's and its velocity is the
-    quasi-static one for its own width - closed forms throughout, and no solver,
-    no mesh and no junction.
-
-    A two-port rather than a reflection alone, so that everything read off the
-    measurement can be read off this by the same calls: a velocity out of S21,
-    a step response out of S11, windows and crossings off the trace. Carrying
-    the identical method through both is what makes it the right thing to hold
-    the measurement against wherever the method's own bias is a term - in the
-    impedance of a masked section, in the size of a step behind one, and in
-    where a smeared edge lands.
+    Beside :func:`ideal` rather than replacing it: one says what the drawing
+    would answer and the other what the grid's own line would, and the gate needs
+    both to say which of the two a difference belongs to.
     """
-    from Microwave.Results import _skrf
+    return tdr.step_response(line.held_cascade(problem.grid), 1)
 
-    skrf = _skrf.module()
-    axis = np.linspace(FREQ_MIN, FREQ_MAX, POINTS)
-    frequency = skrf.Frequency.from_f(axis, unit="hz")
 
-    def section(width):
-        media = skrf.media.DefinedGammaZ0(
-            frequency=frequency,
-            gamma=1j * 2 * np.pi * axis / _quasi_static(width),
-            z0_port=PORT_IMPEDANCE,
-            z0=reference.characteristic_impedance(width, SUBSTRATE_HEIGHT, EPS_R),
+@pytest.fixture(scope="module")
+def cells(problem):
+    """The cell each section's strip edge actually got, in mm.
+
+    Off the finished grid rather than off the policy that asked for it: the
+    mesher sizes a conductor's cell from its own width as well, so a section
+    priced against a cell it did not have would be scored against the wrong
+    allowance. The fixture keeps its policy fine enough that the demand does not
+    bind on either width, and ``test_stepped_stripline_fixture`` is where that is
+    asserted - so today these are the same number twice, and what separates the
+    two allowances is the closed form's own derivative rather than the grid.
+    """
+    return [line.edge_cell(problem.grid.y, width / 2.0) for _, _, width in line.sections()]
+
+
+def mesh_term(held, ideal, index: int) -> float:
+    """What the grid's own line costs section ``index``, as a share.
+
+    The closed form describes the line that was *drawn*; the grid holds a
+    different one, and what that is worth is arithmetic over the planned
+    cross-section rather than a figure. Both cascades are read through the same
+    transform and the same window as the measurement, so the reflectometry's own
+    bias is in all three alike and what separates these two is the mesh.
+    """
+    drawn = line.plateau(ideal, index)
+    return abs(line.plateau(held, index) - drawn) / abs(drawn)
+
+
+def record_term(solved, trace, index: int) -> float:
+    """What is left in the port when the record stops, as a share of an impedance.
+
+    ``tail_share`` is an absolute error in S. A reflection wrong by ``d`` puts a
+    plateau wrong by ``2 d / (1 - rho^2)``, ``rho`` being where that plateau
+    stands against the resistance the ports declare - so the leakage the run
+    reports becomes a term in the same currency as everything else here.
+
+    The trace's own port and no other. A step response is built from that port's
+    reflection alone, so what the record left at the far end lands on a
+    transmission this gate reads no impedance off.
+    """
+    rho = _standing(line.sections()[index][2])
+    return 2.0 * solved.tail_share[trace.port] / (1.0 - rho**2)
+
+
+def tolerance(solved, trace, held, ideal, index: int) -> float:
+    """What an absolute impedance may miss the closed form by, as a share.
+
+    Composed from the run and from two references, and none of the three is a
+    figure chosen here: what the grid's line costs, what the record left behind,
+    and :data:`INSTRUMENT` - which is what
+    :func:`test_each_section_reads_the_line_the_grid_holds` is left with once the
+    first of those is taken out of both sides instead.
+    """
+    return mesh_term(held, ideal, index) + record_term(solved, trace, index) + INSTRUMENT
+
+
+def shape_tolerance(cells, index: int) -> float:
+    """The same for a ratio between two neighbouring plateaus.
+
+    Tighter than either section's own bound, and by a mechanism rather than by
+    choice. The port drops out, being near enough a scale on the whole trace.
+    What is left is the strip's edge - and the mesher puts both sections' edges
+    the same length inside the metal, by the same rule and on the same cell, so
+    what survives the ratio is only the *difference* between what that one
+    length is worth on two widths.
+
+    ``test_acceptance_stripline`` is where the premise is scored rather than
+    assumed: two lines of different widths meshed alike answer with widths
+    within a hundredth of a cell of each other, so what the grid does to a strip
+    is a property of the grid and not of which strip it was.
+    """
+    worth = [
+        line.displacement_worth(STRIP_KEPT * cells[at], line.sections()[at][2])
+        for at in (index, index + 1)
+    ]
+    return abs(worth[1] - worth[0])
+
+
+# ---------------------------------------------------------------------------
+# What the run has to be before any of it means anything
+# ---------------------------------------------------------------------------
+
+
+def test_the_run_is_reproducible(solved):
+    assert solved.reproducible
+
+
+def test_the_response_had_finished_when_the_run_stopped(solved, trace, held, ideal):
+    """That the run ended for the right reason, and what its record is worth here.
+
+    The record's own leakage is a term of every absolute bound below rather than
+    something held under one - :func:`record_term` is where it is converted into
+    an impedance, and :func:`tolerance` is where it is added. So what is left to
+    assert here is the part that is not a magnitude: that the response had
+    finished at all, which ``residual.unfinished`` decides against the study's
+    own declared floor.
+
+    What is printed is each term's share of the bound it sits in, because how
+    those three compare is the whole of what says where this gate could be
+    sharpened.
+    """
+    for index, (_, _, width) in enumerate(line.sections()):
+        record, mesh = record_term(solved, trace, index), mesh_term(held, ideal, index)
+        bound = tolerance(solved, trace, held, ideal, index)
+        print(
+            f"\nGATE tdr section {index + 1} ({width:g} mm) bound {100 * bound:.4f}% is "
+            f"{100 * record:.4f}% record, {100 * mesh:.4f}% mesh and "
+            f"{100 * INSTRUMENT:.4f}% instrument"
         )
-        return media.line(SECTION_LENGTH * 1e-3, unit="m")
-
-    network = None
-    for _, _, width in _trace_sections():
-        piece = section(width)
-        network = piece if network is None else network**piece
-
-    impedance = np.full((POINTS, 2), PORT_IMPEDANCE, dtype=complex)
-    return SParameters(
-        frequency=axis,
-        s=np.asarray(network.s, dtype=complex),
-        port_numbers=(1, 2),
-        reference=impedance,
-        measured_impedance=impedance,
+    assert residual.unfinished(solved.tail_share) is None, (
+        "the response had not finished when the record stopped, so every impedance "
+        "below is of a line the run had not yet settled on"
     )
-
-
-@pytest.fixture(scope="module")
-def ideal_speed(ideal_result) -> float:
-    """That line's velocity, measured from its own S21 the way the board's is.
-
-    Both distance axes then carry the same convention - one number over a line
-    whose sections do not share a velocity - so what a comparison of positions
-    is left with is the board rather than the arithmetic. Its reference planes
-    are the board's ends, there being no port box to reach inside them.
-    """
-    return tdr.velocity(ideal_result, 2, 1, separation=SUBSTRATE_LENGTH * 1e-3)
-
-
-@pytest.fixture(scope="module")
-def ideal_trace(ideal_result):
-    return tdr.step_response(ideal_result, 1)
-
-
-@pytest.fixture(scope="module")
-def ideal(ideal_trace, ideal_speed):
-    """What each section of that line reads, through the same windows."""
-    return [measured(ideal_trace, ideal_speed, index) for index in range(3)]
-
-
-def _reflection(index) -> float:
-    """What the step at the front of section ``index`` reflects, from closed forms."""
-    before = PORT_IMPEDANCE if index == 0 else hammerstad(index - 1)
-    here = hammerstad(index)
-    return (here - before) / (here + before)
-
-
-def test_the_fixture_is_not_vacuous():
-    """Guard the constants, not the round trip.
-
-    Stated as a reflection rather than as an impedance, because that is what the
-    gate actually measures and the two are not equally forgiving. Section 1's
-    step is small on purpose - a 50 ohm feed off a 50 ohm port - so a tolerance
-    that is a percent of an *impedance* is a large fraction of its *reflection*,
-    and it is the middle section that has to carry the weight. Requiring the
-    middle step to move the reflection by much more than the tolerance admits is
-    what stops the whole file passing on a line with no step in it.
-    """
-    admitted = TOLERANCE * hammerstad(1) / (2 * PORT_IMPEDANCE)
-    assert abs(_reflection(1)) > 10 * admitted, (
-        "the middle step must reflect far more than the tolerance admits, or "
-        "the gate would pass on a line that has no step in it"
-    )
-    assert min(hammerstad(0), hammerstad(1)) > 0, "both sections must be real lines"
-
-
-def test_the_widths_are_clear_of_the_references_own_step():
-    """Hammerstad's branches disagree at ``W / h = 1`` by more than this gate
-    claims to resolve, so a width sitting on that shoulder is compared against a
-    reference with a step in it. ``analytic/reference.py`` records the size."""
-    for _, _, width in _trace_sections():
-        ratio = width / SUBSTRATE_HEIGHT
-        assert abs(ratio - 1.0) > 0.25, (
-            f"a {width} mm trace is W/h = {ratio:.3f}, on the shoulder of the "
-            "branch discontinuity in the reference"
+    for index in range(len(line.sections())):
+        record = record_term(solved, trace, index)
+        assert record < max(mesh_term(held, ideal, index), INSTRUMENT), (
+            f"the record is the largest term of section {index + 1}'s bound, so what "
+            "this gate scores most tightly is how long it ran rather than the mesh or "
+            "the instrument it exists to measure. Lengthen the record, or narrow the "
+            "band it is asked to carry"
         )
-
-
-def test_the_window_read_is_clear_of_both_transitions():
-    """The margin every plateau reading rests on, as the one thing that binds it.
-
-    A transition is smeared over about ``v / (4 * B)`` either side of where it
-    was drawn, so the window has to stop that much short of the section's edge.
-    Written as the gap between the two, because that is what fails: widening
-    :data:`PLATEAU` and lengthening the band both look harmless on their own and
-    are the same fault together.
-
-    Runs without a solver, so it is what fails first when the band or the
-    geometry moves without the other.
-    """
-    resolution = _resolution()
-    gap = (0.5 - PLATEAU) * SECTION_LENGTH
-    assert gap > resolution, (
-        f"the window stops {gap:.2f} mm short of the section edge, and a "
-        f"transition is smeared over {resolution:.2f} mm - so what is averaged "
-        "includes the step rather than the line"
-    )
-
-
-def test_the_sweep_leaves_one_invented_bin(matrix):
-    """One, where ``Results.tdr`` would tolerate up to :data:`tdr.INVENTED_BINS`.
-
-    Asked of the axis that came back from the solve rather than of the constants
-    it was built from, so it covers the envelope and the reader as well as the
-    arithmetic here. Held at one rather than at the bar: the bar is the point
-    past which a trace is refused, and a fixture sitting on it would be
-    measuring the guard instead of the line.
-    """
-    frequency = np.asarray(matrix.frequency, dtype=float)
-    step = np.median(np.diff(frequency))
-    assert frequency[0] / step == pytest.approx(1.0, rel=1e-6)
-    assert tdr.INVENTED_BINS > 1, "the fixture must sit inside the bar, not on it"
 
 
 def test_the_ports_declare_their_impedance_rather_than_measuring_it(matrix):
-    """What makes this gate reach an impedance by a route the microstrip one does
-    not.
+    """What makes this gate reach an impedance by a route the other ones do not.
 
-    Asked of the numbers that came back, not of the bookkeeping: a *measured*
-    impedance varies across a band, because a microstrip's does. This one has
-    to be the envelope's constant to the last bit at every frequency, which no
-    extraction would ever produce.
+    Asked of the numbers that came back, not of the bookkeeping: an impedance a
+    port *measured* would carry the discretisation of the line it measured it
+    on. This one has to be the envelope's constant to the last bit at every
+    frequency, which no extraction would produce.
     """
     column = matrix.impedance(1)
-    assert column.real == pytest.approx(PORT_IMPEDANCE, rel=1e-9, abs=0.0)
-    assert np.ptp(column.real) == 0.0, "a measured impedance would disperse"
+    assert column.real == pytest.approx(line.PORT_IMPEDANCE, rel=1e-9, abs=0.0)
+    assert np.ptp(column.real) == 0.0, "a measured impedance would carry the mesh"
     assert np.all(column.imag == 0.0)
 
 
-def test_the_measured_velocity_is_physical(matrix, speed):
-    """It is measured, so it has to be checked against something. The bounds are
-    the two extremes a microstrip's fields can see: all air above, all substrate
-    below - the guide is a mixture and must land between them."""
-    assert SPEED_OF_LIGHT / np.sqrt(EPS_R) < speed < SPEED_OF_LIGHT
-    quasi_static = SPEED_OF_LIGHT / np.sqrt(
-        reference.effective_permittivity(WIDE, SUBSTRATE_HEIGHT, EPS_R)
+def test_nothing_along_the_line_needed_blanking(trace):
+    """``|rho|`` reaching unity means an open or a short, and this line has
+    neither. A blank inside a section would say the window rang past what the
+    structure can do, and every plateau below would be a mean over holes."""
+    place = line.along(trace)
+    inside = (place > -line.LINE_LENGTH / 2.0) & (place < line.LINE_LENGTH / 2.0)
+    assert np.isfinite(trace.impedance[inside]).all()
+
+
+def test_no_power_is_created(matrix):
+    """A residual guard, and on this structure it is a strong one at the bottom
+    of the band and a weak one at the top.
+
+    Nothing here dissipates: every conductor is perfect, the fill is lossless,
+    and the enclosure is conductor on all four transverse faces, so unlike an
+    open microstrip there is no radiation channel either - which is what makes
+    this a check on the instrument rather than an argument about where the power
+    went. The departure is the port's two probes not being one plane, and it
+    falls away with the electrical length of that path - so a departure at the
+    bottom of the band that did not fall away with it would be a different
+    mechanism, which is what the tighter bound there is asked for.
+    """
+    balance = np.abs(matrix.parameter(1, 1)) ** 2 + np.abs(matrix.parameter(2, 1)) ** 2
+    frequency = np.asarray(matrix.frequency, dtype=float)
+    bottom = frequency <= BOTTOM_OF_THE_BAND
+    worst = float(np.max(np.abs(balance - 1.0)))
+    quiet = float(np.max(np.abs(balance[bottom] - 1.0)))
+    print(
+        f"\nGATE tdr power balance departs by {worst:.2e} across the band and "
+        f"{quiet:.2e} below {BOTTOM_OF_THE_BAND / 1e9:g} GHz"
     )
-    print(f"\nGATE tdr velocity = {speed / 1e6:.4f} mm/ns, quasi-static {quasi_static / 1e6:.4f}")
-    assert speed == pytest.approx(quasi_static, rel=0.15)
+    assert worst < PASSIVE_WITHIN
+    assert quiet < PASSIVE_AT_THE_BOTTOM
+
+
+# ---------------------------------------------------------------------------
+# The ohms
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("index", (0, 1))
-def test_each_section_reads_its_own_closed_form(trace, speed, index):
-    """Each section against Hammerstad for the width *that* section was drawn at.
+def test_each_section_reads_its_own_exact_impedance(solved, trace, held, ideal, cells, index):
+    """Each section against conformal mapping for the width *that* section was
+    drawn at, off one trace.
 
-    Off one trace, which is what a single-number gate cannot do: it could not
-    tell a correct trace from one right on average, and the middle section is the
-    only place in the project where an impedance is read somewhere the solver was
-    never asked about directly.
-
-    Held at :data:`TOLERANCE` rather than at the reference's own accuracy,
-    because the reading carries the port and the mesh policy as well. This is the
-    loosest comparison in the file and it is meant to be - what is checked
-    closely here is the shape, not the ohms.
-
-    The **third** section is deliberately not here. It is masked by the two in
-    front of it - see
-    :func:`test_the_third_section_is_masked_by_the_two_before_it` - and holding
-    it to a closed form would gate the reflectometry method's known bias rather
-    than anything the solver did.
+    The **third** is deliberately not here. It is masked by the two in front of
+    it, which the fixture establishes on a line with no solver in it, and holding
+    it to a closed form would gate the reflectometry's known bias rather than
+    anything the solver did. It is scored below instead.
     """
-    got, expected = measured(trace, speed, index), hammerstad(index)
-    width = _trace_sections()[index][2]
+    width = line.sections()[index][2]
+    got, want = line.plateau(trace, index), line.impedance(width)
+    bound = tolerance(solved, trace, held, ideal, index)
     print(
-        f"\nGATE tdr section {index + 1} ({width} mm) Z0 = {got:.4f} ohm, "
-        f"Hammerstad {expected:.4f} ohm, {100 * (got - expected) / expected:+.4f}%"
+        f"\nGATE tdr section {index + 1} ({width:g} mm) Z0 = {got:.4f} ohm, exact "
+        f"{want:.4f} ohm, {100 * (got - want) / want:+.4f}% against {100 * bound:.4f}% "
+        f"on a {cells[index]:.4f} mm cell"
     )
-    assert got == pytest.approx(expected, rel=TOLERANCE)
+    assert got == pytest.approx(want, rel=bound)
 
 
-def test_the_third_section_is_masked_by_the_two_before_it(trace, speed, ideal):
-    """Why the section above is excluded, established rather than asserted.
+@pytest.mark.parametrize("index", (0, 1, 2))
+def test_each_section_reads_the_line_the_grid_holds(trace, held, ideal, index):
+    """What is left of a section once the mesh is taken out of both sides.
 
-    ``Z = Z_ref (1 + rho) / (1 - rho)`` reads a reflection as though the wave had
-    met nothing before it. Past a second interface that is false: what returns
-    has crossed the first interface twice and comes back scaled by its two-way
-    transmission, and the conversion has no term to undo that. Correcting it
-    means peeling the discontinuities off one at a time, which this does not do.
+    The comparisons above score the drawn line, and most of what they find is
+    that the line openEMS was given is a narrower one - a strip conducts on the
+    lines inside it. That is arithmetic over the planned cross-section, so it
+    need not be bounded: the same ideal cascade is built at the impedances the
+    grid holds and read through the same transform and the same window, and what
+    separates the two traces is the reading alone.
 
-    Not multiple reflections - those arrive two section traversals later, off the
-    end of this board entirely.
+    **Both sides carry the reflectometry's own bias**, which is why the
+    comparison is against a cascade rather than against the cross-section
+    directly. Everything past the first interface returns scaled by a two-way
+    transmission the conversion has no term to undo, and the size of that depends
+    on the impedances in front of it - so taking the mesh out at the section and
+    not at the cascade would leave a difference that is mostly the method.
 
-    So the bias is shown to be the *method's*, on a line built from closed forms
-    with no solver anywhere in it - and only then is the solver asked to
-    reproduce it.
+    **This does not isolate the port.** A junction stores energy and an ideal
+    cascade has no term for it, so what is left over here is the port and the
+    steps together. What it does establish is the size, which is far under what
+    the drawn-line comparisons carry, and the direction.
+
+    The direction is printed and not asserted, because the term is now under
+    the wobble an ideal line of the same impedances has across the same window
+    - no solver in that one, and the band alone putting it there. What is
+    asserted is that no section reads *measurably* below the line it was given:
+    above the wobble, a section under its own line would be a mechanism this
+    bound does not describe, and below it a sign is a sign read off the reading.
+    Which way each section actually falls is on the ``GATE`` line beside the
+    wobble it is judged against.
+
+    All three sections, the masked one included: masking is in both traces alike
+    and so drops out, which is the whole reason the third can be scored here and
+    not against a closed form.
     """
-    assert ideal[2] != pytest.approx(hammerstad(2), rel=TOLERANCE), (
-        "an ideal line read this way must miss Hammerstad here, or there is no "
-        "masking and the third section belongs in the gate above"
+    width = line.sections()[index][2]
+    got, want = line.plateau(trace, index), line.plateau(held, index)
+    left = (got - want) / want
+    wobble = float(np.ptp(line.readings(ideal, index))) / float(
+        np.nanmean(line.readings(ideal, index))
     )
-    assert (ideal[2] - hammerstad(2)) * (hammerstad(1) - hammerstad(0)) > 0, (
-        "the bias leans the way the step in front of it does"
+    print(
+        f"\nGATE tdr section {index + 1} ({width:g} mm) vs the line the grid holds = "
+        f"{got:.4f} against {want:.4f} ohm, {100 * left:+.4f}% left for the "
+        f"instrument against {100 * INSTRUMENT:.4f}%, resolved to {100 * wobble:.4f}%"
+    )
+    assert abs(left) < INSTRUMENT, (
+        f"section {index + 1} reads {100 * left:+.4f}% from the line this grid holds, "
+        f"past the {100 * INSTRUMENT:g}% a reading through a lumped element and two "
+        "junctions may cost. What is left is no longer the instrument"
+    )
+    assert left > -wobble, (
+        f"section {index + 1} reads {100 * left:+.4f}% from the line this grid holds, "
+        f"below it by more than the {100 * wobble:.4f}% an ideal line wobbles across "
+        "the same window. A section reading above the line it was given is what this "
+        "instrument does; one reading measurably below it is a different mechanism, "
+        "and the bound above stops describing what it bounds"
     )
 
 
 @pytest.mark.parametrize("index", (0, 1, 2))
-def test_the_whole_trace_matches_a_line_built_from_closed_forms(trace, speed, ideal, index):
+def test_the_whole_trace_matches_a_line_built_from_closed_forms(
+    solved, trace, held, ideal, cells, index
+):
     """Every section, including the masked one, against an ideal line of the
     same impedances read exactly the same way.
 
     This is where the third section is held accountable. The comparison carries
-    the method's bias on both sides and so cancels it, leaving the solver: a
-    grid too coarse or a junction modelled wrongly moves the measurement away
-    from a reference that has neither.
+    the reflectometry's bias on both sides and so cancels it, leaving the
+    solver: a grid too coarse or a junction modelled wrongly moves the
+    measurement away from a reference that has neither.
 
     It is **not** sensitive to the velocity, and neither is anything else here
-    that reads an impedance. A plateau is read off ``|rho|``, which knows nothing
-    about how fast the wave got there; the velocity only decides where the window
-    sits, and it comes from the same solve, so a uniform error in it moves both
-    edges of the window together. Where the velocity is held accountable is
-    :func:`test_each_transition_lands_where_it_should`.
+    that reads an impedance. A plateau is read off ``|rho|``, which knows
+    nothing about how fast the wave got there; the velocity only decides where
+    the window sits, and it is exact.
     """
-    got = measured(trace, speed, index)
-    width = _trace_sections()[index][2]
+    got, want = line.plateau(trace, index), line.plateau(ideal, index)
+    width = line.sections()[index][2]
+    bound = tolerance(solved, trace, held, ideal, index)
     print(
-        f"\nGATE tdr section {index + 1} ({width} mm) vs ideal line = {got:.4f} "
-        f"against {ideal[index]:.4f} ohm, {100 * (got - ideal[index]) / ideal[index]:+.4f}%"
+        f"\nGATE tdr section {index + 1} ({width:g} mm) vs ideal line = {got:.4f} "
+        f"against {want:.4f} ohm, {100 * (got - want) / want:+.4f}% against "
+        f"{100 * bound:.4f}%"
     )
-    assert got == pytest.approx(ideal[index], rel=TOLERANCE)
+    assert got == pytest.approx(want, rel=bound)
+
+
+# ---------------------------------------------------------------------------
+# The shape
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("index", (0, 1))
-def test_each_transition_lands_where_it_should(trace, speed, ideal_trace, ideal_speed, index):
+def test_each_transition_lands_where_it_was_drawn(trace, ideal, index):
     """Where the steps are, which is the half of this gate no impedance can say.
 
-    Reading a step's position brings together where the section was drawn, how
-    fast the wave got there - measured from S21, at the *other* port - and where
-    the reflection turned. Nothing else here checks a velocity a transmission
-    measured against a position a reflection saw, and none of it moves if the
-    whole trace is scaled.
-
-    Bounded by the resolution the bandwidth bought, since a step cannot be placed
-    closer than the width it arrives smeared over. What it is bounded *against*
-    splits the same way the impedances do: the first transition is the first
-    discontinuity the wave meets, so the drawing is its reference, while the
-    second stands behind the first and is held against the ideal line, which is
-    displaced there in the same way and for the same reasons - the masking, and
-    one velocity standing for sections that do not share one.
-
-    Both traces are placed with a velocity measured from their own S21 over their
-    own port separation, which is what makes that second comparison mean
-    anything: put the two on axes of different scale and the scale is most of
-    what a difference in position would be measuring.
+    Both of them against the drawing, which is what the exact velocity buys: the
+    axis carries no fitted speed, so a position is the geometry, the transform's
+    own displacement and the port's launch, and nothing else. The ideal line's
+    own crossing is printed beside it, being how much of the difference is the
+    band rather than the board.
     """
-    drawn = _trace_sections()[index][1]
-    got = transition(trace, speed, index)
-    want = transition(ideal_trace, ideal_speed, index)
-    resolution = _resolution()
+    drawn = line.sections()[index][1]
+    got, want = line.transition(trace, index), line.transition(ideal, index)
+    reach = PLACED_WITHIN * line.resolution()
     print(
         f"\nGATE tdr transition {index + 1} at {got:+.4f} mm, drawn {drawn:+.4f}, "
-        f"ideal line {want:+.4f}, resolution {resolution:.4f} mm"
+        f"ideal line {want:+.4f}, bound {reach:.4f} mm of a {line.resolution():.4f} mm "
+        "resolution"
     )
-    if index == 0:
-        assert abs(got - drawn) < resolution, (
-            "the first step is further from where it was drawn than the band can "
-            "account for, so the geometry, the velocity and the trace disagree"
-        )
-    else:
-        assert abs(got - want) < resolution, (
-            "a step behind another one arrives displaced, and this one is not "
-            "displaced the way an ideal line of the same sections is"
-        )
+    assert abs(got - drawn) < reach
+
+
+def test_the_two_steps_stay_a_section_apart(trace, ideal):
+    """Between the two crossings is one section of uniform line and nothing
+    else - no port, no launch - so this is the closest thing here to a statement
+    about the velocity and the drawing alone. What the port adds to a position
+    is the same at both crossings and subtracts out.
+    """
+    apart = line.transition(trace, 1) - line.transition(trace, 0)
+    want = line.transition(ideal, 1) - line.transition(ideal, 0)
+    print(
+        f"\nGATE tdr the two steps are {apart:.4f} mm apart, drawn "
+        f"{line.SECTION_LENGTH:.4f}, ideal line {want:.4f}"
+    )
+    assert apart == pytest.approx(want, abs=SPACED_WITHIN * line.resolution())
+
+
+def test_the_trace_agrees_with_the_ideal_line_along_its_whole_length(trace, ideal):
+    """The whole curve against the whole curve, rather than three numbers off it.
+
+    Every other comparison here reads the trace at chosen places - the middle of
+    a section, the position of a step - and each of those throws away everything
+    between. A trace can pass all of them and still be the wrong shape: ringing
+    on the plateaus, a transition with the wrong slope, a droop that the windows
+    happen to straddle. What is wanted is a comparison of the traces themselves,
+    and doing that by eye is what this field did before it agreed on how to do it
+    numerically.
+
+    :mod:`tests.fsv` is that agreement - IEEE Std 1597.1 - and its whole value
+    here is that the scale is not ours to move. The two bars are categories
+    rather than tolerances somebody picked, and neither can be loosened by a
+    decimal point without changing category and saying so.
+
+    The two measures are reported apart because they fail for different reasons
+    and point at different things. A trace at the wrong *level* is the port's
+    reference or the sections' impedances; a trace with the wrong *features* is
+    the transitions - their positions, their sharpness, and the reactance of the
+    steps this gate otherwise declares out of scope.
+    """
+    along = line.along(trace)
+    inside = np.abs(along) <= line.LINE_LENGTH / 2.0
+    found = fsv.compare(trace.impedance[inside], ideal.impedance[inside])
+    worst = along[inside][fsv.FIRST_SPAN + fsv.SECOND_SPAN + found.worst_at]
+    print(
+        f"\nGATE tdr trace: GDM {found.gdm:.4f} ({found.grade}), amplitude "
+        f"{found.adm:.4f}, features {found.fdm:.4f}; worst at {worst:+.2f} mm, "
+        + ", ".join(f"{share:.0%} {name}" for name, share in found.confidence.items() if share)
+    )
+    assert fsv.GRADES.index(fsv.grade_of(found.adm)) <= fsv.GRADES.index(TRACE_LEVEL_AT_LEAST), (
+        f"the trace sits at a level the ideal line calls {fsv.grade_of(found.adm)} "
+        f"against {TRACE_LEVEL_AT_LEAST} - which is this gate's own claim, an "
+        f"impedance along the whole line rather than at three windows of it"
+    )
+    assert fsv.GRADES.index(found.grade) <= fsv.GRADES.index(TRACE_AT_LEAST), (
+        f"the trace and the ideal line compare as {found.grade} against "
+        f"{TRACE_AT_LEAST} - amplitude {found.adm:.4f}, features {found.fdm:.4f}, "
+        f"worst at {worst:+.2f} mm along the line"
+    )
 
 
 @pytest.mark.parametrize("index", (0, 1, 2))
-def test_each_section_reads_as_a_plateau(trace, speed, ideal_trace, ideal_speed, index):
+def test_each_section_reads_as_a_plateau(trace, ideal, index):
     """A section has an impedance only if the window read for it is flat.
 
-    Held under :data:`REFERENCE_ACCURACY` rather than under :data:`TOLERANCE`,
-    and it is a statement about the trace alone rather than about any reference:
-    a window varying by more than the closed form's own accuracy has no single
-    impedance at the accuracy worth quoting, and the mean taken from it above
-    would be a reading of a slope rather than of a line.
-
-    What it catches is a section that ramps instead of settling, which need not
-    move that mean at all, and a window that has drifted onto a transition. The
-    ideal line's own spread is printed beside it, being how much of what is left
-    is the band rather than the board.
+    A statement about the trace alone rather than about any reference. What it
+    catches is a section that ramps instead of settling, which need not move the
+    mean at all, and a window that has drifted onto a transition. The ideal
+    line's own spread is printed beside it, being how much of what is left is
+    the band rather than the board.
     """
-    readings = _readings(trace, speed, index)
-    spread = float(np.ptp(readings)) / float(np.nanmean(readings))
-    from_ideal = _readings(ideal_trace, ideal_speed, index)
-    ideal_spread = float(np.ptp(from_ideal)) / float(np.nanmean(from_ideal))
+    got = line.readings(trace, index)
+    spread = float(np.ptp(got)) / float(np.nanmean(got))
+    theirs = line.readings(ideal, index)
     print(
         f"\nGATE tdr section {index + 1} plateau spread = {100 * spread:.4f}%, "
-        f"ideal line {100 * ideal_spread:.4f}%"
+        f"ideal line {100 * float(np.ptp(theirs)) / float(np.nanmean(theirs)):.4f}%"
     )
-    assert spread < REFERENCE_ACCURACY
+    assert spread < FLAT_ENOUGH
 
 
 @pytest.mark.parametrize("index", (0, 1))
-def test_the_step_at_each_transition_is_the_right_size(trace, speed, ideal, index):
+def test_the_step_at_each_transition_is_the_right_size(trace, ideal, cells, index):
     """The change across a step, rather than the impedance either side of it.
 
     A ratio between two plateaus is free of anything that scales the whole
-    trace, so :data:`PORT_BIAS` drops out of it - which no comparison above can
-    say, and which is why this one is held at :data:`SHAPE_TOLERANCE` instead.
-    What it still carries is :data:`MESH_BIAS`, charged unequally on two
-    different widths.
+    trace, so :data:`INSTRUMENT` drops out of it - which no comparison above can
+    say, and it is the tightest bound in the file for that reason: see
+    :func:`shape_tolerance` for what is left, which is less than either
+    section's own discretisation rather than the two added together.
 
-    Against the ideal line rather than against Hammerstad directly, because the
-    second step stands behind the first and carries the masking below.
+    Against the ideal line rather than against the closed form directly, because
+    the second step stands behind the first.
     """
-    got = measured(trace, speed, index + 1) / measured(trace, speed, index)
-    want = ideal[index + 1] / ideal[index]
+    got = line.plateau(trace, index + 1) / line.plateau(trace, index)
+    want = line.plateau(ideal, index + 1) / line.plateau(ideal, index)
+    bound = shape_tolerance(cells, index)
     print(
         f"\nGATE tdr step {index + 1} ratio = {got:.5f}, ideal line {want:.5f}, "
-        f"{100 * (got - want) / want:+.4f}%"
+        f"{100 * (got - want) / want:+.4f}% against {100 * bound:.4f}%"
     )
-    assert got == pytest.approx(want, rel=SHAPE_TOLERANCE)
+    assert got == pytest.approx(want, rel=bound)
 
 
-def test_the_steps_are_seen_in_the_right_direction(trace, speed):
+def test_the_steps_are_seen_in_the_right_direction(trace):
     """A narrower section is a higher impedance, at every step on the line.
 
     Cheap, and it is what fails if the distance axis is ever reversed or the
@@ -805,45 +688,44 @@ def test_the_steps_are_seen_in_the_right_direction(trace, speed):
     perfectly reasonable. The direction expected is taken from the widths drawn,
     so redrawing the line does not quietly redraw the expectation with it.
     """
-    sections = _trace_sections()
+    sections = line.sections()
     for index in range(len(sections) - 1):
         narrower = sections[index + 1][2] < sections[index][2]
-        rises = measured(trace, speed, index + 1) > measured(trace, speed, index)
+        rises = line.plateau(trace, index + 1) > line.plateau(trace, index)
         assert rises == narrower, (
             f"section {index + 2} is the {'narrower' if narrower else 'wider'} of "
             f"the pair, and must therefore read the {'higher' if narrower else 'lower'}"
         )
 
 
-def test_nothing_along_the_line_needed_blanking(trace, speed):
-    """``|rho|`` reaching unity means an open or a short, and this line has
-    neither. A blank inside a section would say the window rang past what the
-    structure can do, and every plateau above would be a mean over holes."""
-    along = _along(trace, speed)
-    inside = (along > -SUBSTRATE_LENGTH / 2) & (along < SUBSTRATE_LENGTH / 2)
-    assert np.isfinite(trace.impedance[inside]).all()
+def test_the_line_carries_the_velocity_of_its_fill(matrix, ideal):
+    """The one quantity a homogeneously filled line states exactly and an
+    inhomogeneous one has no single answer for.
 
-
-def test_the_response_had_finished_when_the_run_stopped(solved):
-    """The bar is an absolute error in S, and this line reads small reflections.
-
-    A study declaring no floor is held at full scale, where leakage only has to
-    be small beside a response of one - and section 1's own step is a reflection
-    of a few parts in a thousand. So the bar is not the thing to read here; the
-    assertion below is, and it says the leakage is smaller than the smallest step
-    this gate has to see.
+    Measured from the phase S21 turns through, so it divides into the whole path
+    between the two reference planes and carries both launches. Against the
+    exact velocity, with the ideal line's own reading printed beside it: that
+    one carries the storage the steps put into the phase and no port at all, so
+    the distance between the two figures is the instrument.
     """
-    worst = max(solved.tail_share.values())
+    separation = (line.reference_plane(2) - line.reference_plane(1)) * 1e-3
+    got = tdr.velocity(matrix, 2, 1, separation=separation)
+    theirs = tdr.velocity(line.ideal_cascade(), 2, 1, separation=separation)
+    exact = line.velocity()
     print(
-        f"\nGATE tdr worst tail share = {worst:.2e}, bound {residual.WANTED:.0e}, "
-        f"section 1 reflection {abs(_reflection(0)):.2e}"
+        f"\nGATE tdr velocity = {got / 1e6:.4f} mm/ns, exact {exact / 1e6:.4f} "
+        f"({100 * (got - exact) / exact:+.4f}%), ideal line {theirs / 1e6:.4f} "
+        f"({100 * (theirs - exact) / exact:+.4f}%)"
     )
-    assert residual.unfinished(solved.tail_share) is None
-    assert worst < abs(_reflection(0)), (
-        "the leakage is larger than the smallest step this gate reads, so a "
-        "plateau could be the tail of the run rather than the line"
+    assert got == pytest.approx(exact, rel=VELOCITY_WITHIN)
+    assert got < exact, (
+        "the line answered faster than the medium it is filled with, which a TEM "
+        "mode cannot do - so the delay, the separation or the fill disagree"
     )
 
 
-def test_the_run_is_reproducible(solved):
-    assert solved.reproducible
+def _standing(width: float) -> float:
+    """Where a section of this width stands against the resistance the ports
+    declare, as a reflection coefficient. From closed forms alone."""
+    here = line.impedance(width)
+    return (here - line.PORT_IMPEDANCE) / (here + line.PORT_IMPEDANCE)

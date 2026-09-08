@@ -23,9 +23,16 @@ is held exactly or as triangles, and where each sits.
 axes. Not the demands themselves: STEP re-parametrises a surface, so a curvature
 is sampled at a different number of points and a demand list that is one entry
 longer is not a difference in what the grid is asked for. What a demand set means
-is the sizing field it induces, ``min over demands of size + g|x - y|``, and two
-sets that induce the same field ask for the same grid. That is the comparison,
-and it is the same argument the sizing layer's own pruning rests on.
+is the sizing field it induces, ``min over demands of size + g|x - y|``, and what
+that field means is the cells it asks for. So the two are compared in cells:
+``mesh.py::_segment_lines`` takes the count across a gap from the integral of
+``1/size`` over it, so the integral of the difference of two reciprocals is how
+many cells one set asks for that the other does not. Below one, neither set asks
+for as much as a cell more than the other anywhere - which is a statement about
+the request and not about the grid, since the mesher rounds that count and a gap
+sitting astride a whole number tips across it under any difference at all. It is
+also a statement at one grading slope, the one ``GRADING`` names, and at that
+slope only.
 
 The lint in ``test_measured_not_typed.py`` is the cheap half of the same rule,
 and it catches the forms this cannot: a branch on a type that no corpus specimen
@@ -35,37 +42,92 @@ happens to reach.
 from __future__ import annotations
 
 import math
+from collections import Counter
 
 import numpy as np
 import pytest
 
-from Microwave.Solvers.openems.lfs import CHORD_TOLERANCE, SURFACE_FIDELITY
+from Microwave.Solvers.openems.lfs import CHORD_TOLERANCE, SEPARATION_REACH, SURFACE_FIDELITY
 from Microwave.Solvers.openems.sizing import DIMENSIONS
 from tests import corpus
 from tests.conftest import corpus_record as _record
 
-#: The sizing field's slope, as ``ln(max cell ratio)``. The invariant holds at
-#: any positive slope - it says two demand sets are the same demand set - and
-#: this is the one the sizing layer's pruning assumes, so it is the slope at
-#: which two sets that pruned differently still have to agree.
+#: The sizing field's slope, as ``ln(max cell ratio)``, and the ratio a mesh
+#: policy ships with. So the comparison below is made at the slope a drawing is
+#: meshed at, unless somebody sets that property to something else. The mesher
+#: ramps a fraction shallower than this, ``mesh.py`` keeping headroom for the
+#: scaling that lands a gap's cells on a whole count.
+#:
+#: **The comparison is made at this slope and says nothing at another one.** A
+#: shallower ramp carries a demand's influence further before the field reaches
+#: the cap, so a demand that moved is felt over more of the axis. That is not a
+#: direction, and the figure is not monotone in the slope. A demand that another
+#: one covers at a shallow ramp, and that the cap has swallowed at a steep one,
+#: binds between the two and nowhere else - so a difference between two sets
+#: there is worth nothing at either end and cells in the middle.
+#:
+#: Sweeping the slope does not rescue the statement. Over this corpus the figure
+#: climbs as the ramp shallows, and two specimens cross the bound at ratios a
+#: user may select - not because the layer read them differently, but because
+#: the file handed back a re-approximated surface and a curvature read on one
+#: asks for a different cell. ``MaxGrowthRatio`` takes any ratio above one, so
+#: there is no shallowest one to make the comparison at instead.
 GRADING = math.log(1.3)
 
-#: Points per axis the two fields are compared at, and how far past the shape
-#: they reach as a share of its extent. Beyond the shape as well as across it,
-#: because a demand is a point constraint that ramps outward and a field that
-#: agrees only where the metal is would say nothing about the grid around it.
-SAMPLES = 33
+#: How far past the shape the two fields are compared, as a share of its extent.
+#: Beyond the shape as well as across it, because a demand is a point constraint
+#: that ramps outward and a field that agrees only where the metal is would say
+#: nothing about the grid around it.
+#:
+#: It is a window rather than the mesher's whole axis, so a demand's ramp is
+#: followed until it is well into the coarse cells and not to where it meets the
+#: cap. What that leaves out is difference, so the comparison is the weaker for
+#: it rather than the stronger.
 BEYOND = 0.25
 
-#: How far apart the two fields may be, relative. A demand is a length arrived
-#: at through a chain of kernel queries, so re-parametrising the surface it was
-#: taken from moves its last bits and moves the point it was taken at. What the
-#: field must not do is answer a different question, and this is what separates
-#: the two: a grid holds ``ceil(length / size)`` cells across a gap, so a
-#: relative move this small can change a line count only where the quotient
-#: already sits within it of a whole number. The departure actually measured is
-#: on the failure message.
-FIELD = 1e-9
+#: Integration samples per cell inside one smooth piece of the field, and the
+#: most any one piece gets. ``1/field`` carries a cusp a few cells wide at each
+#: demand, so a sample every eighth of a cell resolves it however long the axis
+#: is, where a fixed count over the axis steps across the cusp of a fine demand
+#: on a large board. The cap bounds what one piece can ask for.
+#:
+#: Sampled rather than integrated in closed form, which is what the mesher
+#: does. This compares two demand sets and must not be able to agree with the
+#: mesher by sharing its arithmetic.
+PER_CELL = 8
+MOST_SAMPLES = 8192
+
+#: How far apart two demand sets may be, in cells.
+#:
+#: A demand is a length arrived at through a chain of kernel queries, so
+#: re-parametrising the surface it was taken from moves its last bits and moves
+#: the point it was taken at. Two sets that differ that way are not asking for
+#: different grids, and the way to say so is to measure the difference in the
+#: thing a demand set produces: ``mesh.py::_segment_lines`` takes the cell count
+#: across a gap from the integral of ``1/size`` over it, so the integral of
+#: ``|1/mine - 1/theirs|`` is how many cells one set asks for and the other does
+#: not.
+#:
+#: **It bounds what is asked for, not what is laid.** ``mesh.py::_cell_count``
+#: rounds the count it is handed, so a gap whose count sits astride a whole
+#: number tips across it under a difference of any size - which
+#: ``mesh.py::_settle`` states in its own words about the same rounding, and
+#: which ``tests/test_mesh_budget.py`` states about the same integral. The claim
+#: here is the one that survives that: neither set asks for as much as one cell
+#: more than the other, anywhere on the axis. Where the lines then land has its
+#: own tests.
+#:
+#: **It is what this corpus does at one slope**, and it is not a property of
+#: drawings. The figure is not smooth in the drawing any more than it is in the
+#: slope: the finest cell a shape asks for is often a chord with no floor under
+#: it, read at a station near a shallow trim, and one station more or less there
+#: reads a length orders finer. A bore's radius nudged by a fraction of itself
+#: moves the figure by orders, in either direction. So this bound is a
+#: measurement of this corpus rather than one anybody derived, and a specimen
+#: added tomorrow may not meet it.
+#:
+#: The figure measured is on the failure message.
+CELLS = 1.0
 
 #: How far the kernel's own measure of a shape may move across the round trip,
 #: relative. A STEP writer re-approximates a trimmed surface rather than copying
@@ -126,6 +188,58 @@ def envelope(demands, points: np.ndarray) -> np.ndarray:
         away = np.maximum(np.maximum(lower - points, points - upper), 0.0)
         finest = np.minimum(finest, size + GRADING * away)
     return finest
+
+
+def _apart(mine, theirs, low: float, high: float) -> float:
+    """How many cells one demand set asks for over this window that the other
+    does not.
+
+    The integrand is non-negative, so this bounds the difference over every gap
+    inside the window at once as well as over the window itself.
+
+    The field is a lower envelope of ramps, so ``1/field`` bends at each
+    demand's own ends; the window is split there and each piece sampled against
+    its own finest cell, which keeps a fine demand on a large board from being
+    stepped over. A count fixed over the axis instead would step over exactly
+    that.
+
+    A piece's finest cell is read off its two ends and not searched for inside:
+    every ramp is flat across its own demand and linear away from it, and the
+    window is split at every one of those ends, so on a piece each ramp is
+    linear and their minimum is concave - and a concave function over an
+    interval is smallest at an end.
+
+    Both fields are then evaluated once over the union of the pieces rather than
+    piece by piece. A drawing carrying a thousand demands makes as many pieces,
+    and a call per piece spends its whole time in the loop over demands.
+    """
+    edges = np.array(
+        sorted(
+            {low, high}
+            | {
+                float(edge)
+                for demands in (mine, theirs)
+                for lower, upper, _ in demands
+                for edge in (lower, upper)
+                if low < edge < high
+            }
+        )
+    )
+    at_edges = np.minimum(envelope(mine, edges), envelope(theirs, edges))
+    finest = np.minimum(at_edges[:-1], at_edges[1:])
+    counts = np.clip(PER_CELL * np.diff(edges) / finest, PER_CELL, MOST_SAMPLES).astype(int)
+    points = np.unique(
+        np.concatenate(
+            [
+                np.linspace(start, stop, count + 1)
+                for start, stop, count in zip(edges[:-1], edges[1:], counts)
+            ]
+        )
+    )
+    gap = np.abs(1.0 / envelope(mine, points) - 1.0 / envelope(theirs, points))
+    # Written out rather than taken from numpy, which named this function
+    # differently in the version FreeCAD ships.
+    return float(np.sum(np.diff(points) * (gap[:-1] + gap[1:]) / 2.0))
 
 
 def _off_by(one: float, other: float) -> float:
@@ -196,9 +310,121 @@ def _both(artifacts, name):
     return record, back
 
 
+#: The two records a criterion is asked of. Both, because a criterion the
+#: drawing meets and its round trip does not is exactly what this file exists to
+#: find, and comparing the two sides with each other cannot see it - they agree
+#: while both are wrong. Nothing is solved twice for it: the probe already wrote
+#: both sides, so this is the same measurement read a second time.
+DRAWN = "as drawn"
+FROM_A_FILE = "through a file"
+SIDES = (DRAWN, FROM_A_FILE)
+
+#: The same two as test ids, without the spaces that stop ``-k`` selecting them.
+SIDE_IDS = ("drawn", "from-a-file")
+
+
+def _side(artifacts, name, side):
+    """One specimen's record, drawn or read back, or a skip saying why not."""
+    record = _record(artifacts, name)
+    if side == DRAWN:
+        return record
+    back = record["round_trip"]
+    if back["status"] == "unavailable":
+        pytest.skip(f"STEP would not carry {name}: {back['reason']}")
+    changed = _moved(record)
+    if changed:
+        pytest.skip(f"the file gave back a different shape, so it is not this shape: {changed}")
+    return back
+
+
 def _ordered(pieces):
     """Pieces by where they are, since a file may hand the lumps back in any order."""
     return sorted(pieces, key=lambda piece: tuple(piece["lower"]))
+
+
+def _retriangulated(record, back) -> str:
+    """What the file changed about the triangles the mesher measures, said aloud.
+
+    A chord is read off the triangulation and off nothing else, so a body the
+    file tessellates differently is a body a different length was measured on.
+    That is not a fault and it is not this workbench's doing: openEMS is handed
+    those triangles too, so a shape through a file has always been solved as a
+    slightly different shape. It is the coarsest of the ways a file moves a
+    demand, and the one a reader cannot see from the demands, so a comparison
+    that fails says whether it happened.
+    """
+    drawn, restored = _ordered(record["pieces"]), _ordered(back["pieces"])
+    if len(drawn) != len(restored):
+        return f", and the file gave back {len(restored)} pieces where the drawing has {len(drawn)}"
+    changed = [
+        f"{len(mine['faces'])} -> {len(theirs['faces'])}"
+        for mine, theirs in zip(drawn, restored)
+        if len(mine["faces"]) != len(theirs["faces"])
+    ]
+    if not changed:
+        return ", off a triangulation the file left the same size"
+    return ", off a triangulation the file changed: " + "; ".join(changed) + " triangles"
+
+
+def _laid(record):
+    """One record's face station counts, gathered by the body each was laid on,
+    and a length each count was taken from.
+
+    A specimen drawn beside a companion is measured with it, so an entry says
+    which body it belongs to. Within a body the counts are a multiset: a file
+    may hand faces back in any order, and none of what is compared is a face's
+    place in a list.
+
+    The counts are compared and the lengths are not. A length is a measurement
+    and its last bits move across a file on almost every face, which is the
+    whole reason the counts are worth asserting; the length is carried so that
+    a failure can say which face sat on a step.
+    """
+    counts: dict[str, Counter] = {}
+    sizes: dict[tuple[str, int, int], tuple[float, float]] = {}
+    for label, across, along, width, height in record["lattice"]:
+        counts.setdefault(label, Counter())[(across, along)] += 1
+        sizes.setdefault((label, across, along), (width, height))
+    return counts, sizes
+
+
+def _lattice_moved(record, back) -> str:
+    """What the file laid a different lattice on, said in full, or nothing.
+
+    Where every length read off a face is read is decided by the lattice on it,
+    so two sides that laid the same lattices measured one shape at one set of
+    places. Two sides that did not measured two sets, and their demands then
+    differ by where they were taken rather than by what the drawing asks for.
+
+    A length each count was taken from is on the message, because a count is an
+    integer read off one: a face that is a whole number of cells across sits on
+    the step ``lfs.py::_steps`` takes, and the counts alone do not show that it
+    did.
+    """
+    mine, my_sizes = _laid(record)
+    theirs, their_sizes = _laid(back)
+    for label in sorted(set(mine) | set(theirs)):
+        one, other = mine.get(label, Counter()), theirs.get(label, Counter())
+        gone, came = one - other, other - one
+        if not gone and not came:
+            continue
+        return (
+            f"on {label!r} the drawing lays {_faces_said(label, gone, my_sizes)} "
+            f"and the file lays {_faces_said(label, came, their_sizes)}"
+        )
+    return ""
+
+
+def _faces_said(label, counts, sizes) -> str:
+    """A handful of face lattices, as a reader would say them."""
+    if not counts:
+        return "nothing of its own"
+    return "; ".join(
+        f"{across} by {along} stations on a face measuring "
+        f"{sizes[(label, across, along)][0]:.12g} by "
+        f"{sizes[(label, across, along)][1]:.12g} mm"
+        for across, along in sorted(counts.elements())
+    )
 
 
 def _carried(artifacts):
@@ -216,6 +442,16 @@ def _carried(artifacts):
     }
 
 
+def _finest(record) -> float:
+    """The smallest cell anything on the drawing asked for.
+
+    A demand does not say what measured it, so reading the finest is sound only
+    where nothing else on the specimen could have supplied it - which is a
+    property of the specimen and is stated at each place this is used.
+    """
+    return min(size for axis in record["demands"] for _, _, size in axis)
+
+
 def _across(record):
     """The extent both shapes are compared over, per axis, padded."""
     boxes = [record["measured"]["bound_box"], record["round_trip"]["measured"]["bound_box"]]
@@ -229,7 +465,14 @@ def _across(record):
 @pytest.mark.slow
 @pytest.mark.parametrize("specimen", corpus.specimens(), ids=lambda s: s.name)
 class TestOneShapeGetsOneAnswer:
-    """Each specimen against itself, written to STEP and read back."""
+    """Each specimen against itself, written to STEP and read back.
+
+    The checks here are of two kinds. Some compare the two sides with each
+    other, which is what says the layer read the geometry and not what drew it.
+    The rest ask a criterion of each side on its own, and ask it of both: two
+    sides that agree with each other can be wrong together, and a criterion is
+    the only thing here that can say so.
+    """
 
     def test_the_verdict_survives_the_round_trip(self, specimen, artifacts):
         """Meshed stays meshed and refused stays refused.
@@ -308,62 +551,57 @@ class TestOneShapeGetsOneAnswer:
     def test_the_demands_survive_the_round_trip(self, specimen, artifacts):
         """The same grid is asked for, which is what a demand set is for.
 
-        Compared as the field the demands induce and not as the demands
+        Compared as the cells the demands ask for and not as the demands
         themselves: re-parametrising a surface moves where it is sampled, so the
         two lists differ in length on the cone and on the text without either
         asking for anything the other does not.
+
+        Nor as the field, which is the same argument one step short. A demand is
+        the end of a chain of kernel queries and its last bits move whether or
+        not anything about the drawing did, and the chain amplifies that: a
+        chord is where a ray met a facet, so a vertex that moved carries into
+        the answer divided by the cosine of the angle the ray made with it, and
+        that angle is free to be shallow. Nothing in it asks for a different
+        grid, and a comparison of fields cannot say so except under a tolerance
+        chosen to let it through.
+
+        Counting cells can. What the mesher does with a field is integrate
+        ``1/size`` across each gap and take the count from it, so the same
+        integral of the difference of the two reciprocals is the count one set
+        asks for and the other does not. A layer that branched on how a shape
+        was drawn asks for a different count, because a demand it stopped making
+        leaves the field at the material's bulk size wherever that demand was
+        the finest thing.
+
+        It holds over every specimen, with no kind of shape left out. What made
+        that possible is that both sides read the shape in the same places:
+        ``TestTheRoundTripItself`` asserts that the file lays the same lattice on
+        every face, and where a lattice moves the lengths are measured somewhere
+        else and this comparison is between two samplings rather than about one
+        drawing.
         """
         record, back = _both(artifacts, specimen.name)
         if record["status"] != "meshed":
             pytest.skip("nothing was meshed, so nothing was measured off it")
         if not any(record["demands"]) and not any(back["demands"]):
             pytest.skip("this shape is held exactly, so no length was measured off it")
-        if record.get("skin"):
-            pytest.skip("a skin is sampled on a surface this layer built - see the test below")
 
-        worst, worst_axis, worst_point = 0.0, 0, 0.0
+        worst, worst_axis = 0.0, 0
         for dim, (low, high) in enumerate(_across(record)):
-            points = np.linspace(low, high, SAMPLES)
-            mine = envelope(record["demands"][dim], points)
-            theirs = envelope(back["demands"][dim], points)
-            departure = np.abs(mine - theirs) / np.maximum(mine, theirs)
-            if departure.max() > worst:
-                worst = float(departure.max())
-                worst_axis, worst_point = dim, float(points[departure.argmax()])
+            apart = _apart(record["demands"][dim], back["demands"][dim], low, high)
+            if apart > worst:
+                worst, worst_axis = apart, dim
 
-        assert worst <= FIELD, (
+        assert worst < CELLS, (
             f"{specimen.name!r} ({specimen.subject}) asks for a different grid "
-            f"through a file: the sizing field is off by {worst:.3g} at "
-            f"{worst_point:.6g} on axis {worst_axis}"
+            f"through a file: the two demand sets are {worst:.3g} cells apart "
+            f"on axis {worst_axis}{_retriangulated(record, back)}"
         )
 
-    def test_a_skin_asks_for_the_same_lengths_through_the_round_trip(self, specimen, artifacts):
-        """The finest and coarsest cell asked for on each axis, and not where.
-
-        A skin's demands are read off a solid this layer *built*, and the two
-        solids agree - the corner comparison above says so. What the round trip
-        moves is where that solid gets sampled, the parameterisation being
-        inherited from the surface it was offset from, so the field between
-        samples differs while nothing asks for a different length. The finest
-        demand is what costs, and it is what has to survive.
-        """
-        record, back = _both(artifacts, specimen.name)
-        if not record.get("skin") or record["status"] != "meshed":
-            pytest.skip("this specimen is not a conductor drawn as a surface")
-
-        for dim in range(DIMENSIONS):
-            mine = [size for _, _, size in record["demands"][dim]]
-            theirs = [size for _, _, size in back["demands"][dim]]
-            assert bool(mine) == bool(theirs), (
-                f"{specimen.name!r} measures lengths on axis {dim} through a file "
-                "and not off the drawing, or the other way about"
-            )
-            if not mine:
-                continue
-            assert min(theirs) == pytest.approx(min(mine), rel=SAME_SHAPE, abs=0.0)
-            assert max(theirs) == pytest.approx(max(mine), rel=SAME_SHAPE, abs=0.0)
-
-    def test_a_shape_the_grid_does_not_hold_is_asked_for_finely_enough(self, specimen, artifacts):
+    @pytest.mark.parametrize("side", SIDES, ids=SIDE_IDS)
+    def test_a_shape_the_grid_does_not_hold_is_asked_for_finely_enough(
+        self, specimen, artifacts, side
+    ):
         """What makes the comparison above more than two empty sets agreeing.
 
         A piece that came back as triangles is one no rectilinear grid follows,
@@ -385,24 +623,25 @@ class TestOneShapeGetsOneAnswer:
         gates, and they are also the ones a rule about curvature can break
         without any other specimen noticing.
         """
-        record = _record(artifacts, specimen.name)
+        record = _side(artifacts, specimen.name, side)
         if record["status"] != "meshed":
             pytest.skip("nothing was meshed, so nothing was measured off it")
         if not any(piece["faces"] for piece in record["pieces"]):
             pytest.skip("this shape is held exactly, so its own faces are where the grid is")
         assert any(record["demands"]), (
-            f"{specimen.name!r} ({specimen.subject}) is meshed as triangles and "
-            "asks the grid for nothing, so no length was read off it at all"
+            f"{specimen.name!r} ({specimen.subject}) {side} is meshed as triangles "
+            "and asks the grid for nothing, so no length was read off it at all"
         )
-        finest = min(size for axis in record["demands"] for _, _, size in axis)
+        finest = _finest(record)
         across = _size_of(record["measured"]) / finest
         assert across >= FOLLOWED, (
-            f"{specimen.name!r} ({specimen.subject}) is meshed as triangles and asks "
-            f"for cells of {finest:.4g}, which is {across:.3g} of them across the "
+            f"{specimen.name!r} ({specimen.subject}) {side} is meshed as triangles and "
+            f"asks for cells of {finest:.4g}, which is {across:.3g} of them across the "
             f"whole shape - the grid steps over it rather than following it"
         )
 
-    def test_a_body_is_asked_for_across_its_own_wall(self, specimen, artifacts):
+    @pytest.mark.parametrize("side", SIDES, ids=SIDE_IDS)
+    def test_a_body_is_asked_for_across_its_own_wall(self, specimen, artifacts, side):
         """Following a shape is not resolving the metal it is made of.
 
         A conductor is sampled at a point per Yee edge, so a wall the grid puts
@@ -424,19 +663,22 @@ class TestOneShapeGetsOneAnswer:
         """
         if specimen.wall is None:
             pytest.skip("this shape has no single thickness to state")
-        record = _record(artifacts, specimen.name)
+        if specimen.dielectric:
+            pytest.skip("a dielectric is counted across its wall, not fitted inside it")
+        record = _side(artifacts, specimen.name, side)
         if record["status"] != "meshed":
             pytest.skip("nothing was meshed, so nothing was measured off it")
-        finest = min(size for axis in record["demands"] for _, _, size in axis)
+        finest = _finest(record)
         fits = specimen.wall / math.sqrt(3)
         assert finest <= fits * (1.0 + CHORD_TOLERANCE), (
-            f"{specimen.name!r} ({specimen.subject}) has a wall of "
+            f"{specimen.name!r} ({specimen.subject}) {side} has a wall of "
             f"{specimen.wall:.4g} and asks for cells of {finest:.4g}, where a "
             f"cell fitting inside that wall is {fits:.4g} - so nothing measured "
             "the wall and the grid is free to open it"
         )
 
-    def test_a_gap_inside_one_object_is_asked_for_across(self, specimen, artifacts):
+    @pytest.mark.parametrize("side", SIDES, ids=SIDE_IDS)
+    def test_a_gap_inside_one_object_is_asked_for_across(self, specimen, artifacts, side):
         """Two lumps drawn in one operation are still two conductors.
 
         A gap the grid puts no cell inside is a gap the mesh closes, and two
@@ -444,29 +686,118 @@ class TestOneShapeGetsOneAnswer:
         device nobody drew. The measurement has to come from the lumps
         themselves: they are one object, so nothing outside is paired with them.
 
-        A gap has a direction, and a witness pair between two lumps side by side
-        points along one axis - so what a cell must fit inside is the gap
-        itself, where a cross-section spends its length across all three.
+        A gap has a direction, and what a cell must fit inside is the gap
+        along it - where a cross-section spends its length across all three
+        axes. The witness pair between two lumps side by side points along one
+        axis and asks for the gap exactly; the walk along the run reads the
+        same gap through each sample's own normal, and an oblique reading
+        spends a longer crossing across more axes.
 
-        Read as the finest demand the whole record carries, and asserted to
-        *be* the gap rather than merely to clear it. The specimen declaring one
-        has no sharp join anywhere and a radius whose fidelity demand is well
-        coarser, so the gap is the only thing on it that can ask for a cell this
-        small - and an inequality would go quietly vacuous the day that stopped
-        being true, passing on whatever demand was finest instead.
+        Bounded on both sides rather than asserted equal, because those
+        readings straddle the gap: the finest of them cannot go below the
+        allocation's own worst case over unit normals, which is the Holder
+        bound ``SEPARATION_REACH`` is derived from, less the walk's own
+        precision - and the witness itself asks for the gap on its axis, so
+        the finest the record carries cannot sit above it. Both ends are
+        arithmetic. The specimen declaring one has no sharp join anywhere and
+        a radius whose fidelity demand is well coarser, so the gap is the only
+        thing on it that can ask inside this band - and the band would go
+        quietly vacuous the day that stopped being true, passing on whatever
+        demand was finest instead.
         """
         if specimen.gap is None:
             pytest.skip("this shape has no two lumps to state a clearance between")
-        record = _record(artifacts, specimen.name)
+        if specimen.beside is not None:
+            pytest.skip("this clearance is to a second object, which is the case below")
+        record = _side(artifacts, specimen.name, side)
         if record["status"] != "meshed":
             pytest.skip("nothing was meshed, so nothing was measured off it")
-        finest = min(size for axis in record["demands"] for _, _, size in axis)
-        assert finest == pytest.approx(specimen.gap, rel=WITNESS, abs=0.0), (
-            f"{specimen.name!r} ({specimen.subject}) has a gap of "
+        finest = _finest(record)
+        floor = specimen.gap / SEPARATION_REACH * (1.0 - CHORD_TOLERANCE)
+        assert floor <= finest <= specimen.gap * (1.0 + WITNESS), (
+            f"{specimen.name!r} ({specimen.subject}) {side} has a gap of "
             f"{specimen.gap:.4g} between its lumps and asks for cells of "
-            f"{finest:.4g} - so either nothing measured the gap and the mesh is "
+            f"{finest:.4g}, where no reading of that gap can allocate below "
+            f"{floor:.4g} - so either nothing measured the gap and the mesh is "
             "free to close it, or something else on the shape now asks for less "
             "and this specimen has stopped being the instrument it says it is"
+        )
+
+    @pytest.mark.parametrize("side", SIDES, ids=SIDE_IDS)
+    def test_a_gap_to_a_second_drawn_object_is_asked_for_across(self, specimen, artifacts, side):
+        """The same clearance, drawn the way a user assembles a device.
+
+        A gap is a property of two bodies, and the pairing is over the bodies
+        the mesher was handed - so which drawn object each came from is not
+        something it can see. That is the claim rather than the assumption: a
+        specimen is one object, the corpus drew them one at a time, and until
+        there was a second object nothing here ran that pairing across one.
+
+        Bounded to the same band for the reason the case above states it, and
+        the specimen is drawn from the same two lumps its compound sibling is
+        built from, so a difference between the two is the object count and
+        nothing else.
+        """
+        if specimen.beside is None:
+            pytest.skip("this specimen is one drawn object")
+        record = _side(artifacts, specimen.name, side)
+        if record["status"] != "meshed":
+            pytest.skip("nothing was meshed, so nothing was measured off it")
+        assert record["beside"], (
+            f"{specimen.name!r} {side} declares a second object and the layer made "
+            "nothing of it, so the gap has only one side"
+        )
+        finest = _finest(record)
+        floor = specimen.gap / SEPARATION_REACH * (1.0 - CHORD_TOLERANCE)
+        assert floor <= finest <= specimen.gap * (1.0 + WITNESS), (
+            f"{specimen.name!r} ({specimen.subject}) {side} stands {specimen.gap:.4g} "
+            f"from a second drawn object and asks for cells of {finest:.4g}, "
+            f"where no reading of that gap can allocate below {floor:.4g} - so "
+            "the pairing did not cross the two objects, and a mesh is free to "
+            "short them together"
+        )
+
+    @pytest.mark.parametrize("side", SIDES, ids=SIDE_IDS)
+    def test_a_dielectric_is_counted_across_its_own_wall(self, specimen, artifacts, side):
+        """What a layer asks is a count, and a count is not a fit.
+
+        openEMS averages a dielectric over the cell rather than sampling it at a
+        point, so nothing about the layer staircases and no cell has to fit
+        inside it. What under-resolves is the field varying across the layer,
+        and the answer to that is several cells over the thickness - the pitch
+        along the layer's own normal, which is the wall over the count.
+
+        Bounded on both sides rather than asserted equal, because the demand a
+        count arrives as is a cell size **per axis** and delivery is carried by
+        the dominant axis alone. Its cell is the chord's run on it over the
+        count - ``t max_j(|m_j|) / n`` - which is the wall over the count
+        exactly where the normal lies on an axis, and ``sqrt(3)`` times finer
+        where the normal points equally at all three: those two are the whole
+        range any orientation can produce, and both ends are arithmetic rather
+        than observation.
+
+        It stays a narrow window. The specimens declaring a wall carry no sharp
+        join and are asked nothing about their curvature, so the count is the
+        only thing on either drawing that can ask for a cell this small; and the
+        fault the rule exists to stop - a thickness read off the bounding box,
+        which on the rolled one is the bore - lands an order outside the coarse
+        end rather than just past it.
+        """
+        if not specimen.dielectric:
+            pytest.skip("a conductor is asked that a cell fit inside it, not how many span it")
+        record = _side(artifacts, specimen.name, side)
+        if record["status"] != "meshed":
+            pytest.skip("nothing was meshed, so nothing was measured off it")
+        finest = _finest(record)
+        coarse = specimen.wall / corpus.ELEMENTS_ACROSS
+        fine = coarse / math.sqrt(DIMENSIONS)
+        assert fine * (1.0 - CHORD_TOLERANCE) <= finest <= coarse * (1.0 + CHORD_TOLERANCE), (
+            f"{specimen.name!r} ({specimen.subject}) {side} has a wall of "
+            f"{specimen.wall:.4g} and asks for cells of {finest:.4g}, where "
+            f"{corpus.ELEMENTS_ACROSS} across that wall is {coarse:.4g} on an "
+            f"axis-facing layer and no orientation can ask for finer than "
+            f"{fine:.4g} - so the layer is not being counted along its own "
+            "normal at all"
         )
 
 
@@ -510,6 +841,43 @@ class TestTheRoundTripItself:
             "a solid wound the ordinary way is meshed, so this is the shape "
             "changing and not the layer answering differently about one shape"
         )
+
+    def test_the_file_lays_the_same_lattice_on_every_shape(self, artifacts):
+        """What the demand comparison rests on, and the one thing it cannot see.
+
+        Every length a drawing carries is read at a station, and the lattice is
+        what decides where the stations are. Two sides that laid the same
+        lattice measured one shape in one set of places; two sides that did not
+        measured two sets, and their demands then differ by where they were
+        taken rather than by what the drawing asks for. The comparison in the
+        class above would report that as a shape asking for a different grid,
+        which is the wrong sentence about the right fact.
+
+        The lattice is a function of the shape because ``lfs.py::_steps`` takes
+        each direction's count from a length in space. It is an integer taken
+        from a real, so it steps, and a drawing sits on a step whenever a face is
+        a round number of cells across - which is most drawings. That is what
+        :data:`~Microwave.Solvers.openems.lfs.COUNT_SLACK` is under the step for,
+        and this is the assertion that says so.
+        """
+        both = {
+            name: record
+            for name, record in _carried(artifacts).items()
+            if record["status"] == "meshed" and record["round_trip"]["status"] == "meshed"
+        }
+        # Named, because two empty lists agree with each other. A record that
+        # never carried a lattice would pass this without a face being read.
+        laid = {name: len(record["lattice"]) for name, record in both.items()}
+        assert sum(laid.values()), (
+            f"no specimen laid a lattice at all, so nothing here was compared: {laid}"
+        )
+
+        moved = {
+            name: _lattice_moved(record, record["round_trip"])
+            for name, record in both.items()
+            if _lattice_moved(record, record["round_trip"])
+        }
+        assert not moved, f"the file lays a different lattice on these: {moved}"
 
 
 class TestTheFieldTheDemandsInduce:

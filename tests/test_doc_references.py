@@ -3,19 +3,19 @@
 
 """A page this project cites is a page it still has.
 
-Reasoning too long to sit beside the code it governs lives in
-``docs/internals``, and the code says which page. That pointer is the whole of
-what holds the two together, and it is exactly the kind of thing that breaks
-without a sound: the page is renamed or a section retitled, the citation goes on
-reading as though it were still true, and the next person to follow it finds
-nothing. A derivation nobody can reach has been deleted - slowly, and without
-anybody deciding to.
+What a user needs to read lives in ``docs``, and the working behind a rule the
+code states lives in ``docs/internals``. The code says which page. That pointer
+is the whole of what holds the two together, and it is exactly the kind of thing
+that breaks without a sound: the page is renamed or a section retitled, the
+citation goes on reading as though it were still true, and the next person to
+follow it finds nothing. A derivation nobody can reach has been deleted -
+slowly, and without anybody deciding to.
 
-So the pointer is checked. Every ``docs/internals/...`` reference names a file
-that is there, and a ``#section`` on the end of one names a heading in that file.
-A page linking to a sibling is held to the same thing: that link is spelled
-relatively, so it looks nothing like the citations the code makes and would
-otherwise be the one pointer here that nothing watches.
+So the pointer is checked. Every ``docs/...`` reference names a file that is
+there, and a ``#section`` on the end of one names a heading in that file. A page
+linking to a sibling is held to the same thing: that link is spelled relatively,
+so it looks nothing like the citations the code makes and would otherwise be the
+one pointer here that nothing watches.
 
 This is the same bargain the self-containment rule makes. A convention nobody
 checks is a convention that drifts, and the answer is to state it in a form that
@@ -38,16 +38,19 @@ SUFFIXES = (".py", ".md", ".toml")
 SELF = pathlib.Path(__file__).resolve()
 
 #: Where the pages live.
-INTERNALS = ROOT / "docs" / "internals"
+DOCS = ROOT / "docs"
 
 #: A citation: the page, and optionally the section of it. Bounded on the left
-#: so that a longer path ending in these characters is not read as one.
-REFERENCE = re.compile(r"(?<![\w/])docs/internals/([\w.-]+\.md)(?:#([\w-]+))?")
+#: so that a longer path ending in these characters is not read as one. The name
+#: it yields is written from ``docs``, so it carries ``internals/`` where the
+#: page is one of those.
+REFERENCE = re.compile(r"(?<![\w/])docs/((?:internals/)?[\w.-]+\.md)(?:#([\w-]+))?")
 
 #: A page linking to a sibling, which is how the pages cross-reference each
 #: other and how the index names them. It is spelled relatively - ``(page.md)``
 #: rather than the full path - so the pattern above never sees it, and a rename
-#: would break exactly the link this file exists to keep.
+#: would break exactly the link this file exists to keep. It is read in a page
+#: alone, and resolved against that page's own directory.
 SIBLING = re.compile(r"\]\(([\w.-]+\.md)(?:#([\w-]+))?\)")
 
 
@@ -71,15 +74,16 @@ def anchors(page: pathlib.Path) -> set[str]:
     }
 
 
-def offences(path: pathlib.Path, internals: pathlib.Path = INTERNALS) -> list[str]:
+def offences(path: pathlib.Path, docs: pathlib.Path = DOCS) -> list[str]:
     """Every citation in one file that no longer arrives anywhere."""
     found = []
     for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
-        cited = list(REFERENCE.findall(line))
-        if path.parent == internals:
-            cited += SIBLING.findall(line)
-        for name, section in cited:
-            page = internals / name
+        cited = [(docs / name, name, section) for name, section in REFERENCE.findall(line)]
+        if docs in path.parents:
+            cited += [
+                (path.parent / name, name, section) for name, section in SIBLING.findall(line)
+            ]
+        for page, name, section in cited:
             if not page.is_file():
                 found.append(f"{path.name}:{number}: no page {name}")
             elif section and section not in anchors(page):
@@ -97,11 +101,13 @@ def test_every_page_this_file_cites_is_still_there(path):
 
 
 def test_the_check_knows_a_live_citation_from_a_dead_one(tmp_path):
-    internals = tmp_path / "internals"
-    internals.mkdir()
+    docs = tmp_path / "docs"
+    internals = docs / "internals"
+    internals.mkdir(parents=True)
     (internals / "sizing.md").write_text(
         "# Spending a thickness\n\n## Why not the cheaper objective\n", encoding="utf-8"
     )
+    (docs / "results.md").write_text("# Results\n\n## Reference impedance\n", encoding="utf-8")
 
     kept = tmp_path / "kept.py"
     kept.write_text(
@@ -109,10 +115,12 @@ def test_the_check_knows_a_live_citation_from_a_dead_one(tmp_path):
         "# A section of it: docs/internals/sizing.md#spending-a-thickness.\n"
         "# And one whose title carried punctuation and a backtick:\n"
         "#   docs/internals/sizing.md#why-not-the-cheaper-objective\n"
+        "# A page a user reads, and a section of it: docs/results.md, and\n"
+        "#   docs/results.md#reference-impedance\n"
         "# Somebody else's path is not one of these: Mod/docs/internals/x.md\n",
         encoding="utf-8",
     )
-    assert offences(kept, internals) == []
+    assert offences(kept, docs) == []
 
     # A page linking to a sibling, which only counts inside the directory.
     sibling = internals / "index.md"
@@ -120,22 +128,23 @@ def test_the_check_knows_a_live_citation_from_a_dead_one(tmp_path):
         "See [the working](sizing.md) and [one part](sizing.md#spending-a-thickness).\n",
         encoding="utf-8",
     )
-    assert offences(sibling, internals) == []
+    assert offences(sibling, docs) == []
 
     broken = internals / "stale.md"
     broken.write_text("Renamed: [gone](allocation.md).\n", encoding="utf-8")
-    assert [o.split(":")[1] for o in offences(broken, internals)] == ["1"]
+    assert [o.split(":")[1] for o in offences(broken, docs)] == ["1"]
 
     outside = tmp_path / "elsewhere.md"
-    outside.write_text("A link to [something](allocation.md) not in internals.\n", encoding="utf-8")
-    assert offences(outside, internals) == []
+    outside.write_text("A link to [something](allocation.md) not in docs.\n", encoding="utf-8")
+    assert offences(outside, docs) == []
 
     caught = tmp_path / "caught.py"
     caught.write_text(
         "# Renamed out from under it: docs/internals/allocation.md\n"
-        "# Section retitled: docs/internals/sizing.md#spending-the-budget\n",
+        "# Section retitled: docs/internals/sizing.md#spending-the-budget\n"
+        "# And a page a user reads, retitled: docs/results.md#reference-plane\n",
         encoding="utf-8",
     )
     # By line, rather than by how many: which citation died is the thing a
     # reader has to act on, and a tally is the same either way.
-    assert [offence.split(":")[1] for offence in offences(caught, internals)] == ["1", "2"]
+    assert [offence.split(":")[1] for offence in offences(caught, docs)] == ["1", "2", "3"]

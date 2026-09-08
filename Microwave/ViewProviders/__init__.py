@@ -3,27 +3,27 @@
 
 """How the workbench's objects look in the tree and the 3D view.
 
-Nothing here decides anything about the model. A view provider owns an icon, a
-display mode and, for the two objects that carry real geometry, deliberately
-neither - see :class:`Provider` for why defining a display mode on a
-``Part::FeaturePython`` makes its geometry disappear.
+Nothing here decides anything about the model. A view provider owns an icon and
+a display mode. The objects that carry real geometry get the icon and no display
+mode: defining a display mode on a ``Part::FeaturePython`` makes its geometry
+disappear, as :class:`Provider` describes.
 
-**No provider keeps state.** Everything a provider would want is on the document
+No provider keeps state. Everything a provider would want is on the document
 object or derived from it, so ``__getstate__`` returns ``None`` and FreeCAD never
 writes a pickled GUI class into a saved document.
 
-This package is the only one that may import ``FreeCADGui`` - and it does not
-import it at module scope either, because ``Commands`` and the document objects
-both reach it for the icon path.
+This package is the only one that may import ``FreeCADGui``. It does not import
+it at module scope either, because ``Commands`` and the document objects both
+reach it for the icon path.
 """
 
 import os
 
 import FreeCAD
 
-#: Where the icon set lives. One definition; every provider and command asks
-#: here, and a missing file gives "" so a stale name is a plain icon rather
-#: than a traceback during document restore.
+#: Where the icon set lives. Every provider and command asks here. A missing
+#: file gives "", so a stale name gives a plain icon rather than a traceback
+#: during document restore.
 RESOURCES = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Resources")
 
 
@@ -34,18 +34,19 @@ def icon(name):
 
 
 class Provider:
-    """What every view provider here shares: an icon, and no state to keep.
+    """An icon and no state to keep, which every view provider here shares.
 
-    Separate from :class:`HasDisplayMode` rather than merged into it, because the
-    two objects that carry real geometry - a port and the mesh preview, both
-    ``Part::FeaturePython`` - must *not* have display modes. FreeCAD derives
-    their provider from Part's own, which already knows how to draw a ``Shape``;
-    defining ``getDisplayModes`` or ``setDisplayMode`` takes that over and the
-    geometry stops appearing. So they take this and the rest take the subclass.
+    This class stays separate from :class:`HasDisplayMode` because the objects
+    that carry real geometry - a port and the mesh preview, both
+    ``Part::FeaturePython`` - must not have display modes. FreeCAD derives their
+    provider from Part's own, which already knows how to draw a ``Shape``.
+    Defining ``getDisplayModes`` or ``setDisplayMode`` takes that over and the
+    geometry stops appearing. Those objects take this class, and the rest take
+    the subclass.
     """
 
-    #: Icon file in ``Resources``. Set per subclass, with no default on purpose:
-    #: a default would silently give a new kind another kind's picture, and the
+    #: Icon file in ``Resources``. Each subclass sets it, and there is no
+    #: default: a default would give a new kind another kind's picture, and the
     #: tree is where a user tells one port from another at a glance.
     ICON = ""
 
@@ -55,10 +56,10 @@ class Provider:
     def getIcon(self):
         return icon(self.ICON)
 
-    # FreeCAD serialises a view provider through these. Nothing here is worth
-    # keeping - every provider's state is either on the document object or
-    # derived from it - and saying so explicitly is what stops FreeCAD writing
-    # a pickle of a GUI class into the document.
+    # FreeCAD serialises a view provider through these. Every provider's state
+    # is on the document object or derived from it, so there is nothing to
+    # keep. Saying so here stops FreeCAD writing a pickle of a GUI class into
+    # the document.
     def __getstate__(self):
         return None
 
@@ -70,18 +71,18 @@ class HasDisplayMode(Provider):
     """Give a non-geometric object a display mode, so it is not born hidden.
 
     On FreeCAD 1.1.1 an ``App::FeaturePython`` whose view provider offers no
-    display mode reports ``Visibility`` as ``True`` and is still drawn greyed
-    out in the tree, and Space does nothing - ``isShow()`` needs a mode to
+    display mode reports ``Visibility`` as ``True``, is still drawn greyed out
+    in the tree, and does not respond to Space. ``isShow()`` needs a mode to
     show, so without this the whole markup reads as disabled. FreeCAD's own FEM
-    analysis carries a mode called ``Analysis`` for exactly this reason.
+    analysis carries a mode called ``Analysis`` for the same reason.
 
-    The mode draws nothing: an empty ``SoGroup``. These objects have no
-    geometry - what they need is not something to draw but the *right* to be
-    shown, which is what makes hiding one meaningful.
+    The mode draws nothing. It is an empty ``SoGroup``. These objects have no
+    geometry, so they need the right to be shown rather than something to draw,
+    and that right is what makes hiding one meaningful.
     """
 
-    #: One name for all of them. It is never shown: the display-mode combo only
-    #: appears for objects with more than one, and these have exactly one.
+    #: One name for all of them. Nothing shows it: the display-mode combo
+    #: appears only for objects with more than one mode, and these have one.
     DISPLAY_MODE = "Default"
 
     def attach(self, vobj):
@@ -102,9 +103,10 @@ def add_display_mode(vobj, name="Default"):
     """Attach an empty display mode. Never raises.
 
     ``pivy`` is imported here rather than at module scope so these modules stay
-    importable without a GUI, which a test enforces. A view provider that cannot
-    build its mode is a cosmetic loss; one that raises during document restore
-    costs the object its icon and its double-click.
+    importable outside FreeCAD, which is where pivy ships. A test enforces it.
+    A view provider that cannot build its mode costs only appearance. One that
+    raises during document restore costs the object its icon and its
+    double-click.
     """
     try:
         from pivy import coin
@@ -117,12 +119,12 @@ def add_display_mode(vobj, name="Default"):
 
 
 #: Document kind to the module its view provider lives in. The class is always
-#: ``<kind>ViewProvider``, so the name does not need a column of its own.
+#: ``<kind>ViewProvider``, so the name needs no column of its own.
 #:
-#: A table rather than the twelve-branch ladder it replaces, because the branches
-#: were mechanically identical and the thing that actually breaks - adding a
-#: document object and forgetting its provider - is invisible in a ladder and a
-#: missing row here. ``test_every_document_kind_has_a_view_provider`` reads it
+#: This is a table rather than a branch per kind, because the branches are
+#: mechanically identical. Adding a document object and forgetting its provider
+#: is invisible in a ladder of branches, and shows here as a missing row.
+#: ``test_every_document_kind_has_a_view_provider`` reads it
 #: against :func:`Objects.kinds.kinds`, which derives the kinds from the classes.
 _PROVIDER_MODULES = {
     "EMAnalysis": "analysis",
@@ -143,8 +145,8 @@ _PROVIDER_MODULES = {
 def provider_class(kind):
     """The view provider class for a document kind, or ``None`` where there is none.
 
-    Imported on demand, as the ladder did: these modules reach for ``PySide`` and
-    ``pivy`` and must not be imported when nothing is drawing.
+    The module is imported on demand. These modules reach for ``PySide`` and
+    ``pivy``, so they must not be imported when nothing is drawing.
     """
     module = _PROVIDER_MODULES.get(kind)
     if module is None:
@@ -158,24 +160,24 @@ def inject_vp(obj, kind):
     """Attach the view provider for ``kind``, if this workbench has one.
 
     Called from ``Microwave.Objects`` when an object is created, through the
-    injector hook it registers - a document object must not import the GUI.
+    injector hook it registers. A document object must not import the GUI.
     """
     provider = provider_class(kind)
     if provider is not None:
         provider(obj.ViewObject)
 
-    # Assigning Proxy to a *restored* ViewObject does not make FreeCAD 1.1.1
-    # call attach(); on a freshly created one it does. The distinction is the
-    # object's restore state, not whether the ViewObject already exists. Every
-    # provider above sets self.Object in attach and nowhere else, so without
-    # this call the restore path injects a provider without it and anything
-    # reading self.Object silently does nothing.
+    # Assigning Proxy to a restored ViewObject does not make FreeCAD 1.1.1 call
+    # attach(). On a freshly created one it does. The object's restore state
+    # decides that, not whether the ViewObject already exists. Every provider
+    # above sets self.Object in attach and nowhere else, so without this call
+    # the restore path injects a provider that never ran attach, and anything
+    # reading self.Object does nothing.
     #
-    # Guarded on self.Object rather than called unconditionally: that attribute
-    # is exactly "has attach run?", and attach is *not* idempotent everywhere.
-    # ports.py rebuilds its coin subgraph and calls addDisplayMode again,
-    # orphaning an SoSeparator in the mode switch; materials re-runs a
-    # whole-document colour walk.
+    # The call is guarded on self.Object rather than made unconditionally.
+    # That attribute records whether attach has run, and attach is not
+    # idempotent everywhere: ports.py rebuilds its coin subgraph and calls
+    # addDisplayMode again, orphaning an SoSeparator in the mode switch, and
+    # materials re-runs a whole-document colour walk.
     proxy = getattr(getattr(obj, "ViewObject", None), "Proxy", None)
     attach = getattr(proxy, "attach", None)
     if attach is not None and getattr(proxy, "Object", None) is None:
@@ -185,11 +187,11 @@ def inject_vp(obj, kind):
 def restore_view_providers(doc):
     """Give every object in one document its ViewProvider back. Returns the count.
 
-    The sweep over a whole document;
-    :func:`~..Objects._vp_hook.restore_view_provider` does one object and says
-    what a headlessly written document is missing. Objects that already carry a
-    view provider are skipped, so this only fills gaps and can be run as often
-    as it likes.
+    This sweeps a whole document.
+    :func:`~..Objects._vp_hook.restore_view_provider` does one object and
+    reports what a headlessly written document is missing. This function skips
+    objects that already carry a view provider, so it only fills gaps and can
+    be run as often as needed.
     """
     from ..Objects._vp_hook import restore_view_provider
     from ..Objects.kinds import kind_of, kinds
@@ -200,26 +202,26 @@ def restore_view_providers(doc):
         if kind not in kinds():
             continue
         try:
-            # One implementation of "does this already have a provider?", in
-            # the lower module.
+            # The lower module holds the one test for whether an object
+            # already has a provider.
             if not restore_view_provider(obj, kind):
                 continue
             restored += 1
             # The tree was built during restore, before this provider existed,
-            # so it is still showing FreeCAD's default icon and does not ask
-            # again on its own. signalChangeIcon is the cheapest nudge and, on
-            # 1.1.1, leaves the document unmodified - which touch() plus
-            # recompute() is not guaranteed to do. Whether the tree redraws
-            # cannot be checked without Qt.
+            # so it still shows FreeCAD's default icon and does not ask again
+            # on its own. signalChangeIcon is the cheapest nudge, and on 1.1.1
+            # it leaves the document unmodified. touch() plus recompute() is
+            # not guaranteed to do that. Whether the tree redraws cannot be
+            # checked without Qt.
             view_object = getattr(obj, "ViewObject", None)
             signal = getattr(view_object, "signalChangeIcon", None)
             if signal is not None:
                 signal()
         except Exception as error:
-            # Per object, not per document. One object that cannot be given a
-            # view provider must not cost the rest of the tree theirs - an
-            # abort here leaves the simulation with no doubleClicked, which is
-            # the only route to the panel.
+            # The guard is per object rather than per document. One object
+            # that cannot be given a view provider must not cost the rest of
+            # the tree theirs. An abort here leaves the simulation with no
+            # doubleClicked, and that is the only route to the panel.
             FreeCAD.Console.PrintWarning(
                 f"Microwave: no view provider for {getattr(obj, 'Name', '?')!r}: {error}\n"
             )
@@ -232,7 +234,8 @@ def restore_open_documents():
     The per-object ``onDocumentRestored`` hook does the work for documents opened
     while this workbench is loaded, but it can run before the ViewObject exists,
     and a document may well have been opened before the user ever switched here.
-    Sweeping on activation covers both, and costs one pass over the object tree.
+    Sweeping on activation covers both cases, and costs one pass over the object
+    tree.
     """
     total = 0
     for doc in FreeCAD.listDocuments().values():
@@ -246,17 +249,17 @@ def restore_open_documents():
 
 
 class _DocumentWatcher:
-    """Sweep a document when it becomes active, however it got opened.
+    """Sweep a document when it becomes active, however it was opened.
 
     ``restore_open_documents`` runs on workbench activation, which covers
-    "open FreeCAD, open a file, switch to Microwave" and nothing else - a
-    second document opened from inside the workbench got no sweep at all.
+    opening FreeCAD, opening a file and switching to Microwave. A second
+    document opened from inside the workbench gets no sweep from it.
 
-    It restores view providers and nothing else. **It must not touch
-    visibility.** This runs on every switch between documents, so forcing
-    geometry visible here would override a deliberate "hide this" every time
-    the user comes back. A document generated by a script carries its own
-    visibility; see ``examples/microstrip_50ohm.py``.
+    This watcher restores view providers and nothing else. It must not touch
+    visibility. It runs on every switch between documents, so forcing geometry
+    visible here would override a deliberate "hide this" every time the user
+    comes back. A document generated by a script carries its own visibility;
+    see ``examples/microstrip_50ohm.py``.
 
     ``slotActivateDocument`` is the hook. Observing every slot while
     ``openDocument`` runs, on FreeCAD 1.1, gives:
@@ -265,10 +268,10 @@ class _DocumentWatcher:
         slotRelabelDocument, slotCreatedObject, slotBeforeChangeObject,
         slotChangedObject, slotAppendDynamicProperty, slotActivateDocument
 
-    ``slotFinishRestoreDocument``, the obvious candidate, is not in that list:
-    it is never emitted. ``slotActivateDocument`` comes last, after every
-    object exists, and also fires on every switch between open documents. That
-    costs one pass over the object tree, because both sweeps only fill gaps.
+    ``slotFinishRestoreDocument`` is not in that list. FreeCAD never emits it.
+    ``slotActivateDocument`` comes last, after every object exists, and it also
+    fires on every switch between open documents. That costs one pass over the
+    object tree, because both sweeps only fill gaps.
     """
 
     def slotActivateDocument(self, doc):

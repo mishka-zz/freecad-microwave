@@ -171,16 +171,70 @@ def test_the_three_constants_of_the_vacuum_agree_with_each_other():
     assert identity == pytest.approx(1.0, rel=1e-9, abs=0.0)
 
 
-def test_no_other_module_writes_a_constant_of_the_vacuum_down(declared):
-    copies = []
-    for path in repo.sources(".py"):
-        if path == UNITS or "tests" in path.relative_to(repo.ROOT).parts:
-            continue
-        for value, line in literals(path):
-            name = declared.get(digits(value))
-            if name is not None:
-                copies.append(f"{path.relative_to(repo.ROOT)}:{line} restates {name}")
-    assert not copies, "\n".join(copies) + "\n\nImport it from Microwave.units instead"
+def swept() -> list[pathlib.Path]:
+    """Every module the rule runs over: not ``units`` itself, and not the tests,
+    which have to write a constant down in order to recognise one."""
+    return [
+        path
+        for path in repo.sources(".py")
+        if path != UNITS and "tests" not in path.relative_to(repo.ROOT).parts
+    ]
+
+
+def test_the_sweep_reaches_the_modules_it_is_about():
+    """A sweep that had stopped reaching part of the tree is fewer cases rather
+    than a failure, and reads from the outside like a rule holding everywhere -
+    so what it runs over is named. ``portbox`` is the module that wants the
+    speed of light in millimetres, the spelling this rule exists to recognise.
+    """
+    assert repo.ROOT / "Microwave" / "portbox.py" in swept()
+
+
+def copies_in(path: pathlib.Path, declared) -> set[tuple[int, str]]:
+    """Every constant of the vacuum that file writes out, by the line it is on.
+
+    A line is reported once per constant, so a figure and the expression it
+    stands inside do not arrive as two complaints about one place.
+    """
+    return {
+        (line, name)
+        for value, line in literals(path)
+        if (name := declared.get(digits(value))) is not None
+    }
+
+
+def test_a_file_that_writes_one_down_is_caught_by_the_reading_that_sweeps_for_it(
+    declared, tmp_path
+):
+    """The sweep below is every file in the tree and no copy in any of them, so
+    it reads the same whether the rule works or has stopped looking. This file
+    does write a constant down, beside a number this project chose, so the
+    sweep is scored against something other than the tree's own good behaviour.
+
+    The constant sits away from the first line, because the line is what the
+    failure points the reader at and line one is what any wrong answer gives.
+    """
+    written = tmp_path / "restates.py"
+    written.write_text("CHOSEN = 0.35\n\nSPEED = 299_792_458.0\n", encoding="utf-8")
+    assert copies_in(written, declared) == {(3, "SPEED_OF_LIGHT")}
+
+
+@pytest.mark.parametrize("path", swept(), ids=lambda p: str(p.relative_to(repo.ROOT)))
+def test_no_other_module_writes_a_constant_of_the_vacuum_down(declared, path):
+    """One case per file, rather than one sweep over all of them.
+
+    A file this reaches can be one nobody has finished typing, and a sweep meets
+    that as a ``SyntaxError`` on the way past - which stops it before every file
+    after that one alphabetically, and so turns the rule off over most of the
+    tree. Per file, an unreadable one is its own failure and says which.
+    """
+    copies = copies_in(path, declared)
+    assert not copies, (
+        "\n".join(
+            f"{path.relative_to(repo.ROOT)}:{line} restates {name}" for line, name in sorted(copies)
+        )
+        + "\n\nImport it from Microwave.units instead"
+    )
 
 
 def test_a_derived_spelling_is_recognised_as_the_same_constant(declared):

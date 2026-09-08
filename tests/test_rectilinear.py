@@ -22,6 +22,7 @@ import pytest
 
 from Microwave.Solvers.openems.rectilinear import (
     RectilinearError,
+    _sweep,
     rectangles,
 )
 
@@ -117,6 +118,14 @@ SHAPES = {
         1,
         40.0,
     ),
+    # What a slab of a via between two pads arrives as: the pad's own outline,
+    # drawn again by the plane the via stands on, and the via's wall between
+    # them. The pad is metal straight through that wall, so it is one rectangle.
+    "a wall drawn again by the plane above it": (
+        ring((0, 0), (4, 0), (4, 4), (0, 4)) * 3 + ring((1, 1), (3, 1), (3, 3), (1, 3)) * 2,
+        1,
+        16.0,
+    ),
 }
 
 
@@ -139,6 +148,47 @@ def test_the_pieces_never_overlap(shape):
         for second in cut[index + 1 :]
         if overlap(first, second)
     ]
+
+
+@pytest.mark.parametrize("shape", list(SHAPES), ids=list(SHAPES))
+def test_no_piece_is_thinner_than_the_tolerance(shape):
+    """A piece thinner than that is a seam the mesher refuses as below its cell
+    floor, and it would name geometry the user drew as square.  Both spans come
+    out of the sweep already wider than the tolerance - a run is keyed on that
+    test and a band is a gap between levels laid on it - so this holds the
+    construction rather than a filter over its output.
+
+    Both orientations, because :func:`rectangles` keeps the cheaper cut and
+    would hide a sliver the other sweep produced.
+    """
+    edges = SHAPES[shape][0]
+    flipped = [((v0, u0), (v1, u1)) for (u0, v0), (u1, v1) in edges]
+    for cut in (_sweep(edges, TOLERANCE), _sweep(flipped, TOLERANCE)):
+        assert not [
+            piece for piece in cut if min(piece[2] - piece[0], piece[3] - piece[1]) <= TOLERANCE
+        ]
+
+
+@pytest.mark.parametrize(
+    "shape", ["seam counted twice", "a wall drawn again by the plane above it"]
+)
+def test_a_wall_drawn_twice_does_not_split_the_run(shape):
+    """Asserted on one sweep rather than through :func:`rectangles`, which runs
+    both ways round and keeps the cheaper - so a cut one orientation gets wrong
+    is rescued by the other, and the count says nothing about the rule."""
+    edges = SHAPES[shape][0]
+    cut = _sweep(edges, TOLERANCE)
+    assert len(cut) == 1
+    assert area(cut) == pytest.approx(SHAPES[shape][2], rel=1e-12, abs=0.0)
+
+
+def test_a_wall_drawn_three_times_is_still_a_wall():
+    """Odd, so it stands: a boundary drawn again by two planes above it is
+    still the boundary. A rule that dropped anything repeated returns the shape
+    as nothing at all with no refusal to say so, so the rectangle is named here
+    rather than compared against another answer."""
+    pad = ring((0, 0), (4, 0), (4, 4), (0, 4))
+    assert _sweep(pad * 3, TOLERANCE) == [(0, 0, 4, 4)]
 
 
 def test_a_bar_split_by_extra_corners_is_still_one_rectangle():
@@ -181,6 +231,17 @@ def test_an_open_outline_is_refused():
     with pytest.raises(RectilinearError) as refusal:
         rectangles(broken, tolerance=TOLERANCE)
     assert "not closed" in str(refusal.value)
+
+
+def test_the_refusal_counts_the_walls_the_drawing_has():
+    """Not the ones that survived the dropping, which is a number nobody can
+    find in their model. The two have the same parity, so the refusal fires
+    either way and only what it says differs."""
+    broken = ring((0, 0), (10, 0), (10, 4), (0, 4))[:-1]
+    doubled = [((5, 0), (5, 4)), ((5, 0), (5, 4))]
+    with pytest.raises(RectilinearError) as refusal:
+        _sweep(broken + doubled, TOLERANCE)
+    assert "(3)" in str(refusal.value), str(refusal.value)
 
 
 def test_a_tie_is_broken_toward_the_cut_without_a_sliver():

@@ -1,402 +1,250 @@
 # Ports
 
-A port is where the model is driven and where it is measured. In this workbench
-a port is a **box** - a volume the solver builds the excitation and the probes
-inside - together with the planes in it where numbers are read.
+A port defines excitation sources and measurement reference planes for the
+simulation. In the 3D viewport, each port is represented by a bounding box
+containing the source plane and voltage/current probe planes.
 
-The box is drawn in the 3D view, and what is drawn is what the solver gets - so
-a port that looks wrong is wrong.
+The displayed 3D bounding box reflects the exact volume and probe placement
+passed to the solver. Verify port orientation and dimensions in the viewport
+before running the simulation.
 
-## Choosing a kind
+## Port types
 
-| Kind | Use it for | Impedance |
+| Type | Application | Characteristic Impedance |
 |---|---|---|
-| **Microstrip** | A strip over a ground plane, fed across the substrate | Measured from the field |
-| **Lumped** | A resistor across a gap: a circuit element, a load, a feed between two conductors | Declared - it is the resistance set on the port |
-| **Rectangular waveguide** | A mode launched into a hollow guide | Analytic, from the guide and the mode |
+| **Microstrip** | Planar trace over ground plane, fed across substrate | Extracted dynamically from simulated field |
+| **Lumped** | Discrete circuit element, load, or feed across a gap | User-declared resistance value |
+| **Rectangular waveguide** | Modal excitation in hollow rectangular guide | Calculated analytically from guide geometry and mode |
 
-The distinction that matters most later is the third column. A microstrip port
-*discovers* its impedance; a lumped port *states* one. Which of the two is in
-use decides what a result can be referenced to, what can be exported, and how an
-impedance-against-distance trace must be read - see [Results](results.md).
+Reference impedance behavior:
+- Microstrip ports extract impedance from field distributions at the
+  measurement plane.
+- Lumped ports enforce the declared resistance across the gap.
+- Waveguide ports use analytic modal wave impedance.
 
-## Creating one
+## Creating a port
 
-1. Select the faces the port needs, **in the order the tooltip gives**.
-2. Press **Add Microstrip Port**, **Add Lumped Port** or **Add Waveguide
+1. In the 3D viewport, select the required geometric faces or edges in the
+   order specified in the table below (hold `Ctrl` for multiple selections).
+2. Click **Add Microstrip Port**, **Add Lumped Port**, or **Add Waveguide
    Port**.
 
-The port's axes are then read off the geometry picked. Which face the wave enters
-through says which way it travels; where the ground sits says which way the field
-points. Those are facts about the drawing, not preferences, so the port does not
-ask for them to be restated.
+The command infers propagation and excitation axes directly from the selected
+geometry. The wave enters through the selected trace cross-section and travels
+along the normal; the excitation field vector points toward the reference
+ground.
 
-Selection **order** is the one thing geometry cannot supply: two copper faces do
-not announce which is the trace and which is the ground. That is the whole
-reason each command documents an order.
+Selection order defines polarity:
 
-A port is created even when the picks are incomplete or contradictory. What
-could not be read is reported, the links that were picked are set, and the
-missing property is left in the property editor. A port with one axis to choose
-is a better place to stand than no port and an error.
-
-Any inferred axis can be changed afterwards. The adapter measures the same
-geometry again at translation time and refuses an axis that disagrees with it -
-so an edited axis is checked, not trusted.
-
-### What exactly to select
-
-Pick in the 3D view, holding Ctrl for the second pick so the first stays
-selected. What each command wants:
-
-| Port | First pick | Then |
+| Port type | First selection | Second selection |
 |---|---|---|
-| **Microstrip** | The trace's cross-section where the wave enters | The ground plane it is referenced to |
-| **Lumped** | The source face | The reference face across the gap |
-| **Waveguide** | The guide's cross-section | - |
+| **Microstrip** | Signal trace cross-section | Ground plane reference face or solid |
+| **Lumped** | Source terminal face or edge | Reference terminal face or edge across the gap |
+| **Waveguide** | Waveguide cross-section face | - |
 
-The cross-section is a **face** on a solid trace and an **edge** on a trace
-drawn as a zero-thickness sheet. Both are correct, and every port takes either -
-which is why the properties are named `TraceEnd` and `CrossSection`, for what
-they mean rather than for a topology the name would be wrong about half the
-time.
+Cross-section selections accept solid faces (`Part::Box`) or 1D edges on
+zero-thickness planar sheets (`Part::Plane`).
 
-For a **lumped** port the two picks are not interchangeable, because they say
-different things about what the port covers. An edge encloses no area, so it is
-read as a cross-section: the port becomes a plane at the end of the conductor.
-A face is read as the area it covers, and the port spans all of it - which is
-what a lumped element under a pad wants and what a trace end does not. Pick the
-edge where the conductor ends, and the face where the port really is the pad.
+For lumped ports, the element spans the transverse spatial overlap between
+the two selected picks across the excitation gap (not their geometric union).
 
-That distinction only shows on a trace running **off the grid axes**. openEMS
-has no rotated port, so the end of such a trace arrives as the bounding box of a
-diagonal, which reaches past where the copper stops. Read as a cross-section it
-is put back onto the end of the conductor; read as an area it is not. A layout
-drawn on the axes is unaffected either way.
+Avoid selecting the dielectric substrate. Port selections must be assigned to
+conductors (`PEC` or `ConductingSheet`).
 
-The **ground reference** is the whole conductor, not a cross-section of it. A
-face of the ground plane is the usual pick, and selecting the ground object in
-the tree does the same thing: the port reads where the ground *is*, not where it
-ends.
+### Creation workflow
 
-Do not pick the substrate. Both microstrip picks are copper; the substrate is
-between them and is never selected - and the geometry a port sits on has to be
-**bound to a conductor**, since the port lays its strip in whatever material it
-finds there and a dielectric strip carries no current.
+1. Create geometry (trace, substrate, ground plane).
+2. Assign materials (`EMMaterialBinding`) to all conductors and dielectrics.
+3. Create the `EMAnalysis` container and specify the frequency range.
+   Microstrip ports calculate initial `MeasurementDistance` defaults from
+   the analysis band.
+4. Select geometric features in order and click the port command.
+5. Inspect the generated port bounding box in the 3D viewport.
 
-The pick has to be an end. A face in the middle of a solid gives no inward
-direction to build the port from, and is refused saying so.
-
-### Sequence
-
-Create the study and set its band **before** adding ports. A new microstrip port
-writes `MeasurementDistance` from the band once, at creation; with no study in
-the document it gets zero and refuses itself at the first check. See
-[The document model](model.md).
-
-## Properties every port has
+## Common port properties
 
 <!-- defaults: EMPortMicrostrip, EMPortLumped, EMPortRectWaveguide -->
-| Property | Default | Meaning |
+| Property | Default | Description |
 |---|---|---|
-| `Number` | assigned | Which row and column of the S-matrix this port is |
-| `Excitation` | true | Whether this port is driven. A run is one solve per driven port |
-| `ReferencedTo` | Fixed impedance | What the S-parameters are reported against |
-| `ReferenceImpedance` | 50.0 | The number they are reported against, when that is fixed |
+| `Number` | assigned | Matrix index (row/column) in the S-parameter matrix |
+| `Excitation` | true | Enables signal excitation. Each excited port requires one FDTD solve |
+| `ReferencedTo` | Fixed impedance | Reference impedance definition for S-parameter normalization |
+| `ReferenceImpedance` | 50.0 | Normalization impedance in ohms when `ReferencedTo` is Fixed impedance |
 
-`Number` is assigned when the port is made and is not offered for renumbering.
-A stored S-matrix is indexed by these numbers, so moving one would silently
-re-label a result against the tree it came from.
+`Number` is assigned sequentially at creation to the lowest unused index in
+the document. Existing ports are never renumbered.
 
-`Excitation` is what makes an N-port cost N solves in the time domain. Turn it
-off on a port that is only to be *measured* - it still appears in the matrix, and
-its own column comes back empty unless symmetry fills it.
+`Excitation` determines whether the port acts as a driven source. An $N$-port
+network with $N$ excited ports requires $N$ independent FDTD simulation
+runs. Set `Excitation` to `false` for ports that only record received transmission
+signals.
 
-**Do not leave a microstrip port to be measured in a run a lumped port drives.**
-A microstrip port that is measured rather than driven in a lumped-driven run
-reports a non-finite reference impedance at every frequency on this engine, and
-the whole matrix is normalised in those - so the run completes, takes its full
-time and yields nothing. Drive the microstrip port instead, or make both ports
-the same kind. It is warned about before the minutes are spent.
+When a lumped port is excited, all microstrip ports in the study should also be
+excited. In such a run the microstrip port reports a non-finite reference
+impedance at every frequency point, and the matrix is normalized in each port's
+reference impedance, so the run yields no S-parameters after taking its full
+time. Pre-flight validation warns when an excited lumped port is combined with
+an unexcited microstrip port.
 
-### Reference impedance
+### Reference impedance normalization
 
-`ReferencedTo` chooses between two different questions.
+- **Fixed impedance** (default): S-parameters are renormalized to the
+  specified value (typically 50 Ω).
+- **Port impedance**: S-parameters are reported relative to the port's
+  intrinsic characteristic impedance (field-extracted for microstrip,
+  declared resistance for lumped, analytic modal impedance for waveguide).
 
-**Fixed impedance** - the default, and what "a 50 ohm system" means. Every port's
-S-parameters are renormalised to the number entered. Nothing about the model
-changes; it is the reference the answer is expressed in.
-
-**Port impedance** - report this port against the impedance the port itself has:
-measured from the field for a microstrip, analytic for a waveguide, the
-resistance for a lumped element. This is what a bench does - a TRL calibration
-references a line to the standard's own characteristic impedance, dispersive,
-with no number entered anywhere. Nor is there one to enter for a guide, whose
-impedance is convention-dependent by a factor of a quarter; only the ratios a
-reference cancels out of are convention-free.
-
-`ReferenceImpedance` is hidden while `ReferencedTo` is *Port impedance*, because
-a greyed-out `50.00` beside a result referenced to 475 ohm answers the question
-being asked, wrongly.
+`ReferenceImpedance` is hidden when `ReferencedTo` is set to Port
+impedance.
 
 ---
 
 ## Microstrip port
 
-A strip over a ground plane, driven across the substrate.
+Excites and measures quasi-TEM modes on planar transmission lines over a
+ground plane.
 
-**Select:** the trace's end face, then the ground plane it is referenced to.
+**Selection:** Signal trace cross-section face/edge, then reference ground
+plane face/solid.
 
-### What the box is
-
-The box is the port's **requirement**, not a reading of the geometry. It runs
-inward from the picked face as far as the measurement plane has to be, whether
-or not the trace under it is that long.
-
-That is deliberate. A box derived from the copper always looks like it fits,
-which is exactly when it does not - and a feed line too short to measure on is
-something to be shown in the 3D view, before a solve goes into it.
-
-![A microstrip line in elevation, with the port box occupying the left quarter
-of the board](images/port-elevation.png)
-
-*The board edge-on, substrate nearly clear. The port is the shaded region: it
-starts at the picked face on the left, spans the full substrate from strip to
-ground, and stops at the measurement plane - the vertical edge a quarter of the
-way along. Everything to the right of that line is line the port does not read.
-The S-parameters are referenced to that plane, not to the board edge.*
-
-The distances that shape it, all absolute and all in millimetres:
+### Propagation and excitation axes
 
 <!-- defaults: EMPortMicrostrip -->
-| Property | Default | Measured from | Meaning |
+| Property | Default | Description |
+|---|---|---|
+| `PropagationAxis` | X | Direction of wave propagation into the structure |
+| `ExcitationAxis` | -Z | Vector direction of electric field (trace to ground) |
+
+Axes are inferred from selected geometry. If pre-flight validation detects
+an orientation mismatch (such as an excitation vector pointing away from
+ground), the error is reported before simulation.
+
+### Port bounding box configuration
+
+The port bounding box encloses the source excitation plane and the downstream
+voltage/current probe planes.
+
+![Microstrip port elevation](images/port-elevation.png)
+
+Distances are specified in millimetres:
+
+<!-- defaults: EMPortMicrostrip -->
+| Property | Default | Reference origin | Description |
 |---|---|---|---|
-| `FeedOffset` | 0 | the picked face, inward | Where the source sits |
-| `MeasurementDistance` | from the band | the **source** | How far downstream the probes sit |
-| `Length` | 0 | the picked face, inward | How far the box reaches. 0 ends it at the measurement plane |
-| `FeedResistance` | 0 | - | Series resistance damping the feed. 0 is a bare voltage source |
+| `FeedOffset` | 0 | Source face | Distance from source face to excitation plane |
+| `MeasurementDistance` | from the band | Excitation plane | Distance from excitation plane to probe measurement plane |
+| `Length` | 0 | Source face | Total port box length (0 sets length to measurement plane) |
+| `FeedResistance` | 0 | - | Series source damping resistance in ohms (0 = ideal source) |
 
-`FeedOffset` is zero in the ordinary case: the trace ends at the port and the
-source sits on that end face.
+`FeedOffset` is normally 0 mm when the trace terminates at the port boundary.
+When transmission lines extend through absorbing boundaries (`Through`
+padding), set `FeedOffset` so that the excitation plane is placed inside the
+active domain beyond the absorbing boundary layer. The absorber thickness in
+millimetres is determined during grid generation; running **Check** validates
+the excitation and measurement planes, and reports the absorber depth together
+with how far the plane falls inside it.
 
-It is **not** zero when the line runs out through the absorber - the `Through`
-padding that makes a feed line infinite. The absorber then stands on the strip,
-and a source inside it drives a field that is being eaten as fast as it is made.
-Both the source and the measurement plane have to clear it, so `FeedOffset` has
-to be at least the absorber's depth: `PMLCells` cells, laid at the cell size at
-that wall. Pre-flight measures it and refuses a port that does not clear it,
-naming the depth and the shortfall in millimetres.
+### Placement guidelines and MeasurementDistance
 
-`MeasurementDistance` is measured from the source, not from the picked face,
-because that is what the physics is about. The two are equal only while
-`FeedOffset` is zero.
+The voltage and current probes must be placed on a uniform line section,
+sufficiently far from source near-field evanescent modes and downstream
+discontinuities (such as stubs, steps, or bends).
 
-### Where along the line to put it
+The default `MeasurementDistance` is initialized to 10% of the free-space
+wavelength at the lowest frequency ($\lambda_0 / 10$ at `FrequencyStart`),
+rounded up to the nearest millimetre.
 
-The probes read the total field where they sit, so the measurement plane must
-be on **plain transmission line**: clear of the source's near field, which is
-what `MeasurementDistance` is for, and equally clear of whatever the port is
-measuring. A plane a substrate height or two from a stub, a bend or a step is
-reading the discontinuity's evanescent field as though it were the line.
+Evanescent feed modes attenuate exponentially over a distance proportional to
+the line cross-section dimensions. If `MeasurementDistance` is reduced
+manually, verify that probe planes remain outside the near-field region by
+confirming that extracted line impedance remains stable.
 
-The port's box counts as part of the structure when the domain is sized, so a
-port reaching further in makes the model bigger, not just longer.
+Ensure the mesh around the measurement plane uses uniform cell sizing. Cell
+size steps at probe locations can introduce numerical reflection errors.
 
-The plane also wants **even cells either side of it**. The impedance extraction
-telescopes exactly on a matched line at any grading, but an uneven pair of cells
-turns any reflection at the plane into an error in the impedance - so a
-measurement plane landing where the grid is changing pitch, at the edge of a
-refinement region for instance, is warned about with the two cell sizes and what
-they cost.
+### Impedance extraction
 
-### The one number that decides whether the impedance is right
-
-`MeasurementDistance`.
-
-The source is a sheet of current across the strip, and it radiates a near field
-that is not the transmission-line mode. The probes have to sit far enough
-downstream for that to have decayed. Too short returns a plausible impedance and
-no complaint; too long costs line, which is visible and can be edited.
-
-The default is filled in from the study's band when the port is created: a tenth
-of the **free-space** wavelength at the bottom of the sweep, rounded up to the
-next whole millimetre.
-
-Free space, and not the guided wavelength that actually governs, is a choice
-about what is knowable. The guided wavelength needs the effective permittivity,
-which needs the strip width, the substrate height and which substrate the line
-sits on - none of which exist at the moment a port is created. Of the two
-knowable bounds, free space is the conservative one, since the effective
-permittivity is never below 1.
-
-It is written into the port as a property, not recomputed on the fly, so that it
-can be read, changed, and refused on. Change the band afterwards and the number
-does **not** follow: FreeCAD has no dependency edge from an analysis
-to a port, so a live value would leave the drawn box quietly disagreeing with
-the solve.
-
-### How it measures impedance
-
-openEMS extracts an impedance from three voltage and two current probes around
-the measurement plane. The differences telescope, so the extraction is exact on a
-matched line at any grading. What breaks it is a reflection at the plane sitting
-beside an uneven pair of cells, and a plane still inside the feed's evanescent
-field - both are checked before the run.
-
-### The excitation sign
-
-The field points from the trace down to the ground. That direction is measured
-from the geometry and compared against `ExcitationAxis`; a disagreement is
-refused, naming both planes and the axis to use.
-
-The sign is not cosmetic. Inverting it produces a perfectly clean-looking solve
-with the phase reversed.
-
-Both planes are the conductor *surfaces* facing each other, never the mid-planes
-of the solids they came from. A ground plane drawn with real thickness has its
-middle inside the metal, and driving to it would cross a gap half a conductor
-too long.
+OpenEMS extracts characteristic transmission line impedance using three
+voltage probes and two current probes centered on the measurement plane.
 
 ---
 
 ## Lumped port
 
-A resistor across a gap. A circuit element, not a transmission line.
+Represents a discrete lumped circuit element, termination load, or voltage
+feed spanning a gap between two conductors.
 
-**Select:** the source face, then the reference face across the gap.
+**Selection:** Source terminal face/edge, then reference ground face/edge.
 
 <!-- defaults: EMPortLumped -->
-| Property | Default | Meaning |
+| Property | Default | Description |
 |---|---|---|
-| `Resistance` | 50.0 | The element's resistance. 0 lays metal across the gap - a short |
-| `ExcitationAxis` | inferred | Which way the field crosses the gap |
+| `Resistance` | 50.0 | Port resistance in ohms (0 = short circuit / metal bridge) |
+| `ExcitationAxis` | inferred | Axis along which electric field spans the gap |
 
-`Resistance` is part of the *structure*: openEMS builds a resistive sheet across
-the gap. It is not the microstrip's `FeedResistance`, which damps a source, and
-zero means opposite things about the two. Here zero is a short circuit, which is
-a legitimate thing to ask for.
+`Resistance` defines the resistance of the internal sheet element. Setting
+`Resistance` to 0 models a zero-resistance short circuit.
 
-Only the **axis** of `ExcitationAxis` is read, not its sign. Which way the port
-drives is decided by which entity was picked as the source, so `Z` and `-Z` are
-the same setting here. A microstrip port is the opposite case, and refuses a
-sign that disagrees with the drawing.
+Selected faces must directly bound the gap along the excitation axis.
+Selecting entire 3D solid bodies is rejected to prevent resistive sheets
+from penetrating conductor volumes.
 
-Both picks must be **surfaces bounding the gap**, flat along the axis being
-driven across. Selecting a solid instead is refused: the port would be built
-from its outer face and reach back through the conductor.
+### Bounding box and grid alignment
 
-### What the box is
+The lumped port box spans the spatial overlap between the two selected
+terminals along the excitation axis.
 
-Across the excitation axis the port spans where the two entities actually face
-each other - their **overlap**. Not their union, and not either one alone.
+Both terminal ends of the gap must snap to distinct grid planes along the
+excitation axis. A gap of one cell or wider always satisfies this. Pre-flight
+validation rejects configurations where both terminals snap to the same grid
+plane, which would cause openEMS to drop the lumped element.
 
-A union is wrong the moment the reference is a ground plane covering the whole
-board: the port becomes a sheet resistor spanning the model, and it solves.
-Taking the source alone leaves an asymmetry, so picking the ground as the source
-brings the same fault straight back. An overlap has no preferred end.
+### Line termination applications
 
-Fed from a trace end face against a ground plane, the overlap has zero extent
-across one axis and the box is a plane. That is legitimate: openEMS snaps a
-lumped element's box to the mesh whatever shape it is, and a driven port's plane
-is given a grid line of its own so that the excitation, which is not snapped,
-has a coordinate to be laid on.
-
-What snapping does not survive is a **gap thinner than one cell** along the
-excitation axis: both ends land on the same grid line and openEMS drops the
-element silently.
-
-The excitation fails differently, being snapped nowhere. Its box has to hold a
-grid coordinate across each of the other axes, and a box that spans cells asks
-the mesher for no line of its own - so beside a **curved conductor**, where
-nothing else pins one either, it can come to rest between two lines and be laid
-nowhere at all. The run then takes its full time and reports zeros.
-
-Snapping has a third way of going wrong, and it is the element rather than the
-excitation. The conductor is rasterised on the same grid, out of the Yee edges
-whose own sample point it holds, so an element ending on a **conductor with no
-thickness** - a trace or a ground plane, as they are usually drawn - is bonded
-to it only on the line that conductor lies on. Where the grid has no line there,
-the element is laid with a live edge between it and the metal, in series with
-the resistance the port declares. A conductor with thickness has no such fault:
-the edge running out of the terminal into it is zeroed, and snapping cannot put
-that edge's midpoint further than half a cell past where the end was drawn.
-
-Each is refused before the run.
-
-### Terminating a line with one
-
-The commonest use, and it takes **the same two picks a microstrip port takes**:
-the trace's end, then the ground plane under it. The port closes the circuit at
-the end of the board, so the line sees its resistance rather than an open.
-
-What differs is what comes back. The microstrip port measures the line's own
-impedance and needs room downstream to do it; the lumped port declares one and
-needs no room at all. Reach for the lumped one where the line's impedance is not
-the question, or where the trace in [Results](results.md) is to be read at the
-launch rather than past it.
-
-### When to reach for it
-
-- A load, a source resistance, or a series or shunt element.
-- Terminating a line of known impedance, where the reference should be a
-  declared number rather than a measured one.
-- Any study whose **impedance-against-distance** trace is to be read at the
-  launch. The transform runs off either kind of port, but a port that measured
-  its own reference reads that measurement back over the section it sits on. A
-  declared reference is an independent number, so the first plateau means
-  something. See [Results](results.md).
+Lumped ports are commonly used to terminate transmission lines with a matched
+load (e.g. 50 Ω):
+- For zero-thickness planar traces (`ConductingSheet`): Select the end edge
+  of the trace, then the ground plane below.
+- For 3D volumetric traces (`Part::Box`): Select the bottom edge of the end
+  face where the conductor meets the substrate, then the ground plane.
 
 ---
 
 ## Rectangular waveguide port
 
-A mode launched over a cross-section.
+Excites modal fields across the cross-section of a hollow rectangular
+waveguide.
 
-**Select:** the guide's cross-section.
+**Selection:** Waveguide interior cross-section face.
 
 <!-- defaults: EMPortRectWaveguide -->
-| Property | Default | Meaning |
+| Property | Default | Description |
 |---|---|---|
-| `Mode` | TE10 | Which mode is launched. The first index counts half-waves across the broad wall |
-| `Length` | 0 | Where the measurement plane sits along the propagation axis. 0 means five mesh cells |
-| `PropagationAxis` | inferred | Which way the wave travels, into the guide |
+| `Mode` | TE10 | Propagating modal field pattern |
+| `Length` | 0 | Distance along propagation axis to probe plane (0 = 5 grid cells) |
+| `PropagationAxis` | inferred | Direction of wave propagation into the guide |
 
-**TE modes only.** openEMS' waveguide port refuses TM outright, so offering one
-in the dropdown would be a port that builds and that no solver can run.
+Only TE modes are supported by openEMS waveguide ports. The mode index follows
+standard microwave conventions (`TE10` represents the dominant mode along the
+broad wall).
 
-The mode is named the textbook way round - TE10 is the dominant mode however the
-guide happens to be drawn on the axes. Which axis carries which index is
-openEMS' business, and the adapter renumbers it when writing.
+Validation requirements:
+- The waveguide interior must be vacuum/air (dielectric-filled guides are
+  not supported by openEMS waveguide ports).
+- The selected mode must propagate within the simulation band. A mode cutting off
+  above `FrequencyStop` is rejected during pre-flight checks. If the cutoff falls
+  within the band, pre-flight emits a warning; below cutoff, modal propagation
+  ceases and S-parameters represent evanescent attenuation.
 
-`Length` is a **reference plane**, not an invisible depth: the excitation goes on
-the near face of the box and the probes on the far one, so the length is where
-the measurement is taken. Neither the feed shift nor the measurement distance of
-a microstrip port applies here, and the adapter refuses an envelope that carries
-one.
+## Reported problems
 
-Zero means five mesh cells, which is what openEMS' own examples use. It is the
-one number in the whole port surface that depends on the *mesh*, and so the one
-thing about a port that cannot be drawn before meshing.
+| Reported message | Cause | Corrective action |
+|---|---|---|
+| "there is no gap to drive across" | Selected terminals share the same coordinate on the excitation axis | Adjust selection or check geometry alignment |
+| "the field points the other way" | `ExcitationAxis` opposes the physical vector to ground | Invert excitation axis sign |
+| "stand apart along both X and Y" | Selected terminals are diagonal without axis alignment | Align terminals along coordinate axes |
+| "the probes would sit on the source" | `MeasurementDistance` is $\le 0$ | Increase measurement distance |
+| "the box would stop short of it" | Port `Length` is less than `FeedOffset + MeasurementDistance` | Increase port length or set to 0 |
+| "does not say which side of it" | Selected face cuts through a solid without clear orientation | Select outer boundary face |
+| No bounding box displayed in 3D | Missing geometry links, conflicting axes, or waveguide `Length = 0` | Set required links and check property editor |
 
-### What is checked
-
-- **The guide must be empty.** This adapter drives openEMS' waveguide port at
-  its vacuum default, so a guide with a dielectric in it is refused rather than
-  solved as though the dielectric were not there.
-- **The mode must propagate.** A mode below cutoff over the band carries
-  nothing, and a run that launches one reports nothing worth reading.
-
-
-## What goes wrong, and where it is caught
-
-| Symptom | Cause |
-|---|---|
-| "there is no gap to drive across" | The two picks are at the same coordinate on the excitation axis |
-| "the field points the other way" | `ExcitationAxis` disagrees with where the ground actually is |
-| "stand apart along both X and Y" | The picks are diagonal to each other; nothing can say which axis the field crosses |
-| "the probes would sit on the source" | `MeasurementDistance` is zero or negative |
-| "the box would stop short of it" | `Length` is shorter than `FeedOffset` plus `MeasurementDistance` |
-| "select an end face" | The picked face is at the middle of its solid, so there is no inward direction to read |
-| A port that draws no box at all | Its links are unset, or an axis is left at a default that contradicts the geometry |
-
-Every one of these is raised before any solving starts, naming the port.

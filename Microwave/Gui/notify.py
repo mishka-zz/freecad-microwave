@@ -3,9 +3,10 @@
 
 """Put a message where the user is looking.
 
-The Report view is off in a default FreeCAD, so a printed line alone is a
-button that does nothing. Both channels: the console keeps the record, the box
-delivers it. Success gets neither - it is visible on its own.
+The Report view is off in a default FreeCAD, so a printed line alone does not
+reach the user. This module writes to both channels: the console keeps the
+record and the box delivers it. A success writes to neither channel, because
+it is visible on its own.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import FreeCAD
 
 
 def main_window() -> Any:
-    """FreeCAD's main window, or ``None`` - which Qt accepts as a parent."""
+    """FreeCAD's main window, or ``None``. Qt accepts ``None`` as a parent."""
     try:
         import FreeCADGui
 
@@ -27,15 +28,15 @@ def main_window() -> Any:
 
 
 def refused(title: str, message: str) -> None:
-    """Nothing happened, and this is why. Console first, so a box that cannot
-    be built costs the delivery and not the record."""
+    """Report that nothing happened, and why. The console is written first, so
+    a box that cannot be built still leaves the message in the log."""
     FreeCAD.Console.PrintError(f"Microwave: {message}\n")
     _box(title, message, refusal=True)
 
 
 def noted(title: str, notes: Iterable[str]) -> None:
-    """It happened, and this is what is left to finish. One box for all of
-    them: they answer one press."""
+    """Report that it happened, and what is left to finish. All the notes go
+    into one box, so that one press answers them all."""
     said = list(notes)
     if not said:
         return
@@ -47,8 +48,8 @@ def noted(title: str, notes: Iterable[str]) -> None:
 def _box(title: str, text: str, *, refusal: bool) -> None:
     """One message box, or nothing where there is no GUI to put it in.
 
-    A window rather than an importable PySide is the test: ``freecadcmd``
-    imports Qt happily and aborts on the first widget built without a
+    The test is a window rather than an importable PySide. ``freecadcmd``
+    imports Qt and then aborts on the first widget built without a
     QApplication.
     """
     window = main_window()
@@ -64,7 +65,8 @@ def _box(title: str, text: str, *, refusal: bool) -> None:
     box.setInformativeText(text)
     box.setStandardButtons(QtWidgets.QMessageBox.Ok)
     box.setAttribute(QtCore.Qt.WA_DeleteOnClose)
-    # Shown, not executed. `exec_` and the `QMessageBox.warning` family run an
-    # event loop until OK is pressed; modality is QMessageBox's own and
-    # survives this. The parent owns the widget, and closing it deletes it.
+    # The box is shown rather than executed. `exec_` and the
+    # `QMessageBox.warning` family run an event loop until OK is pressed.
+    # Modality is QMessageBox's own and survives this. The parent owns the
+    # widget, and closing it deletes it.
     box.show()

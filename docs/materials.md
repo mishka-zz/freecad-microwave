@@ -1,165 +1,177 @@
 # Materials
 
-A material is a document object holding *values*. Geometry gets a material
-through a **binding**, which names one material and the solids made of it.
+An `EMMaterial` object defines electromagnetic properties (permittivity,
+permeability, loss tangent, conductivity, thickness). Geometry is associated
+with materials using `EMMaterialBinding` objects, which link one material to
+one or more shapes or solid faces.
 
 ## Material types
 
-| `MaterialType` | What it is | Properties read | openEMS |
+| `MaterialType` | Description | Active properties | openEMS support |
 |---|---|---|---|
-| `Dielectric` | A substrate. Lossless, or lossy through `LossTangent` | `Permittivity`, `Permeability`, `LossTangent`, `MeasuredAt` | yes |
-| `PEC` | A perfect conductor, no loss and no thickness to resolve | none | yes |
-| `ConductingSheet` | A thin conductor with real loss, thickness as a property | `Conductivity`, `Thickness` | yes |
-| `FrequencyDependentDielectric` | A substrate whose permittivity varies across the band | - | refused |
+| `Dielectric` | Substrates and isolators. Lossless or lossy via `LossTangent` | `Permittivity`, `Permeability`, `LossTangent`, `MeasuredAt` | Supported |
+| `PEC` | Perfect Electric Conductor. Zero loss and zero thickness | None | Supported |
+| `ConductingSheet` | Thin lossy conductor with thickness modeled as a property | `Conductivity`, `Thickness` | Supported |
+| `FrequencyDependentDielectric` | Substrate with frequency-dispersive permittivity | - | Rejected |
 
-A dispersive material needs a fitted Debye or Lorentz pole set, which this
-adapter does not write. It is refused by name rather than flattened to one
-permittivity, because a flattened one is a wrong answer that looks like a right
-one. Use a `Dielectric` quoted at the frequency of interest.
+For conductors (`PEC` and `ConductingSheet`), keep `Permittivity` and
+`Permeability` at 1.0 and `LossTangent` at 0.0. OpenEMS uses only electrical
+conductivity for conductors. Non-unity permittivity or permeability values
+on conductors alter grid cell sizing calculations and are refused during
+translation, before the pre-flight checks run.
 
-### Loss, and the frequency it was quoted at
+Dispersive dielectrics requiring multi-pole Debye or Lorentz models are not
+currently supported by the openEMS adapter. Dispersive material definitions
+are rejected during validation rather than approximated with a single value.
+Use a constant `Dielectric` specified at the center frequency of interest.
 
-openEMS carries dielectric loss as a conductivity. A loss tangent is converted
-once, at band centre:
+### Dielectric loss and characterization frequency
+
+OpenEMS models dielectric loss using an equivalent constant conductivity
+calculated at the sweep center frequency `f_centre`:
 
 ```
 kappa = 2 * pi * f_centre * eps0 * eps_r * tan(delta)
 ```
 
-That is openEMS' own convention, and it is an approximation with a name: a
-fixed conductivity gives a loss tangent that falls as 1/f, so the model is
-exact at band centre and drifts either side of it.
+Because equivalent conductivity is held constant throughout the time-domain
+run, the effective loss tangent scales as `1/f`. The loss model is exact at
+`f_centre` and deviates toward the sweep band edges.
 
-`MeasuredAt` is the frequency the permittivity and loss tangent were quoted at.
-It is not decoration - nothing below the conversion can recover where the number
-was true, and pre-flight compares it against the band being solved. FR-4
-characterised at 1 GHz and solved to 20 GHz gets a warning saying so.
+The `MeasuredAt` property specifies the characterization frequency of the
+loss tangent. Pre-flight checks compare `MeasuredAt` with the simulation
+center frequency and generate a warning if the difference is significant
+(for example, FR-4 characterized at 1 GHz but simulated up to 20 GHz).
+Omitting `MeasuredAt` on a lossy dielectric emits a warning prompting you to
+record the characterization frequency.
 
-A loss tangent without a `MeasuredAt` is not a physical quantity, it is a number
-somebody wrote down. Catalogs are required to state one wherever loss is
-nonzero.
-
-The band asks the same thing a second time, and `MeasuredAt` says nothing about
-it: however well the loss tangent was quoted, one conductivity is one loss
-tangent at one frequency. What the model carries is the declared figure scaled
-by `f_centre / f`, so the bottom of a wide band is that many times lossier than
-the material - a sweep from 50 MHz to 10 GHz is centred near 5 GHz and a
-hundredfold too lossy at its own bottom end. Pre-flight warns once that factor
-reaches four, which a band of 7:1 or wider does, and says what the factor is.
-
-Both ends are wrong, and only one of them looks it. A fixed conductivity
-attenuates the same at every frequency while a dielectric's loss rises with it,
-so the two ends are out by the same amount of loss in opposite directions: the
-bottom carries far more loss than it should, the top a little under half of
-what it should. The ratio is alarming at the bottom and the missing decibels
-are at the top.
-
-Nothing you can set fixes it: narrow the band, split the sweep into studies, or
-read the ends knowing which way each is wrong.
+For wideband sweeps (frequency ratio of 7:1 or greater), the fixed
+conductivity model overestimates loss at the low end and underestimates loss
+at the high end. For high-ratio sweeps, consider splitting the simulation
+into narrower sub-band studies.
 
 ### Conducting sheets
 
-A `ConductingSheet` is copper drawn as a zero-thickness sheet, carrying its
-thickness as a property. openEMS models it as a surface impedance rather than
-as metal to be meshed, which is what saves the cells.
+A `ConductingSheet` represents thin metal (such as copper foil) modeled as a
+2D surface impedance rather than a volumetric 3D mesh, avoiding the need
+for fine grid cells across the foil thickness.
 
-Two separate questions are asked about one, and they are easy to read as one
-question:
+Validation requirements for `ConductingSheet`:
+1. **Planar 2D surface**: The bound geometry must be a 2D planar face or
+   sheet. Volumetric 3D solids cannot use `ConductingSheet`; openEMS applies
+   surface impedance only to 2D elements.
+2. **Sheet thickness vs cell size**: The specified `Thickness` must be
+   smaller than the grid cell holding the sheet. If foil thickness exceeds
+   the cell dimension, model the conductor as a 3D solid (`Part::Box`) with
+   `PEC`.
+3. **Valid surface impedance fit**: OpenEMS must be able to fit surface
+   impedance coefficients across the simulation band.
 
-- **Is it thin against the cell that holds it?** A sheet thicker than the cell
-  straddling it is not a sheet. This one is about the mesh, and refining fixes
-  it.
-- **Does openEMS have fitted surface-impedance coefficients for it at the top
-  of the band?** This one is not about the mesh, and refining does not touch it.
+Curved lossy foils are not supported because 3D curved surfaces are
+automatically extruded into volumetric shells by the adapter. Model curved
+conductors as `PEC`.
 
-A conducting sheet with `Thickness` left at zero has no surface impedance to
-model and behaves as a **perfect conductor**. That is a warning rather than a
-refusal - it is a legitimate thing to ask for - but it is rarely what was
-meant when a conductivity has been typed in beside it.
+A `ConductingSheet` with `Thickness` set to 0 generates a warning and is
+treated as lossless `PEC`.
 
 ## Catalogs
 
-**Add Material from Catalog...** picks from every catalog installed on the
-machine. A catalog is a TOML file - data, read with `tomllib`, never executed -
-holding a `[catalog]` header and a list of `[[material]]` entries.
+The **Add Material from Catalog...** command provides access to material
+libraries defined in TOML format. Material catalogs are read using standard
+data parsers and are not executed as code.
 
-Catalogs are searched in this order, first mention winning:
+Catalogs are searched in the following priority order:
+1. Built-in catalogs shipped with the workbench.
+2. `<FreeCAD user data>/Microwave/materials/`.
+3. Directories listed in parameter `Mod/Microwave/MaterialCatalogPaths`.
+4. Directories listed in environment variable `$MICROWAVE_MATERIAL_PATH`.
 
-1. the ones shipped with the workbench,
-2. `<FreeCAD user data>/Microwave/materials/`,
-3. anything listed in the parameter group `Mod/Microwave`, key
-   `MaterialCatalogPaths`,
-4. anything on `$MICROWAVE_MATERIAL_PATH`.
+Paths in `MaterialCatalogPaths` and `$MICROWAVE_MATERIAL_PATH` use the
+system path separator (`:` on POSIX, `;` on Windows) and can point to
+directories or individual `.toml` files.
 
-Several catalogs are live at once by design - a board house's laminates
-beside the generic nominal ones. A material is identified as
-`catalog:material`, so two catalogs both defining FR-4 give `generic:fr4` and
-`myfab:fr4` with no collision to resolve.
+Materials are identified as `catalog_id:material_id` (e.g. `generic:fr4`
+and `vendor:fr4`), preventing naming collisions across libraries.
 
-One malformed catalog does not cost the others: it is reported and the rest
-load. Inside a single file the rule is the opposite - one bad entry refuses the
-whole file - because a silently missing *material* is indistinguishable from one
-the vendor never shipped, while a missing *catalog* is obvious the moment
-anybody looks for it.
+### Material assignment and provenance
 
-### A catalog is a starting point, not a link
+Selecting a material from a catalog copies its property values directly
+into the FreeCAD document. Simulations do not require external catalog
+files at runtime, allowing `.FCStd` files to be shared portably.
 
-Picking a material **copies its values into the document**. Nothing is
-consulted at solve time, which is what lets a `.FCStd` solve unchanged on a
-machine with no catalogs installed at all.
+If a catalog entry includes frequency-dependent measurement tables, the
+workbench automatically copies the row closest to the active study center
+frequency. Create the `EMAnalysis` container before selecting materials
+so the center frequency is known.
 
-Where the values came from is recorded beside them, read-only, in the
-Provenance group:
+Material provenance is stored in read-only properties:
+- `Source`: Catalog identifier (`catalog:material`).
+- `SourceCatalog`: Catalog name and version at the time of selection.
+- `SourceDigest`: SHA-256 hash of the catalog values when imported.
+- `Description`: Description text from the catalog.
 
-| Property | |
-|---|---|
-| `Source` | `catalog:material` |
-| `SourceCatalog` | The catalog's name and version when it was picked |
-| `SourceDigest` | A fingerprint of the values as the catalog stated them |
-| `Description` | What the catalog says the material is |
+Modifying material properties in the FreeCAD Property Editor updates the
+simulation model. The original `SourceDigest` remains unchanged for
+auditing.
 
-A measured laminate typed in as 4.15 over the catalog's 4.3 stays 4.15 for ever.
-The digest then says the material has been edited since it was imported, which
-is information rather than a fault.
+### Authoring custom catalogs
 
-Picking the same catalog entry twice makes a second material and says so. Both
-readings are real - a mis-click, or a stackup wanting FR-4 on both sides of a
-core with their own numbers - and nothing but the engineer can tell them apart.
+Custom catalogs are created by copying an existing `.toml` file and assigning
+a unique `[catalog] id`. Units in catalog files are millimetres (mm),
+hertz (Hz), and Siemens per metre (S/m).
 
-### Writing a catalog
+Key catalog formatting rules:
+- Include the `schema` line at the top of the file.
+- Required physical keys per kind: `epsilon_r` for `dielectric` (even if
+  1.0); `conductivity` and `thickness` for `conducting_sheet`. Optional keys
+  like `mu_r` (defaults to 1.0) and `loss_tangent` (defaults to 0.0) may be
+  omitted.
+- Unrecognized or incompatible properties (such as `loss_tangent` on a `PEC`
+  entry) are rejected during parsing.
+- Measurement tables are specified using `[[material.dispersion]]` entries,
+  ordered by increasing frequency.
 
-Copy the shipped catalog and change its `[catalog] id`, or two copies refuse to
-load beside each other. Units are millimetres, hertz and S/m, matching the
-document.
+## Manual material creation
 
-Nothing that changes physics has a default: `epsilon_r` is required on a
-dielectric even when it is 1.0. A key that means nothing for that kind - a loss
-tangent on a PEC - is a refusal rather than an ignored field. A typo comes back
-as a line number and a suggestion, not as a permittivity of 1.
+The **Create Material** command creates a new empty `EMMaterial` object
+defaulting to vacuum properties (`Dielectric`, $\varepsilon_r=1$, $\mu_r=1$).
 
-## Binding a material to geometry
+To configure a custom material:
+1. Set `MaterialType` (`Dielectric`, `PEC`, or `ConductingSheet`).
+2. Enter the relevant physical properties (`Permittivity`, `LossTangent`,
+   `Conductivity`, `Thickness`).
+3. For lossy dielectrics, set `MeasuredAt` to the characterization
+   frequency.
 
-Select the material and the solids it is made of, in any order, and press
-**Bind Material to Shape**. Order says nothing here and is not read: one of the
-picks is a material and the rest are geometry, so the pick tells its own halves
-apart. (A port is the opposite case - see [Ports](ports.md).)
+Materials reside at the document root, allowing multiple simulation studies
+within the same document to share material definitions.
 
-One binding carries one material and any number of solids or faces. Use one
-binding per material.
+## Binding materials to geometry
 
-**A binding is how geometry gets into the simulation at all.** Anything nothing
-points at is absent from the run - see [Drawing the device](geometry.md).
+To assign a material to CAD geometry:
+1. Select the `EMMaterial` object and the target 3D solids or 2D faces in the
+   tree or 3D viewport.
+2. Click **Bind Material to Shape**.
 
-**Air is not modelled.** Everything the geometry does not fill is vacuum, so
-there is no background material to set and nothing to draw for the space around
-the board. The catalog carries an air entry for the case where a volume of it
-has to exist as an object - a cavity waiting to be filled with something else -
-and an ordinary study never needs it.
+An `EMMaterialBinding` links one material to the selected shapes or faces.
+Geometry without an active material binding is ignored during simulation.
 
-A binding with a link left empty is still created, and translation refuses it by
-name later: half a binding with the other half to fill in is a better place to
-stand than no binding and an error message.
+Background space is treated as vacuum by default. Explicit air volumes are
+not required around planar boards or open structures.
 
-Bound solids take the material's `Color` in the 3D view, so the model is
-readable at a glance. Where a solid is bound twice, the last binding in document
-order is the one that shows.
+Assigned solids adopt the material's `Color` in the 3D view. When a solid is
+referenced by multiple bindings, the last binding in document order sets the
+viewport display color.
+
+### Coincident solids validation
+
+Pre-flight validation detects coincident solid bodies occupying identical
+spatial coordinates:
+- **Same material**: Generates a warning. OpenEMS discretizes one solid and
+  drops coincident duplicate bodies with an "Unused primitive" notification.
+  Delete redundant duplicate bodies in CAD.
+- **Different materials**: Generates an error and halts simulation. OpenEMS
+  resolves overlapping cells by material hierarchy (conductors take
+  precedence over dielectrics), which can silently alter intended geometry.
+  Assign each physical volume to a single material.
+

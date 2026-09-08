@@ -3,15 +3,18 @@
 
 """Checks about what the model is made of.
 
-Whether a material is one this adapter can build, whether a loss figure quoted
-at one frequency still stands in over this band, whether any one figure could,
-whether two solids claim the same space, and whether a conductor is standing on
-a thickness the drawing never carried.
+These checks ask whether a material is one this adapter can build, whether a
+loss figure quoted at one frequency still stands in over this band, whether any
+one figure could, whether two solids claim the same space, and whether a
+conductor is standing on a thickness the drawing never carried.
 
-A conducting sheet is asked two separate questions, and the pair is easy to read
-as one: whether it is thin against the *cell* that has to hold it, and whether
-openEMS has fitted surface-impedance coefficients for it at the top of the band.
-Neither implies the other, and only the first is about the mesh.
+A conducting sheet is asked separate questions that are easy to read as one:
+whether the shape it is bound to spans a surface at all, whether it is thin
+against the cell that has to hold it, and whether openEMS has fitted
+surface-impedance coefficients for it at the top of the band. They run in that
+order because the first decides whether the others reach the object. The cell
+measurement reaches only a solid that is flat on an axis, so a sheet given a
+volume is invisible to it.
 """
 
 from __future__ import annotations
@@ -55,19 +58,19 @@ def _check_the_loss_was_measured_in_this_band(problem: Problem) -> list[Finding]
 
     ``kappa`` is one number for the whole run, so it reproduces the loss tangent
     it came from at exactly one frequency and falls away as 1/f either side.
-    Nothing downstream can tell: the envelope hands the engine a conductivity
+    Nothing downstream sees this: the envelope hands the engine a conductivity
     and the engine uses it. ``measured_at`` is the only record of where that
-    number was true, and this is what reads it.
+    number was true, and this check is what reads it.
 
-    Warns, never refuses. An engineer who knows their laminate is flat across
-    the band is right, so this says its piece and stops.
+    This warns and never refuses. An engineer who knows their laminate is flat
+    across the band is right, so the check states its point and stops.
     """
     centre = problem.frequency.center
     findings = []
     for material in problem.materials:
-        # The term, not the kind. They agree - ``Material`` refuses a kappa on
-        # any kind the engine would not be handed it for - and it is the term
-        # that carries the approximation.
+        # Tested on the term rather than on the kind. The two agree, since
+        # ``Material`` refuses a kappa on any kind the engine would not be
+        # handed it for, and the term is what carries the approximation.
         if material.kappa <= 0:
             continue
         if material.measured_at <= 0:
@@ -100,30 +103,30 @@ def _check_the_band_fits_one_conductivity(problem: Problem) -> list[Finding]:
     """A band no single conductivity covers, however well the number was quoted.
 
     The check above asks whether a loss tangent was quoted where it is being
-    used. This asks the question that survives a yes: ``kappa`` is fixed for the
-    run, so the loss tangent it amounts to is the declared one scaled by
-    ``f_centre / f``, and a band wide enough sets its own ends far from centre.
+    used. This one asks what survives a yes. ``kappa`` is fixed for the run, so
+    the loss tangent it amounts to is the declared one scaled by
+    ``f_centre / f``, and a wide enough band sets its own ends far from centre.
 
-    The scaling is that frequency ratio and nothing else - the permittivity and
-    the loss tangent both divide out - so every lossy material in a model is off
-    by the same factor, and one sentence merges to name all of them.
+    The scaling is that frequency ratio alone, since the permittivity and the
+    loss tangent both divide out. Every lossy material in a model is therefore
+    off by the same factor, and one sentence merges to name all of them.
 
-    Only the bottom is looked at, and only the bottom can be. The centre is the
-    mean of the two ends, so the top is never a factor of two from it and
-    ``FAR`` is out of its reach; the bottom has no such bound and runs away as
+    Only the bottom of the band is looked at, and only the bottom can be. The
+    centre is the mean of the two ends, so the top is never a factor of two from
+    it and cannot reach ``FAR``. The bottom has no such bound and runs away as
     the band widens.
 
-    That is a bound on the *ratio* and not on the damage. Attenuation from a
-    fixed conductivity does not vary with frequency at all, while a low-loss
+    That bounds the ratio rather than the damage. Attenuation from a fixed
+    conductivity does not vary with frequency at all, while a low-loss
     dielectric's rises in proportion to it, and the two are made equal at the
-    centre - so the band's two ends are wrong by the same amount of loss,
-    over-stated below the centre and under-stated above it. The message says
+    centre. The band's two ends are therefore wrong by the same amount of loss,
+    over-stated below the centre and under-stated above it. The message states
     both, because the top is where a dielectric's loss is largest and so where
     that same amount is the smaller share of the answer.
 
-    Warns, never refuses. Narrowing the band changes the question being asked
-    rather than answering it, and what would answer it - a Debye fit, whose
-    poles openEMS integrates itself - is not something this adapter writes.
+    This warns and never refuses. Narrowing the band changes the question being
+    asked rather than answering it. What would answer it is a Debye fit, whose
+    poles openEMS integrates itself, and this adapter does not write one.
     """
     frequency = problem.frequency
     overstated = frequency.center / frequency.start
@@ -147,18 +150,18 @@ def _check_the_band_fits_one_conductivity(problem: Problem) -> list[Finding]:
 def _same_space(one: Solid, other: Solid) -> bool:
     """Whether two boxes stand in the same place, to ``_ON_THE_GRID``.
 
-    Not equality. Two coordinates a part in 1e16 apart - what a stackup
-    measured from the top on one layer and from the bottom on the other
-    produces - build the structure identical numbers build, because every
-    cell centre inside one box is inside the other. A tolerance below any
-    length this workbench meshes is what makes the check about the structure
-    rather than about the arithmetic that reached it.
+    The test is not equality. Two coordinates a part in 1e16 apart, which is
+    what a stackup measured from the top on one layer and from the bottom on the
+    other produces, build the structure identical numbers build, because every
+    cell centre inside one box is inside the other. A tolerance below any length
+    this workbench meshes keeps the check about the structure rather than about
+    the arithmetic that reached it.
 
-    A triangulated solid answers no: its corners bound the shape rather than
+    A triangulated solid answers no. Its corners bound the shape rather than
     being it, so equal corners are not two objects in one place. A coil and the
-    former it is wound on share a bounding box exactly and touch nowhere, and
-    refusing that pair - which is what this finding does for two materials -
-    would refuse an ordinary model to catch a fault it has no evidence of.
+    former it is wound on share a bounding box exactly and touch nowhere.
+    Refusing that pair, which is what this finding does for two materials, would
+    refuse an ordinary model to catch a fault there is no evidence of.
     """
     if one.is_mesh or other.is_mesh:
         return False
@@ -172,28 +175,28 @@ def _same_space(one: Solid, other: Solid) -> bool:
 def _check_coincident_solids(problem: Problem) -> list[Finding]:
     """Two solids in the same place, of one material or of two.
 
-    Both come back from openEMS as the same sentence: the box that gets no
+    openEMS reports both cases with the same sentence: the box that gets no
     cells is reported as ``Warning: Unused primitive (type: Box) detected in
     property: Copper!`` (``CSProperties::WarnUnusedPrimitves``, called for
     every run at ``openEMS/openems.cpp:1335``). A CSXCAD property is a
-    *material*, so the only name in that line is the material's, and which
-    object it meant appears nowhere. It is also the same line a healthy run
-    prints for a benign reason, since ``Unused primitive`` also has one. The
-    engine cannot tell these apart. This can, and that is the whole point of
-    it.
+    material, so the only name in that line is the material's, and the object
+    it meant appears nowhere. A healthy run prints the same line for a benign
+    reason, since ``Unused primitive`` also has one. The engine cannot tell
+    these apart. This check can.
 
-    **One material** is a drawing to tidy up rather than a fault: the same
-    conductor drawn twice is one conductor, and the run is right. So it warns,
-    and names the two objects the engine's line does not.
+    Two solids of one material are a drawing to tidy up rather than a fault:
+    the same conductor drawn twice is one conductor, and the run is right. So
+    this warns, and names the two objects the engine's line does not.
 
-    **Two materials** is a wrong structure, so it refuses. One space cannot be
-    made of two materials, and the engine resolves the contradiction rather
-    than reporting it: ``ContinuousStructure::GetPropertyByCoordPriority``
+    Two solids of different materials are a wrong structure, so this refuses.
+    One space cannot be made of two materials, and the engine resolves the
+    contradiction rather than reporting it:
+    ``ContinuousStructure::GetPropertyByCoordPriority``
     (``CSXCAD/src/ContinuousStructure.cpp:276``) gives every cell to the
     highest priority covering it, and to the property added first where they
     tie. A board bound to both a laminate and a copper is meshed as solid
-    copper and answers like a board. Binding geometry twice is one selection
-    away, so this names the pair.
+    copper, and the run completes and reports numbers for it. Binding geometry
+    twice is one selection away, so this names the pair.
     """
     findings = []
     seen: list[Solid] = []
@@ -209,8 +212,8 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
                 Finding(
                     WARN,
                     subject,
-                    # No numeral, here or below: identical sentences are merged
-                    # into one line naming every object that said them, and
+                    # No numeral here or below. Identical sentences are merged
+                    # into one line naming every object that said them, so
                     # "both" would be false the moment a third solid shares the
                     # space.
                     f"{occupies}, which is also {solid.material!r}. openEMS "
@@ -222,8 +225,8 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
             )
             continue
         # Labels are unique in a FreeCAD document, so two solids carrying one
-        # is one object bound twice rather than two objects in a heap - and
-        # "Substrate occupies the same space as 'Substrate'" is no help to the
+        # label are one object bound twice rather than two objects in a heap.
+        # "Substrate occupies the same space as 'Substrate'" would not help the
         # person who did it.
         clash = (
             f"is bound to both {first.material!r} and {solid.material!r}"
@@ -248,10 +251,20 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
 def _check_a_thickness_was_invented(problem: Problem) -> list[Finding]:
     """A conductor drawn as a surface, and the metal built off it.
 
-    Said even where the drawing meant a surface, because the thickness follows
-    the cell the metal is meshed at and so moves with the band and the mesh
-    policy - a length the document does not carry anywhere a reader could look.
+    This is reported even where the drawing meant a surface. The thickness
+    follows the cell the metal is meshed at, so it moves with the band and the
+    mesh policy, and the document carries that length nowhere a reader could
+    look.
+
+    A conducting sheet is left out. Its length is not free, being what carries
+    the shape out of the surface-impedance model, and the remedy offered here -
+    close the shape around its drawn thickness - produces the shape the adapter
+    refuses. :func:`_check_a_conducting_sheet_spans_a_surface` names that object
+    instead.
     """
+    sheets = {
+        material.name for material in problem.materials if material.kind == "conducting_sheet"
+    }
     return [
         Finding(
             SUBSTITUTE,
@@ -264,28 +277,89 @@ def _check_a_thickness_was_invented(problem: Problem) -> list[Finding]:
             "the thickness you drew",
         )
         for solid in problem.solids
-        if solid.thickened
+        if solid.thickened and solid.material not in sheets
     ]
+
+
+def _check_a_conducting_sheet_spans_a_surface(problem: Problem) -> list[Finding]:
+    """A conducting sheet that is not a surface is solved as a perfect conductor.
+
+    openEMS applies the surface-impedance model only where the primitive
+    carrying the property spans exactly two axes. The test is what the shape
+    spans rather than how thin it is, so a volume fails it, and so do a line and
+    a point. Everything else is written as a perfect conductor, with the
+    conductivity and the thickness discarded together, and the run finishes.
+
+    A sheet gets a volume either from the mesher, where a conductor is drawn as
+    a surface it cannot lay flat, or from the user, by binding a sheet material
+    to something drawn solid. The material alone distinguishes neither case from
+    a working sheet. The geometry does.
+
+    A port's own trace never reaches this check. It is flattened onto its
+    excitation coordinate as it is built, so it spans two axes by construction.
+    """
+    sheets = {
+        material.name for material in problem.materials if material.kind == "conducting_sheet"
+    }
+    findings = []
+    for solid in problem.solids:
+        if solid.material not in sheets:
+            continue
+        spanned = sum(1 for dim in range(3) if solid.lower[dim] != solid.upper[dim])
+        if spanned == 2:
+            continue
+        if spanned < 2:
+            fault = f"it spans {spanned} of the three axes, so it has no area to carry a surface"
+            remedy = "Draw the conductor as the face it is meant to be"
+        elif solid.thickened:
+            fault = (
+                "the drawing carried no surface this could be laid flat on, so "
+                f"{solid.thickened:.4g} mm of metal was built off it to close it"
+            )
+            remedy = (
+                "A conductor that curves out of one plane cannot carry a surface "
+                "impedance; bind it to a perfect conductor and take the answer as "
+                "lossless"
+            )
+        else:
+            fault = "it is drawn with thickness on every axis"
+            remedy = (
+                "Draw the conductor as a flat face - a conducting sheet carries "
+                "its thickness as a loss property rather than as geometry - or "
+                "bind it to a perfect conductor"
+            )
+        findings.append(
+            Finding(
+                REFUSE,
+                solid.name,
+                f"it is bound to {solid.material!r}, a conducting sheet, and "
+                f"{fault}. openEMS applies its surface-impedance model only to a "
+                "shape spanning two axes; this one it would write as a perfect "
+                "conductor, discarding the conductivity and the thickness both, "
+                f"and say so only in its own output. {remedy}",
+            )
+        )
+    return findings
 
 
 def _check_sheet_thickness(problem: Problem) -> list[Finding]:
     """A conducting sheet thicker than a cell is not a sheet.
 
-    Worth a check of its own because openEMS will not stop for it. Its
+    This has a check of its own because openEMS will not stop for it. Its
     surface-impedance model fits a rational approximation whose validity scales
-    as ``1/thickness**2``; outside that range it prints a warning to stderr,
-    clamps to its last tabulated coefficients and keeps going. The result looks
-    like a solve and is wrong. A unit slip - CSXCAD wants this field in metres
-    while everything around it is in grid units - lands exactly there, and
-    this is what catches it.
+    as ``1/thickness**2``. Outside that range openEMS prints a warning to
+    stderr, clamps to its last tabulated coefficients and keeps going. The
+    result looks like a solve and is wrong. A unit slip lands exactly there,
+    since CSXCAD wants this field in metres while everything around it is in
+    grid units, and this check is what catches it.
     """
     findings = []
     for material in problem.materials:
         if material.kind != "conducting_sheet":
             continue
 
-        # Compared against the cells the sheet actually lies in, along the axis
-        # it is thin in - not against the finest cell anywhere in the model.
+        # Compared against the cells the sheet lies in, along the axis it is
+        # thin in, rather than against the finest cell anywhere in the model.
         # The global minimum makes this check strictly stronger, so one fine
         # feature elsewhere on the board would refuse a perfectly valid sheet.
         smallest = _cells_at_sheet(problem, material.name)
@@ -310,25 +384,27 @@ def _check_sheet_thickness(problem: Problem) -> list[Finding]:
 #: How far a frequency may sit from band centre before the fixed conductivity
 #: built from a loss tangent stops standing in for it. Two octaves.
 #:
-#: Two frequencies are held to it, for reasons that are not the same size. The
-#: frequency the loss tangent was **quoted** at is a question about the
-#: material: two octaves away, its own drift is small next to the spread between
-#: one sheet of FR-4 and the next, so inside that the number still describes the
-#: laminate. The **bottom of the band** is a question about the conversion, and
-#: there the ratio is the error itself - at this threshold the model carries
-#: four times the declared loss tangent, which no laminate's spread excuses.
+#: Two frequencies are held to it, for reasons of different weight. The
+#: frequency the loss tangent was quoted at is a question about the material:
+#: two octaves away, the material's own drift is small next to the spread
+#: between one sheet of FR-4 and the next, so inside that the number still
+#: describes the laminate. The bottom of the band is a question about the
+#: conversion, and there the ratio is the error itself - at this threshold the
+#: model carries four times the declared loss tangent, which no laminate's
+#: spread excuses.
 #:
-#: So the band question is the loosely held one, and it is held here anyway:
-#: a second constant would be a second thing to tune with no better argument
-#: behind its value, and one number that moves both is the honest way to say
-#: that this is a judgement about how far is too far. Below it the band check
-#: is silent while the model runs up to fourfold lossy at the bottom.
+#: The band question is therefore the more loosely held of the two, and it is
+#: held to this figure anyway. A second constant would be a second thing to tune
+#: with no better argument behind its value, and one number that moves both
+#: states plainly that this is a judgement about how far is too far. Below it
+#: the band check is silent while the model runs up to fourfold lossy at the
+#: bottom.
 #:
-#: It is also what lets that check look only downwards - the top of a band is
-#: never a factor of two from centre, which a threshold of two octaves is out of
-#: reach of.
+#: The same figure lets that check look only downwards. The top of a band is
+#: never a factor of two from centre, and a threshold of two octaves is out of
+#: its reach.
 #:
-#: Read by ``Gui.material_picker`` too, which shows the same thing about a
+#: ``Gui.material_picker`` reads this too, and shows the same thing about a
 #: catalog entry before there is a model to translate.
 FAR = 4.0
 
@@ -345,22 +421,20 @@ def _check_sheet_fits_the_surface_impedance_model(problem: Problem) -> list[Find
     ``operator_ext_conductingsheet.cpp`` forms ``w0 = 8 / (sigma t^2 mu0)`` and
     takes the first tabulated ``omega_stop`` above ``Omega = 2 pi f_max / w0``.
     Past the last entry it prints *"conductor thickness, conductivity or max.
-    simulation frequency of interest is too high"* and **clamps to the last
-    coefficient set** - a solve-shaped wrong answer, which is the same way the
-    check above fails and the reason both exist.
+    simulation frequency of interest is too high"* and clamps to the last
+    coefficient set, returning a wrong answer in the shape of a solve. The
+    check above guards a failure of the same shape against a different bound.
 
-    ``Omega`` is the skin depth in disguise. With ``delta^2 = 2/(w mu sigma)``
-    it is exactly ``(t / 2 delta)^2``, so the bound is ``t <= 3198 delta`` at
-    the top of the band - which is why the neighbouring guard, comparing
-    thickness against the *cell*, could never have caught this. Ordinary foil
-    at ordinary frequencies sits inside the fit with room to spare, so a
-    complaint from it reads like a silent failure and is openEMS being right.
+    ``Omega`` is the skin depth in another form. With
+    ``delta^2 = 2/(w mu sigma)`` it is exactly ``(t / 2 delta)^2``, so the bound
+    is ``t <= 3198 delta`` at the top of the band. The neighbouring guard
+    compares thickness against the cell and so could never have caught this.
+    Ordinary foil at ordinary frequencies sits inside the fit with room to
+    spare, so a complaint from it reads like a silent failure and is openEMS
+    being right.
     """
-    findings = []
+    findings: list[Finding] = []
     top = float(problem.frequency.stop)
-    if top <= 0:
-        return findings
-
     for material in problem.materials:
         if material.kind != "conducting_sheet":
             continue

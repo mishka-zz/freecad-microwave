@@ -68,9 +68,14 @@ description = "99.6% Al2O3 ceramic substrate."
 
 # --- conductors -------------------------------------------------------------
 #
-# A conductor drawn as a solid but modelled as a sheet is the usual case: in
-# FDTD a trace is a surface, and the thickness below is a loss parameter feeding
-# the surface impedance rather than geometry that reaches the grid.
+# Every conductor here carrying a conductivity is a sheet, and a sheet has to be
+# drawn as a flat face. In FDTD a trace is a surface: the thickness below is a
+# loss parameter feeding the surface impedance rather than geometry that reaches
+# the grid, and openEMS applies that impedance only to a shape spanning two axes.
+# Bind one of these to something drawn with thickness and it is refused, because
+# the engine would silently solve a perfect conductor instead. For a conductor
+# that has to be a solid - a machined wall, a curved foil - take one of the
+# perfect-conductor entries at the end and read the answer as lossless.
 
 [[material]]
 id = "copper"
@@ -97,7 +102,7 @@ kind = "conducting_sheet"
 conductivity = 1.57e7
 thickness = 0.5
 color = "#C8A951"
-description = "CuZn37. Waveguide and enclosure walls."
+description = "CuZn37. Waveguide and enclosure walls, drawn as faces."
 
 [[material]]
 id = "aluminium"
@@ -106,7 +111,7 @@ kind = "conducting_sheet"
 conductivity = 2.5e7
 thickness = 1.0
 color = "#A8A8A8"
-description = "Enclosures and machined cavities."
+description = "Enclosures and machined cavities, drawn as faces."
 
 [[material]]
 id = "copper-pec"

@@ -4,38 +4,42 @@
 """Drawing a port: the box the solver builds, and the two planes inside it.
 
 The shape is built from :mod:`Microwave.portbox`, which is the same arithmetic
-the openEMS adapter runs - so this is not an illustration of the port, it is
-the port. That is the whole reason to draw it: a picture that could disagree
-with the solve would be worse than none.
+the openEMS adapter runs, so the drawing is the port itself rather than an
+illustration of it. A picture that could disagree with the solve would be worse
+than none.
 
-Live, not manual. ``EMMeshPreview`` is also a ``Part::FeaturePython`` and its
-``execute`` is deliberately empty, because meshing is expensive and a recompute
-must not silently rebuild the grid. A port box is neither expensive nor
-ambiguous - it is a dozen operations on bounding boxes, with no dependence on
-the mesh or the band - so it recomputes like any other parametric feature, and
-needs no Update button and no staleness badge. FreeCAD already knows a port
-depends on the trace and the ground, because ``PropertyLinkSub`` *is* a
+Live rather than manual. ``EMMeshPreview`` is also a ``Part::FeaturePython``,
+and its ``execute`` does not mesh, because meshing is expensive and a
+recompute must not silently rebuild the grid. A port box is neither expensive
+nor ambiguous - it is arithmetic on bounding boxes, with no dependence
+on the mesh or the band - so it recomputes like any other parametric feature,
+and needs no Update button and no staleness badge. FreeCAD already tracks that a
+port depends on the trace and the ground, because a ``PropertyLinkSub`` is a
 dependency edge.
 
-**``build`` never raises.** A port is created before it is configured, by
-design: the commands make one from whatever was selected and name what is
-missing. A half-built port simply has no box yet, and an empty shape says that
-more honestly than a traceback in the report view.
+``build`` never raises. A port is created before it is configured, by design:
+the commands make one from whatever was selected and name what is missing. A
+half-built port has no box yet, and an empty shape reports that better than a
+traceback in the report view.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 from .. import annulus, picks, portbox
+from ..portbox import Box, PortBox
 from .kinds import kind_of
 
 AXES = {"X": (0, 1), "Y": (1, 1), "Z": (2, 1), "-X": (0, -1), "-Y": (1, -1), "-Z": (2, -1)}
 
 
-def _axis(name):
+def _axis(name: Any) -> tuple[int, int] | None:
     return AXES.get(str(name))
 
 
-def _box_of(obj, sub_element=""):
+def _box_of(obj: Any, sub_element: str = "") -> Box | None:
     shape = getattr(obj, "Shape", None)
     if shape is None:
         return None
@@ -48,7 +52,7 @@ def _box_of(obj, sub_element=""):
     return ((bound.XMin, bound.YMin, bound.ZMin), (bound.XMax, bound.YMax, bound.ZMax))
 
 
-def _linked(link):
+def _linked(link: Any) -> tuple[Box | None, Box | None]:
     """A ``PropertyLinkSub`` as ``(whole-body box, sub-element box)``."""
     if not link or link[0] is None:
         return None, None
@@ -57,8 +61,8 @@ def _linked(link):
     return _box_of(obj), _box_of(obj, names[0] if names else "")
 
 
-def _element(link):
-    """The shape a ``PropertyLinkSub`` names, for what a box does not hold."""
+def _element(link: Any) -> Any:
+    """The shape a ``PropertyLinkSub`` names, for what a box does not carry."""
     if not link or link[0] is None:
         return None
     shape = getattr(link[0], "Shape", None)
@@ -68,13 +72,13 @@ def _element(link):
     return shape.getElement(names[0])
 
 
-def port_box(obj):
+def port_box(obj: Any) -> PortBox | None:
     """The :class:`~Microwave.portbox.PortBox` for this port, or ``None``.
 
-    ``None`` whenever the port is not yet configured enough to have one - and
-    for a waveguide port with ``Length`` unset, because that default is five
-    *mesh* cells and there is no mesh here. That is the one thing about a port
-    that genuinely cannot be drawn before meshing.
+    ``None`` whenever the port is not yet configured enough to have one, and for
+    a waveguide port with ``Length`` unset, because that default is five mesh
+    cells and there is no mesh here. That length is the one thing about a port
+    that cannot be drawn before meshing.
     """
     kind = kind_of(obj)
     try:
@@ -87,17 +91,17 @@ def port_box(obj):
         if kind == "EMPortCoaxial":
             return _coaxial(obj)
     except (portbox.BoxError, annulus.AnnulusError, AttributeError, IndexError, TypeError):
-        # An unfinished or contradictory port has no box. The adapter says why,
-        # loudly, when the user asks it to; drawing is not the place for it.
+        # An unfinished or contradictory port has no box. The adapter reports
+        # why, loudly, when the user runs it. The drawing layer does not.
         return None
     return None
 
 
-def _length(quantity):
+def _length(quantity: Any) -> float:
     return float(getattr(quantity, "Value", quantity))
 
 
-def _microstrip(obj):
+def _microstrip(obj: Any) -> PortBox | None:
     propagation = _axis(obj.PropagationAxis)
     excitation = _axis(obj.ExcitationAxis)
     _, face = _linked(obj.TraceEnd)
@@ -119,7 +123,7 @@ def _microstrip(obj):
     )
 
 
-def _lumped(obj):
+def _lumped(obj: Any) -> PortBox | None:
     excitation = _axis(obj.ExcitationAxis)
     body, source = _linked(obj.SourceEntity)
     _, reference = _linked(obj.ReferenceEntity)
@@ -133,7 +137,7 @@ def _lumped(obj):
     )
 
 
-def _coaxial(obj):
+def _coaxial(obj: Any) -> PortBox | None:
     propagation = _axis(obj.PropagationAxis)
     _, face = _linked(obj.Annulus)
     if not propagation or face is None:
@@ -148,7 +152,7 @@ def _coaxial(obj):
     )
 
 
-def _waveguide(obj):
+def _waveguide(obj: Any) -> PortBox | None:
     propagation = _axis(obj.PropagationAxis)
     _, face = _linked(obj.CrossSection)
     stated = _length(obj.Length)
@@ -165,21 +169,21 @@ def _waveguide(obj):
 
 #: Thickness given to a box that is flat across one axis, in mm.
 #:
-#: A lumped port drawn on a face has zero extent along one axis - legitimate,
-#: and ``portbox.lumped`` says why - but OpenCascade will not make a solid out
-#: of it. Set the floor below what OCC accepts and *every* lumped port raises
-#: ``length of box too small`` out of ``Part.makeBox``, prints a traceback and
-#: leaves the port with no Shape: the drawing layer refusing what the model
-#: layer and the solver both take.
+#: A lumped port drawn on a face has zero extent along one axis. That is
+#: legitimate, and ``portbox.lumped`` says why, but OpenCascade will not make a
+#: solid out of it. With the floor set below what OCC accepts, every lumped port
+#: raises ``length of box too small`` out of ``Part.makeBox``, prints a
+#: traceback and leaves the port with no Shape, so the drawing layer refuses
+#: what the model layer and the solver both take.
 #:
 #: On FreeCAD 1.1.1, 1e-9 and 1e-8 raise ``ValueError``, 1e-7 raises
 #: ``OCCDomainError``, and 1.01e-7 builds. The bound is strictly above
-#: ``Precision::Confusion()``, so this sits a decade clear of it and is still a
-#: thousandth of the smallest cell ever meshed.
+#: ``Precision::Confusion()``, so this sits a decade clear of it and far below
+#: any cell a model here is meshed on.
 _FLAT_BOX = 1e-6
 
 
-def build(obj):
+def build(obj: Any) -> Any:
     """This port's shape, or an empty compound when it has no box yet."""
     import Part
 
@@ -190,11 +194,11 @@ def build(obj):
     ring = _ring_of(obj)
     lower, upper = box.corners()
 
-    # The planes span exactly the port's cross-section - no overhang. An
-    # overhanging marker is easier to see and makes the compound's bounding box
-    # bigger than the port, so measuring the drawn port with FreeCAD's own tools
-    # would give the wrong length. Being measurable is most of the point; the
-    # body is translucent, so an interior plane shows through it anyway.
+    # The planes span exactly the port's cross-section, with no overhang. An
+    # overhanging marker is easier to see, and it makes the compound's bounding
+    # box bigger than the port, so measuring the drawn port with FreeCAD's own
+    # tools would give the wrong length. Being measurable matters more. The body
+    # is translucent, so an interior plane shows through it anyway.
     pieces = [_body(box, ring, lower, upper)]
     for distance in (box.feed, box.measurement):
         if distance <= 0:
@@ -205,7 +209,7 @@ def build(obj):
     return Part.Compound(pieces)
 
 
-def _ring_of(obj):
+def _ring_of(obj: Any) -> annulus.Annulus | None:
     """The annulus a round port is built on, or ``None`` for a rectangular one.
 
     ``build`` never raises, so a port whose pick has stopped being a ring falls
@@ -219,7 +223,9 @@ def _ring_of(obj):
         return None
 
 
-def _body(box, ring, lower, upper):
+def _body(
+    box: PortBox, ring: annulus.Annulus | None, lower: Sequence[float], upper: Sequence[float]
+) -> Any:
     """The volume the port occupies: a tube where it is round, a box otherwise."""
     import FreeCAD
     import Part
@@ -233,7 +239,7 @@ def _body(box, ring, lower, upper):
     return outer.cut(Part.makeCylinder(ring.inner, box.length, base, along))
 
 
-def _axis_frame(box, ring, position):
+def _axis_frame(box: PortBox, ring: annulus.Annulus, position: float) -> tuple[Any, Any]:
     """``(point on the line, unit vector along it)`` at ``position``."""
     import FreeCAD
 
@@ -245,7 +251,13 @@ def _axis_frame(box, ring, position):
     return FreeCAD.Vector(*base), FreeCAD.Vector(*along)
 
 
-def _marker(box, ring, distance, lower, upper):
+def _marker(
+    box: PortBox,
+    ring: annulus.Annulus | None,
+    distance: float,
+    lower: Sequence[float],
+    upper: Sequence[float],
+) -> Any:
     """The plane across the port at ``distance``, shaped like its cross-section."""
     import Part
 
@@ -259,12 +271,12 @@ def _marker(box, ring, distance, lower, upper):
         return None
 
 
-def _plane(position, axis, lower, upper):
+def _plane(position: float, axis: int, lower: Sequence[float], upper: Sequence[float]) -> Any:
     """A flat rectangle across the box at ``position`` along ``axis``."""
     import FreeCAD
     import Part
 
-    corners = []
+    corners: list[Any] = []
     transverse = [dim for dim in range(3) if dim != axis]
     for first, second in ((0, 0), (1, 0), (1, 1), (0, 1)):
         point = [0.0, 0.0, 0.0]

@@ -27,6 +27,7 @@ Keep them matching if the bindings move.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import types
 from dataclasses import replace
@@ -34,8 +35,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from Microwave.Solvers.openems import write
-from Microwave.Solvers.openems.mesh import MeshParams
+from Microwave.Solvers.openems import excitation, plan, staircase
 from Microwave.Solvers.openems.model import (
     THROUGH,
     Frequency,
@@ -46,6 +46,7 @@ from Microwave.Solvers.openems.model import (
     Solid,
     Termination,
 )
+from Microwave.Solvers.openems.regions import MeshParams
 
 
 class FakePolyhedron:
@@ -126,8 +127,16 @@ class FakeCSX:
 class FakePort:
     """A port, and after ``CalcPort`` the arrays the driver reads off one.
 
-    The record is a ringing mode cut off at :attr:`record_decay` of its peak, so
-    a test can say how truncated the run was and nothing else has to change.
+    The record is a drive that finishes well inside it and a ringing mode cut off
+    at :attr:`record_decay` of its peak, so a test can say how truncated the run
+    was and nothing else has to change. The current carries the same two with the
+    outgoing one reversed, which is what gives the record an incident and a
+    reflected wave to be split into.
+
+    **Only the port that was excited has the drive in it.** A passive port's
+    record is what came out of the device and nothing that went in, so its own
+    incident wave is nothing at all - and a residual that divided a port by
+    itself rather than by the port that drove would say so loudly.
     """
 
     #: Where the record was cut, as a share of its own peak. The default is a
@@ -137,9 +146,19 @@ class FakePort:
     #: Long enough to hold many cycles of the bands the problems here use.
     RECORD_SECONDS = 8e-9
 
+    #: When the drive arrives, as a share of the record. One sample wide, so its
+    #: spectrum is flat across whatever band a problem here asks for and
+    #: truncating the record leaves it alone: what moves is the reflected wave.
+    DRIVE_AT = 0.05
+
     #: One volt-nanosecond, the scale a transform of a one-volt pulse comes out
-    #: at - so a share of it reads as a share rather than as an exponent.
+    #: at - so a share of it reads as a share rather than as an exponent. The
+    #: drive in the record is scaled to transform to exactly this, so what the
+    #: fake declares and what it recorded are the same wave.
     INCIDENT = 1e-9
+
+    #: What the fake's waves are referenced to, in ohms.
+    REFERENCE = 50.0
 
     def __init__(self, kind, **recorded):
         self.kind = kind
@@ -150,12 +169,19 @@ class FakePort:
         freq = np.asarray(freq, dtype=float)
         points = freq.size
         times = np.linspace(0.0, self.RECORD_SECONDS, 4096)
-        envelope = self.record_decay ** (times / times[-1])
-        # Three voltage probes sharing one time axis, as an MSLPort has.
-        record = envelope * np.cos(2 * np.pi * freq.mean() * times)
+        span = times[-1]
+        drive = np.zeros_like(times)
+        if self.recorded.get("excite"):
+            drive[int(times.size * self.DRIVE_AT)] = self.INCIDENT / (2 * (times[1] - times[0]))
+        envelope = self.record_decay ** (times / span)
+        ringing = envelope * np.cos(2 * np.pi * freq.mean() * times)
+        # Three voltage probes sharing one time axis, as an MSLPort has, and the
+        # current on its own - a Yee scheme staggers the two by half a step.
         self.u_data = types.SimpleNamespace(ui_time=[times, times, times])
-        self.ut_tot = record
-        self.Z_ref = np.full(points, 50.0)
+        self.i_data = types.SimpleNamespace(ui_time=[times + 0.5 * (times[1] - times[0])])
+        self.ut_tot = drive + ringing
+        self.it_tot = (drive - ringing) / self.REFERENCE
+        self.Z_ref = np.full(points, self.REFERENCE)
         self.uf_inc = np.full(points, self.INCIDENT, dtype=complex)
         self.uf_ref = np.full(points, 0.1 * self.INCIDENT, dtype=complex)
         self.P_inc = np.ones(points)
@@ -176,8 +202,8 @@ class FakeFDTD:
         self.ports: list[FakePort] = []
         self.run_args = None
 
-    def SetGaussExcite(self, f0, fc):
-        self.excite = (f0, fc)
+    def SetCustomExcite(self, _str, f0, fmax):
+        self.excite = (_str, f0, fmax)
 
     def SetBoundaryCond(self, BC):
         self.boundary = list(BC)
@@ -289,7 +315,7 @@ def _microstrip() -> Problem:
         ),
     )
     params = MeshParams(metal_res=0.5, dielectric_res=1.0, min_lines=6, pml_cells=8)
-    grid = write.plan_grid(solids, ports, materials, params, ((THROUGH, THROUGH), (8, 8), (8, 8)))
+    grid = plan.plan_grid(solids, ports, materials, params, ((THROUGH, THROUGH), (8, 8), (8, 8)))
     return Problem(
         frequency=Frequency(1e9, 10e9, 51),
         grid=grid,
@@ -333,7 +359,7 @@ def _waveguide(broad_axis: int = 0) -> Problem:
         ),
     )
     params = MeshParams(metal_res=0.4, dielectric_res=0.4, min_lines=10, pml_cells=(0, 0, 8))
-    grid = write.plan_grid(solids, ports, materials, params, ((0, 0), (0, 0), (THROUGH, THROUGH)))
+    grid = plan.plan_grid(solids, ports, materials, params, ((0, 0), (0, 0), (THROUGH, THROUGH)))
     return Problem(
         frequency=Frequency(20e9, 26e9, 51),
         grid=grid,
@@ -510,7 +536,17 @@ class TestNothingIsDroppedOnTheWay:
     def test_the_excitation_spectrum_follows_the_band(self, fake_engine, tmp_path):
         problem = _microstrip()
         fdtd, _, _ = _build(problem, tmp_path)
-        assert fdtd.excite == pytest.approx((5.5e9, 4.5e9))
+        assert fdtd.excite[0] == excitation.expression(5.5e9, 4.5e9)
+
+    def test_and_both_frequencies_it_is_given_are_the_top_of_that_band(self, fake_engine, tmp_path):
+        """Neither argument is what its name says. openEMS takes the probes'
+        sampling rate from the second, overwriting whatever the third said, and
+        builds the conducting-sheet model off the third before the signal
+        exists - so a centre frequency in either place undersamples the record
+        or ages the sheet at the wrong frequency.
+        """
+        fdtd, _, _ = _build(_microstrip(), tmp_path)
+        assert fdtd.excite[1:] == (10e9, 10e9)
 
     def test_the_grid_reaches_the_solver_as_drawn_apart_from_where_it_is(self):
         """The envelope's lines are what gets solved - that is what makes a
@@ -583,8 +619,10 @@ class TestNothingIsDroppedOnTheWay:
 
 class TestOrderingTheEngineRequires:
     def test_the_grid_exists_before_any_port_is_built(self, fake_engine, tmp_path):
-        """MSLPort and RectWGPort both read the grid at construction; RectWGPort
-        raises outright with fewer than five lines on its axis."""
+        """MSLPort and RectWGPort both read the grid at construction. MSLPort
+        counts the lines on its axis and raises where there are too few;
+        RectWGPort takes the grid's unit off it and counts nothing. Either way
+        the grid has to be in place first."""
         problem = _waveguide()
 
         seen: list[str] = []
@@ -689,6 +727,47 @@ class TestWhatASolveSaysAboutItsOwnRecords:
         assert sorted(provenance["tail_share"]) == ["1", "2"]
         assert sorted(provenance["recorded_samples"]) == ["1", "2"]
 
+    def test_and_each_is_weighed_against_the_port_that_drove(self, fake_engine, tmp_path):
+        """An S-parameter is one port's reflection over the *driven* port's
+        incident wave, so a passive port's share is not its own record divided by
+        itself.
+
+        Both ports ring the same way here and only one of them was driven, so
+        the wave coming back out is the same at both and the wave it is weighed
+        against is the same one twice: the two shares are one number. A measure
+        asking each port what drove it would ask the passive one about a drive it
+        never saw.
+        """
+        from Microwave.Solvers.openems import residual
+
+        share = self.solved(tmp_path, _two_port())["provenance"]["tail_share"]
+        # Not to the last bit: the current probe sits half a step behind the
+        # voltage probe, so what cancels out of one port's split is a phase away
+        # from cancelling out of the other's.
+        assert share["2"] == pytest.approx(share["1"], rel=1e-3, abs=0.0)
+        assert 0.0 < share["2"] < residual.WANTED
+
+    def test_and_off_the_probes_and_the_axes_the_run_wrote(self, fake_engine, tmp_path):
+        """The wiring between the port objects and the measurement, which no
+        figure downstream would show as wrong - a residual computed off the wrong
+        axis, or against the wrong reference, is a plausible small number."""
+        from Microwave.Solvers.openems import residual
+
+        problem = _microstrip()
+        reported = self.solved(tmp_path, problem)["provenance"]["tail_share"]["1"]
+        port = FakePort("lumped", excite=1)
+        port.CalcPort(str(tmp_path), problem.frequency.values())
+        record = residual.Record(
+            voltage=residual.Probe(port.u_data.ui_time[0], port.ut_tot),
+            current=residual.Probe(port.i_data.ui_time[0], port.it_tot),
+            reference=port.Z_ref,
+        )
+        assert reported == pytest.approx(
+            residual.tail_shares({1: record}, 1, problem.frequency.values())[1],
+            rel=1e-12,
+            abs=0.0,
+        )
+
     def test_a_run_that_stopped_while_it_was_ringing_says_so(
         self, fake_engine, tmp_path, monkeypatch, capsys
     ):
@@ -752,8 +831,37 @@ def _octahedron(centre, radius):
     return tuple(points[index] for index in order), _OCTAHEDRON_FACES
 
 
-def _with_a_curved_solid(material_kind: str) -> Problem:
-    vertices, faces = _octahedron((10.0, 10.0, 10.0), 4.0)
+def _prism(centre, radius, height, facets=12):
+    """A closed prism on ``z``, capped by fans from its own rim.
+
+    An octahedron cannot pose the question the clearance answers: every one of
+    its faces lies oblique, so the mesher pins a line to none of them and there
+    is nothing for a displacement to make conduct. This one has two faces square
+    to an axis and a wall that is square to none, so both corrections are legible
+    in one shape and in different directions.
+    """
+    ring = [
+        (
+            centre[0] + radius * math.cos(2 * math.pi * step / facets),
+            centre[1] + radius * math.sin(2 * math.pi * step / facets),
+        )
+        for step in range(facets)
+    ]
+    vertices = [(x, y, centre[2] + height / 2) for x, y in ring]
+    vertices += [(x, y, centre[2] - height / 2) for x, y in ring]
+    faces = []
+    for step in range(facets):
+        here, ahead = step, (step + 1) % facets
+        faces.append((here, facets + here, facets + ahead))
+        faces.append((here, facets + ahead, ahead))
+    for step in range(1, facets - 1):
+        faces.append((0, step, step + 1))
+        faces.append((facets, facets + step + 1, facets + step))
+    return tuple(vertices), tuple(faces)
+
+
+def _with_a_curved_solid(material_kind: str, shape=None) -> Problem:
+    vertices, faces = _octahedron((10.0, 10.0, 10.0), 4.0) if shape is None else shape
     lower = tuple(min(point[dim] for point in vertices) for dim in range(3))
     upper = tuple(max(point[dim] for point in vertices) for dim in range(3))
     return Problem(
@@ -799,6 +907,52 @@ def _with_a_curved_solid(material_kind: str) -> Problem:
     )
 
 
+class TestWhichSurfacesTheEnvelopeAnswersFor:
+    """``as_given`` says what openEMS is handed, and for most solids that is what
+    was drawn: it returns nothing rather than a copy.
+
+    Asked of the method rather than of what the engine got, because most of these
+    are shapes the driver already declines to correct by another route - a box
+    never reaches the polyhedron builder, and a sheet's own primitive ignores the
+    surface offered to it. A growth made here for one of them would be invisible
+    in the structure and still be there for the next caller that trusts it.
+    """
+
+    def _one(self, problem: Problem):
+        return problem.as_given(problem.solids[0])
+
+    def test_a_curved_conductor_is_answered_for(self):
+        problem = _with_a_curved_solid("pec")
+        assert self._one(problem) != problem.solids[0].vertices
+
+    def test_a_dielectric_is_not(self):
+        """openEMS averages it over quarter cells rather than sampling a point,
+        so it carries no rounding and growing it would introduce one."""
+        assert self._one(_with_a_curved_solid("dielectric")) is None
+
+    def test_a_box_is_not(self):
+        """The mesher pins a line to each of its faces, so there is nothing left
+        to round."""
+        problem = _with_a_curved_solid("pec")
+        box = replace(problem.solids[0], vertices=(), faces=())
+        assert problem.as_given(box) is None
+
+    def test_a_sheet_is_not(self):
+        """It is modelled at the plane it lies in, where there is no outward
+        direction to grow along; its rim is a separate question."""
+        problem = _with_a_curved_solid("pec")
+        corners = ((6.0, 6.0, 10.0), (14.0, 6.0, 10.0), (14.0, 14.0, 10.0), (6.0, 14.0, 10.0))
+        sheet = replace(
+            problem.solids[0],
+            lower=(6.0, 6.0, 10.0),
+            upper=(14.0, 14.0, 10.0),
+            vertices=corners,
+            faces=((0, 1, 2), (0, 2, 3)),
+            sheet_normal=2,
+        )
+        assert problem.as_given(sheet) is None
+
+
 class TestAConductorIsGrownBeforeItIsSampled:
     """openEMS decides a metal edge on one point and so builds a conductor's
     surface at the last grid line still inside the drawing. The adapter answers for
@@ -837,6 +991,19 @@ class TestAConductorIsGrownBeforeItIsSampled:
             "a dielectric was moved, and nothing rounds it"
         )
 
+    def test_the_engine_gets_exactly_the_surface_the_envelope_says_it_will(
+        self, fake_engine, tmp_path
+    ):
+        """Everything that asks where a conductor's metal is asks
+        :meth:`~Microwave.Solvers.openems.model.Problem.as_given`, so its answer
+        has to be the surface the engine gets - point for point, not a size or a
+        distance two different surfaces could share.
+        """
+        problem = _with_a_curved_solid("pec")
+        placed, _ = problem.at_the_origin()
+        handed, _ = self._handed(problem, tmp_path)
+        assert handed.tolist() == [list(point) for point in placed.as_given(placed.solids[0])]
+
     def test_the_triangles_are_handed_over_unchanged(self, fake_engine, tmp_path):
         """Growing a surface moves its points. How they are joined is what makes
         it the same surface."""
@@ -850,3 +1017,145 @@ class TestAConductorIsGrownBeforeItIsSampled:
         problem = _microstrip()
         _, csx, _ = _build(problem, tmp_path)
         assert not any(prop.polyhedra for prop in csx.properties)
+
+    def test_a_share_of_nothing_hands_the_metal_over_as_it_was_drawn(self, fake_engine, tmp_path):
+        """Which is the case that prices the correction against not making it -
+        see :class:`~Microwave.Solvers.openems.model.Problem`."""
+        problem = replace(_with_a_curved_solid("pec"), grown_by=0.0)
+        drawn = np.asarray(problem.solids[0].vertices)
+        handed, _ = self._handed(problem, tmp_path)
+        was = np.linalg.norm(drawn - drawn.mean(axis=0), axis=1)
+        now = np.linalg.norm(handed - handed.mean(axis=0), axis=1)
+        assert now == pytest.approx(was, rel=1e-9, abs=0.0), (
+            "a conductor was moved on a run that asked for no correction"
+        )
+
+    def test_and_says_nothing_about_having_grown_it(self, fake_engine, tmp_path, capsys):
+        """``GROWN`` is the marker that says the structure openEMS was given is
+        not the size it was drawn. On this run it is, so the run has nothing to
+        report and a marker reading zero would be the opposite of the truth."""
+        _build(replace(_with_a_curved_solid("pec"), grown_by=0.0), tmp_path)
+        assert "GROWN" not in capsys.readouterr().out
+
+    def test_where_a_run_that_grew_it_does(self, fake_engine, tmp_path, capsys):
+        _build(_with_a_curved_solid("pec"), tmp_path)
+        assert "GROWN" in capsys.readouterr().out
+
+
+class TestAFlatFaceIsDisplacedSoTheLinePinnedToItConducts:
+    """The other correction the same call makes, and it is not a share of the
+    same thing. A flat conductor face square to an axis gets a grid line of its
+    own from the mesher, and the line lands *on* the face - where openEMS'
+    containment ray has nothing to be sure about, so the face can read as air and
+    never zero the tangential field standing on it. The face is handed over
+    displaced into the void by enough for that line to fall in metal.
+
+    Read here off what the engine was given, and off a prism rather than an
+    octahedron, because a shape with no face square to an axis cannot show it.
+    """
+
+    def _capped(self, **fields) -> Problem:
+        shape = _prism((10.0, 10.0, 10.0), 4.0, 6.0)
+        return replace(_with_a_curved_solid("pec", shape=shape), **fields)
+
+    def _standing_on_a_cap(self, **fields) -> Problem:
+        """The same prism with the element drawn just off its top face.
+
+        Off it rather than on it: an end that landed on a grid line did not move,
+        so the check has nothing to ask about it, and an element meeting no metal
+        at all is a probe in free space and is left alone. Both ends here snap,
+        which is the case where what conducts has to be decided.
+        """
+        port = replace(
+            self._capped().ports[0],
+            start=(9.5, 9.5, 13.2),
+            stop=(10.5, 10.5, 14.2),
+            propagation_axis=0,
+            excitation_axis=2,
+        )
+        return self._capped(ports=(port,), **fields)
+
+    def _cell(self, problem) -> float:
+        """The grid's own pitch, which both corrections are shares of."""
+        return float(np.diff(problem.grid.z)[0])
+
+    def _reach(self, problem, tmp_path):
+        """How far the caps and the wall each ended up from where they were drawn.
+
+        Measured about each set's own centre, so that the translation onto the
+        origin drops out. Both corrections push a closed surface outward, so
+        neither moves that centre and neither is hidden by taking it out.
+        """
+        drawn = np.asarray(problem.solids[0].vertices)
+        _, csx, _ = _build(problem, tmp_path)
+        handed = np.asarray(next(p for p in csx.properties if p.polyhedra).polyhedra[0].vertices)
+        step = (handed - handed.mean(axis=0)) - (drawn - drawn.mean(axis=0))
+        return float(np.abs(step[:, 2]).max()), float(np.hypot(step[:, 0], step[:, 1]).max())
+
+    def test_the_clearance_the_run_carries_reaches_the_surface(self, fake_engine, tmp_path):
+        """The envelope's field and not the module's constant, so a run
+        reproduced from a file builds the wall that file describes."""
+        problem = self._capped(pinned_clearance=0.01)
+        along, _ = self._reach(problem, tmp_path)
+        assert along == pytest.approx(0.01 * self._cell(problem), rel=1e-9, abs=0.0)
+
+    def test_a_clearance_of_nothing_hands_the_cap_over_as_it_was_drawn(self, fake_engine, tmp_path):
+        """Which is the case that prices the displacement against not making it,
+        and the one where openEMS may decide the wall is not there at all."""
+        problem = self._capped(pinned_clearance=0.0)
+        along, across = self._reach(problem, tmp_path)
+        assert along == pytest.approx(0.0, rel=0.0, abs=0.0), (
+            "a flat face was displaced on a run that asked for no clearance"
+        )
+        assert across == pytest.approx(
+            staircase.GROWN_BY * self._cell(problem), rel=1e-9, abs=0.0
+        ), "the curved wall stopped being grown, and the clearance is a separate correction"
+
+    def test_and_the_two_corrections_are_asked_for_separately(self, fake_engine, tmp_path):
+        """A share of nothing is about where a sampled boundary lands and says
+        nothing about whether one is built, so it leaves the caps displaced."""
+        problem = self._capped(grown_by=0.0)
+        along, across = self._reach(problem, tmp_path)
+        assert along == pytest.approx(
+            staircase.PINNED_CLEARANCE * self._cell(problem), rel=1e-9, abs=0.0
+        )
+        assert across == pytest.approx(0.0, rel=0.0, abs=1e-15)
+
+    def test_every_route_that_asks_what_conducts_asks_the_envelope(
+        self, fake_engine, tmp_path, monkeypatch
+    ):
+        """Each of these routes asks where a conductor's metal is - what the
+        driver builds, whether a port's plane stands in it, whether the grid
+        still holds it whole - and an answer about a conductor the run will not
+        build is worse than none: it names a fault in a shape nobody solved, or
+        passes one that is there. That is what
+        :meth:`~Microwave.Solvers.openems.model.Problem.as_given` is for, and a
+        route reaching past it is what this keeps closed.
+
+        Asserted over the calls rather than over a shape, because a route that
+        stopped asking would still answer plausibly about the drawing, and a
+        fixture where the two surfaces differ enough to notice is built around
+        one route's arithmetic.
+        """
+        from Microwave.Solvers.openems import conductors, preflight
+
+        problem = self._standing_on_a_cap(pinned_clearance=0.01, grown_by=0.2)
+        asked = []
+        answered = Problem.as_given
+
+        def recording(self, solid):
+            asked.append(solid.name)
+            return answered(self, solid)
+
+        monkeypatch.setattr(Problem, "as_given", recording)
+        _build(problem, tmp_path)
+        driver_asked = list(asked)
+        preflight.ports._check_the_element_meets_its_metal(problem.ports[0], problem)
+        ports_asked = asked[len(driver_asked) :]
+        conductors.check(problem)
+        conductors_asked = asked[len(driver_asked) + len(ports_asked) :]
+
+        metal = problem.solids[0].name
+        assert metal in driver_asked, "the driver stopped asking, and builds its own surface"
+        assert metal in ports_asked, "a port's plane is checked against the drawing"
+        assert metal in conductors_asked, "connectivity is checked against the drawing"

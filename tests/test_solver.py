@@ -66,18 +66,29 @@ def test_the_mesh_policy_defaults_to_air_padding():
 
 
 def test_the_default_mesh_follows_the_rule_the_gate_measured():
-    """``EdgeRefinement`` is what the defaults are *for*.
+    """The values, so a change to one of them fails somewhere cheap.
 
     ``ElementsPerWavelength`` only means a length once a frequency and a
-    permittivity exist. The refinement does not depend on either, and it is the
-    quantity that was measured: at the same cell count, refining conductor edges
-    by 2 instead of 6 moved the microstrip gate's extracted impedance by 1.4%,
-    more than its whole tolerance. See tests/test_acceptance_microstrip.py.
+    permittivity exist; the refinement means the same thing whatever the model
+    is, which is why it is the one a gate can be solved at several values of.
+    ``tests/test_acceptance_microstrip.py`` is that gate, and it prints what
+    coarsening this refinement costs a line whose impedance is extracted.
+
+    That gate writes the refinement out as a constant of its own, so the two are
+    compared here rather than left to agree. Without it the gate goes on
+    measuring a refinement nobody ships the moment this default moves, and every
+    figure it prints is about a policy that is no longer the policy.
     """
+    from tests.test_acceptance_microstrip import REFINEMENT
+
     mesh = mesh_policy()
 
     assert mesh.ElementsPerWavelength == pytest.approx(20.0)
     assert mesh.EdgeRefinement == pytest.approx(6.0)
+    assert mesh.EdgeRefinement == pytest.approx(REFINEMENT), (
+        "the microstrip gate solves its ladder around a refinement this policy no "
+        "longer ships, so what it prints is not what a user gets"
+    )
     assert mesh.MinElementsAcross >= 9, "a thin substrate carries the whole field"
     assert mesh.MaxGrowthRatio > 1.0, "a ratio of 1 forbids grading"
 

@@ -609,8 +609,8 @@ class TestTheGlueThatFilesIt:
 
     def test_the_result_object_is_created_inside_it(self, doc, monkeypatch):
         """As for the mesh: wrapping nothing is not the fix. Hoisting the
-        creation above the block leaves the matrix in the tree after Ctrl-Z,
-        which is the bug this replaced, and passed the suite until this test."""
+        creation above the block leaves the matrix in the tree after Ctrl-Z, and
+        nothing but this notices."""
         analysis = self.analysis(doc)
         opened_when = []
         real = glue.createEMSParameters
@@ -817,9 +817,10 @@ class TestDecidingWhatATouchstoneExportWrites:
     def test_a_reference_the_format_cannot_hold_is_refused_before_the_dialog(self, doc):
         """The whole point of asking here rather than only in ``write_touchstone``.
 
-        This case used to reach the user as scikit-rf's own sentence, out of a
-        vendored library, *after* they had picked a filename - and it did so
-        for the ordinary 30/75 study, not only for a port referenced to itself.
+        Asked only there, this case reaches the user as scikit-rf's own
+        sentence, out of a vendored library, *after* they have picked a
+        filename - and it does so for the ordinary 30/75 study, not only for a
+        port referenced to itself.
         """
         full = matrix()
         for reference, self_referenced, wanted in (

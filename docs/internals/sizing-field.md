@@ -1,216 +1,244 @@
 # Deciding where the grid lines go
 
-An FDTD solver needs a grid before it can start. This page is about producing
-one: given a drawing, a resolution policy and a box to fill, where should the
-lines go?
+An FDTD solver requires a discrete spatial grid before simulation can begin. This
+document describes the rectilinear grid generation algorithm: given CAD geometry,
+mesh policies, and domain bounds, how grid line coordinates are determined along
+each Cartesian axis.
 
-The grid here is **rectilinear**. It is not a set of cubes - it is three
-independent lists of coordinates, one per axis, and the cells are the boxes
-between them. Each axis is decided separately, so everything below describes the
-work done for one axis and then done again for the other two.
+The grid is rectilinear and composed of three independent coordinate lists
+($x, y, z$). Cell dimensions are determined along each axis independently.
 
-## What makes it hard
+## Governing constraints in grid generation
 
-Two demands pull against each other. The grid has to be fine wherever something
-small matters - the edge of a conductor, a narrow gap - and it has to be coarse
-everywhere else, because the cost of a simulation is the number of cells
-multiplied by the number of time steps.
+Grid generation balances competing numerical requirements:
+1. **Resolution of fine features**: High spatial resolution is required at
+   conductor edges, thin dielectric layers, and narrow gaps.
+2. **Computational efficiency**: Cell dimensions should expand away from critical
+   features to minimize total cell count and maximize the FDTD time step ($\Delta t$).
+3. **Smooth grading**: Transitions between fine and coarse cells must be gradual.
+   Rapid cell size changes introduce numerical impedance discontinuities that
+   produce spurious artificial reflections. The cell expansion ratio between
+   adjacent cells is constrained to a factor the policy declares, 1.3 by
+   default.
 
-A third demand rules out the obvious compromise. **Cell sizes may not change
-abruptly.** A sudden jump from fine cells to coarse ones is a discontinuity in
-the numerical scheme, and a wave crossing it partly reflects - an error that
-looks exactly like a real reflection from the device. So the grid must grade:
-neighbouring cells may differ, but only by some ratio, typically around 1.3.
+Rather than placing lines heuristically and performing subsequent subdivision,
+the mesher defines a continuous sizing field function $h(x)$ along each axis.
 
-The usual approach is to place the lines you know you need, then walk the gaps
-subdividing until the ratios come out acceptable. This one does something else.
+## Fixed coordinate constraints (anchors and preferences)
 
-## Some positions are not negotiable
+Before evaluating the sizing field, coordinates along each axis are classified:
 
-Before any sizing happens, certain coordinates are settled. They divide in two.
+- **Anchors**: Fixed coordinates that must lie on grid lines and cannot be
+  displaced. For example, zero-thickness PEC sheets require grid lines passing
+  through their planes to align tangential electric field components correctly
+  (`Operator::CalcPEC_Range`, `openEMS/FDTD/operator.cpp:2029`). Opposing
+  conductor faces and simulation domain
+  boundaries are likewise treated as anchors. When two anchors are separated by
+  less than the minimum cell floor, the geometry is unmeshable and the mesher
+  refuses it by name.
+- **Preferences**: Desired coordinates (such as dielectric boundaries) that align
+  with grid lines when convenient, but may be omitted if they conflict with
+  anchors or cause excessive cell refinement. openEMS averages dielectric
+  properties across cut cells (`Operator::AverageMatQuarterCell`), maintaining
+  accuracy even when dielectric boundaries do not align with grid lines.
 
-**Anchors** must be grid lines and are never moved. A zero-thickness conducting
-sheet is the strict case: openEMS applies a perfect-conductor condition by
-sampling material at electric-field locations (`Operator::CalcPEC_Range`,
-`openEMS/FDTD/operator.cpp:2045`), and for a sheet lying in the z plane the
-field components tangential to it sit on a *main-grid* z line. If the
-sheet does not land on such a line, it is not modelled at all - and the run
-finishes cleanly, having simulated a device with no conductor there. Conductor
-faces and the walls of the domain are anchors for the same kind of reason.
+## Continuous sizing field formulation
 
-Two anchors closer together than the floor described below are not a hard
-problem to solve; they are geometry that cannot be meshed, and the honest answer
-is to say so.
+The mesher expresses the desired cell size at coordinate $x$ as a continuous
+lower envelope:
 
-**Preferences** would like to be grid lines and are dropped when they get in the
-way. A dielectric interface is the usual one. openEMS averages material within
-a cell that a boundary cuts through (`Operator::AverageMatQuarterCell`,
-`openEMS/FDTD/operator.cpp:1447`), so a dielectric that misses a line loses a
-little accuracy and nothing else - never worth displacing an anchor for, and
-certainly never worth halving the time step.
+$$h(x) = \text{clamp}\left(\min\left(\text{cap}, \min_j (s_j + g \cdot \text{dist}(x, \text{source}_j))\right)\right)$$
 
-## A field, instead of a repair
+Each sizing demand contributes one term: a target cell size $s_j$ across a
+geometric span $\text{source}_j$, relaxing at a linear rate $g$ with distance away
+from that span. The global field is the lower envelope of all sizing terms, bounded
+by the maximum allowed cell size (`cap`).
 
-Rather than fixing up ratios afterwards, the cell size wanted at each point is
-written down as a function:
+Because $h(x)$ has a bounded derivative ($|h'(x)| \le g$), cells generated from
+the field cannot exceed the configured expansion ratio. Smooth mesh grading is
+guaranteed by the continuity of the sizing field rather than by post-processing
+corrections.
 
-    h(x) = clamp( min( cap, min_j ( size_j + g * dist(x, source_j) ) ) )
+Local user refinement boxes contribute additional terms to the same formulation,
+grading smoothly into surrounding cells without requiring dedicated fixed lines.
 
-Each thing that wants fine cells contributes one term: a size it asks for, over
-a span it covers, relaxing at a fixed rate `g` with distance away from that span.
-The field is the lower envelope of all of them, capped at the coarsest cell
-allowed anywhere.
+### Polyline representation of the sizing field
 
-The point of this shape is that `h` **cannot change faster than `g` per unit
-length**. Cells sized from it therefore cannot differ from their neighbours by
-more than a fixed factor - not because anything checks, but because the field
-has no way to express it. Smoothness stops being a property to repair and
-becomes one that cannot be violated.
+Direct point-wise evaluation of the minimum over all sizing demands requires an
+array of $N_{\text{points}} \times N_{\text{terms}}$, which scales quadratically
+with geometric complexity and becomes memory-prohibitive for complex models.
 
-It also gives local refinement a place to plug in. A user's refinement box is
-one more term over one more span, graded into the grid by the same arithmetic as
-everything else, pinning no line of its own.
+Instead, the sizing field is stored as an exact 1D piecewise linear polyline.
+The polyline knots correspond directly to the coordinate boundaries of each sizing
+demand. Sizing terms are initialized at their respective knots, and two linear sweeps
+propagate the growth slope outward:
 
-### Why coarsening is not a term
+1. Forward sweep: Evaluating `value[i] = min(value[i], value[i-1] + g * dx)`
+   propagates constraints to the right.
+2. Reverse sweep: Evaluating `value[i] = min(value[i], value[i+1] + g * dx)`
+   propagates constraints to the left.
 
-The field is a **lower** envelope, so every term can only pull `h` down. There
-is no term that raises it: a request to coarsen is not something to add, it is
-something to *withhold*.
+Interpolating the field at any coordinate reduces to identifying the enclosing knot
+segment and evaluating the linear ramps from the two bounding knots. Because demand
+boundaries define all knot locations, no sizing term begins or ends within a segment,
+guaranteeing that the polyline represents the continuous lower envelope exactly.
 
-That is the shape the second direction of a mesh region takes. It floors what
-the geometry it names asks for, so the terms that geometry would have
-contributed arrive already relaxed, and everything downstream - the envelope,
-the grading, the placement - is unchanged. Nothing has to reason about a maximum
-fighting a minimum, because there is no maximum.
+Anything that reads the field over a span - how many cells the span holds, the
+finest cell in a band - reads it as these pieces, so the positions offered have
+to be a superset of the bends. They are every knot, and every place a ramp
+leaving a knot is cut off: by the cap, by the floor, by the size the segment
+holds its own span to, and by the size of the segment behind it. The two ramps
+of one segment also cut each other off, so their crossing is offered as well. A
+position the field does not in fact bend at costs one more piece and changes no
+answer, the field being linear across it.
 
-It also settles the shape of the request. The grid is meshed one axis at a time,
-so a *box* is spent as three slabs through the whole model. Refining a slab
-hands out cells nobody asked for, and grading absorbs it; coarsening one would
-take cells away from whatever lies level with the box on some axis, arbitrarily
-far from it. So the second direction names an object and not a region of space,
-and cannot reach past the geometry it was aimed at.
+Coordinate calculations in the sweeps are offset relative to the first knot coordinate
+rather than the global origin. This relative indexing maintains floating-point
+precision when simulating geometry located at large CAD coordinate offsets.
+
+### Handling coarsening constraints
+
+Because the sizing field is a lower envelope, each term can only decrease $h(x)$.
+Coarsening cannot be implemented by adding terms to a lower envelope. Instead,
+coarsening constraints floor the demands of specified geometry before those demands
+are added to the polyline, allowing cells to expand up to the floored value.
+
+The second direction of a mesh region takes that shape. It floors what the
+geometry it names asks for, so the terms that geometry would have contributed
+arrive already relaxed, and the envelope, the grading and the placement are
+unchanged. The field holds no maximum at all, so nothing downstream has to
+reconcile a maximum with a minimum.
+
+Because the rectilinear mesh is generated independently along each Cartesian axis,
+a spatial bounding box projects across the entire computational domain as three
+slabs. While refining a slab adds cells that grade smoothly outward, coarsening
+a volumetric spatial box would coarsen unrelated geometry sharing the same
+coordinate ranges. Consequently, coarsening constraints target specific geometry
+objects rather than spatial bounding boxes.
 
 ### Why the slope is a logarithm
 
-The natural guess for `g` is `ratio - 1`. It is wrong, and the reason is worth
-following.
-
 Lines are placed so that each cell spans an equal amount of *arclength* in the
-field - that is, an equal amount of `dx/h` (the next section explains why).
+field, which is an equal amount of `dx/h` (explained below).
 Consider a region where the field rises linearly, `h = h0 + g*x`. Integrating
-`dx/h` across one cell and asking that consecutive cells carry the same amount
-gives
+`dx/h` across one cell and requiring that consecutive cells grow by `ratio`
+gives:
 
     h1 / h0 = exp(g)
 
-So to make consecutive cells grow by a factor `ratio`, the slope must be
-`g = ln(ratio)`, not `ratio - 1`. Using `ratio - 1` overshoots by a factor of
-`exp(r-1)/r`, which at any useful ratio is enough to fail every smoothness check
-downstream.
+Consequently, to achieve a growth factor `ratio` between adjacent cells, the
+slope must be set to `g = ln(ratio)` rather than `ratio - 1`. Setting
+`g = ratio - 1` overshoots by a factor of `exp(r-1)/r`, violating mesh
+smoothness limits.
 
 ## Placing the lines
 
-For each gap between two fixed positions, integrate `1/h` across it. That
-integral `N` is the number of cells the gap wants. Round up to `n = ceil(N)`,
-then place the lines by inverting the cumulative integral at `n` equally spaced
-values.
+For each gap between two fixed positions, the mesher integrates `1/h` across it.
+That integral `N` is the number of cells the gap wants. The mesher rounds up to
+`n = ceil(N)`, then places the lines by inverting the cumulative integral at `n`
+equally spaced values.
 
-Two things fall out of this that are worth noticing.
+Lines are placed such that each cell spans an identical increment of normalized
+metric length:
 
-The lines land **exactly** on both endpoints, with no drift correction. The
-sampling runs from one end to the other exactly, so the first and last targets
-are the first and last cumulative values themselves, and interpolating at a knot
-returns that knot.
+$$\Delta s = \int_{x_k}^{x_{k+1}} \frac{dx}{h(x)}$$
 
-And because every cell carries the same arclength, rounding `N` up to `n` scales
-the whole gap by one factor, `n/N`. Every cell in the gap shrinks by the same
-proportion, so the *ratios* between neighbouring cells still follow the field
-exactly. This is the property that makes the approach work, and it is fragile in
-one specific way described next.
+For each interval between two fixed anchor positions $[a, b]$, the total metric
+length is:
 
-### The correction that must not be made
+$$N = \int_a^b \frac{dx}{h(x)}$$
 
-Rounding up means the cells at the two ends of a gap are slightly smaller than
-`h(a)` and `h(b)`, which is mildly annoying if you want cells to agree exactly
-across a fixed line. The tempting fix is to absorb the slack with a correction
-that is largest in the middle of the gap and vanishes at both ends, holding the
-end cells at the sizes the field asked for.
+The mesher rounds $N$ up to $n = \lceil N \rceil$, then places internal grid
+lines by inverting the cumulative integral at $n$ equally spaced metric
+increments. Rounding up scales every cell in the gap by $N / n \le 1$, which
+keeps them at or below what the field asked for and so respects the cap. Where
+the field already sits on the floor it pushes the realized cells under it, and a
+layer the policy was willing to mesh would be refused; the count is rounded down
+instead in that case. Where neither direction satisfies both bounds, the gap is
+refused and names the geometry.
 
-Do not. Such a bump has a gradient of its own, and that gradient adds to the
-field's. The smoothness budget is spent by the field alone, and there is nothing
-spare in it. Getting the seams to agree is a separate job, done by grading the
-*neighbour* rather than by deforming this gap - see below.
+Key properties:
+- **Exact endpoint placement**: Lines land exactly on both boundary coordinates.
+  The first target corresponds to $s = 0$ ($x = a$). The final endpoint coordinate
+  $x = b$ is pinned explicitly to avoid numerical rounding drift.
+- **Proportional scaling**: Rounding up to $n$ scales metric cell lengths uniformly
+  by $N / n$, reducing every cell in the interval by the same ratio while
+  strictly preserving relative growth rates between adjacent cells.
 
-### Sampling the integral
+### Preserving field gradients across internal intervals
 
-A uniform set of sample points fails when the field has a large dynamic range. A
-fine feature inside a long span gets stepped straight over: the samples miss it,
-the trapezoid rule draws a chord across a strongly curved `1/h`, and every line
-position derived from that integral is wrong. Raising the sample budget only
-moves the span at which it breaks.
+Rounding up interval cell counts leaves cells at interval boundaries slightly
+smaller than the sizing field targets $h(a)$ and $h(b)$.
 
-Instead the gap is cut at the field's own breakpoints - the places where it can
-change slope, which are the bounds of each contributing term and the points
-where each term's ramp meets the cap - and each piece is sampled against its own
-finest cell. Fine regions get dense samples, flat ones get few, and the total
-stays bounded however extreme the ratio between them.
+Applying an ad-hoc polynomial correction across the interval to match boundary cell
+sizes introduces an additional artificial gradient that compounds with the field's
+growth rate, violating the configured maximum cell growth ratio. Instead, boundary
+discrepancies between adjacent intervals are reconciled by updating the sizing
+constraints of neighboring intervals, as described below.
 
-## Seams: why neighbouring gaps disagree
+### Analytical integration and inversion
 
-A gap holds a whole number of cells, so its realised cell size is `length / n`
-and not what the field asked for. Neighbouring gaps round independently, so the
-cells meeting at a fixed line can disagree even though the field is smooth
-across it.
+The sizing field $h(x)$ is piecewise linear, allowing exact analytical integration
+and inversion without numerical quadrature:
 
-The bad case is a gap one cell long, where the smallest perturbation tips it to
-two cells and halves its cell size against a neighbour that has not moved.
+1. **Analytical integration**: For a linear segment spanning length $L$ from $h_0$
+   to $h_1$:
 
-The fix is to let each gap publish its realised *edge* cell size back into the
-field, as a point constraint at that fixed line, and re-place everything. The
-neighbour then grades down to meet it. It has to be the edge size specifically:
-publishing one size for the whole gap would flatten the neighbour's interior
-too, forcing it fine everywhere rather than only near the seam.
+   $$\int_0^L \frac{dx}{h_0 + m x} = \frac{L \ln(h_1 / h_0)}{h_1 - h_0} = \frac{\ln(1 + m L / h_0)}{m}$$
 
-This settles, because published sizes only ever shrink and are floored. It does
-not settle *quickly* - a constraint travels one gap per pass - so the budget of
-passes has to scale with the number of fixed positions rather than being a small
-constant. A budget that is too small gives up quietly, and the symptom surfaces
-one step later as a smoothness violation blamed on the user's geometry.
+   For a flat segment ($m = 0$), the integral evaluates to $L / h_0$.
+2. **Analytical inversion**: Inverting the cumulative metric length $s$ yields:
 
-## Two properties grading cannot provide
+   $$x(s) = x_0 + h_0 \frac{\exp(m s) - 1}{m}$$
 
-### A floor under the cell size
+Using `log1p` and `expm1` preserves full floating-point precision when adjacent
+cell sizes differ by small increments ($h_1 \approx h_0$).
 
-In FDTD the time step is set by the **smallest cell in the entire domain**. A
-stray sliver left by a CAD boolean does not produce a slightly finer mesh in one
-corner; it produces a simulation that never finishes.
+## Seam reconciliation across adjacent intervals
 
-So there is a hard floor. Preferences that crowd it are dropped, and anchors
-that crowd each other are refused by name. It guards against degenerate geometry
-and nothing else - set anywhere near the working resolutions it would start
-contradicting the requested cell counts and refusing legitimate features, which
-is why it sits orders of magnitude below them.
+Because each interval rounds its cell count independently, cell sizes at the shared
+boundary of adjacent intervals can differ, even though the continuous sizing field
+is smooth.
 
-### Symmetry
+Boundary discrepancies are resolved through iterative seam reconciliation:
+1. Each meshed interval evaluates its realized cell size at boundary anchor lines.
+2. If adjacent intervals disagree, the smaller boundary cell size is published
+   back to the sizing field as a local point constraint.
+3. The sizing field is re-evaluated, and neighboring intervals grade smoothly down
+   to match the tighter boundary constraint in subsequent meshing passes.
 
-A symmetric structure must produce a symmetric grid. Otherwise the solver sees
-asymmetric modes that are not in the model, and the asymmetry needed to do that
-is far smaller than anything anyone would notice by eye. Placement gets close on
-its own; an explicit fold about the centre makes it exact.
+Because realized cell sizes only decrease and are bounded by the minimum cell floor,
+the iterative seam reconciliation process is guaranteed to converge. The iteration
+budget scales linearly with the number of geometric intervals to ensure complete
+propagation across multi-section structures.
 
-The subtlety is what symmetry is judged *on*. It has to be the sizing field, not
-the list of fixed positions - because the two domain walls always mirror each
-other, so testing positions alone declares a structure sitting entirely at one
-end of the domain "symmetric" and folds its grading away.
+## Additional mesh constraints
 
-The fold has a second trap. It pairs line `i` with line `n-1-i` and averages
-them, which is only meaningful if the two halves hold the *same number of
-cells*. They can fail to: mirrored gaps integrate the same field over mirrored
-sample points, so a one-ulp difference in the total can tip the rounding and
-give one side an extra cell. The field and the positions still mirror, so the
-symmetry test approves, and the fold then averages a dense region against a
-sparse one. The result is not obviously broken - that is the danger. It comes
-out strictly increasing and perfectly uniform, having averaged the grading away
-entirely. So the fold checks how far it is moving any line, measured against the
-smallest cell rather than against the span, and refuses when that is more than
-rounding could explain.
+### Minimum cell floor
+
+In FDTD, the Courant stability condition sets the global time step ($\Delta t$)
+from the smallest cell in the entire 3D computational domain. Unintended micro-slivers
+from CAD boolean operations can produce excessively small cells, resulting in
+impractically small time steps and long runtimes.
+
+To prevent this, the mesher enforces a minimum cell floor. Preferences
+crowding the floor are omitted, and mutually conflicting anchors are refused by
+the mesher, which is the only stage that knows where the lines went.
+
+### Symmetric grid generation
+
+Symmetric electromagnetic structures require symmetric discretization grids. An
+asymmetric grid introduces artificial asymmetric field modes that corrupt scattering
+parameters. While the sizing field places lines symmetrically in theory, floating-point
+rounding differences can introduce minor line shifts or asymmetric cell counts.
+
+To guarantee exact grid symmetry:
+1. **Symmetry validation**: Symmetry is evaluated directly on the continuous sizing
+   field rather than on discrete line positions. The mesher verifies that the sizing
+   field is identical under reflection across the center plane at all demand knots.
+2. **Center fold operation**: When symmetry is verified, every line is paired
+   with its mirror and both move to their common midpoint. Each line is averaged with its mirror, $(u + v) / 2$, which is exact
+   only for a domain centred on zero; elsewhere a few parts in $10^{15}$
+   survive. That is beneath notice on a cell boundary and fatal on an anchor, so
+   the anchors are written back verbatim afterwards, and the fold is rejected if
+   any line moved by more than a small fraction of the smallest cell.

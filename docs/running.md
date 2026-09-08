@@ -1,267 +1,174 @@
 # Running a study
 
-**Run Simulation** opens the panel that translates the document, checks it,
-solves it and stores the answer.
+The **Run Simulation** command opens the execution panel to validate,
+discretize, solve, and store simulation results.
 
-## The panel
+The command is accessible from the Microwave toolbar, the workbench menu, or
+by double-clicking an `EMAnalysis` container in the FreeCAD tree view. If a
+document contains multiple studies, select the target study before launching.
 
-The buttons, in the order they are used:
+## Simulation task panel
 
-| | |
+The control panel provides sequential workflow actions:
+
+| Action | Function |
 |---|---|
-| **Update Mesh** | Mesh the study and redraw the preview. The same action as the toolbar button |
-| **Check** | Translate and run pre-flight. Nothing is solved. This is free, and it is where most modelling faults are found |
-| **Run** | Translate, check, then solve every driven port in turn |
-| **Stop** | Cancel a running solve. It returns at once; the child process is signalled and the panel reports the verdict when it dies |
+| **Update Mesh** | Generates the grid and updates the 3D viewport preview. |
+| **Check** | Translates geometry and executes pre-flight validation rules without launching the solver. |
+| **Run** | Translates model, performs pre-flight validation, and solves each excited port sequentially. |
+| **Stop** | Signals the solver subprocess to terminate execution immediately and discards partial data. |
 
-Above them: the study's name, where the run will write, the mesh state, a status
-line and a log. Below them, the build version - quote it in a bug report.
+The panel displays the active study name, target output directory, mesh
+status, validation log, and workbench build version.
 
-A cancelled run keeps **nothing**. A truncated solve that could be read is worse
-than no answer at all.
+## Execution model
 
-## What a run does
+In time-domain FDTD, each excited port requires an independent simulation run:
+- An $N$-port network requires $N$ sequential solves.
+- Column $j$ of the S-parameter matrix $[S]$ is derived from the simulation
+  where port $j$ is driven.
+- Each solve writes to an isolated subfolder named after the driven port
+  (`<SimDir>/port1/`, `<SimDir>/port2/`).
 
-A time-domain solver drives **one port per run**, so an N-port S-matrix is N
-solves, and column *j* of the matrix comes from the run that excited port *j*.
+When `Symmetry = Mirror` is configured on the `EMAnalysis` container,
+symmetric port columns can be derived automatically by setting `Excitation =
+false` on mirrored ports (see [The document model](model.md)).
 
-Each solve gets its own directory named after the port it drives -
-`<simdir>/port2/` - so an envelope, its digest and its results stay beside each
-other. One directory per solve, always; a one-port study is a sweep of length
-one.
+At least one port in the study must have `Excitation = true`.
 
-`Symmetry = Mirror` on the analysis removes a solve: the second column is
-derived rather than measured. See [The document model](model.md).
+### Working directory structure
 
-At least one port must have `Excitation` set, or nothing drives the model and
-the run is refused.
+Simulation data is stored in the path specified by the `SimDir` property
+on the solver object. If unset, data is saved in `<filename>_sim/` beside the
+`.FCStd` file. Unsaved documents must be saved to disk before running.
 
-### Where it writes
+The run driving each port writes into its own subdirectory, `<SimDir>/port1/`
+and so on. A completed per-port directory contains:
+- `openems.json`: The solver envelope describing geometry, mesh, and sources.
+- `envelope.sha256`: Cryptographic SHA-256 hash of the input envelope.
+- `structure.xml`: Translated OpenEMS CSXCAD geometry model.
+- `results.json`: Solver results and provenance metadata in adapter JSON
+  format.
+- `geometry.txt`: Mean surface deviation metrics for curved bodies.
+- `run/`: OpenEMS internal field dumps and working files.
 
-`SimDir` on the solver object, where it is set. Otherwise, beside the document and
-named after it: `<document>_sim/`. A document that has never been saved has
-nowhere to put this, and the panel says **Save the document first**.
+## OpenEMS solver settings
 
-## The openEMS solver object
+The `EMSolverOpenEMS` object controls FDTD time-stepping and boundary
+formulations.
 
-Everything here is FDTD vocabulary, which is the test for whether a property
-belongs on a solver rather than on the study.
-
-### Boundaries
+### Boundary conditions
 
 <!-- defaults: EMSolverOpenEMS -->
-| Property | Default | |
+| Property | Default | Description |
 |---|---|---|
-| `Boundary<axis><side>` | PML | Per face. The openEMS adapter builds `PML`, `PEC`, `PMC` and `Mur` |
-| `PMLCells` | 8 | Absorber thickness, in cells |
+| `Boundary<axis><side>` | PML | Boundary type per face (`PML`, `PEC`, `PMC`, `Mur`, `Periodic`) |
+| `PMLCells` | 8 | Absorber thickness in Yee grid cells |
 
-The dropdown also offers `Periodic`, which the openEMS adapter refuses by name
-rather than building.
+- **PML (Perfectly Matched Layer)**: Absorbs outgoing waves. For `Through`
+  domain faces, PML cells are subtracted from the outer extent of the CAD
+  structure (see [Meshing](meshing.md)).
+- **PEC / PMC**: Perfect Electric / Magnetic Conductor walls.
+- **Mur**: First-order absorbing boundary. Do not place driven excitation
+  ports on `Mur` boundaries.
 
-A perfectly matched layer is **grid, not empty space**: it eats cells from the
-end of every axis it is declared on. That is why it interacts with the domain
-padding on the mesh policy, and why a face declared `Through` pulls the domain
-in rather than growing it. See [Meshing](meshing.md).
-
-Checked before a run: that the absorber stands on something it can absorb, that
-it leaves a model behind after taking its share, that each boundary is a word
-openEMS knows, and that the depth asked for matches the cells the mesher
-actually set aside.
-
-### The run
+### Time-stepping and termination
 
 <!-- defaults: EMSolverOpenEMS -->
-| Property | Default | |
+| Property | Default | Description |
 |---|---|---|
-| `MaxTimesteps` | 30000 | How many steps to take |
-| `EnergyDecay` | 0.0 | Stop early once energy falls this far below its peak, in dB. 0 never stops early |
-| `TimestepFactor` | 1.0 | Scale openEMS' own timestep, for stability. 1 leaves it alone |
-| `Threads` | 0 | 0 is automatic |
+| `MaxTimesteps` | 30000 | Maximum simulation time steps |
+| `EnergyDecay` | 0.0 | Early termination threshold in dB below peak energy (e.g. `-40`). 0 disables early termination |
+| `TimestepFactor` | 1.0 | Courant stability factor multiplier ($0 < \text{factor} \le 1.0$) |
+| `Threads` | 0 | OpenMP worker thread count (0 = auto-detect system cores) |
 
-With `EnergyDecay` at 0, `MaxTimesteps` is the run length rather than a ceiling:
-every step is taken.
+- **`EnergyDecay`**: A negative value is a level in dB: `-50` stops the run
+  once the domain energy has fallen 50 dB below its peak. Any value of zero or
+  above disables early termination, giving a deterministic run over all
+  `MaxTimesteps`.
+- **`TimestepFactor`**: Values below 1.0 reduce the time increment $\Delta t$
+  for enhanced numerical stability on high-aspect-ratio meshes.
 
-**Leave `EnergyDecay` at 0 without a specific reason not to.** It reads like a
-disabled feature and it is the only *reproducible* setting: openEMS re-evaluates
-its energy criterion on a four-second wall-clock timer, so an energy-terminated
-run stops at a step count that depends on how busy the machine was. Pre-flight
-warns when it is switched on.
+#### Minimum time steps for excitation pulse
 
-`TimestepFactor` below 1 trades simulated time for stability: the same
-`MaxTimesteps` then covers proportionally less of it, and pre-flight says so.
-Outside the range (0, 1] the translation refuses it, because openEMS' own answer
-is to step at full size anyway - warning below zero and saying nothing at all
-above one.
+The FDTD excitation pulse length is inversely proportional to the frequency
+bandwidth ($\Delta f = f_\text{stop} - f_\text{start}$). Narrow-band
+simulations on fine grids require sufficient time steps for the source pulse
+to enter the domain completely.
 
-#### The run has to be long enough to carry its own pulse
+Pre-flight validation rejects a simulation if `MaxTimesteps` is shorter
+than the source excitation pulse duration, and warns if `MaxTimesteps` is
+less than three pulse durations (the recommended openEMS minimum).
 
-This is the refusal that catches a first narrow-band run, and the two numbers
-behind it are unrelated: the **pulse length** is set by the bandwidth, and the
-**timestep** by the cell size. Nothing ties them together, so a narrow band on a
-fine grid asks for a pulse that does not fit in the steps it was given.
+### Python interpreter discovery
 
-openEMS cuts the source to the steps available, says so in one line among
-thousands, exits cleanly and returns a full S-matrix - of a device that was
-driven by half a pulse. So it is refused up front instead, and the message says
-what to raise `MaxTimesteps` to. Widening the band shortens the pulse and works
-just as well.
+The openEMS engine executes in an external Python subprocess.
 
-That is separate from having enough run left for the device to *stop ringing*,
-which is measured afterwards - see below.
+An explicit `SolverPython` path is launched directly without candidate
+discovery or pre-flight import probes; an invalid path fails when the
+subprocess starts.
 
-### Where the engine is found
+When `SolverPython` is empty, the workbench searches for an interpreter that
+can import `openEMS` and `CSXCAD` in the following order:
+1. `$MICROWAVE_OPENEMS_PYTHON` environment variable.
+2. The current Python interpreter.
+3. `python3` found on system `PATH`.
 
-openEMS usually lives in a different Python installation from FreeCAD's - several
-platforms ship FreeCAD with an interpreter of its own - so the solve runs as a
-subprocess. That is the right shape even where the two turn out to be the same
-interpreter: a solver crash takes down a child process instead of the session and
-its unsaved document.
+If none of these candidates can import the openEMS bindings, the run halts
+with an "openEMS was not found" error.
 
-Candidates are tried in this order, and each is *verified* by actually importing
-the bindings:
+## Post-simulation tail decay verification
 
-1. `SolverPython` on the solver object,
-2. `$MICROWAVE_OPENEMS_PYTHON`,
-3. the interpreter FreeCAD is running,
-4. `python3` on `PATH`.
+An FDTD simulation terminates upon reaching `MaxTimesteps` even if electromagnetic
+energy remains inside the domain. Truncating non-decayed time-domain signals
+introduces spectral leakage into the Fourier transform, causing artificial
+ripple, incorrect resonance depths, or non-physical gains ($|S_{ij}| > 1$).
 
-Nothing is guessed beyond that list. Silently adopting whatever is on the system
-is how an afternoon goes into debugging a version nobody knew was installed.
+To verify sufficient energy decay, the workbench evaluates S-parameters using
+two time intervals: the complete simulation record and a record with the final
+10% truncated. The maximum deviation between these two spectra represents the
+absolute truncation error in S.
 
-Drawing, meshing and checking all work with no openEMS installed at all.
+Each port's truncation error is recorded in the result provenance and checked
+against the threshold defined by `SmallestResponse` on the `EMAnalysis`
+container. If the deviation at any port exceeds the tolerance, a warning is
+emitted in the task panel and the CLI marker stream, identifying the port and
+the estimated error magnitude. For highly resonant or high-Q structures,
+increase `MaxTimesteps` to allow full energy dissipation.
 
-## What the run cannot know beforehand
+## Pre-flight validation checks
 
-One thing: whether the run was long enough for the field to decay.
+Pre-flight validation verifies model integrity prior to simulation:
 
-A run ends at `MaxTimesteps` whether or not the device has stopped ringing, and
-what gets cut off is the tail of the very time series openEMS transforms. A
-transform missing its tail is the response plus leakage - ripple that is not in
-the device, a notch at the wrong depth, a magnitude above one - and the results
-file looks exactly as it does after a finished run.
-
-So it is measured afterwards: the transform of the record's last tenth, against
-the wave that drove the run, as an absolute error in S. A run that stopped early
-says so, naming the port, and the figure stays with the result.
-
-What counts as early depends on what is being read. The bar is a share of the
-smallest response the study says it reads, and full scale until one is named -
-so a leak that is nothing beside a response of one, and is judged so, is the
-whole of a -40 dB stopband. A study that reads that deep says so on the
-analysis, as `SmallestResponse`. See
-[The smallest response](model.md#the-smallest-response).
-
-Resonant structures are where this matters most. A high-Q device needs a long
-decay, and runtimes an order of magnitude above a matched line are normal for one.
-
-## What Check reports, and where to read about it
-
-Every finding names its object and what to change, so the message is the
-instruction. For the reasoning behind one:
-
-| The finding is about | Read |
+| Verification category | Documentation reference |
 |---|---|
-| A shape openEMS cannot hold - a tilted dielectric surface, one flat in two axes, a solid wound inside out - and a conductor given a thickness the drawing did not carry | [Drawing the device](geometry.md) |
-| A material openEMS cannot build, loss quoted outside the band, a band too wide for one conductivity, a sheet too thick for its cell, two solids in one place | [Materials](materials.md) |
-| A port's axes, its picks, its measurement plane, a mode below cutoff, a gap that snaps shut | [Ports](ports.md) |
-| Cells per wavelength, a grid too large to build, a plane with no line on it, the absorber eating the model, a conductor the grid barely holds | [Meshing](meshing.md) |
-| Step count, energy termination, the timestep factor, a pulse that does not fit | this page |
-| A matrix that cannot be assembled or exported | [Results](results.md) |
+| CAD solids, shells, curved conductor offsets, non-manifold geometry | [Drawing the device](geometry.md) |
+| Material assignments, loss tangent limits, 2D sheet requirements | [Materials](materials.md) |
+| Port picks, reference planes, polarity, cut-off waveguide modes | [Ports](ports.md) |
+| Discretization resolution, memory budget limits, PML overlap | [Meshing](meshing.md) |
+| Timestep bounds, pulse duration limits, boundary definitions | This page |
 
-Some findings are worth knowing in advance, because they let a run
-finish and hand back something worthless:
+## Headless CLI execution
 
-- **A microstrip port measured in a lumped-driven run.** No S-matrix, after the
-  full wall time. See [Ports](ports.md).
-- **A run too short to carry its own excitation.** Refused up front, because
-  openEMS truncates the source and returns a full matrix anyway.
-- **A conductor the grid barely holds.** The run completes and the matrix looks
-  ordinary; what was solved is a strip narrower than anything drawn, and
-  refining once to check does not settle it. The mesher sizes every conductor it
-  can measure so this cannot arise, and the warning is what says a shape was not
-  one of those - one held as triangles, or one whose demand `MinElementSize` cut
-  off. See
-  [Meshing](meshing.md#except-across-a-conductor-where-the-mesher-does-it-for-you).
-
-## Running headlessly
-
-The adapter runs on its own, under the interpreter that owns the openEMS
-bindings:
+The openEMS adapter driver can execute standalone from the command line:
 
 ```bash
-python -m Microwave.Solvers.openems.driver <dir>/openems.json
-#   --build-only   construct the structure and write the XML, do not solve
+python -m Microwave.Solvers.openems.driver <simdir>/openems.json
+#   --build-only   Build CSXCAD geometry and XML without solving
 ```
 
-It writes line-oriented markers to stdout, prefixed `OPENEMS:`, which the panel
-parses:
+Standard output markers emitted during execution:
+- `STARTED`: Process initialized.
+- `ENVELOPE digest=... ports=...`: Input envelope validated and hashed.
+- `CHECK severity=...`: A pre-flight finding, or one about the finished solve,
+  including the tail-decay warning.
+- `PLACED offset=...`: Geometry origin offset applied for ray-tracing.
+- `GRID cells=... lines=...`: Grid dimensions.
+- `GROWN solids=... most=...`: Curved conductor offset corrections applied.
+- `BUILT`: OpenEMS structure assembled.
+- `SOLVER_STARTED threads=... dir=...`: OpenEMS FDTD engine executing.
+- `SOLVER_FINISHED seconds=...`: Time stepping complete.
+- `RESULTS <path>`: Output S-parameters written to disk.
+- `DONE`: Simulation completed successfully.
+- `ERROR kind=... message=...`: Simulation error encountered.
 
-| Marker | Meaning |
-|---|---|
-| `STARTED` | Process is alive, envelope not yet read |
-| `ENVELOPE digest=...` | Envelope parsed and hashed |
-| `CHECK severity=... ...` | One pre-flight finding |
-| `PLACED offset=...` | How far the structure was moved to be solved |
-| `GRID cells=... lines=...` | Grid installed |
-| `GROWN solids=... most=...` | Conductors fitted to where openEMS samples them |
-| `BUILT` | Geometry and ports constructed |
-| `SOLVER_STARTED` | Handed off to openEMS |
-| `SOLVER_FINISHED` | Time stepping done |
-| `RESULTS <path>` | Results written |
-| `DONE` | Clean exit |
-| `ERROR kind=... message=...` | Giving up |
-
-Exit codes: `0` success, `1` the envelope is bad or pre-flight refused it, `2`
-anything else.
-
-The driver runs pre-flight **itself** before building, and not only where the
-envelope was made. It is the one point every route passes through - the panel, a
-script, a bug report replayed by hand - so the guards are not opt-in.
-
-`PLACED` is the marker to know about if you ever open the `structure.xml` a run
-leaves behind. openEMS reads a solid held as its own surface by casting a ray
-from the query point toward a point built by scaling that solid's maximum corner
-away from the origin, which is only outward while some part of it is above the
-origin - so the driver moves every structure until its minimum corner sits
-there. That is a translation and changes nothing about the model, but the XML is
-in those coordinates and nothing else is. The offset relates the two.
-
-`GROWN` is the other one. openEMS decides whether a metal edge conducts by
-sampling a single point on it, so only the grid lines that fall *inside* a
-conductor conduct and it arrives smaller than you drew it - a solid comes back
-thin, a cavity's wall opens the cavity out. It costs half a cell on average, and
-no mesh removes it, because it is proportional to the cell. Where a grid line
-lies on the surface there is nothing to give up, which is why an axis-aligned
-conductor arrives exactly and only a curved one needs anything done about it.
-
-So a curved conductor is handed to openEMS grown by half the cell it will be
-sampled on, and the last line still inside it is the one you drew. It applies to
-conductors only - a dielectric boundary is averaged over the cell rather than
-point-sampled, and carries no such loss - and to curved solids only. A box has a
-line pinned to each of its faces. A flat sheet has one at the plane it lies in,
-so nothing eats it across its thickness, but a curved outline is point-sampled
-like any other conductor boundary and is not corrected - how much that costs
-cannot be read off a capacitance, and is stated nowhere for that reason. See
-[Drawing the device](geometry.md). Nothing you see is in those coordinates: the
-geometry, the preview and every message stay as drawn.
-
-The half is not exact, and it cannot be. A conductor in openEMS is only
-*electrically* perfect: the sampling above zeroes the electric field on an edge
-and leaves the magnetic one alone, so the field that is kept out of the metal and
-the field that is not sit against two different walls, a sixth of a cell or so
-apart. One drawing cannot be both.
-
-A half serves the wall a **resonance** sees, and that is the deliberate choice: a
-frequency in the wrong place detunes a filter, where an impedance slightly out
-merely mismatches a line. So a cutoff or a resonance off a curved conductor is
-the figure to trust here, and an **impedance** off one is the looser of the two -
-by about a factor of ten on the shapes both have been measured on.
-
-Both improve when the mesh is refined, and faster than the cell: what the growth
-leaves is not a fixed offset but a smaller error of the same kind. So refining is
-worth paying for on a curved conductor, which it is not when the rounding is left
-in place.
-
-The envelope is this adapter's private format. It is not an interchange format
-and nothing else reads it: the neutral layer of this workbench is the document,
-not a file.

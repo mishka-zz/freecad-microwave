@@ -19,6 +19,11 @@ from .test_tdr import SECTION, V, against, line, measured, reflected
 TRACE = tdr.step_response(reflected(line([50.0, 75.0, 50.0])), 1)
 OWN = tdr.step_response(against(line([50.0, 75.0, 50.0]), measured()), 1)
 
+#: A line with one impedance from end to end, where nothing stands behind
+#: anything - so a chart of it still carries the footnote about readings behind
+#: a discontinuity.
+PLAIN = tdr.step_response(reflected(line([50.0, 50.0, 50.0])), 1)
+
 
 class TestTheAxisIsTheUsersChoice:
     def test_both_axes_are_offered(self):
@@ -94,6 +99,33 @@ class TestWhatTheChartSaysItIs:
         # 1 m/s is 1e-6 mm/ns, and V is a real guided velocity, so this pins the
         # exponent rather than the arithmetic.
         assert quoted == pytest.approx(V * 1e-6, rel=1e-3)
+
+    def test_what_the_conversion_does_to_every_reflection_but_the_first(self):
+        """A plateau standing behind a discontinuity is not the impedance it was
+        drawn at, and the curve looks exactly as it would if it were. That is a
+        fact about the vertical axis rather than about the board, so it is said
+        on every chart and under either axis: a sentence that came and went
+        would read as a verdict on the board that got it."""
+        for axis in plot_tdr.AXES:
+            assert plot_tdr.MASKING in plot_tdr.chart_text(TRACE, V, axis=axis).footnote
+        assert plot_tdr.MASKING in plot_tdr.chart_text(PLAIN).footnote
+
+    def test_what_the_velocity_carries_besides_distance(self):
+        """The velocity is the delay averaged across the band, and what a
+        structure stores is delay with no distance in it. Said with the number
+        it qualifies, so it goes wherever that number goes and nowhere else."""
+        assert plot_tdr.STORAGE in plot_tdr.chart_text(TRACE, speed=V).footnote
+        assert plot_tdr.STORAGE not in plot_tdr.chart_text(TRACE).footnote
+        assert plot_tdr.STORAGE not in plot_tdr.chart_text(TRACE, V, axis=plot_tdr.TIME).footnote
+
+    def test_the_basis_stays_short_enough_to_be_read(self):
+        """The footnote is one wrapped text under a heading that reserves it one
+        line, so a basis that grows reaches into the axes. Every clause is here
+        at once - the reference the port measured, and the distance axis - which
+        is the longest this chart can say."""
+        longest = plot_tdr.chart_text(OWN, speed=V, axis=plot_tdr.DISTANCE).footnote
+        assert "measured at band centre" in longest and "mm/ns" in longest
+        assert len(longest) <= plot_tdr.LONGEST_BASIS
 
     def test_the_study_titles_the_chart_and_does_not_take_the_footnote(self):
         text = plot_tdr.chart_text(TRACE, speed=V, title="Board A")

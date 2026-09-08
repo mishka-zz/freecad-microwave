@@ -47,25 +47,15 @@ What the tolerance is, and why
 ------------------------------
 
 Reciprocity is exact in the continuum; on a Yee grid it is not, and the residual
-is ordinary discretisation error. Measured on this geometry, worst case over
-1.5--5.5 GHz:
+is ordinary discretisation error. Refining this geometry converges it, which is
+the point: the error is the grid's, not the arithmetic's. The operating point is
+the shorter board at the finer mesh, which reaches what the long board reaches
+at half the cells - shortening a line that nothing is measured along costs
+nothing.
 
-===================================  =======  ============  ==========
-mesh                                 cells    reciprocity   max power
-===================================  =======  ============  ==========
-40x30 mm, lambda/20, edge bulk/4     437k     9.05%         1.058
-40x30 mm, lambda/30, edge bulk/6     828k     4.04%         -
-20x18 mm, lambda/30, edge bulk/6     406k     **3.94%**     **1.010**
-===================================  =======  ============  ==========
-
-It converges, which is the point: the error is the grid's, not the arithmetic's.
-The last row is the operating point - the same accuracy as the row above it at
-half the cells, because shortening a line that nothing is measured along costs
-nothing. Both runs together take about four minutes.
-
-The tolerance is therefore 6%, sized on a measured 3.94% plus headroom for
-machine-to-machine variation. That is loose for a physics assertion and
-deliberately so: this gate exists to catch a **factor of four**, and no
+The tolerance is 6%, which is headroom over the residual refinement reaches on
+this geometry, and the gate prints both. That is loose for a physics assertion
+and deliberately so: this gate exists to catch a **factor of four**, and no
 tolerance that admits ordinary grid error would also admit that. Tightening it
 would mean spending minutes of every test run to measure something this file is
 not trying to measure.
@@ -81,8 +71,7 @@ import pytest
 from Microwave.Gui import results as glue
 from Microwave.Gui.symmetry import mirror_warnings
 from Microwave.Results.sparameters import MIRROR, SParameters
-from Microwave.Solvers.openems import preflight, read, residual, run, write
-from Microwave.Solvers.openems.mesh import MeshParams
+from Microwave.Solvers.openems import plan, preflight, read, residual, run, write
 from Microwave.Solvers.openems.model import (
     Frequency,
     Material,
@@ -91,6 +80,7 @@ from Microwave.Solvers.openems.model import (
     Solid,
     Termination,
 )
+from Microwave.Solvers.openems.regions import MeshParams
 
 pytestmark = pytest.mark.slow
 
@@ -109,6 +99,20 @@ TRACE_WIDTH = 3.0
 FREQ_MIN = 1e9
 FREQ_MAX = 6e9
 TIMESTEPS = 20000
+
+#: The band and the step count for the run that reads openEMS' own timestep
+#: back. Nothing in it reads a result, and the timestep is a property of the grid
+#: and the factor rather than of the band - so the band is free here, and it is
+#: what makes the run affordable.
+#:
+#: Pre-flight refuses a step count that would cut the excitation off at or before
+#: its peak, and the excitation lasts a fixed number of *seconds*: a wider band is
+#: a shorter pulse and so fewer steps to play it, while halving the timestep
+#: doubles them. Widened until the halved run clears that demand with room, rather
+#: than pinned at a measured count - the timestep follows the smallest cell the
+#: mesher produced, so any line that moves would move a measured one.
+TIMESTEP_PROBE_BAND = (1e9, 16e9)
+TIMESTEP_PROBE_STEPS = 24000
 
 #: The whole point of the fixture. Equal values would make the correction a
 #: no-op and the gate vacuous - see the module docstring.
@@ -212,7 +216,7 @@ def _problem(z1: float = Z_PORT_1, z2: float = Z_PORT_2) -> Problem:
         pml_cells=8,
         cap=DIELECTRIC_RES,
     )
-    grid = write.plan_grid(solids, ports, materials, params, padding=((8, 8), (8, 8), (8, 8)))
+    grid = plan.plan_grid(solids, ports, materials, params, padding=((8, 8), (8, 8), (8, 8)))
 
     return Problem(
         title="two-port mismatched acceptance line",
@@ -568,28 +572,21 @@ def test_the_stored_matrix_names_the_runs_it_came_from(sweep_directory, doc):
 SYMMETRIC_Z = 40.0
 #: Deliberately *not* 50, which is what the matrix is referenced to. With the
 #: ports already at the reference, ``wanted == measured`` everywhere and
-#: scikit-rf's renormalize short-circuits - so the derived matrix differed
-#: from the measured one by exactly ``mirror_disagreement()``, bit for bit, and
-#: the two gates below were one gate written twice with no renormalisation
-#: exercised at all. 40 ohm makes them independent.
+#: scikit-rf's renormalize short-circuits, so the two gates below reduce
+#: algebraically to one another and no renormalisation is exercised at all.
+#: 40 ohm makes them independent, and their two figures then differ, which is
+#: the whole of what these solves exist to show.
 
 #: How far the two gates below are allowed to miss.
 #:
-#: **Ports at 40 ohm, matrix referenced to 50:**
-#: mirror disagreement 5.55e-07, derived-against-measured 5.89e-07. That is the
-#: whole answer to the question these two solves exist to ask - a rectilinear
-#: Yee grid laid on a mirror-symmetric structure preserves the symmetry to
-#: about five parts in ten million, so a matrix derived from one solve is the
-#: matrix two solves would have measured.
+#: A rectilinear Yee grid laid on a mirror-symmetric structure preserves the
+#: symmetry to a few parts in ten million, so a matrix derived from one solve is
+#: the matrix two solves would have measured. Both figures are on the ``GATE``
+#: lines.
 #:
-#: The two figures differing is itself the point. With the ports at 50 ohm they
-#: were bit-identical, because ``wanted == measured`` made scikit-rf's
-#: renormalize a no-op and the second gate reduced algebraically to the first.
-#:
-#: 1e-4 is ~170x the measured figures: loose enough not to flake on a solver
-#: build or a rounding change, tight enough that a real regression - a copy
-#: into the wrong term, a grid that stops being mirrored - cannot hide. A 5%
-#: tolerance, which is what this started at, would have passed almost anything.
+#: 1e-4 is orders above that: loose enough not to flake on a solver build or a
+#: rounding change, tight enough that a real regression - a copy into the wrong
+#: term, a grid that stops being mirrored - cannot hide.
 SYMMETRY_TOLERANCE = 1e-4
 
 
@@ -602,6 +599,10 @@ def symmetric(interpreter, tmp_path_factory):
     other's image however symmetric the trace between them is - which is why
     it cannot serve here, and why the pre-flight check for unequal port
     impedances exists.
+
+    A second structure whose whole purpose is to be compared with the first, so
+    it is named in ``conftest.STUDY_FIXTURES`` and the tests behind it - the
+    grid's own mirror symmetry among them - belong to the release run.
     """
     base = _problem(SYMMETRIC_Z, SYMMETRIC_Z)
     preflight.refuse_if_blocked(preflight.check(base))
@@ -657,10 +658,9 @@ def test_the_measured_column_is_untouched_by_the_derivation(symmetric):
 
     Referenced to the ports' own impedance, so that no renormalisation happens
     on either side and the completion is the only difference between the two
-    calls. At 50 ohm this comparison is *not* valid and asserting it was my
-    mistake: completing the matrix is what makes port 2 renormalisable, so the
-    derived matrix moves port 2 to 50 and the measured column moves with it -
-    correctly, and by 160%. Whether that final matrix is right is
+    calls. At 50 ohm the comparison is *not* valid: completing the matrix is
+    what makes port 2 renormalisable, so the derived matrix moves port 2 to 50
+    and the measured column moves with it. Whether that final matrix is right is
     ``test_one_solve_reproduces_the_two_solve_matrix``'s question.
     """
     plain = SParameters.from_runs(symmetric[:1], reference=SYMMETRIC_Z)
@@ -689,6 +689,9 @@ def test_the_cheap_check_passes_the_symmetric_model_and_stops_the_other():
 
 
 @pytest.mark.slow
+# Two solves of one model at two settings, compared with each other, and both
+# in the body rather than behind a fixture - so this says what it is itself.
+@pytest.mark.release
 def test_openems_steps_at_the_factor_the_envelope_carries(interpreter, tmp_path):
     """The gate under the whole ``TimestepFactor`` wiring: the engine obeys it.
 
@@ -711,23 +714,26 @@ def test_openems_steps_at_the_factor_the_envelope_carries(interpreter, tmp_path)
     """
     from dataclasses import replace
 
-    # Not 1200 steps, which pre-flight refuses: this band's Gaussian pulse is
-    # 4,311 steps long on this grid, so openEMS would cut the source off at its
-    # own peak. That refusal is right and this run is the
-    # exception that proves it - nothing here reads a result, only the
-    # timestep openEMS prints during SetupFDTD.
+    # Long enough that pre-flight does not refuse either run. The excitation is
+    # a fixed number of *seconds*, so how many steps it takes to play depends on
+    # the timestep, and pre-flight refuses a count that would cut the source off
+    # at or before its peak. The halved run is the binding one: scaling the
+    # timestep by 0.5 doubles the steps the same pulse takes.
     #
-    # 10,000 and not 6,000 because the *halved* run is the binding one: the
-    # excitation is a fixed number of seconds, so scaling the timestep by 0.5
-    # doubles the steps it takes to play it, 4,311 to 8,623. That is the same
-    # arithmetic `_check_timestep_factor` warns about, arriving from the other
-    # side. Left deliberately inside the warning rather than above it, which
-    # costs a minute rather than four and says something true about a run this
-    # short.
-    termination = Termination(max_timesteps=10000, end_criteria=0.0)
+    # Not written down as a measured step count, because it is not one to write
+    # down: the timestep comes from the smallest cell the mesher produced, so
+    # anything that moves a line here moves this. Asked of pre-flight instead -
+    # the refusal states the count it wants - and set above what the halved run
+    # needs.
+    termination = Termination(max_timesteps=TIMESTEP_PROBE_STEPS, end_criteria=0.0)
     coarse = replace(
         _problem(),
-        frequency=replace(_problem().frequency, points=11),
+        frequency=replace(
+            _problem().frequency,
+            start=TIMESTEP_PROBE_BAND[0],
+            stop=TIMESTEP_PROBE_BAND[1],
+            points=11,
+        ),
         termination=termination,
     )
 

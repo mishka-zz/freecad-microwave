@@ -3,15 +3,14 @@
 
 """What this adapter can and cannot express.
 
-Pure data. Imports nothing beyond the standard library - not FreeCAD, not
-openEMS, not even numpy - because the workbench has to answer "which solvers
-could run this model?" on a machine where no engine is installed at all. A
-capability table that needs its engine present to be read is useless for
-choosing an engine.
+This module is pure data. It imports nothing beyond the standard library: no
+FreeCAD, no openEMS, not even numpy. The workbench has to say which solvers could
+run a model on a machine where no engine is installed, and a capability table
+that needs its engine present to be read cannot help choose an engine.
 
-The declaration is deliberately about *modelling concepts*, not about openEMS
-API surface. "microstrip port" is a thing a user draws; ``MSLPort`` is how this
-adapter happens to build it.
+The declaration describes modelling concepts rather than openEMS API surface. A
+microstrip port is a thing a user draws, and ``MSLPort`` is how this adapter
+builds it.
 """
 
 from __future__ import annotations
@@ -21,9 +20,9 @@ from dataclasses import dataclass, field
 from ... import __version__
 
 #: What produced a result, recorded in its provenance. The adapter ships with
-#: the workbench and has no release of its own, so it is the workbench's
+#: the workbench and has no release of its own, so this is the workbench's
 #: version rather than a second number that would agree with it at first and
-#: then quietly stop.
+#: then stop.
 ADAPTER_VERSION = __version__
 
 
@@ -53,8 +52,8 @@ class Capabilities:
 def capabilities() -> Capabilities:
     """This adapter's declaration.
 
-    Kept narrow on purpose. Every entry here is something the adapter has been
-    run against; adding a name because openEMS could in principle do it turns a
+    The list is kept narrow. Every entry here is something the adapter has been
+    run against. Adding a name because openEMS could in principle do it turns a
     refusal the user can act on into a silent failure they cannot.
     """
     return Capabilities(
@@ -70,11 +69,15 @@ def capabilities() -> Capabilities:
         notes={
             "high_q": "resonant structures need a long pulse decay; expect "
             "runtimes an order of magnitude above a matched line",
-            "staircasing": "a solid of any shape is held exactly - its own "
-            "surface is sent, and the engine answers containment against that "
-            "- so what approximates a curve is the grid rather than the "
-            "geometry. A solid that already fills its bounding box is sent as "
-            "a box, which is cheaper and identical",
+            "staircasing": "a solid is not squared onto the grid on the way "
+            "in. Its own surface is sent as triangles and the engine answers "
+            "containment against those, so a curve is approximated by the "
+            "triangulation and by the grid rather than by a box. How far each "
+            "triangulation stands from the drawing is measured and reported. A "
+            "solid that already fills its bounding box is sent as a box, which "
+            "is cheaper and exact, and one made of axis-aligned faces is cut "
+            "into boxes where that is exact; see square_solids for which of "
+            "those it reaches",
             "curved_conductor_thickness": "a solid held as a surface is "
             "resolved by the wavelength in its material and by the lengths its "
             "boundary carries - a gap to another body, how tightly a face "
@@ -91,6 +94,15 @@ def capabilities() -> Capabilities:
             "rectangles exactly and costs the grid the least; anything else - a "
             "round pad, a curved taper, a letter with a counter in it - is sent "
             "as coplanar polygons, holes included",
+            "square_solids": "the same cut reaches a solid bounded entirely by "
+            "planes square to the grid, which is how a conductor carrying a "
+            "thickness is drawn: it is cut into the slabs and rectangles it "
+            "stands in, so a trace folded back on itself arrives as its arms "
+            "and a ridge fused to the wall under it as the two blocks it is. "
+            "That matters beyond mesh cost, because the cell laid at a "
+            "conductor's face is sized from a bounding box and neither a bend "
+            "nor a step fills one. Metal on the diagonal or along an arc is "
+            "still handed over whole and measured on its box",
             "coaxial_port": "a coaxial port measures a line the drawing "
             "supplies - it lays no conductor and no fill of its own, so what "
             "it reports is the line that was drawn rather than an ideal one "

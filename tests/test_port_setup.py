@@ -13,7 +13,7 @@ would accept. ``TestAgainstTheAdapter`` is the test that ties the two together
 import pytest
 
 from Microwave.Objects import port_setup
-from Microwave.Objects.port_setup import SetupError
+from Microwave.Objects.port_setup import SetupError, middle
 
 # A board in XY: 1.5 mm of substrate, ground underneath, trace on top running
 # along X. The same arrangement as examples/microstrip_50ohm.py, in millimetres.
@@ -49,14 +49,29 @@ class TestReadingOneBox:
         with pytest.raises(SetupError, match="an edge rather than a"):
             port_setup.cross_section_axis(edge, TRACE, "the pick")
 
-    def test_the_inward_direction_is_where_the_rest_of_the_solid_is(self):
-        assert port_setup.inward(TRACE_END, TRACE, 0, "the face") == 1
-        assert port_setup.inward(FAR_END, TRACE, 0, "the face") == -1
+    def test_the_inward_direction_is_where_the_metal_is(self):
+        trace = _shape(TRACE, {"near": TRACE_END, "far": FAR_END})
+        assert port_setup.inward((trace, ["near"]), 0, "the face") == 1
+        assert port_setup.inward((trace, ["far"]), 0, "the face") == -1
 
-    def test_a_face_through_the_middle_has_no_inward_direction(self):
-        middle = ((25, -1.5, 1.5), (25, 1.5, 1.535))
-        with pytest.raises(SetupError, match="middle of the shape"):
-            port_setup.inward(middle, TRACE, 0, "the face")
+    def test_a_face_with_metal_on_both_sides_has_no_inward_direction(self):
+        trace = _shape(TRACE, {"cut": ((25, -1.5, 1.5), (25, 1.5, 1.535))})
+        with pytest.raises(SetupError, match="does not say which side of it"):
+            port_setup.inward((trace, ["cut"]), 0, "the face")
+
+    def test_a_fold_launches_into_its_own_arm_rather_than_across_its_box(self):
+        """The whole reason this is asked of the metal and not of the box.
+
+        A trace folded back on itself with arms of unequal length puts the
+        centre of its own box past the end of the short arm, so a rule reading
+        the box answers that the wave should travel away from the metal. The
+        end face here is the short arm's own, and everything behind it is the
+        arm.
+        """
+        arms = [((0, 0, 0), (10, 1, 0.5)), ((0, 0, 0), (1, 3, 0.5)), ((0, 2, 0), (4, 3, 0.5))]
+        fold = _shape(None, {"end": ((4, 2, 0), (4, 3, 0.5))}, lumps=arms)
+        assert middle(port_setup.from_shape(fold), 0) > 4.0
+        assert port_setup.inward((fold, ["end"]), 0, "the face") == -1
 
 
 class TestFindingTheGap:
@@ -87,10 +102,12 @@ class TestFindingTheGap:
 
 class TestOnePerPortKind:
     def test_a_microstrip_reads_both_axes_off_the_board(self):
-        assert port_setup.microstrip_axes(TRACE_END, TRACE, GROUND) == ("X", "-Z")
+        trace = _shape(TRACE, {"end": TRACE_END})
+        assert port_setup.microstrip_axes((trace, ["end"]), TRACE_END, TRACE, GROUND) == ("X", "-Z")
 
     def test_the_far_end_of_the_same_trace_propagates_the_other_way(self):
-        assert port_setup.microstrip_axes(FAR_END, TRACE, GROUND) == ("-X", "-Z")
+        trace = _shape(TRACE, {"end": FAR_END})
+        assert port_setup.microstrip_axes((trace, ["end"]), FAR_END, TRACE, GROUND) == ("-X", "-Z")
 
     def test_a_board_drawn_upside_down_points_the_field_up(self):
         """The sign is the sign of the excitation, not a label.
@@ -100,7 +117,8 @@ class TestOnePerPortKind:
         mismatch. Here the ground is above the trace, so the field points +Z.
         """
         ground = ((0, -25, 3.0), (50, 25, 3.035))
-        assert port_setup.microstrip_axes(TRACE_END, TRACE, ground) == ("X", "Z")
+        trace = _shape(TRACE, {"end": TRACE_END})
+        assert port_setup.microstrip_axes((trace, ["end"]), TRACE_END, TRACE, ground) == ("X", "Z")
 
     def test_a_lumped_port_reads_the_axis_it_drives_across(self):
         source = ((10, -1.5, 1.5), (12, 1.5, 1.5))
@@ -110,7 +128,8 @@ class TestOnePerPortKind:
     def test_a_waveguide_reads_the_way_into_the_guide(self):
         guide = ((0, 0, 0), (10.7, 4.3, 40))
         mouth = ((0, 0, 0), (10.7, 4.3, 0))
-        assert port_setup.waveguide_axis(mouth, guide) == "Z"
+        body = _shape(guide, {"mouth": mouth})
+        assert port_setup.waveguide_axis((body, ["mouth"]), mouth, guide) == "Z"
 
     def test_a_coaxial_line_reads_the_way_down_it(self):
         """The ring is a cross-section like a guide's mouth, so the axis comes
@@ -118,7 +137,8 @@ class TestOnePerPortKind:
         are read and nowhere here."""
         line = ((-3.5, -3.5, 0), (3.5, 3.5, 80))
         ring = ((-3.5, -3.5, 80), (3.5, 3.5, 80))
-        assert port_setup.coaxial_axis(ring, line) == "-Z"
+        body = _shape(line, {"ring": ring})
+        assert port_setup.coaxial_axis((body, ["ring"]), ring, line) == "-Z"
 
 
 class TestAgainstTheAdapter:
@@ -142,6 +162,7 @@ class TestAgainstTheAdapter:
 
         strip, plane = trace(), ground()
         propagation, excitation = port_setup.microstrip_axes(
+            (strip, ["Face1"]),
             port_setup.from_shape(strip, "Face1"),
             port_setup.from_shape(strip),
             port_setup.from_shape(plane, "Face1"),
@@ -263,30 +284,25 @@ class TestWhatGetsPicked:
 
 
 # ---------------------------------------------------------------------------
-# Stubs. A shape is only ever read for its bounding box.
+# Stubs. A shape is read for its bounding box, and met to see which side of a
+# face it is on - so the kernel model is the translation's own, not a second one.
 # ---------------------------------------------------------------------------
 
 
-class _Box:
-    def __init__(self, box):
-        (self.XMin, self.YMin, self.ZMin), (self.XMax, self.YMax, self.ZMax) = box
+def _shape(box, faces=None, lumps=None):
+    """A document object carrying one drawn shape, or a fold made of lumps."""
+    from .test_document_translation import Compound, Shape
 
+    body = Compound(*(Shape(*lump) for lump in lumps)) if lumps else Shape(*box)
+    for name, at in (faces or {}).items():
+        body._faces[name] = Shape(*at)
 
-class _Shape:
-    def __init__(self, box, faces):
-        self.BoundBox = _Box(box)
-        self._faces = faces
-
-    def getElement(self, name):
-        return _Shape(self._faces[name], {})
-
-
-def _shape(box, faces=None):
     class Stub:
         Label = "Stub"
-        Shape = _Shape(box, faces or {})
 
-    return Stub()
+    stub = Stub()
+    stub.Shape = body
+    return stub
 
 
 class _Selected:

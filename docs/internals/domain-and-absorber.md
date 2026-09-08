@@ -1,96 +1,108 @@
-# Where the domain ends, and where the absorber goes
+# Boundary padding, domain sizing, and absorbing boundaries
 
-An FDTD grid is finite and the world is not, so every run needs a box to solve
-in and something at its faces to stop the wave coming back. This page is about
-deciding where that box's walls are, which sounds like arithmetic and is not:
-the answer depends on the mesh, and the mesh depends on the answer.
+In FDTD simulations, open boundaries are terminated using absorbing boundary
+conditions (such as Perfectly Matched Layers, PML) to simulate radiation into
+unbounded space or propagation along infinite waveguiding structures.
 
-Read [Deciding where the grid lines go](sizing-field.md) first if you have not.
-It settles how a cell size is chosen; this page is about a length that has to be
-committed to before any cell exists.
+This document describes how computational domain boundaries, air padding, and
+absorbing layer thicknesses are determined and reconciled with the non-uniform
+grid.
 
-## The absorber is grid, not empty space
+See [Deciding where the grid lines go](sizing-field.md) for grid line placement
+rules.
 
-A perfectly matched layer is a number of *cells* at the end of an axis, in which
-the material is lossy. It is not free space around the model - it is part of the
-grid and it eats lines from the end of every axis it is declared on. So its
-thickness in millimetres is not a property of the absorber at all. It is the
-number of cells times whatever pitch the mesher ends up laying there.
+## Absorber structure and PML scaling
 
-That is the whole difficulty. The depth has to be reserved before meshing, and
-what it will actually measure is not known until after.
+A PML consists of a specified number of grid cells (`pml_cells`) along the outer
+boundary of an axis, configured with artificial electrical and magnetic
+conductivity to absorb impinging waves.
 
-## Two ways to pad a face, and they are counted differently
+In openEMS, PML conductivity grading is normalized across the specified physical
+depth (`openEMS/FDTD/extensions/operator_ext_upml.cpp:30`). Consequently, total
+integrated absorption does not depend on the physical layer thickness in
+millimetres. The profile rises by a fixed factor per cell, so more cells do not
+sample it more finely; what they buy is a lower conductivity at the first cell,
+because the normalization divides by that factor raised to the cell count. The
+step a wave meets on entering is therefore smaller, and the numerical reflection
+at the interface falls.
 
-Each face of the domain is padded either by a count of air cells or by
-`THROUGH`.
+## Boundary padding: Air padding vs. THROUGH
 
-**A cell count** leaves air between the structure and the absorber, and the
-domain grows outward. The absorber sits beyond it, in air. This is what an
-antenna wants: room for the near field to become a far field before anything
-absorbs it.
+Domain boundaries are configured per face using one of two methods:
 
-**`THROUGH`** is not more air. The structure continues out through the absorber,
-so the domain is pulled *inward* by the absorber's depth and the absorber lands
-on the structure. That is what makes a transmission line infinite - substrate and
-trace run into the PML, and the line never sees an end. Give a line air at its
-ends instead and it radiates off an open circuit, contaminating every impedance
-extracted from it with the reflection.
+1. **Air Cell Padding (Count)**:
+   Specifies a count of background air cells between the CAD geometry and the
+   absorber. The domain extends outward by this distance. This padding is
+   required for radiating structures (e.g. antennas) where near fields must
+   decay before reaching absorbing boundaries. The distance is the count times
+   the bulk cell size the policy allows in vacuum, not a share of a wavelength.
 
-The two are counted in different cells, and the reason is what each one is
-padding.
+2. **Through Boundaries (`THROUGH`)**:
+   Adds zero outward padding. Geometry extends directly through the boundary into
+   the absorbing layer. This represents infinitely extending waveguiding
+   structures (e.g. microstrip lines or waveguides) without generating end-face
+   radiating open-circuit reflections. The outer domain boundary coincides with
+   the CAD geometry boundary, and the PML layer is placed inward within the
+   outer extent.
 
-Outward padding is counted in the bulk size in *vacuum*, because what is being
-padded is air. A clearance whose job is to let a wave in air decay must not
-shrink as the substrate gets slower.
+## Absorber cell sizing
 
-A `THROUGH` face is counted in the size of the material that will be **at the
-wall**, because that is what the absorber is laid in. Counting it in a vacuum
-cell over-reserves by the square root of the permittivity, and the error
-compounds at low bands until the domain collapses on itself. Pulling in by the
-smaller of the vacuum ceiling and the slowest material's size fails the other
-way: it lets the absorber overrun the end of the structure wherever the slowest
-material does not cross that wall, which puts the line inside its own PML.
+To prevent spurious reflections at the PML interface, absorber cells are uniform
+(non-graded) along the normal axis.
 
-## The circularity, and the way out of it
+The absorber cell pitch must not be coarser than the interior cell size at the
+boundary, while also respecting the maximum cell grading ratio (`max_ratio`):
+1. The mesher evaluates the continuous sizing field across the domain to determine
+   the required cell size at the boundary face.
+2. The absorber pitch is set to the minimum field value across the projected PML
+   depth.
+3. The interior domain boundary is recessed by `pml_cells` times this pitch, and
+   identical uniform cells are placed in the absorber layer.
 
-A `THROUGH` wall lands somewhere in a window, and its position depends on the
-reservation, which depends on the material at the wall, which depends on where
-the wall landed. Nothing can be evaluated in order.
 
-The way out is to stop asking where the wall lands and take the **coarsest**
-cell the mesher could lay anywhere in the window. Whatever material turns out to
-be at the wall, its own size is no larger than that, and the pitch actually laid
-is no larger again - because constraints only ever lower the sizing field, and
-the cell count rounds up.
+## Seam reconciliation between absorber and interior grid
 
-So the reservation is at or above what gets laid, and the grid can end short of
-the structure but never past it. Short is waste, and is reported. Past would be a
-reflector, and is refused.
+Because the interior grid discretizes gaps into integer numbers of cells, the
+realized cell size at the interior boundary face may differ slightly from the
+continuous sizing field value.
 
-### Why not the finest
+The uniform absorber cells and the adjacent interior cells are held to the
+standard mesh grading ratio (`max_ratio`). If the ratio between the interior cell
+and the absorber cell exceeds `max_ratio`:
+1. The absorber cell pitch adopts the realized interior edge cell size.
+2. The interior domain is re-clipped and re-meshed.
+3. The loop is bounded by a pass count, and the bound is on the work rather
+   than a promise of convergence. A gap holds a whole number of cells, so the
+   map from a block to the cell the interior lays beside it is a step function
+   and a model can fall into an orbit it never leaves. Such a model is refused
+   by name: whichever pass the count stopped on is an arbitrary one, and
+   handing back its grid would read as the grid the model asked for.
 
-Taking the finest value in the window instead would be tighter, and it is wrong.
-A fine region anywhere in the window would shrink the reservation below what a
-coarse region at the wall actually lays, which is exactly the overrun the
-coarsest value exists to prevent.
+## Treatment of cut edges at THROUGH boundaries
 
-Air counts as the ceiling, and so does a conductor: a conductor asks for no bulk
-size, and the sizing field relaxes to the cap over one.
+When a face is declared `THROUGH`, geometry terminating at that boundary represents
+an artificial cross-section cut of an infinitely continuing structure.
 
-### It is a bound, not an estimate
+Any sharp edges, sliced shell boundaries, or perimeter corners lying exactly on a
+`THROUGH` plane are non-physical artifacts of the CAD model boundary. Resolving
+these fictitious cut edges would place unnecessarily fine cells inside the
+absorbing layer, drastically reducing the FDTD time step via the Courant limit.
 
-Grading pulls the pitch down near any finer region further in, so the mesher can
-lay considerably less than was reserved. The structure then overhangs the grid
-wherever the wall material is slower than vacuum.
+Consequently:
+- Sizing demands originating from geometry that does not extend inward past a
+  `THROUGH` boundary are discarded.
+- The bulk material resolution of solids extending through the boundary is
+  preserved for the interior.
 
-That is waste rather than error - openEMS clips to the grid - and it is reported
-as a substitution rather than passed over, because a domain quietly smaller than
-the drawing is the kind of thing that is never noticed afterwards.
-
-## What counts as two faces
-
-The mesher has a floor under its cell size, and that floor decides which faces
-are two faces. Bands narrower than it are not places: the mesher would merge
-their bounds, so a reservation that read a gap there would be predicting a grid
-it is not going to build.
+What is discarded is only what sits on the declared plane itself, which is the
+artificial cut. Anything real standing near that wall is not discarded, and this
+is what declaring a face `THROUGH` costs. The block is a fixed number of cells
+at one pitch, and that pitch is the finest size the sizing field asks for
+anywhere within the block's own depth. A feature inside that band therefore does
+not get coarsened by the block - it drives every cell of the block down to its
+own demand, and the block collapses to a shallow fine one rather than deepening.
+That is the right trade for a line running out through the wall, whose
+cross-section the interior already resolves, and the wrong one for a model that
+should not have declared the face `THROUGH`. Nothing downstream computes the
+absorber's depth from the policy for this reason; the checks that care about it
+read the finished grid.

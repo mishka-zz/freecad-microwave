@@ -1,201 +1,147 @@
 # The document model
 
-A study is a group of document objects. Everything the solver is told comes out
-of that group and out of the geometry it points at, so the document *is* the
-model - there is no separate input file to keep in step with it.
+An electromagnetic simulation study is represented as a structured group of
+FreeCAD document objects. The workbench translates these objects directly into
+solver inputs without requiring external project files.
 
-## The tree
+## Document hierarchy
 
 ```
 Document
-├── Body / Part::Box / Sketch ...     the geometry drawn - not the study's
-├── Generic FR4 (1)                   EMMaterial          } a shared library at
-├── Generic Copper, 1 oz (1)          EMMaterial          } document root
-└── EM Analysis                       EMAnalysis          the study
-    ├── openEMS                       EMSolverOpenEMS     one solver
-    ├── Mesh Policy                   EMMeshPolicy        sizing intent
-    ├── Binding                       EMMaterialBinding   material -> solids
-    ├── MicrostripPort                EMPortMicrostrip
-    ├── MicrostripPort001             EMPortMicrostrip
-    ├── Mesh Refinement               EMMeshRegion        optional, any number
-    ├── Mesh Preview                  EMMeshPreview       drawn by Update Mesh
-    └── S-Parameters                  EMSParameters       written by a finished run
+├── Body / Part::Box / Sketch ...  CAD geometry (independent of study)
+├── Generic FR4 (1)                EMMaterial          } Global material
+├── Generic Copper, 1 oz (1)       EMMaterial          } definitions
+└── EM Analysis                    EMAnalysis          Study container
+    ├── openEMS                    EMSolverOpenEMS     Solver backend
+    ├── Mesh Policy                EMMeshPolicy        Discretization rules
+    ├── EMMaterialBinding          EMMaterialBinding   Material link
+    ├── MicrostripPort             EMPortMicrostrip    Port 1
+    ├── MicrostripPort001          EMPortMicrostrip    Port 2
+    ├── Mesh Refinement            EMMeshRegion        Optional refinement
+    ├── Mesh Preview               EMMeshPreview       Visualized grid
+    └── S-Parameters               EMSParameters       Stored results
 ```
 
-**Create EM Analysis** makes the analysis, a solver and a mesh policy in one
-step, because none of them is useful alone.
+The **Create EM Analysis** command creates the `EMAnalysis` container,
+`EMSolverOpenEMS` solver object, and `EMMeshPolicy` simultaneously.
 
-The analysis is a real FreeCAD group, as the FEM workbench's analysis container
-is. Membership is ownership: drag and drop works, and deleting the analysis
-deletes what is in it.
+The `EMAnalysis` container groups the solver, mesh policy, ports, mesh
+refinement, and result objects for a study.
 
-**In the group:** the solver, the mesh policy, the bindings, the ports, the
-refinement regions, the preview, the results.
+Geometry objects (`Part::Box`, `Part::Feature`) and materials (`EMMaterial`)
+reside at the document root, allowing multiple simulation studies to share
+the same geometry and substrate definitions.
 
-**Not in the group:** the geometry, and the materials. Ports and bindings
-*reference* real CAD solids, and a `Part::Box` stays the document's. Materials
-sit at document root because they are a library - two studies over one board use
-the same FR-4.
+### Object creation workflow
 
-### The order things are made in
-
-Most of it is free order - bind materials before or after drawing the ports, add
-a refinement region whenever. Where the order is load-bearing:
-
-**The study and its band come before the ports.** A new microstrip port fills in
-its own `MeasurementDistance` from the band it finds, and that is a one-time
-write, not a live link. Made with no study in the document it gets zero, and the
-first thing the model does is refuse itself; made before the band is widened
-downward it gets a value that is then too small.
-
-Neither is fatal - `MeasurementDistance` is a property that can be read and
-edited - but the cheap order is: create the analysis, set `FrequencyStart` and
-`FrequencyStop`, then add ports.
-
-**Geometry comes before the port that measures it.** A port reads its axes off
-the faces selected at the time, so it needs something to select.
-
-Nothing else has to be done in an order. Meshing is manual and reads the
-document as it stands; pre-flight runs against whatever is there when Check is
-pressed.
+1. Draw CAD geometry (substrate bodies, conductor traces, ground planes).
+2. Create the `EMAnalysis` study and configure `FrequencyStart` and
+   `FrequencyStop`.
+3. Assign materials using `EMMaterialBinding`.
+4. Create ports (**Add Microstrip Port**, **Add Lumped Port**, etc.).
+   Microstrip ports automatically compute initial `MeasurementDistance`
+   from the analysis frequency band.
+5. Optional: Add `EMMeshRegion` objects for localized refinement.
+6. Click **Update Mesh** to verify discretization in the 3D viewport.
 
 ### Where a new object goes
 
-Every creation command puts its object in the analysis it can identify:
+Commands assign newly created objects to:
+1. The `EMAnalysis` container currently selected in the tree view, or the
+   container of any object inside it that is selected.
+2. The default `EMAnalysis` container if the document holds exactly one.
 
-1. the study of whatever was selected, or
-2. the document's single study, if it holds exactly one.
+If the document contains multiple studies and none is selected, the command
+refuses with an error naming the existing studies and asking you to select
+the target container first.
 
-Anything else - no study, or several with nothing selected - is refused with a
-sentence saying which. There is deliberately no remembered "active analysis" to
-go stale.
+## Document objects
 
-## The objects
-
-| Object | Label | What it holds | Solver |
+| Object | Label | Function | Scope |
 |---|---|---|---|
-| `EMAnalysis` | EM Analysis | Frequency band, points, waveform, declared symmetry, how far down it is read | neutral |
-| `EMSolverOpenEMS` | openEMS | Boundaries, PML depth, timesteps, threads, interpreter | openEMS |
-| `EMMeshPolicy` | Mesh Policy | Sizing per wavelength, growth, domain padding | neutral |
-| `EMMeshRegion` | Mesh Refinement | Local element size over some geometry | neutral |
-| `EMMaterial` | *catalog name* | Permittivity, loss, conductivity, thickness, colour | neutral |
-| `EMMaterialBinding` | Binding | One material, and the solids made of it | neutral |
-| `EMPortMicrostrip` | MicrostripPort | Trace end, ground, feed and measurement planes | neutral |
-| `EMPortLumped` | LumpedPort | Two entities, and a resistance across them | neutral |
-| `EMPortRectWaveguide` | WaveguidePort | Cross-section, mode, reference plane | neutral |
-| `EMMeshPreview` | Mesh Preview | The generated grid, as geometry to look at | openEMS |
-| `EMSParameters` | S-Parameters | The measured matrix, and its provenance | neutral |
-
-One solver per study is the ordinary case. A study holding an openEMS and a
-NEC2 solver at once chooses between them by selecting the one to run, exactly as
-the FEM workbench does.
+| `EMAnalysis` | EM Analysis | Study container (frequency band, points, symmetry) | Solver-neutral |
+| `EMSolverOpenEMS` | openEMS | Solver settings (PML boundaries, time steps, threads) | openEMS |
+| `EMMeshPolicy` | Mesh Policy | Mesh resolution per wavelength, growth ratio | Solver-neutral |
+| `EMMeshRegion` | Mesh Refinement | Localized mesh refinement/coarsening region | Solver-neutral |
+| `EMMaterial` | *material name* | Physical properties (permittivity, loss tangent, thickness) | Solver-neutral |
+| `EMMaterialBinding` | EMMaterialBinding | Associates an `EMMaterial` with target CAD shapes/faces | Solver-neutral |
+| `EMPortMicrostrip` | MicrostripPort | Planar microstrip excitation and measurement port | Solver-neutral |
+| `EMPortLumped` | LumpedPort | Discrete element/resistor port across a gap | Solver-neutral |
+| `EMPortRectWaveguide` | WaveguidePort | Rectangular waveguide modal port | Solver-neutral |
+| `EMMeshPreview` | Mesh Preview | Generated Yee grid visualizer | openEMS |
+| `EMSParameters` | S-Parameters | Extracted S-parameter dataset and provenance | Solver-neutral |
 
 ## EM Analysis
 
-What is being measured, and with what.
+The `EMAnalysis` container defines the frequency sweep range and global study
+properties.
 
 <!-- defaults: EMAnalysis -->
-| Property | Default | Meaning |
+| Property | Default | Description |
 |---|---|---|
-| `FrequencyStart` | 1.0 GHz | Bottom of the band being characterised |
-| `FrequencyStop` | 10.0 GHz | Top of the band |
-| `NumFrequencyPoints` | 501 | How many points results are reported at |
-| `Waveform` | Gaussian | The excitation the band is measured with |
-| `Symmetry` | None | Mirror symmetry declared about the device |
-| `SmallestResponse` | 0.0 | Smallest response this study reads, in dB (0 = full scale) |
+| `FrequencyStart` | 1.0 GHz | Sweep start frequency |
+| `FrequencyStop` | 10.0 GHz | Sweep stop frequency |
+| `NumFrequencyPoints` | 501 | Number of evaluated frequency sample points |
+| `Waveform` | Gaussian | Time-domain excitation pulse envelope |
+| `Symmetry` | None | Geometric and field symmetry (`None` or `Mirror`) |
+| `SmallestResponse` | 0.0 | Dynamic range threshold for energy decay check in dB (0 = full scale) |
 
-The band is not a sweep list. A time-domain run excites the whole band with one
-pulse and transforms the answer, so the point count costs nothing but the size
-of the output - it is how finely the answer is reported, not how much work is
-done.
+In time-domain FDTD, a broadband pulse excites all frequencies
+simultaneously. The `NumFrequencyPoints` property controls Fourier transform
+output resolution and does not increase simulation time.
 
-The band does reach the mesh, though, and hard: element size is a fraction of
-the wavelength at `FrequencyStop`, and the pulse's spectrum is set by the band.
-Widening a band re-meshes the model finer. See [Meshing](meshing.md).
-
-`Waveform` currently offers one value. It is on the study rather than on the
-solver because "measure this band with a broadband pulse" describes the
-measurement, not the backend - the enumeration exists so a second waveform joins
-it beside the code that honours it, rather than as a setting that silently does
-nothing.
+Mesh element sizing is governed by `FrequencyStop` (the shortest electrical
+wavelength). Increasing `FrequencyStop` automatically refines the generated
+mesh (see [Meshing](meshing.md)).
 
 ### Symmetry
 
-`Symmetry = Mirror` declares that the device is its own mirror image about the
-plane between its two ports, and that the two ports are identical.
+Setting `Symmetry = Mirror` declares that the device geometry and ports are
+mirror-symmetric about a plane between Port 1 and Port 2.
 
-It is a statement about the *device*, which is why it is here and not on a
-solver, and it is one no geometric test can make - a board symmetric to
-within an irrelevant via is symmetric for this purpose. So it is declared, never
-inferred, and nothing refuses a run over it.
+Declaring symmetry does not skip any solves automatically. Every port with
+`Excitation = true` is solved. To reduce solve time:
+- In a 2-port network, disable `Excitation` on Port 2 (`Excitation = false`).
+- The workbench solves Port 1 and populates the Port 2 column:
+  $S_{22} = S_{11}$ (by mirror symmetry) and $S_{12} = S_{21}$ (by
+  reciprocity).
+- If both ports remain excited, the solver runs both simulations and the
+  task panel compares measured $S_{22}$ against $S_{11}$ to verify whether
+  the mirror declaration holds.
 
-What it buys: a time-domain solver drives one port per run, so a symmetric
-two-port needs one solve instead of two. S22 follows from S11 by the mirror and
-S12 from S21 by reciprocity, which every material this workbench can express
-obeys.
-
-What it costs when the declaration is wrong: the derived half of the matrix is a
-claim, not a measurement. The run warns where the drawing, the ports or the grid
-do not look like the mirror declared, and it warns rather than refuses, because
-the engineer may know something the geometry does not say.
+**Check** and **Run** in the simulation panel warn if the model geometry,
+ports, or grid do not mirror across the declared symmetry plane. Simulation
+execution is not blocked by this check.
 
 ### The smallest response
 
-`SmallestResponse` says how far down the response is going to be read, in dB,
-where 0 is full scale and a stopband is written the way it is plotted: `-40`.
-It changes nothing about the solve. What it changes is the bar a finished run is
-held to.
+The `SmallestResponse` property specifies the target dynamic range for
+S-parameters in dB, where `0.0` is full scale (e.g. `-40.0` dB for measuring
+deep filter stopbands).
 
-A run stops at `MaxTimesteps` whether or not the device has, and what is left
-ringing shows up as leakage across the whole response - measured afterwards, and
-reported per port. Whether that leakage matters depends entirely on what it
-lands beside. Left at 0 the run is held to a leakage small beside a response of
-one, which is the right bar for a matched line or a length of guide.
+This value sets the tolerance threshold for post-simulation energy decay
+verification. The decay check evaluates absolute truncation error in
+S-parameters; specifying `SmallestResponse` scales the acceptable truncation
+error proportionally to the expected signal level, ensuring stopband
+measurements are verified with adequate precision. If residual energy
+truncation exceeds the threshold, the solver emits a warning advising an
+increase in `MaxTimesteps`. The property does not alter FDTD field
+time-stepping.
 
-It is the wrong bar for a filter. A stopband of -40 dB *is* |S21| = 0.01, so a
-run leaking at that bar carries a 100% error in the only quantity the device
-exists to deliver, and says nothing. Set `SmallestResponse` to -40 and the bar
-moves down with it: the leakage is now weighed against the stopband rather than
-against unity, and a run too short to resolve it says so.
+## Pre-flight validation rules
 
-Nothing measures this for you, and that is deliberate. Every solved response has
-small terms in it - a well-matched line's own reflection is one - and nothing in
-the numbers distinguishes a term that is the point of the exercise from one
-nobody will look at. Only whoever asked for the run knows which is which.
+Pre-flight validation inspects the model against solver capabilities:
 
-Expect longer runs when you declare a deep one. Reading further down means
-waiting for the field to decay further, and that is real time rather than a
-setting.
+- **Refusal (Error)**: Blocks simulation. Displayed when encountering
+  unsupported geometry, conflicting port orientations, or non-physical
+  material properties.
+- **Warning**: Logs potential setup issues (e.g. non-zero loss tangent on
+  PEC, or potential PML overlap) but allows simulation to proceed.
+- **Substitution**: Reports where the adapter solved something other than
+  what was drawn - a zero-thickness surface given a thickness, or geometry
+  clipped at a `Through` boundary. The run proceeds.
 
-Declare it before the run. The bar is applied while the solve is being read, and
-the figure it reached is stored with the result - so changing `SmallestResponse`
-afterwards moves the envelope without re-judging anything already on disk. There
-is nothing to lose by setting it early: it changes no number the solver
-produces.
+Pre-flight checks execute during **Check** and **Run** in the simulation
+panel, and inside the solver driver process. The toolbar **Update Mesh**
+button executes translation and grid meshing only.
 
-## Pre-flight
-
-Before anything is written or run, the model is checked against what the chosen
-adapter declares it can express. Each check produces findings, and a finding is
-one of these:
-
-| | |
-|---|---|
-| **Refusal** | The run does not start. The message names the object and what to change |
-| **Warning** | The run starts. Something is worth knowing - a symmetry that does not look symmetric, an energy-decay setting that makes the step count depend on machine load |
-| **Substitution** | The run starts with something adjusted, and says what was adjusted and to what |
-
-A silent no-op is never one of them. An unsupported object is a refusal naming
-the object, not an empty section in the solver's input.
-
-The checks are grouped by what they ask about: materials, the grid as a whole,
-the absorbing boundary, each port, the measurement planes, and the run itself.
-They run when the panel opens, and again inside the solver process before it
-builds - the one point every route passes through, so the guards are not
-opt-in.
-
-`Microwave/Solvers/openems/capabilities.py` is the authoritative list of what
-the openEMS adapter can express. It is deliberately narrow: every entry is
-something the adapter has been run against, because adding a name that openEMS
-could in principle do turns a refusal that can be acted on into a failure that
-cannot.

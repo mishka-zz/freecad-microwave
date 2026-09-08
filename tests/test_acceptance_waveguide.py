@@ -57,8 +57,7 @@ import numpy as np
 import pytest
 
 from Microwave.Results.sparameters import SParameters
-from Microwave.Solvers.openems import preflight, read, residual, run, write
-from Microwave.Solvers.openems.mesh import MeshParams
+from Microwave.Solvers.openems import plan, preflight, read, residual, run, write
 from Microwave.Solvers.openems.model import (
     THROUGH,
     Frequency,
@@ -68,6 +67,7 @@ from Microwave.Solvers.openems.model import (
     Solid,
     Termination,
 )
+from Microwave.Solvers.openems.regions import MeshParams
 from tests.analytic import reference
 
 pytestmark = pytest.mark.slow
@@ -104,17 +104,16 @@ TIMESTEPS = 12000
 LENGTH_TOLERANCE = 0.01
 
 #: A hollow PEC guide in vacuum is lossless, so all the power that does not come
-#: back must go through; the only slack is absorber leakage at the two ends,
-#: which measures **4.71e-5** on x and 4.69e-5 on y. One order of magnitude
-#: above that: a regression guard with headroom, not a claim about how exact the
-#: physics is.
+#: back must go through; the only slack is absorber leakage at the two ends, and
+#: the gate prints what that comes to. Set one decade above it: a regression
+#: guard with headroom, not a claim about how exact the physics is.
 #:
-#: Keep it one decade clear, not two. A bound two decades above the measurement
-#: guards nothing - the absorber could stop working almost entirely and this
-#: would still pass.
+#: One decade clear, not two. A bound two decades above the leakage guards
+#: nothing - the absorber could stop working almost entirely and this would
+#: still pass.
 POWER_TOLERANCE = 5e-4
 
-#: Measured -47 dB. Kept well clear of that for the same reason.
+#: One decade clear of the match the gate reports, for the same reason.
 MATCH_TOLERANCE = 0.02
 
 
@@ -174,7 +173,7 @@ def _problem(broad_axis: int) -> Problem:
         # growing the mesh sideways would move them.
         pml_cells=(0, 0, 8),
     )
-    grid = write.plan_grid(
+    grid = plan.plan_grid(
         solids,
         ports,
         materials,
@@ -203,10 +202,9 @@ def orientation(request) -> int:
     Every assertion below runs against both drawings of the same guide, because
     openEMS binds ``a`` to the first transverse axis *positionally* while the
     document names the mode after the broad wall. Handing it the pair sorted
-    instead - broad wall first, whatever it is bound to - launched a field
-    that is not a mode of the guide: without ``Port.waveguide_arguments`` the
-    second drawing returns ``|S11| = 1.0193``, ``|S21| = 0`` and a plane
-    separation off by -250.7%.
+    instead - broad wall first, whatever it is bound to - launches a field that
+    is not a mode of the guide: the second drawing then reflects everything,
+    transmits nothing, and fits a plane separation with the wrong sign.
 
     The cutoff and the reference impedance are analytic in ``a`` and ``b`` alone,
     so both looked correct throughout. Only a solve catches this, which is why it

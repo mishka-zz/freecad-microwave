@@ -1,52 +1,76 @@
-# Getting a velocity out of a transmission phase
+# Extracting phase velocity from transmission phase
 
-Putting *distance* on the axis of a reflection plot means knowing how fast the
-wave travels, and a result holds no geometry to work it out from. What it holds
-is a transmission term whose phase advances with frequency. This page is about
-turning that into a velocity, and about three ways of doing it that look
-reasonable and are wrong.
+Plotting time-domain reflectometry (TDR) or spatial reflection profiles against
+physical distance requires the propagation velocity. S-parameter results store
+transmission phase across frequency, but do not retain CAD geometry. This document
+describes how propagation velocity is derived from transmission phase, and explains
+why common alternative estimators introduce systematic errors.
 
-The distance between the two ports' reference planes has to be supplied, because
-nothing in a result knows it. The delay then divides into the *whole* path
-between those planes, launches included. That is the right quantity for putting
-distance on an axis and the wrong one for quoting a substrate's effective
-permittivity, which is a different measurement of a different thing.
+The physical distance between port reference planes must be provided by the caller.
+The extracted delay scales across the full path between reference planes, including
+launch transitions. This yields the correct scaling for distance-axis plots,
+though it differs from the intrinsic effective permittivity of the uniform
+transmission line alone.
 
-## Across the band, not an average of local group delays
+## Broadband phase accumulation versus local group delay
 
-Group delay is the local slope of phase against frequency, and averaging it over
-the sweep is the obvious way to get one number. It is wrong here.
+Group delay represents the local frequency derivative of transmission phase
+($\tau_g = -\frac{d\phi}{d\omega}$). However, averaging local group delays across
+a frequency sweep can yield inaccurate velocity estimates.
 
-A structure that reflects also **stores**, and stored energy is delay with no
-distance in it. Storage is resonant: it gives the phase back where it borrowed
-it, so it cancels out of the phase accumulated across a band wide enough to hold
-the ripple. It does not cancel out of local slopes, which are dominated by
-wherever the structure happens to be ringing.
+Structures with internal discontinuities or impedance steps store reactive
+electromagnetic energy. This reactive storage produces frequency-dependent delays
+independent of physical propagation length. Over a sufficiently wide bandwidth,
+these reactive phase variations complete full ripple cycles and cancel when
+evaluating total accumulated phase:
 
-So the phase is taken end to end across the band. A band narrower than the ripple
-cannot be checked from inside this calculation at all, and one absurd sample is
-carried rather than rejected - there is nothing here that could tell it from a
-real one.
+$$\Delta \phi = \phi(f_{\text{max}}) - \phi(f_{\text{min}})$$
 
-## Do not centre the unwrapping on the band's own advance
+Consequently, effective phase velocity is derived from total accumulated phase
+across the entire sweep band rather than by averaging local group delay derivatives.
 
-Unwrapping a phase means deciding, at each step, how many whole turns were
-skipped, and the usual trick is to centre that decision on the advance the band
-is expected to show.
+## Bandwidth limits and reactive energy storage
 
-Either side of a transmission zero a structure's phase runs **backwards**, so
-honest steps can span more than a whole turn. No centre is safe for all of them,
-and one chosen from the middle of the band relocates the outliers by a turn each
-- quietly, and in a way that looks like a plausible line of a different length.
+A potential strategy is to detect and warn when reactive energy storage
+distorts velocity estimates. However, statistical indicators based on group delay
+variation fail on practical microwave networks:
 
-## A sweep too coarse to unwrap cannot be caught from the phase
+- Peak-to-peak group delay variation reacts strongly to sharp transmission nulls,
+  scaling with frequency step size rather than physical line properties.
+- Percentile filtering discards localized peaks, but fails to distinguish between
+  physical propagation delay and resonant group delay peaks.
+- Phase non-linearity tests fail below filter cutoff frequencies, where phase
+  remains linear but exhibits an altered slope.
+- Return loss magnitude cannot identify internal reactive reflections in matched
+  multi-section structures.
 
-If the points are too far apart, the unwrapping folds. The tempting check is to
-look for something wrong in the phase, and there is nothing to find: a folded
-phase stays perfectly straight and simply takes the wrong slope.
+A lumped element network can synthesize the same transmission phase as a distributed
+transmission line without possessing physical length. Therefore, transmission phase
+alone cannot separate physical propagation delay from localized reactive storage
+without a differential two-length measurement.
 
-What the fold does leave is a delay too small for the distance it is supposed to
-cover. So the check is on the resulting **velocity against the speed of light**.
-That is exact, needs no tuning, and is necessary rather than sufficient - a fold
-that lands under the speed of light passes it. Choosing enough frequency points
-remains the caller's job.
+The plot basis displays the velocity derived from total band delay, documenting that
+the distance axis reflects total phase delay including any localized reactive
+storage.
+
+## Phase unwrapping conventions
+
+Phase unwrapping reconstructs continuous phase by adding integer multiples of
+$2\pi$ at phase discontinuities. Unwrapping algorithms that center phase jumps
+around the expected band slope can fail near transmission zeros.
+
+Near transmission notches, transmission phase can rotate rapidly, producing phase
+steps exceeding $\pi$ radians. Centering the unwrap threshold around the band mean
+can introduce an erroneous $2\pi$ shift across resonant transitions, altering the
+derived line length without triggering an explicit error. The workbench uses
+standard consecutive unwrapping to avoid assuming a predetermined line delay.
+
+## Frequency resolution requirements
+
+When frequency steps are too coarse ($\Delta f > 1 / (2 \tau)$), phase unwrapping
+aliases. Aliased phase remains linear but assumes an artificially lower slope,
+yielding an unphysically high velocity.
+
+The workbench validates the derived velocity against the speed of light in vacuum
+($c_0$). While this check catches severe phase aliasing, selecting sufficient
+frequency points to resolve phase progression remains the user's responsibility.

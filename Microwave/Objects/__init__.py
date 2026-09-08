@@ -3,8 +3,8 @@
 
 """The solver-neutral document objects, and how they are made.
 
-Every class here is prefixed ``EM`` - not ``EMS``, which reads as *openEMS*,
-one backend of the three this architecture is built for.
+Every class here is prefixed ``EM``. The prefix ``EMS`` reads as *openEMS*,
+which is one backend among those this architecture is built for.
 
 The proxy class name identifies an object in a restored document, so renaming
 one of these classes invalidates every saved file that holds it.

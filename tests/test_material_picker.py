@@ -84,10 +84,10 @@ class TestBandCentre:
         assert material_picker.band_centre(FreeCAD.ActiveDocument) == 10e9
 
     def test_geometry_in_the_document_does_not_hide_the_analysis(self):
-        """The scan this replaced read ``obj.Proxy`` on every object. A
-        ``Part::Box`` has none, and one blanket ``except`` then swallowed the
-        failure for the *whole* document - so on the workbench's own example
-        file this returned 0.0 and every dispersion feature downstream was dead.
+        """Reading ``obj.Proxy`` on every object walks into geometry: a
+        ``Part::Box`` has none, and one blanket ``except`` then swallows the
+        failure for the *whole* document - which on the workbench's own example
+        file returns 0.0 and kills every dispersion feature downstream.
         """
         doc = FreeCAD.ActiveDocument
         doc.addObject("Part::Box", "Substrate")

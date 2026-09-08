@@ -5,52 +5,49 @@
 
 Three sections of microstrip end to end - wide, narrow, wide - with a lumped
 50 ohm port at each end. A step response taken at port 1 puts impedance against
-distance along the board, and the middle section stands up out of it: the trace
-*shows where the line changes*, which is the whole reason the impedance chart
-exists.
+distance along the board, and the middle section stands up out of it. The trace
+shows where the line changes, which is what the impedance chart draws.
 
-The other two examples cannot demonstrate that. ``microstrip_50ohm.FCStd`` is a
-uniform line, so its profile is a flat trace at 50 ohm; ``stub_notch.FCStd`` has
+``microstrip_50ohm.FCStd`` and ``stub_notch.FCStd`` cannot demonstrate that.
+The first is a uniform line, so its profile is a flat trace at 50 ohm; the
+second has
 a feature, but the feature is a resonance and reflectometry reads a shunt stub
 as one narrow spike at the T. This one has structure along its length, which is
 the quantity the chart draws.
 
-It is also the line ``tests/test_acceptance_tdr.py`` measures, drawn with
-document objects rather than built by hand - so what comes off the chart has a
-known answer. Each of the first two sections is a Hammerstad impedance for the
-width it was drawn at, to within Hammerstad's own accuracy, and the gate prints
-both on its ``GATE`` lines. The third is masked by the two in front of it and
-the gate says why.
+What comes off the chart has an answer to compare against, and it is a fit: each
+of the first two sections is a Hammerstad impedance for the width it was drawn
+at, to within Hammerstad's own accuracy. The third is masked by the two in front
+of it, as it is on any reflectometry trace - what returns from beyond a
+discontinuity comes back scaled by that discontinuity's two-way transmission,
+and the conversion from a reflection to an impedance has no term to undo it.
 
-The same line and not the same solve, in one respect: a port here is the plane
-the trace ends on, where the gate builds a box one cell thick along the line.
-Both are legitimate - openEMS snaps a lumped element to the grid either way,
-and ``portbox.lumped`` records the three spellings that were solved to
-establish it - but they put the port's reference plane in slightly different
-places, so the velocity and the figures are the gate's to within that and not
-to the last digit.
+The gate that scores a trace like this reads a different board.
+``tests/test_acceptance_tdr.py`` steps a *stripline*, where every section has an
+exact impedance and one exact velocity runs under all three - a microstrip has
+neither, its mode being hybrid rather than TEM. So this example is a
+demonstration of the chart and not a measurement of anything.
 
 Why the ports are lumped
 ------------------------
 
 A microstrip port measures the line's impedance and reports it; a lumped port
-*is* a resistance, and its reference impedance is the number in the envelope. So
-the reflection that comes back from a lumped port carries the line's impedance
-and no port has an opinion about it, which is what makes a reflectometry trace
-mean anything.
+*is* a resistance, and its reference impedance is the number in the envelope.
+The reflection that comes back from a lumped port therefore carries the line's
+impedance and not the port's, so the trace measures the line.
 
 It also decides how the board ends. The line terminates in 50 ohm at both ends
-at every frequency, extrapolated DC included, so - unlike the other two examples
-- the domain is *not* pulled in over the structure: there is no absorber in the
-signal path and nothing for the low-frequency end of the trace to mistake for
-a discontinuity. Every face is left at ``Air``.
+at every frequency, extrapolated DC included, so the domain is not pulled in
+over the structure: there is no absorber in the signal path and nothing for the
+low-frequency end of the trace to mistake for a discontinuity. Every face is
+left at ``Air``, as on both stepped low-pass boards.
 
 What the sweep has to be
 ------------------------
 
-The one setting here that is not obvious from the drawing. A step response is
-carried by its low frequencies, and everything below the first solved point is
-invented by the extrapolation to DC - so the sweep starts **one step above DC**,
+This is the one setting that is not obvious from the drawing. A step response
+is carried by its low frequencies, and everything below the first solved point
+is invented by the extrapolation to DC - so the sweep starts one step above DC,
 ``FREQ_STOP / POINTS``, which is the shape ``Results.tdr`` insists on and refuses
 without by name. A band starting at 1 GHz solves perfectly well and has no trace
 in it at all.
@@ -66,8 +63,10 @@ distance axis comes from the transmission to port 2 in the same run.
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
-    /Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd \\
-        examples/stepped_line.py
+    freecadcmd examples/stepped_line.py
+
+``freecadcmd`` ships inside the FreeCAD installation. On macOS it is
+``FreeCAD.app/Contents/Resources/bin/freecadcmd``.
 
 It writes beside itself. Set ``OUT`` to put the document somewhere else.
 """
@@ -127,11 +126,11 @@ def geometry(doc):
     Both conductors are faces rather than solids, as in the other examples.
 
     Each section is its own sheet, butted against its neighbour rather than
-    overlapping it. Translation proves every shape fills its bounding box, and a
-    stepped trace does not, so more than one sheet is the only way to draw this;
-    butting rather than overlapping is because two solids in the same place is
-    the thing pre-flight refuses when they are different materials and cannot
-    tell from a mistake when they are the same one.
+    overlapping it. Translation cuts a stepped outline into rectangles by itself,
+    so drawing the sections is a way of saying them in the file rather than the
+    only way to draw this; butting rather than overlapping is because two solids
+    in the same place is the thing pre-flight refuses when they are different
+    materials and cannot tell from a mistake when they are the same one.
     """
     board = doc.addObject("Part::Box", "Substrate")
     board.Length, board.Width, board.Height = LENGTH, BOARD, HEIGHT

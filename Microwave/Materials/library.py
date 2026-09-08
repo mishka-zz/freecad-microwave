@@ -3,18 +3,16 @@
 
 """Every catalog this machine has, loaded together.
 
-Several catalogs are live at once by design: a board house's laminates beside
-the generic nominal ones, and whatever else the user has been sent. That is the
-whole feature, and it works because a material is named ``catalog:material`` -
-two catalogs both defining FR4 produce ``generic:fr4`` and ``jlcpcb:fr4`` and
-there is no collision to resolve.
+Several catalogs are live at once: a board house's laminates beside the generic
+nominal ones, and whatever else the user has been sent. A material is named
+``catalog:material``, so two catalogs both defining FR4 produce ``generic:fr4``
+and ``jlcpcb:fr4`` and there is no collision to resolve.
 
 ``load_library`` never raises. One malformed file must not cost the user every
 other catalog, so failures are collected and reported alongside what did load.
-That is the opposite of the rule inside a single file, where one bad entry
-refuses the whole thing - and deliberately so: a silently missing *material*
-is indistinguishable from one the vendor never shipped, while a missing
-*catalog* is obvious on sight.
+The rule inside a single file runs the other way, and one bad entry refuses the
+whole file. A silently missing material is indistinguishable from one the vendor
+never shipped, and a missing catalog is obvious on sight.
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ from .model import Catalog, MaterialEntry, MaterialRef
 
 @dataclass(frozen=True)
 class LoadFailure:
-    """A catalog that did not load, and why."""
+    """A catalog that did not load, and the reason."""
 
     path: str
     message: str
@@ -55,9 +53,9 @@ class Library:
     def search(self, text: str) -> tuple[tuple[Catalog, MaterialEntry], ...]:
         """Everything matching, by material name, id, description or catalog.
 
-        The catalog name is in there on purpose: typing "jlcpcb" has to find
-        their laminates, because "which board house is this from" is the
-        question the user is actually asking.
+        The catalog name is included so that typing "jlcpcb" finds that board
+        house's laminates. Which board house a material comes from is what the
+        user is asking.
         """
         needle = text.strip().lower()
         if not needle:
@@ -76,12 +74,12 @@ class Library:
 def _files(path: pathlib.Path) -> list[pathlib.Path]:
     """A directory's catalogs, or the single file itself.
 
-    Both, because an emailed ``jlcpcb.toml`` should be usable from wherever it
-    landed without first inventing a folder for it.
+    A single file is accepted so that an emailed ``jlcpcb.toml`` is usable from
+    wherever it landed, without first making a folder for it.
 
-    Case-insensitive on the suffix: a file saved as ``Rogers.TOML`` is a catalog
-    by any reasonable reading, and skipping it silently is the failure mode this
-    whole module is arranged against.
+    The suffix test is case-insensitive. A file saved as ``Rogers.TOML`` is a
+    catalog, and skipping it silently is the failure mode this module is
+    arranged against.
     """
     if path.is_dir():
         return sorted(
@@ -97,23 +95,23 @@ def load_library(
 ) -> Library:
     """Load every catalog on every path. Never raises.
 
-    Order is precedence: the first catalog to claim an id keeps it, and a later
-    one with the same id is a *failure* naming both files. Not last-wins -
-    that lets a forgotten copy in a downloads folder redefine what FR4 means
-    with nothing said, and "why did my permittivity change?" becomes
-    unanswerable. A user who really wants their own generics changes one line,
-    ``id = "generic-mine"``, and then both are in the picker, which is honest.
+    Order is precedence. The first catalog to claim an id keeps it, and a later
+    one with the same id is a failure naming both files. Under a last-wins rule
+    a forgotten copy in a downloads folder would redefine what FR4 means with
+    nothing said, and the user could not find out why their permittivity had
+    changed. To keep their own generics, a user changes one line,
+    ``id = "generic-mine"``, and both catalogs are then in the picker.
     """
     catalogs: list[Catalog] = []
     failures: list[LoadFailure] = []
     claimed: dict[str, Catalog] = {}
 
-    # A path the user typed and got wrong must say so. The bundled directory
-    # and the FreeCAD user directory are *not* in ``required``: the first is
-    # always there and the second legitimately does not exist until a user
-    # puts a catalog in it, so complaining about them would be noise. A path
-    # from $MICROWAVE_MATERIAL_PATH or the parameter store is different - it
-    # exists because a user meant it to.
+    # A path the user typed and got wrong is reported. The bundled directory and
+    # the FreeCAD user directory are not in ``required``: the first is always
+    # there, and the second does not exist until a user puts a catalog in it, so
+    # complaining about them would be noise. A path from
+    # $MICROWAVE_MATERIAL_PATH or the parameter store exists because a user meant
+    # it to.
     for path in required:
         if not pathlib.Path(path).exists():
             failures.append(
@@ -123,11 +121,11 @@ def load_library(
             )
 
     for path in paths:
-        # ``_files`` reads the directory, and a directory can refuse to be read
-        # - a mode set by accident, a network share that went away. That
-        # is a failure about one path, which is what this function returns;
-        # letting it out would take the whole picker down, against a docstring
-        # promising it never raises.
+        # ``_files`` reads the directory, and the read can fail - a mode set by
+        # accident, a network share that went away. That is a failure about one
+        # path, which is what this function returns. Letting the error out would
+        # take the whole picker down, against a docstring promising it never
+        # raises.
         try:
             files = _files(pathlib.Path(path))
         except OSError as error:

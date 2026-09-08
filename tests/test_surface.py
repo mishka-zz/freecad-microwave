@@ -10,13 +10,19 @@ set can fail to be a solid is asserted here, and each is asserted to fail for
 its *own* reason rather than merely to fail.
 """
 
+import math
+import struct
+
 import pytest
 
 from Microwave.Solvers.openems.surface import (
+    collapsed_in_single_precision,
     covered_area,
     enclosed_volume,
     sheet_fault,
+    stored_spacing,
     surface_fault,
+    winding,
 )
 
 # A unit cube, wound outward. Every case below is this with one thing done to
@@ -62,8 +68,13 @@ class TestASolidPasses:
         assert surface_fault(CUBE_VERTICES, inverted) is None
 
     def test_an_unused_vertex_changes_nothing(self):
-        """The builder works on the faces; a vertex no face names does nothing."""
-        spare = CUBE_VERTICES + ((5.0, 5.0, 5.0),)
+        """The builder works on the faces; a vertex no face names does nothing.
+
+        Sitting on a corner rather than away from one, since a spare vertex
+        somewhere of its own passes every check by having nothing to disagree
+        with.
+        """
+        spare = CUBE_VERTICES + (CUBE_VERTICES[0],)
         assert surface_fault(spare, CUBE_FACES) is None
 
 
@@ -153,16 +164,23 @@ class TestDegenerateInput:
 
 
 class TestSinglePrecision:
-    """The check has to run on the surface the engine will build, not on the
-    one the CAD kernel held: CSXCAD stores a vertex as three ``float``.
+    """CSXCAD stores a vertex as three ``float``, so two positions the CAD
+    kernel held apart can arrive at one point and the faces between them
+    collapse.
 
     What makes this reachable is that the format's resolution is *relative*
     while the kernel's tolerance is absolute. Two points a millionth of a
     millimetre apart are far outside FreeCAD's own 1e-7 mm tolerance and are
     distinct in the drawing - but a hundred millimetres from the origin, which
     is an ordinary place for a board to be, single precision cannot tell them
-    apart. The same pair beside the origin survives, which is why the check
-    cannot be a distance threshold.
+    apart. The same pair beside the origin survives, which is why this cannot be
+    a distance threshold.
+
+    That relative resolution is also why the answer belongs to a placed
+    structure rather than to a triangle set, and the coordinates it is asked
+    about are the engine's.
+    ``tests/test_adapter_openems.py::TestVerticesTheEngineCannotTellApart``
+    is where that placement is made.
     """
 
     def board(self, separation):
@@ -173,12 +191,186 @@ class TestSinglePrecision:
         return tuple(moved)
 
     def test_two_vertices_that_collapse_when_rounded(self):
-        fault = surface_fault(self.board(1e-6), CUBE_FACES)
-        assert fault is not None
-        assert "single precision" in fault
+        assert collapsed_in_single_precision(self.board(1e-6), CUBE_FACES) == (0, 1)
 
     def test_a_separation_single_precision_still_holds_is_accepted(self):
-        assert surface_fault(self.board(1e-3), CUBE_FACES) is None
+        assert collapsed_in_single_precision(self.board(1e-3), CUBE_FACES) is None
+
+    def test_the_same_pair_beside_the_origin_is_told_apart(self):
+        """The separation that collapses at a hundred millimetres survives at
+        the origin, which is where the adapter puts a structure."""
+        beside = list(CUBE_VERTICES)
+        beside[1] = (1e-6, 0.0, 0.0)
+        assert collapsed_in_single_precision(tuple(beside), CUBE_FACES) is None
+
+    def test_a_vertex_no_face_uses_is_not_compared(self):
+        """An unused vertex changes nothing the builder does, so a collision
+        with one is not a collision."""
+        spare = (*CUBE_VERTICES, CUBE_VERTICES[0])
+        assert collapsed_in_single_precision(spare, CUBE_FACES) is None
+
+    def test_the_surface_check_does_not_ask_it(self):
+        """It is not a property of a triangle set, so it is not among the things
+        the set alone is held to."""
+        assert surface_fault(self.board(1e-6), CUBE_FACES) is None
+
+
+class TestWhatSinglePrecisionHolds:
+    """The spacing the refusal quotes is the format's, at the coordinate it is
+    quoted for.
+
+    A share of the magnitude is the widest the spacing gets in a binary
+    exponent's range, and up to twice the spacing everywhere else in it, so a
+    message built from that share overstates what the engine cannot tell apart.
+    """
+
+    def as_stored(self, value):
+        """``value`` as single precision keeps it."""
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+
+    def test_it_is_the_step_to_the_next_value_the_format_holds(self):
+        """A step of it lands on the next value the format has, and a quarter of
+        one lands back where it started."""
+        for value in (0.5, 47.0, 63.9, 64.0, 1e6):
+            stored = self.as_stored(value)
+            step = stored_spacing(value)
+            assert self.as_stored(stored + step) != stored
+            assert self.as_stored(stored + step / 4.0) == stored
+
+    def test_a_share_of_the_magnitude_is_it_only_at_a_power_of_two(self):
+        """Which is why the share is not what the message quotes."""
+        assert stored_spacing(64.0) == 64.0 * 2**-23
+        assert stored_spacing(63.9) == 32.0 * 2**-23
+
+    def test_it_answers_for_a_negative_coordinate_as_for_its_magnitude(self):
+        """Single precision is symmetric about zero, and a structure placed at
+        the origin still has coordinates on both sides of a solid's own."""
+        assert stored_spacing(-47.0) == stored_spacing(47.0)
+
+
+class TestTwoVerticesAtOnePoint:
+    """A pair the kernel itself put at one place is one vertex.
+
+    The faces naming both of them enclose nothing, and openEMS builds the
+    polyhedron from the index list, so it reads the set as a solid and finds
+    nothing inside it. Unlike the single-precision question, this one is settled
+    by the drawing and moves with nothing.
+    """
+
+    def doubled(self):
+        pair = list(CUBE_VERTICES)
+        pair[1] = pair[0]
+        return tuple(pair)
+
+    def test_it_is_refused(self):
+        fault = surface_fault(self.doubled(), CUBE_FACES)
+        assert fault is not None
+        assert "at one point" in fault
+
+    def test_and_still_is_a_kilometre_away(self):
+        far = tuple(tuple(value + 1e6 for value in point) for point in self.doubled())
+        assert surface_fault(far, CUBE_FACES) is not None
+
+
+class TestTheVerdictDoesNotDependOnWhereTheShapeWasDrawn:
+    """A triangle set carried away from the origin is the same set, and every
+    question :func:`surface_fault` asks is about the set.
+
+    The checks that read indices cannot move at all. The check that reads
+    coordinates for a figure rather than for a comparison is the winding: it
+    decides which way a shell is wound from the sign of the volume that shell
+    encloses, and that sum is where a translation can cost the answer. A thin
+    body far out is where it does.
+    """
+
+    #: A foil with a void in it: two shells, the outer wound outward and the
+    #: inner wound inward, a hair thick against a body millimetres across. The
+    #: thinness is the point - the volume the sum has to reach is small beside
+    #: the coordinates every term of it carries.
+    THICK = 0.035
+
+    def shell(self, lower, upper, inward=False):
+        low_x, low_y, low_z = lower
+        high_x, high_y, high_z = upper
+        corners = (
+            (low_x, low_y, low_z),
+            (high_x, low_y, low_z),
+            (high_x, high_y, low_z),
+            (low_x, high_y, low_z),
+            (low_x, low_y, high_z),
+            (high_x, low_y, high_z),
+            (high_x, high_y, high_z),
+            (low_x, high_y, high_z),
+        )
+        faces = CUBE_FACES if not inward else tuple((a, c, b) for a, b, c in CUBE_FACES)
+        return corners, faces
+
+    def foil(self, offset):
+        outer, outer_faces = self.shell((0.0, 0.0, 0.0), (8.0, 6.0, self.THICK))
+        inner, inner_faces = self.shell(
+            (1.0, 1.0, self.THICK * 0.25), (7.0, 5.0, self.THICK * 0.75), inward=True
+        )
+        moved = tuple(
+            tuple(value + shift for value, shift in zip(corner, offset)) for corner in outer + inner
+        )
+        return moved, outer_faces + tuple(
+            tuple(index + len(outer) for index in face) for face in inner_faces
+        )
+
+    #: What the foil holds, from its own dimensions.
+    VOLUME = 8.0 * 6.0 * THICK - 6.0 * 4.0 * THICK * 0.5
+
+    #: How far out the shape is drawn, in mm, on every axis at once. A metre is
+    #: an ordinary datum for a board taken out of an assembly.
+    FAR = (1e6, 1e6, 1e6)
+
+    #: What the volume is held to out there, relative. A coordinate at the datum
+    #: is itself held to a double's spacing there, so the thinnest dimension of
+    #: the shape carries that much noise before any of this is summed. That is
+    #: the floor, and the sum crosses it once per coordinate, so the assertion
+    #: allows an order above it. Nothing is derivable about the constant; what
+    #: is derivable is that the figure follows the datum and the thickness, and
+    #: not the size of the body.
+    HELD_TO = 10.0 * math.ulp(FAR[0]) / THICK
+
+    def test_it_reads_as_a_solid_at_the_origin(self):
+        vertices, faces = self.foil((0.0, 0.0, 0.0))
+        assert surface_fault(vertices, faces) is None
+        assert enclosed_volume(vertices, faces) == pytest.approx(self.VOLUME, rel=1e-12, abs=0.0)
+
+    def test_and_it_still_does_a_kilometre_away(self):
+        vertices, faces = self.foil(self.FAR)
+        assert surface_fault(vertices, faces) is None
+        assert enclosed_volume(vertices, faces) == pytest.approx(
+            self.VOLUME, rel=self.HELD_TO, abs=0.0
+        )
+
+    @pytest.mark.parametrize("wound_out", [True, False])
+    @pytest.mark.parametrize("offset", [(0.0, 0.0, 0.0), FAR])
+    def test_and_which_way_it_is_wound_is_read_the_same_out_there(self, offset, wound_out):
+        """A body this thin against its own extent is where a sign goes first.
+        Measured from far enough away each term stands orders above what the set
+        encloses, and the cancellation takes the sign with it."""
+        vertices, faces = self.foil(offset)
+        if not wound_out:
+            faces = tuple((first, third, second) for first, second, third in faces)
+        assert winding(vertices, faces) == (1.0 if wound_out else -1.0)
+
+
+class TestWhichWayASetIsWound:
+    def test_a_set_wound_out_of_the_solid(self):
+        assert winding(CUBE_VERTICES, CUBE_FACES) == 1.0
+
+    def test_and_the_same_set_wound_into_it(self):
+        turned = tuple((first, third, second) for first, second, third in CUBE_FACES)
+        assert winding(CUBE_VERTICES, turned) == -1.0
+
+    @pytest.mark.parametrize("faces", [((0, 3, 2), (0, 2, 1)), ((0, 2, 3), (0, 1, 2))])
+    def test_a_set_enclosing_nothing_is_left_the_way_it_arrived(self, faces):
+        """The cube's own floor, taken alone and wound each way. The corner it
+        is measured from lies in the floor's own plane, so every tetrahedron is
+        degenerate and the sum is exactly zero."""
+        assert winding(CUBE_VERTICES, faces) == 1.0
 
 
 class TestItIsCheckedOnTheWayIntoTheEnvelope:
@@ -467,13 +659,6 @@ class TestWhatATriangleSetMeasures:
 
     def test_a_closed_set_encloses_what_it_bounds(self):
         assert enclosed_volume(self.CUBE, self.SIDES) == pytest.approx(1.0, abs=0.0, rel=1e-12)
-
-    def test_and_it_does_not_depend_on_where_the_origin_is(self):
-        """The theorem sums tetrahedra from the origin, and the parts outside
-        the solid cancel - so a shape drawn far from it must not lose the
-        difference between two large numbers."""
-        far = tuple((x + 1e4, y - 1e4, z + 1e4) for x, y, z in self.CUBE)
-        assert enclosed_volume(far, self.SIDES) == pytest.approx(1.0, rel=1e-9, abs=0.0)
 
     def test_an_area_counts_every_triangle_whichever_way_it_is_wound(self):
         """Two coplanar faces can reach one triangulation wound opposite ways,

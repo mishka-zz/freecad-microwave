@@ -44,13 +44,9 @@ import numpy as np
 import pytest
 
 from Microwave.Solvers.openems.containment import contains
-from Microwave.Solvers.openems.mesh import (
-    MaterialClass,
-    MeshParams,
-    Region,
-    generate_mesh_lines,
-)
+from Microwave.Solvers.openems.mesh import generate_mesh_lines
 from Microwave.Solvers.openems.model import Solid
+from Microwave.Solvers.openems.regions import MaterialClass, MeshParams, Region
 from tests.triangulated import bar, centre_of, extent, volume
 
 #: The domain everything here is drawn inside, in mm.

@@ -3,22 +3,23 @@
 
 """Reading one catalog file, and refusing it by name when it is wrong.
 
-The refusals here are the point of the module. A catalog is written by hand, by
-a third party, and the difference between a library an engineer trusts
-and one they retype is whether a typo comes back as *"line 41: 'epsilon' is not
-a key; did you mean 'epsilon_r'?"* or as a permittivity of 1.
+A catalog is written by hand, by a third party. An engineer trusts a library
+whose typo comes back naming the entry, the key it does not recognise and the
+required key that is missing; a typo that comes back as a permittivity of 1 gets
+the library retyped instead. The refusals below name the entry, the unknown
+key and the missing key.
 
-The rules that shape all of it:
+The rules that shape all of them:
 
-* **Nothing that changes physics has a default.** ``epsilon_r`` is required on a
-  dielectric even when it is 1.0. That is what makes ``epsilon = 4.3`` produce
-  both a missing-key refusal and an unknown-key one, instead of a silent vacuum.
-* **A key that means nothing for this kind is a refusal, not an ignored field.**
-  ``loss_tangent`` on a PEC is the same fault as a document property no solver
-  reads: a field that looks like it does something and does not.
+* Nothing that changes physics has a default. ``epsilon_r`` is required on a
+  dielectric even when it is 1.0, so ``epsilon = 4.3`` produces both a
+  missing-key refusal and an unknown-key one rather than a silent vacuum.
+* A key that means nothing for this kind is a refusal rather than an ignored
+  field. ``loss_tangent`` on a PEC is the same fault as a document property no
+  solver reads: a field that looks like it does something and does not.
 
-Standard library only. ``tomllib`` has been in it since 3.11, which is what
-FreeCAD 1.1 embeds (measured: 3.11.14).
+Standard library only. ``tomllib`` has been in it since Python 3.11, and
+FreeCAD 1.1 embeds 3.11.
 """
 
 from __future__ import annotations
@@ -40,9 +41,9 @@ BY_KIND: dict[str, frozenset[str]] = {
     "conducting_sheet": frozenset({"conductivity", "thickness"}),
 }
 
-#: Keys without which the kind is not determined. ``mu_r`` is absent on purpose:
-#: non-magnetic is a safe default in a way that a permittivity of 1 is not,
-#: because a dielectric entry exists precisely to state its permittivity.
+#: Keys without which the kind is not determined. ``mu_r`` is absent: a
+#: non-magnetic default is safe where a permittivity of 1 is not, because a
+#: dielectric entry exists to state its permittivity.
 REQUIRED: dict[str, frozenset[str]] = {
     "dielectric": frozenset({"epsilon_r"}),
     "pec": frozenset(),
@@ -51,7 +52,7 @@ REQUIRED: dict[str, frozenset[str]] = {
 
 
 class CatalogError(Exception):
-    """A catalog file cannot be read, and the message names file and entry."""
+    """A catalog file cannot be read. The message names the file and the entry."""
 
 
 def _fault(origin: str, faults: list[str]) -> None:
@@ -74,7 +75,7 @@ def _number(
         return 0.0
     number = float(value)
     # TOML 1.0 has `nan` and `inf` as float literals, so a catalog can state
-    # them and `number < minimum` is False for NaN - every range check below
+    # them, and `number < minimum` is False for NaN. Every range check below
     # passes it, so an epsilon_r of nan loads, shows in the picker, and solves.
     if not math.isfinite(number):
         faults.append(f"{where} is {number}, which is not a finite number")
@@ -166,11 +167,11 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
             f"{where}: {subject} nothing for a {kind} and would be read by "
             f"nothing. Remove {pronoun}, or change the kind"
         )
-    # An unknown key is a refusal, not a note. ``schema`` is what carries
-    # forward compatibility; merely mentioning an unknown key lets
-    # ``loss_tangnet = 0.02`` produce a *lossless* FR4 that loads, appears in
-    # the picker and solves. A typo in an optional key is the one case where
-    # silence changes physics.
+    # An unknown key is a refusal rather than a note. ``schema`` carries forward
+    # compatibility. Merely mentioning an unknown key lets
+    # ``loss_tangnet = 0.02`` produce a lossless FR4 that loads, appears in the
+    # picker and solves. A typo in an optional key is the one case where silence
+    # changes physics.
     unknown = sorted(set(raw) - allowed - _all_kind_keys())
     if unknown:
         subject, _ = _names(unknown)
@@ -189,10 +190,9 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
         )
 
     # Past here, only keys that are both present and meaningful for this kind
-    # are worth checking. Reporting that a missing thickness is also zero, or
-    # that a loss tangent this kind ignores also lacks a frequency, is one
-    # mistake wearing two hats - and a message that pads is a message people
-    # stop reading.
+    # are checked. Reporting that a missing thickness is also zero, or that a
+    # loss tangent this kind ignores also lacks a frequency, reports one mistake
+    # twice, and a padded message is read less carefully.
     def stated(key: str) -> bool:
         return key in raw and key in allowed
 
@@ -272,8 +272,8 @@ def parse_catalog(text: str, origin: str = "<string>", *, bundled: bool = False)
     """One catalog out of TOML, or a ``CatalogError`` naming everything wrong.
 
     Every fault in the file is collected before raising. A vendor catalog is
-    hundreds of entries and reporting them one per run would make fixing it a
-    day's work; reporting them together makes it one pass.
+    hundreds of entries, and reporting them one per run would make fixing it a
+    day's work. Reporting them together makes it one pass.
     """
     try:
         data = tomllib.loads(text)
@@ -307,7 +307,7 @@ def parse_catalog(text: str, origin: str = "<string>", *, bundled: bool = False)
     if not isinstance(identifier, str) or not SLUG.match(identifier):
         raise CatalogError(
             f"{origin}: [catalog] has no usable id. It is this catalog's identity "
-            "-- the 'generic' in 'generic:fr4' - and it is not the filename, so "
+            "- the 'generic' in 'generic:fr4' - and it is not the filename, so "
             "renaming the file leaves every document that used it still correct"
         )
     for key in ("name", "version"):
@@ -319,10 +319,10 @@ def parse_catalog(text: str, origin: str = "<string>", *, bundled: bool = False)
         raise CatalogError(f"{origin}: 'material' must be a list of [[material]] tables")
 
     entries: list[MaterialEntry] = []
-    #: Position in the *file*, not in the survivors. Numbering the survivors
-    #: makes a duplicate message point at the wrong pair as soon as an earlier
-    #: entry has been rejected, and a refusal that names the wrong lines is
-    #: worse than one that names none.
+    #: Position in the file rather than among the survivors. Numbering the
+    #: survivors makes a duplicate message point at the wrong pair as soon as an
+    #: earlier entry has been rejected, and a refusal that names the wrong lines
+    #: is worse than one that names none.
     at_position: list[int] = []
     for position, raw in enumerate(raw_entries, start=1):
         entry = _entry(raw, position, faults)
@@ -364,9 +364,10 @@ def read_catalog(path: pathlib.Path, *, bundled: bool = False) -> Catalog:
     except OSError as error:
         raise CatalogError(f"{path}: cannot be read - {error}") from error
     except UnicodeDecodeError as error:
-        # A ValueError, not an OSError: uncaught it escapes load_library's
-        # ``except CatalogError`` and takes down every other catalog with it,
-        # which is exactly what that function's docstring promises cannot happen.
+        # UnicodeDecodeError is a ValueError rather than an OSError. Uncaught,
+        # it escapes load_library's ``except CatalogError`` and takes down every
+        # other catalog with it, which that function's docstring promises cannot
+        # happen.
         raise CatalogError(
             f"{path}: is not UTF-8 text - {error}. Catalogs are UTF-8; "
             "re-save the file with that encoding"

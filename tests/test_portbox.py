@@ -382,8 +382,8 @@ class TestTheDrawingIsTheSolversBox:
     def test_a_lumped_port_draws_what_the_adapter_builds(self):
         """Meshed with air at both ends, which a lumped port at a board edge
         needs: a driven one pins a grid line on the plane it is flat across, and
-        THROUGH pulls the domain inside the board, so the plane - and the port
-        with it - would be outside the meshed volume entirely."""
+        THROUGH puts the absorber on the board's own ends, so the plane - and
+        the port with it - would stand inside the absorber."""
         port = lumped_port(1, trace(), ground())
         drawn = port_shape.port_box(port)
         solved = self.built(port, PaddingXMin="Air", PaddingXMax="Air")
@@ -434,9 +434,8 @@ class TestAPortThatIsFlatAcrossOneAxisCanStillBeDrawn:
     ``portbox.lumped`` documents with three solves and what the solver takes
     without complaint.
 
-    The clamp was there and was two orders of magnitude too small. On FreeCAD
-    1.1.1, re-measured the same day: 1e-9 and 1e-8 raise ``ValueError``, 1e-7
-    raises ``OCCDomainError``, 1.01e-7 and 1e-6 build a six-faced solid.
+    On FreeCAD 1.1.1: 1e-9 and 1e-8 raise ``ValueError``, 1e-7 raises
+    ``OCCDomainError``, and 1.01e-7 and 1e-6 build a six-faced solid.
 
     ``Part`` is not importable here, so what is asserted is the number handed
     to ``makeBox`` - which is the number OpenCascade was measured against.

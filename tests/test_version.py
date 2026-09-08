@@ -42,10 +42,18 @@ def test_the_version_is_three_numbers():
 
 
 def test_the_changelog_names_this_version():
-    """A version with nothing said about it is a number, not a release."""
-    changelog = (ROOT / "CHANGELOG.md").read_text()
+    """A version with nothing said about it is a number, not a release.
 
-    assert f"## {Microwave.__version__}" in changelog
+    The property, and not the spelling of a heading: a section is what carries
+    the account, and how it is titled - bare, or with a word and a date - is
+    the document's business.
+    """
+    changelog = (ROOT / "CHANGELOG.md").read_text()
+    headings = re.findall(r"^#+ (.*)$", changelog, re.MULTILINE)
+
+    assert any(Microwave.__version__ in heading for heading in headings), (
+        f"no section of CHANGELOG.md names {Microwave.__version__}"
+    )
 
 
 # That reading the version through `capabilities` costs no import is covered

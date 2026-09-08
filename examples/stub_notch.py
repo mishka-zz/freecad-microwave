@@ -9,21 +9,20 @@ circuit at its root, so at that frequency the stub grounds the through line and
 the transmission drops into a notch. Away from it the stub is a mild reactance
 and the line is just a line.
 
-That is the whole point of this file. ``microstrip_50ohm.FCStd`` is the
-validation case: one port, a line with no features, and an S11 that is a flat
-floor because there is nothing to reflect off. It proves the numbers are right
-and shows the user nothing. This one has two ports, so there is an S21, and a
-resonance, so the S21 has a shape - which is what a person opening the
-workbench for the first time needs to see come out of it.
+This file exists for that shape. ``microstrip_50ohm.FCStd`` is the validation
+case: one port, a line with no features, and an S11 that is a flat floor
+because there is nothing to reflect off. It checks the numbers and shows the
+user nothing. This one has two ports, so there is an S21, and a resonance, so
+the S21 has a shape a first-time user can read.
 
 Where the notch lands, and why not exactly where it is drawn
 ------------------------------------------------------------
 
 The stub is cut to a quarter of a guided wavelength at 5 GHz by the closed form
-- see :data:`STUB_LENGTH` for the arithmetic. The solve puts the notch
-**below** that, and the gap is not an error in either the drawing or the
-solver. What it is, is everything the closed form leaves out. Three things move
-this resonance and none of them appears in ``lambda_g / 4``:
+- see :data:`STUB_LENGTH` for the arithmetic. The solve puts the notch below
+that, and the gap is not an error in either the drawing or the solver. The gap
+is everything the closed form leaves out. None of what moves this resonance
+appears in ``lambda_g / 4``:
 
 - **the open end.** The field does not stop where the copper does; it fringes
   past it, so the stub is electrically longer than it is drawn. Hammerstad and
@@ -43,18 +42,19 @@ hand. That is the ordinary reason to simulate a stub instead of computing one,
 and this example is a better demonstration for showing the gap than for tuning
 it away.
 
-No symmetry is declared, deliberately. The structure *is* its own mirror image,
-and saying so would be true - ``EMAnalysis.Symmetry`` buys one solve instead
-of two by deriving the second column from the first. This example spends both
-solves on purpose: a demonstration that measures half its matrix and infers the
-rest is a weaker demonstration, and measuring both is what makes the agreement
-between them visible in the plot rather than assumed.
+No symmetry is declared. The structure is its own mirror image, and
+``EMAnalysis.Symmetry`` set to ``Mirror`` would fill the second column from the
+first, so port 2 could be left undriven and the run would cost one solve
+instead of two. This example drives both ports, so the agreement between the
+two columns is visible in the plot rather than assumed.
 
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
-    /Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd \\
-        examples/stub_notch.py
+    freecadcmd examples/stub_notch.py
+
+``freecadcmd`` ships inside the FreeCAD installation. On macOS it is
+``FreeCAD.app/Contents/Resources/bin/freecadcmd``.
 
 It writes beside itself. Set ``OUT`` to put the document somewhere else.
 """
@@ -82,8 +82,7 @@ from _visibility import stamp_visibility  # noqa: E402
 #: substrate heights past it. Too narrow and the resonance is a property of the
 #: board rather than of the stub.
 #:
-#: Wide enough was established by widening it and re-solving, not by judgement:
-#: the notch does not move and the power balance does not either.
+#: Wide enough that neither the notch nor the power balance depends on it.
 LENGTH, BOARD, HEIGHT = 90.0, 30.0, 1.6
 WIDTH = 3.0
 EPS_R = 4.4
@@ -137,9 +136,10 @@ def geometry(doc):
     Both conductors are faces rather than solids, as in ``microstrip_50ohm.py``
     - zero-thickness sheets carrying a ConductingSheet material.
 
-    The stub is a second sheet, not a corner cut into one: translation proves
-    every shape fills its bounding box, and an L does not, so two sheets is the
-    only way to draw this and not a preference.
+    The stub is a second sheet rather than a corner cut into one, and that is a
+    preference now: translation cuts an L into the rectangles it is made of by
+    itself. Two sheets say the shape in the file, where one leaves it to be read
+    back out of the outline.
 
     It butts against the through line's edge rather than overlapping it. Two
     primitives that share a face are one conductor to openEMS whatever the grid
@@ -217,9 +217,8 @@ def markup(analysis, board, plane, strip, stub):
         port = createEMPortMicrostrip(f"Port{number}")
         port.Label = f"Port{number}"
         port.Number = number
-        # Both ports are excited, and that is what makes this a two-port: the
-        # run solves the structure once per excited port and assembles the
-        # columns of the S-matrix from the results.
+        # Both ports are excited, so both columns of the S-matrix are
+        # measured: the run solves the structure once per excited port.
         port.Excitation = True
         # A bare voltage source. The line runs out through the absorber, so
         # there is nothing for a reflection off the feed to come back from, and
@@ -266,8 +265,8 @@ def study(doc):
     solver.MaxTimesteps = 20000
 
     settings = document.contents(analysis).settings
-    # The feed lines are meant to be infinite: pull the domain in at both ends
-    # so the absorber lands on the structure. Give them air instead and they
+    # The feed lines are meant to be infinite: put the absorber on the board at
+    # both ends, so the lines run out through it. Give them air instead and they
     # radiate off an open circuit, and every S-parameter is contaminated by the
     # reflection off it.
     settings.PaddingXMin = "Through"

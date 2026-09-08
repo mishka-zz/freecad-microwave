@@ -3,16 +3,16 @@
 
 """Checks about the ports, one port at a time.
 
-:func:`_check_ports` is the loop, and everything below it asks one question of
-one port - that the adapter can build its kind, that it survives snapping to
-the grid, that a guide is empty and its mode propagates, that its box lies inside
-the grid and clear of the absorber, that the lines it needs exist, that its
-excitation catches one, and that its element still meets the metal it was drawn
-against.
+:func:`_check_ports` is the loop, and each function below it asks one question
+of one port: that the adapter can build its kind, that it survives snapping to
+the grid, that a guide is empty and its mode propagates, that its box lies
+inside the grid and clear of the absorber, that the lines it needs exist, that
+its excitation catches one, and that its element still meets the metal it was
+drawn against.
 
-:func:`_check_lumped_excitation_beside_a_measured_line` is the exception, and
-sits above the loop: it is about the *combination* of ports in one run, which no
-port can answer on its own.
+:func:`_check_lumped_excitation_beside_a_measured_line` sits above the loop. It
+is about the combination of ports in one run, which no port can answer on its
+own.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from __future__ import annotations
 import numpy as np
 
 from ....units import MM_PER_M
-from .. import staircase
 from ..capabilities import Capabilities
 from ..containment import contains
 from ..model import (
@@ -32,28 +31,33 @@ from ..model import (
     Port,
     Problem,
 )
-from .absorber import _absorber_bounds, _absorber_cells, _absorber_depth
+from .absorber import (
+    _absorber_bounds,
+    _absorber_cells,
+    _absorber_covers_the_axis,
+    _absorber_depth,
+)
 from .finding import _ON_THE_GRID, REFUSE, WARN, Finding
 
 
 def _check_lumped_excitation_beside_a_measured_line(problem: Problem) -> list[Finding]:
     """A run a lumped port drives, with a microstrip port left to measure.
 
-    In such a run the ``MSLPort`` reports ``z0 = nan`` at every frequency
-    point, while the same two ports in the same document are finite in the run
-    the microstrip port drives. Not a resistance effect - the table is
-    identical at 0 ohms - and not the near-null indeterminacy, which blanks
-    some points rather than all of them. The control, two ``MSLPort``s, is
-    finite in both runs.
+    In such a run the ``MSLPort`` reports ``z0 = nan`` at every frequency point,
+    while the same two ports in the same document are finite in the run the
+    microstrip port drives. Resistance is not the cause: the table is identical
+    at 0 ohms. Nor is the near-null indeterminacy, which blanks some points
+    rather than all of them. The control, two ``MSLPort``s, is finite in both
+    runs.
 
-    ``Z_ref`` per port is what the whole matrix is normalised in, so this run
-    yields nothing, and it yields nothing after taking its full wall time.
+    The whole matrix is normalised in each port's ``Z_ref``, so this run yields
+    nothing, and it yields nothing after taking its full wall time.
 
-    A warning and not a refusal. The consequence is certain on what has been
-    measured, but the *mechanism* is not established, so refusing would block
-    an untried geometry on the strength of one combination. Saying it
-    before the minutes are spent is the part that has value; the assembly
-    refuses by name afterwards either way.
+    This warns rather than refusing. The consequence is certain on what has been
+    measured, but the mechanism is not established, so a refusal would block an
+    untried geometry on the strength of one combination. The value here is
+    saying it before the minutes are spent. The assembly refuses by name
+    afterwards either way.
     """
     driven = [port for port in problem.ports if port.excite]
     if not any(port.kind == "lumped" for port in driven):
@@ -66,7 +70,7 @@ def _check_lumped_excitation_beside_a_measured_line(problem: Problem) -> list[Fi
     return [
         Finding(
             WARN,
-            # `.name`, as every other check spells a port: a labelled port
+            # `.name`, as every other check spells a port. A labelled port
             # named two ways is one object counted twice.
             measured[0].name,
             f"this run is driven by lumped port {lumped}, and a microstrip "
@@ -75,6 +79,45 @@ def _check_lumped_excitation_beside_a_measured_line(problem: Problem) -> list[Fi
             "will complete, take its full time and produce no S-matrix. Drive "
             "the microstrip port instead, or measure both ports the same way",
         )
+    ]
+
+
+def _check_the_launch_direction_was_read(problem: Problem) -> list[Finding]:
+    """A port whose propagation axis nothing held against the drawing.
+
+    Which way a port launches is a fact about the shape it sits on. The
+    translation reads it there and refuses an axis pointing the other way. Some
+    drawings do not answer: a conductor drawn as a surface has no volume for the
+    picked element to be on a side of, so the only feature that answers is a
+    wall running parallel to the axis. A pipe's end ring has such a wall; the
+    same pipe flared out does not.
+
+    What is left then is the enumeration as it stands, whose default is the
+    first value rather than a reading. Reversed, it solves cleanly with the
+    phase inverted: no refusal, no warning from the engine, an S-matrix that
+    looks like every other. This check reports it before the run has cost
+    anything.
+
+    It warns rather than refusing. A correct declaration solves correctly, and a
+    refusal would leave a conductor drawn as a surface unsolvable in order to
+    catch the declarations that are wrong.
+    """
+    return [
+        Finding(
+            WARN,
+            port.name,
+            f"it launches along {AXIS_NAMES[port.propagation_axis]}"
+            f"{'+' if port.direction > 0 else '-'}, and the shape it is built on "
+            "does not say which side of the pick its body is on - so that "
+            "direction is as it was set and nothing has checked it. A "
+            "conductor drawn as a surface reaches this, and so does a pick "
+            "with the body on both sides of it. Turned around, the run "
+            "finishes and reports a plausible S-matrix with the phase "
+            "inverted. Check it points into the structure, or pick an end of "
+            "the conductor and draw it as a solid, so the drawing answers",
+        )
+        for port in problem.ports
+        if port.direction_unchecked
     ]
 
 
@@ -104,10 +147,10 @@ def _check_ports(problem: Problem, caps: Capabilities) -> list[Finding]:
 
 #: How many grid lines a coaxial port's annulus must carry for its probes to
 #: read anything. A probe integrates the field along the edges between the lines
-#: its box covers, so two lines is one edge and one edge is the least that is an
-#: integral at all. This is the floor at which the port is not broken, not the
-#: resolution at which its answer is right - what an under-resolved annulus
-#: costs in impedance is the acceptance gate's subject, not a threshold's.
+#: its box covers, so two lines give one edge, and one edge is the least that is
+#: an integral at all. This is the floor at which the port is not broken rather
+#: than the resolution at which its answer is right. What an under-resolved
+#: annulus costs in impedance is the acceptance gate's subject.
 _ANNULUS_LINES = 2
 
 
@@ -117,12 +160,12 @@ def _check_the_annulus_is_resolved(port: Port, grid: MeshGrid) -> list[Finding]:
     Every primitive this port kind places lives in the annulus: three voltage
     probes running radially across it, two current loops just outside the inner
     conductor, and an excitation shell filling it. openEMS discretises each by
-    the grid lines its box covers, so an annulus that no line falls inside is a
-    port with no field in it - and the run completes, having driven and read
+    the grid lines its box covers, so an annulus with no line inside it is a
+    port with no field in it, and the run completes having driven and read
     nothing.
 
-    Both transverse axes, because the current loop spans both while the voltage
-    probe runs along one.
+    Both transverse axes are tested. The current loop spans both, while the
+    voltage probe runs along one.
     """
     if port.kind != "coaxial":
         return []
@@ -155,25 +198,26 @@ def _check_the_element_survives_snapping(port: Port, grid: MeshGrid) -> list[Fin
     """A lumped gap thinner than a cell snaps shut, and the resistor is dropped.
 
     ``Operator::Calc_LumpedElements`` snaps the element's box to the mesh and
-    then, if both ends land on the *same* line, prints a warning and lays no
+    then, if both ends land on the same line, prints a warning and lays no
     element at all (``operator.cpp``:1637-1652; the RLC extension repeats it at
     ``operator_ext_lumpedRLC.cpp``:262-277). A gap wider than a cell builds
-    silently; one thinner prints
+    silently. A thinner one prints
 
         Warning: Lumped Element with zero (snapped) length is invalid! skipping.
 
-    and the run finishes with every S-parameter **NaN** - the port has an
+    and the run finishes with every S-parameter NaN: the port has an
     excitation and probes across a gap with nothing in it. The warning is merged
     into the run log rather than lost, but it is one line among thousands of
-    progress lines and nothing acts on it; what the user meets is the results
-    layer refusing a matrix that holds no numbers, which cannot say why.
+    progress lines and nothing acts on it. What the user meets is the results
+    layer refusing a matrix that holds no numbers, and that refusal cannot say
+    why.
 
     ``model.Port`` already refuses a gap of exactly zero, which is openEMS' own
-    Python-side check (``openEMS/ports.py``:169). That one runs before snapping, so it
-    passes everything the mesh is about to close.
+    Python-side check (``openEMS/ports.py``:169). That check runs before
+    snapping, so it passes everything the mesh is about to close.
 
-    Snapping is nearest-line: ``SnapToMeshLine`` returns the first line whose
-    dual node is not below the coordinate, and a dual node is the midpoint
+    Snapping is to the nearest line. ``SnapToMeshLine`` returns the first line
+    whose dual node is not below the coordinate, and a dual node is the midpoint
     between two lines (``operator.cpp``:144-157), so ``argmin`` reproduces it,
     ties included.
     """
@@ -207,30 +251,24 @@ def _check_the_element_survives_snapping(port: Port, grid: MeshGrid) -> list[Fin
 def _in_the_metal(problem: Problem, points: np.ndarray) -> np.ndarray:
     """Which points sit in a conductor, as the engine will be given them.
 
-    Given rather than drawn: a curved conductor is handed over grown by half the
-    cell it will be sampled on, so the metal that conducts reaches past the
-    surface that was drawn, and asking the drawing would answer a question about
-    a shape the run never sees. :func:`driver.add_solid` decides the same thing
-    the same way, so what is asked here is what is built.
+    As given rather than as drawn. A curved conductor is handed over grown by
+    the share of a cell the envelope carries, so the metal that conducts reaches
+    past the surface that was drawn, and asking the drawing would answer a
+    question about a shape the run never sees. The surface comes from
+    :meth:`~.model.Problem.as_given`, which is where the driver gets it too.
 
-    A port that lays metal of its own lays it as a box, which is the one shape
-    nothing rounds.
+    A port that lays metal of its own lays it as a box, and nothing rounds a
+    box.
     """
     conducting = {
         material.name for material in problem.materials if material.kind in CONDUCTOR_KINDS
     }
-    lines = tuple(problem.grid[dim] for dim in range(DIMENSIONS))
 
     held = np.zeros(len(points), dtype=bool)
     for solid in problem.solids:
         if solid.material not in conducting:
             continue
-        grown = (
-            staircase.grown(solid.vertices, solid.faces, lines)
-            if solid.is_mesh and not solid.is_sheet
-            else None
-        )
-        held |= contains(solid, points, vertices=grown)
+        held |= contains(solid, points, vertices=problem.as_given(solid))
     for port in problem.ports:
         if port.lays_conductor():
             lower, upper = port.trace_region()
@@ -247,38 +285,41 @@ def _check_the_element_meets_its_metal(port: Port, problem: Problem) -> list[Fin
     of that run. The conductor is a separate rasterisation of the same grid:
     ``CalcPEC_Range`` zeroes an edge whose own sample point the shape holds
     (:2029, :2046-2055), and that point sits on the grid lines across the edge
-    and at the cell's midpoint along it (``GetYeeCoords``, :182-186).
+    and at the cell's midpoint along it (``GetYeeCoords``, :183-187).
 
-    So a terminal is bonded to the metal in either of two ways, and needs only
-    one:
+    A terminal is bonded to the metal in either of two ways, and needs only one:
 
-    - **The node is in the conductor.** That is how a conductor with no
-      thickness conducts at all - it holds no midpoint, so the only edges it
-      zeroes are the ones tangential to it, on the single line it lies on.
-    - **The edge running out of the terminal is zeroed**, which is how a
-      conductor with thickness conducts. ``SnapToMeshLine`` returns the first
-      line whose dual node is not below the coordinate (:253-282), and that dual
-      node is the outward edge's own sample point - so for an end that snapped
-      *into* the gap it lands at or past where the end was drawn, on the metal's
-      side, and never more than half a cell past it. Half a cell of metal beyond
-      the drawing is therefore enough, and a solid has it.
+    - The node lies in the conductor. That is how a conductor with no thickness
+      conducts at all. It holds no midpoint, so the only edges it zeroes are the
+      ones tangential to it, on the single line it lies on.
+    - The edge running out of the terminal is zeroed, which is how a conductor
+      with thickness conducts. ``SnapToMeshLine`` returns the first line whose
+      dual node is not below the coordinate (:253-282), and that dual node is
+      the outward edge's own sample point, so for an end that snapped into the
+      gap it lands at or past where the end was drawn, on the metal's side, and
+      never more than half a cell past it. Half a cell of metal beyond the
+      drawing is therefore enough, and a curved solid grown by the share that
+      ships has exactly that. Whether it has it at all is what the share
+      decides, so this check asks the surface the run will be built from rather
+      than the one that was drawn.
 
     What is left is the conductor with neither: a plane, on a grid holding no
     line where it lies. The element ends a cell away from it with a live edge in
     between, in series with the resistance the port declares, and the run
     completes.
 
-    What is asked is the *pair*: the end as drawn lies in the metal, and neither
-    answer holds once it is snapped. An element meeting no metal as drawn is left
-    alone, that being a model a user means - a short element in the middle of a
-    cavity is a dipole probe. The fault is the grid moving a terminal off the
-    conductor it was drawn against, and only the grid can be asked about that.
+    The check asks for the pair: the end as drawn lies in the metal, and neither
+    answer holds once it is snapped. An element meeting no metal as drawn is
+    left alone, that being a model a user means - a short element in the middle
+    of a cavity is a dipole probe. The fault is the grid moving a terminal off
+    the conductor it was drawn against, and only the grid can be asked about
+    that.
 
     The ends are asked at the box's transverse centre. openEMS lays the element
     across every transverse line pair the snapped box covers (:1682-1684), so
     that one sample stands for all of them and is the one the element's own
-    geometry names. An end the grid did not move is not asked at all: it cannot
-    have been moved off anything.
+    geometry names. An end the grid did not move is not asked at all, since it
+    cannot have been moved off anything.
     """
     if port.kind != "lumped" or port.excitation_axis is None:
         return []
@@ -289,8 +330,8 @@ def _check_the_element_meets_its_metal(port: Port, problem: Problem) -> list[Fin
     landed = [int(np.argmin(np.abs(lines - end))) for end in drawn]
     if landed[0] == landed[1]:
         # The element snaps shut, which _check_the_element_survives_snapping
-        # says. A box entirely off this axis lands here too, both ends on the
-        # edge line, and _check_port_inside_the_grid owns that one.
+        # reports. A box entirely off this axis lands here too, with both ends
+        # on the edge line, and _check_port_inside_the_grid owns that one.
         return []
 
     ends = []
@@ -298,8 +339,8 @@ def _check_the_element_meets_its_metal(port: Port, problem: Problem) -> list[Fin
     # the lower one and above the upper.
     for end, index, outward in zip(drawn, landed, (-1, 1)):
         node = float(lines[index])
-        # The same slack a line is called present within, so that a plane the
-        # mesher pinned and rounded is one the element still ends on.
+        # The same slack a line is called present within, so that the element
+        # still ends on a plane the mesher pinned and rounded.
         if abs(node - end) <= _ON_THE_GRID:
             continue
         beyond = index + outward
@@ -344,8 +385,8 @@ def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
 
     ``WaveguidePort.__init__`` sets ``ref_index = 1`` unconditionally and never
     reads a material (``openEMS/ports.py``:355). Everything the port reports is
-    built on it: the phase constant, and through it the mode impedance the
-    S-parameters are referenced to.
+    built on that value: the phase constant, and through it the mode impedance
+    the S-parameters are referenced to.
 
     A filled guide asked for over a band where it genuinely propagates comes
     back with nan S-parameters across the lower half, a reference impedance
@@ -356,13 +397,14 @@ def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
     in ``ZL``, which is built from free-space ``Z0`` where the medium's
     ``Z0 / n`` belongs. The other half is
     ``CalcPort(..., ref_impedance=k * Z0 * mu_r / (n * beta))``, since ``ZL``
-    only *defaults* ``Z_ref`` and the wave decomposition reads ``Z_ref`` alone
-    (``openEMS/ports.py``:136-139). What stops that being two lines is
-    ``driver._extract``, which passes no reference impedance on purpose so an
-    ``MSLPort`` keeps the impedance it measured - so the override has to be per
-    port kind, and needs a gate of its own. Until then this refuses by name.
+    only defaults ``Z_ref`` and the wave decomposition reads ``Z_ref`` alone
+    (``openEMS/ports.py``:136-139). Two lines would not cover it, because
+    ``driver._extract`` passes no reference impedance on purpose, so that an
+    ``MSLPort`` keeps the impedance it measured. The override therefore has to
+    be per port kind, and needs a gate of its own. Until then this refuses by
+    name.
 
-    The fill is the solids that overlap the port box, not the largest
+    The fill is the solids that overlap the port box rather than the largest
     permittivity in the model, which is usually somewhere else entirely.
     """
     if port.kind != "rect_waveguide":
@@ -375,9 +417,10 @@ def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
     findings = []
     for solid in problem.solids:
         # A triangulated solid's corners bound its shape rather than being it,
-        # so an overlap between boxes is no evidence that any material is in the
-        # guide - a curved part passing beside a port clips its box while its
-        # surface stays clear. Refusing on that would refuse a legal model.
+        # so an overlap between boxes is no evidence that any material is in
+        # the guide. A curved part passing beside a port clips its box while
+        # its surface stays clear, and refusing on that would refuse a legal
+        # model.
         if solid.is_mesh:
             continue
         if any(
@@ -405,20 +448,21 @@ def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
 
 
 def _check_the_mode_propagates(port: Port, problem: Problem) -> list[Finding]:
-    """A waveguide mode below cutoff carries nothing, and says nothing.
+    """A waveguide mode below cutoff carries nothing, and raises no error.
 
-    Below cutoff the phase constant is imaginary: the field decays instead of
+    Below cutoff the phase constant is imaginary. The field decays instead of
     travelling, so the run completes its full step count and every S-parameter
     comes back at the noise floor. Asking for ``TE01`` on WR-42 over 20-26 GHz
-    does exactly that - cutoff 34.9 GHz, nothing propagates, no error.
+    does exactly that: cutoff is 34.9 GHz, nothing propagates, and no error is
+    reported.
 
-    The cutoff is the **vacuum** one, because that is the one openEMS uses:
+    The cutoff taken here is the vacuum one, which is the one openEMS uses.
     ``WaveguidePort`` fixes ``ref_index = 1`` and ``CalcPort`` builds
-    ``beta = sqrt(k^2 - kc^2)`` from it (``openEMS/ports.py``:393-395). Dividing by
-    ``sqrt(epsilon)`` here instead made this check disagree with the engine it
-    is checking - it concluded a filled guide propagated while the engine was
-    computing that the mode did not exist. A guide that is not empty is refused
-    by :func:`_check_the_guide_is_empty` before this runs, so the two agree.
+    ``beta = sqrt(k^2 - kc^2)`` from it (``openEMS/ports.py``:393-395). Dividing
+    by ``sqrt(epsilon)`` here instead would make this check disagree with the
+    engine it checks: it would conclude that a filled guide propagates while the
+    engine computes that the mode does not exist. :func:`_check_the_guide_is_empty`
+    refuses a guide that is not empty before this runs, so the two agree.
     """
     if port.kind != "rect_waveguide":
         return []
@@ -453,27 +497,28 @@ def _check_the_mode_propagates(port: Port, problem: Problem) -> list[Finding]:
     return []
 
 
-#: Port kinds that re-derive their geometry from the lines they land on instead
-#: of being laid as the box they were given, so an overhang costs them nothing.
+#: Port kinds that re-derive their geometry from the lines they land on rather
+#: than being laid as the box they were given, so an overhang costs them
+#: nothing.
 #:
 #: ``MSLPort`` picks its excitation plane and its three voltage probes by
-#: ``argmin`` over the propagation axis' lines (``openEMS/ports.py``:258-264, :297) -
-#: and *only* over that axis. The strip, the probe boxes' transverse extent and
+#: ``argmin`` over the propagation axis' lines (``openEMS/ports.py``:258-264, :297),
+#: and over that axis only. The strip, the probe boxes' transverse extent and
 #: the current probes all take the box verbatim (``openEMS/ports.py``:246-249, :273-274,
-#: :284-286), so the exemption this set grants is per axis as well as per kind:
-#: see :func:`_check_port_inside_the_grid`.
+#: :284-286), so the exemption this set grants is per axis as well as per kind.
+#: See :func:`_check_port_inside_the_grid`.
 #:
-#: A *coaxial* port is here for a stronger reason than a microstrip's: it lays
+#: A coaxial port is here for a stronger reason than a microstrip's: it lays
 #: nothing at all. Along the line its box supplies only the origin the two
-#: shifts are measured from, and both land on grid lines by ``argmin`` like the
-#: microstrip's. Across the line it supplies the bore's centre and radius, which
-#: every probe and the excitation shell are built from - so there the box is
-#: taken verbatim and the strict rule holds.
+#: shifts are measured from, and both land on grid lines by ``argmin`` as the
+#: microstrip's do. Across the line it supplies the bore's centre and radius,
+#: which every probe and the excitation shell are built from, so there the box
+#: is taken verbatim and the strict rule holds.
 #:
-#: A kind absent from here gets the strict rule, which is the safe direction -
-#: a refusal is loud where a clamp is silent. Distinct from
-#: :meth:`model.Port.snaps_to_the_grid`, which asks whether openEMS *moves* a
-#: port's planes onto the grid; a lumped port's box is snapped that way and is
+#: A kind absent from here gets the strict rule, which is the safe direction: a
+#: refusal is loud where a clamp is silent. This set is distinct from
+#: :meth:`model.Port.snaps_to_the_grid`, which asks whether openEMS moves a
+#: port's planes onto the grid. A lumped port's box is snapped that way and is
 #: still laid as a box, so it answers yes there and is absent here.
 _REBUILT_FROM_THE_GRID = frozenset({"microstrip", "coaxial"})
 
@@ -482,31 +527,32 @@ def _check_port_inside_the_grid(port: Port, grid: MeshGrid) -> list[Finding]:
     """How much of a port's box has to be on the grid, which is per kind and axis.
 
     ``_check_grid_covers_the_model`` looks only at solids and at the strip a
-    microstrip port lays, so nothing else sees a *port box* at all.
+    microstrip port lays, so nothing else examines a port box at all.
 
-    openEMS never rejects a box for hanging off the grid; it clamps it to the
-    edge in silence. What the clamp costs depends on how the port uses its box:
+    openEMS never rejects a box for hanging off the grid. It clamps the box to
+    the edge in silence. What the clamp costs depends on how the port uses its
+    box:
 
     - ``MSLPort`` rebuilds itself from the lines it lands on along the
       propagation axis, so there the clamp is the operation it was going to
       perform anyway, and its box legitimately overhangs. On the other two axes
       it is laid as a box like anything else, and the voltage probes'
       integration path is the box's excitation-axis extent verbatim.
-    - A *lumped* port's box is the gap the element sits across, and its
+    - A lumped port's box is the gap the element sits across, and its
       conductance is integrated over the snapped index range
-      (``operator.cpp``:1654-1673). ``kappa`` is normalised by that, so the
-      resistance survives the clamp and the *geometry* does not: the element is
-      laid across a shorter path than was drawn, and the run returns a
+      (``operator.cpp``:1654-1673). ``kappa`` is normalised by that range, so
+      the resistance survives the clamp and the geometry does not: the element
+      is laid across a shorter path than was drawn, and the run returns a
       plausible reflection for a termination that was not asked for.
-    - A *waveguide* port's ``kc`` - and through it ``beta`` and the ``ZL``
+    - A waveguide port's ``kc`` - and through it ``beta`` and the ``ZL``
       everything is referenced to - comes from the ``a`` and ``b`` the port was
-      *told* (``openEMS/ports.py``:437-444), while the excitation is an analytic
+      told (``openEMS/ports.py``:437-444), while the excitation is an analytic
       mode profile anchored at the box's own start (:448-458). Clamped, that
       profile is laid over fewer cells than it was written for and no longer
       falls to zero at the wall, so what is launched is not the mode.
 
-    Per axis in every case: a box outside the grid on any single axis has no
-    intersection with it, whatever the other two do.
+    The test is per axis in every case. A box outside the grid on any single
+    axis has no intersection with it, whatever the other two do.
 
     Landing on a line is a separate question from lying inside the grid, and
     :func:`_check_required_lines_exist` asks it.
@@ -535,9 +581,9 @@ def _check_port_inside_the_grid(port: Port, grid: MeshGrid) -> list[Finding]:
         if rebuilt:
             continue
 
-        # Each end named separately, as _check_the_absorber_leaves_a_model does
-        # and for the same reason: a box can hang off both, and one number for
-        # the pair is not a distance anything can be moved by.
+        # Each end is named separately, as _check_the_absorber_leaves_a_model
+        # names them and for the same reason: a box can hang off both ends, and
+        # one number for the pair is not a distance anything can be moved by.
         past = [
             f"{gap:.4g} mm past {AXIS_NAMES[dim]}={end}"
             for end, gap in (("min", low - start), ("max", stop - high))
@@ -565,15 +611,15 @@ def _check_required_lines_exist(port: Port, grid: MeshGrid) -> list[Finding]:
     """A plane openEMS will not move needs a grid line on it, and may not have one.
 
     :meth:`model.Port.required_lines` names those planes, and
-    :func:`write.plan_grid` hands them to the mesher as anchors, so on the route
-    that meshes they are there by construction. That is not every route: the
-    driver is handed a finished envelope with its grid already in it and re-runs
-    pre-flight over that, which is the whole reason the guards live here rather
-    than beside the mesher. Nothing between a replayed envelope and the solver
-    would otherwise look.
+    :func:`plan.plan_grid` hands them to the mesher as anchors, so on the route
+    that meshes they are there by construction. The driver is the other route:
+    it is handed a finished envelope with its grid already in it and re-runs
+    pre-flight over that, which is why the guards live here rather than beside
+    the mesher. Nothing else between a replayed envelope and the solver would
+    look.
 
-    Driven by what the port *declares* rather than by its kind, so a kind that
-    grows a pinned plane is covered by saying so once.
+    The check follows what the port declares rather than its kind, so a kind
+    that grows a pinned plane is covered by declaring it once.
     """
     findings = []
     for dim, positions in enumerate(port.required_lines()):
@@ -602,13 +648,13 @@ def _check_required_lines_exist(port: Port, grid: MeshGrid) -> list[Finding]:
 
 
 #: The kinds whose excitation is a box driving a single field component, which
-#: is what lets the rule below be read one axis at a time. A waveguide port and
-#: a coaxial one drive both transverse components, so each of their axes carries
-#: a demand from each - a different statement, and not one this makes. Both
-#: place their excitation on a grid line along the propagation axis, through
-#: :meth:`model.Port.required_lines` and through :mod:`.coaxial` respectively,
-#: and the plane the rest of their primitives occupy is where the annulus check
-#: and the guide's own cross-section answer for them.
+#: lets the rule below be read one axis at a time. A waveguide port and a
+#: coaxial one drive both transverse components, so each of their axes carries a
+#: demand from each component. That is a different statement, and this set does
+#: not make it. Both place their excitation on a grid line along the propagation
+#: axis, through :meth:`model.Port.required_lines` and through :mod:`.coaxial`
+#: respectively, and on the plane the rest of their primitives occupy the
+#: annulus check and the guide's own cross-section answer for them.
 _EXCITES_ONE_COMPONENT = frozenset({"lumped", "microstrip"})
 
 
@@ -616,36 +662,36 @@ def _check_the_excitation_is_sampled(port: Port, grid: MeshGrid) -> list[Finding
     """A box wide enough to span cells, and placed so it holds no sample at all.
 
     An excitation is laid by walking the grid and asking the geometry what is at
-    each coordinate (``operator_ext_excitation.cpp``:158-166); nothing moves it
+    each coordinate (``operator_ext_excitation.cpp``:158-166). Nothing moves it
     onto the grid the way a resistor and a probe are moved. A box holding no
     coordinate is dropped as ``Unused primitive``, one line in a log of
     thousands, after which the run completes having driven nothing and every
     S-parameter comes back 0/0.
 
-    Which coordinates those are is staggered. A field component is sampled on
-    the dual grid along the axis it points down and on the ordinary grid along
-    the other two (``operator.cpp``:183-187), so the excitation axis wants a
-    cell centre inside the box and the axes either side of it want a line.
+    Those coordinates are staggered. A field component is sampled on the dual
+    grid along the axis it points down and on the ordinary grid along the other
+    two (``operator.cpp``:183-187), so the excitation axis wants a cell centre
+    inside the box and the axes either side of it want a line.
 
-    What is tested here is the axis that asks for nothing: one the box has
-    *extent* on, where the position a line would have to take is the mesher's to
-    choose and so is nothing a port can name in advance. Whether one landed
-    inside is a question about the grid, and this is where the grid is.
+    This tests the axis that declares nothing: one the box has extent on, where
+    the mesher chooses the position a line would have to take, so a port cannot
+    name it in advance. Whether one landed inside is a question about the grid,
+    and this is where the grid is.
 
-    Each of the others is left to what already answers for it:
+    Each of the other axes is left to what already answers for it:
 
-    - A **flat** axis. :meth:`model.Port.required_lines` names the plane, the
-      mesher pins it, and :func:`_check_required_lines_exist` says so when a
-      replayed envelope arrives without it.
-    - A **lumped** port's excitation axis. A box holding no cell centre is one
-      whose ends snap to a single line, which
+    - A flat axis. :meth:`model.Port.required_lines` names the plane, the mesher
+      pins it, and :func:`_check_required_lines_exist` reports a replayed
+      envelope that arrives without it.
+    - A lumped port's excitation axis. A box holding no cell centre is one whose
+      ends snap to a single line, which
       :func:`_check_the_element_survives_snapping` refuses from the resistor's
-      end. That one refuses a shade more - a box whose face lands exactly on a
-      cell centre holds it and the element still snaps shut - so the axis is
+      end. That check refuses a shade more, since a box whose face lands exactly
+      on a cell centre holds it and the element still snaps shut, so the axis is
       covered rather than shared.
-    - A **microstrip** port's propagation axis, which openEMS puts on the
-      nearest existing line (``openEMS/ports.py``:297-301). That axis alone: the
-      two either side of it are the port's own box, copied unchanged.
+    - A microstrip port's propagation axis, which openEMS puts on the nearest
+      existing line (``openEMS/ports.py``:297-301). That axis alone: the two
+      either side of it are the port's own box, copied unchanged.
     """
     if port.kind not in _EXCITES_ONE_COMPONENT or not port.excite:
         return []
@@ -666,8 +712,9 @@ def _check_the_excitation_is_sampled(port: Port, grid: MeshGrid) -> list[Finding
 
         centres = axis == port.excitation_axis
         samples = 0.5 * (lines[:-1] + lines[1:]) if centres else lines
-        # The slack is the mesher's arithmetic, not openEMS' box test, which
-        # takes a coordinate on the face exactly (``CSPrimitives.cpp``:69-72).
+        # The slack allows for the mesher's arithmetic rather than for openEMS'
+        # box test, which takes a coordinate on the face exactly
+        # (``CSPrimitives.cpp``:69-72).
         if np.any((samples >= low - _ON_THE_GRID) & (samples <= high + _ON_THE_GRID)):
             continue
 
@@ -692,55 +739,71 @@ def _check_the_excitation_is_sampled(port: Port, grid: MeshGrid) -> list[Finding
 
 
 def _check_port_clear_of_absorber(port: Port, grid: MeshGrid) -> list[Finding]:
-    """A probe or feed inside the absorber measures a field that is being eaten.
+    """A probe or feed inside the absorber measures a field that is being absorbed.
 
     The absorber's depth, the shortfall and the end are all named here rather
-    than left to :func:`~.absorber._check_the_absorber_leaves_a_model`, which is
-    a warning with a threshold and stays silent in exactly the case that
-    produces this refusal - and an interior quoted on its own gives the symptom
+    than left to :func:`~.absorber._check_the_absorber_leaves_a_model`. That one
+    is a warning with a threshold and stays silent in exactly the case that
+    produces this refusal, and an interior quoted on its own gives the symptom
     with no route to the cause.
 
-    A point past the grid edge is a different fault and is said differently:
-    "inside the absorber" is not true of a waveguide plane, which is simply not
-    discretised, and the run returns 0/0.
-    :func:`_check_port_inside_the_grid` covers neither, testing the port *box*,
-    which legitimately overhangs on a THROUGH face.
+    A point past the grid edge is a different fault and is described
+    differently. "Inside the absorber" is not true of a waveguide plane, which
+    is simply not discretised, and the run returns 0/0.
+    :func:`_check_port_inside_the_grid` covers neither case: it tests the port
+    box, which legitimately overhangs on a THROUGH face.
 
-    What is quoted is how far the *grid* falls short, not how far the plane
-    would travel: ``openEMS/ports.py``:257-260 clamps the probe triplet's centre
-    into ``[1, len-2]``, so a plane past the edge lands one edge cell beyond it.
-    The shortfall is the number a user acts on and is the same for every kind.
+    The message quotes how far the grid falls short rather than how far the
+    plane would travel. ``openEMS/ports.py``:257-260 clamps the probe triplet's
+    centre into ``[1, len-2]``, so a plane past the edge lands one edge cell
+    beyond it. The shortfall is the number a user acts on, and it is the same
+    for every kind.
 
-    The closing advice holds only where the face was pulled *in*. On an
+    The closing advice holds only where the face was pulled in. On an
     outward-padded face the interior wall is the domain wall, so lowering
-    PMLCells does not move it. No branch for that: ``model.py`` bounds both
-    shifts inside the port box and ``structure_bounds`` includes ports, so on a
-    padded axis this check cannot fire.
+    PMLCells does not move it. There is no branch for that case: ``model.py``
+    bounds both shifts inside the port box and ``structure_bounds`` includes
+    ports, so on a padded axis this check cannot fire.
     """
     dim = port.propagation_axis
-    interior = _absorber_bounds(grid, dim)
-    if interior is None:
-        return []
-
-    low, high = interior
     lines = grid[dim]
-    edges = float(lines[0]), float(lines[-1])
     cells = _absorber_cells(grid, dim)
-    depths = _absorber_depth(grid, dim)
     axis = AXIS_NAMES[dim]
-
-    findings = []
     positions = {
         "measurement plane": port.measurement_position(),
         "feed": port.start[dim] + port.direction * port.feed_shift,
     }
+
+    # An axis the absorber covers has no interior for a port to be outside of,
+    # and no depth as laid to quote: the two blocks together are at least as
+    # deep as the axis is long, so the millimetres each reaches say nothing
+    # about where this port stands. The axis is described instead.
+    covered = _absorber_covers_the_axis(grid, dim)
+    interior = _absorber_bounds(grid, dim)
+    if interior is None and not covered:
+        return []
+
+    edges = float(lines[0]), float(lines[-1])
+    # Where the interior is, or the axis' own midpoint where there is none.
+    # It decides which wall a position is judged against, and nothing else.
+    low, high = interior if interior is not None else ((edges[0] + edges[1]) / 2,) * 2
+
+    findings = []
     for what, position in positions.items():
-        if low <= position <= high:
+        if not covered and low <= position <= high:
             continue
         face = 0 if position < low else 1
         end = "min" if face == 0 else "max"
         beyond = (edges[0] - position) if face == 0 else (position - edges[1])
 
+        # What to do about it, which the case decides. Moving the port further
+        # in is the answer to a plane past the edge and to one inside a block,
+        # and it is no answer at all on an axis the absorber covers: there is
+        # nowhere on that axis to move to.
+        advice = (
+            "Move it further in, or raise ElementsPerWavelength or lower "
+            "PMLCells to make the absorber thinner"
+        )
         if beyond > 0:
             where = (
                 f"outside the grid, which runs {edges[0]:.4g} to {edges[1]:.4g} "
@@ -756,21 +819,31 @@ def _check_port_clear_of_absorber(port: Port, grid: MeshGrid) -> list[Finding]:
             )
         else:
             inside = (low - position) if face == 0 else (position - high)
-            where = f"inside the absorber (the interior runs {low:.4g} to {high:.4g})"
-            why = (
-                f"the field there is being attenuated on purpose and anything "
-                f"measured in it is meaningless. The absorber is {cells} cells "
-                f"and {depths[face]:.4g} mm deep at {axis}={end}, so this sits "
-                f"{inside:.4g} mm inside it"
-            )
+            if covered:
+                advice = "Lower PMLCells, or mesh this axis more finely"
+                where = "inside the absorber, which covers this axis end to end"
+                why = (
+                    f"the field there is being attenuated on purpose and "
+                    f"anything measured in it is meaningless. The axis has "
+                    f"{len(lines) - 1} cells and declares {cells} of absorber "
+                    f"at each end, so nothing on it is outside the attenuating "
+                    f"region"
+                )
+            else:
+                where = f"inside the absorber (the interior runs {low:.4g} to {high:.4g})"
+                depth = _absorber_depth(grid, dim)[face]
+                why = (
+                    f"the field there is being attenuated on purpose and "
+                    f"anything measured in it is meaningless. The absorber is "
+                    f"{cells} cells and {depth:.4g} mm deep at {axis}={end}, "
+                    f"so this sits {inside:.4g} mm inside it"
+                )
 
         findings.append(
             Finding(
                 REFUSE,
                 port.name,
-                f"its {what} sits at {axis}={position:.4g}, {where}; {why}. "
-                f"Move it further in, or raise ElementsPerWavelength or lower "
-                f"PMLCells to make the absorber thinner",
+                f"its {what} sits at {axis}={position:.4g}, {where}; {why}. {advice}",
             )
         )
     return findings

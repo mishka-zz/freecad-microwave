@@ -14,9 +14,11 @@ inventory to keep in step, and the failure it invites is the one this file is
 about: a third example added, committed broken, and covered by nothing.
 """
 
+import ast
 import importlib
 import math
 import pkgutil
+import re
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from pathlib import Path
@@ -24,7 +26,7 @@ from pathlib import Path
 import pytest
 
 import Microwave.Objects
-from tests import published
+from tests import published, stripline
 from tests.analytic import reference as analytic
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
@@ -845,3 +847,213 @@ class TestTheMeasuredLowPassIsTheBoardThatWasBuilt:
         assert sum(self.section(document, n)[0] for n in range(1, 8)) == pytest.approx(
             float(board["Length"]), abs=1e-9
         )
+
+
+class TestTheStriplineIsStillExact:
+    """The one example that can be scored rather than demonstrated.
+
+    ``stripline_50ohm.FCStd`` exists because a stripline is TEM and so has an
+    impedance in closed form, where every microstrip expression is a fit. Each
+    property below is what makes that true of this file, and each is an edit away
+    from being lost while the document still opens, translates, meshes and
+    solves: a fill with a permittivity from somewhere, a strip with loss in it, a
+    strip off the centre plane, walls that absorb, air between the drawing and
+    the walls. None of them changes the answer the note inside the document
+    names, and all but the strip's own position are settings rather than
+    geometry, so opening the file and looking at it would show nothing.
+
+    ``tests/test_stripline_document.py`` is the other half: what this translates
+    to is the structure the acceptance gate solves, line for line.
+    """
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def document():
+        with zipfile.ZipFile(EXAMPLES / "stripline_50ohm.FCStd") as opened:
+            return {name: opened.read(name) for name in opened.namelist()}
+
+    @staticmethod
+    def placement(document, name):
+        """One object's placement, as ``(x, y, z)``.
+
+        ``properties_of`` reads the ``value`` attribute every simple property
+        carries, and a placement has none - it carries a position and a
+        quaternion as attributes of its own.
+        """
+        root = ElementTree.fromstring(document["Document.xml"])
+        obj = next(o for o in root.find("ObjectData").iter("Object") if o.get("name") == name)
+        found = next(p for p in obj.iter("Property") if p.get("name") == "Placement")
+        held = found.find("PropertyPlacement")
+        return tuple(float(held.get(axis)) for axis in ("Px", "Py", "Pz"))
+
+    @classmethod
+    def cross_section(cls, document):
+        """The strip's width and the separation between the planes, in mm.
+
+        Read off the drawing rather than off the script that drew it: the closed
+        form answers about the shape in the file, and dimensions taken from
+        anywhere else would agree with themselves while the document said
+        something different.
+        """
+        return (
+            float(properties_of(document, "Strip")["Width"]),
+            float(properties_of(document, "Fill")["Height"]),
+        )
+
+    def test_the_fill_is_vacuum(self, document):
+        """Not a catalog laminate: the impedance depends on the fill through one
+        square root, so a permittivity resolved from a catalog would make the
+        reference no better than that catalog value.
+        """
+        assert set(bound_to(document, "FillBinding")) == {"Fill"}
+        fill = properties_of(document, "Vacuum")
+        assert enum_of(document, "Vacuum", "MaterialType") == "Dielectric"
+        assert float(fill["Permittivity"]) == 1.0
+        assert float(fill["Permeability"]) == 1.0
+        assert float(fill["LossTangent"]) == 0.0
+
+    def test_the_strip_is_a_perfect_conductor(self, document):
+        """A conducting sheet in its place gives the line a loss term the closed
+        form has none of, and the impedance picks up a reactance to match.
+
+        The binding is checked too: a port takes its metal from whatever its
+        trace is bound to, so a binding aimed elsewhere leaves the strip made of
+        something the document never says, whatever material sits in the tree.
+        """
+        assert set(bound_to(document, "StripBinding")) == {"Strip"}
+        assert enum_of(document, "PEC", "MaterialType") == "PEC"
+
+    def test_the_strip_is_centred_between_the_planes(self, document):
+        """What the word symmetric in the reference means. Off the centre plane
+        it is still a stripline and still solvable, and the mapping it is scored
+        against no longer describes it.
+        """
+        width, separation = self.cross_section(document)
+        assert self.placement(document, "Strip")[2] == pytest.approx(
+            self.placement(document, "Fill")[2] + separation / 2.0, abs=1e-9
+        )
+        assert self.placement(document, "Strip")[1] == pytest.approx(-width / 2.0, abs=1e-9)
+
+    def test_the_note_says_what_the_drawing_answers(self, document):
+        """The figure the file offers a reader, re-derived from the file: the
+        mapping is asked about the strip and the separation the document
+        actually holds, and the answer has to be the one the note names.
+        """
+        width, separation = self.cross_section(document)
+        exact = analytic.stripline_impedance(width, separation, 1.0)
+        text = properties_of(document, "ReadMe")["Text"]
+        assert f"{exact:.4f} ohm" in text, (
+            f"the note in the document does not name {exact:.4f} ohm, which is "
+            f"what a {width:g} mm strip between plates {separation:g} mm apart "
+            "has. EXACT_IMPEDANCE in examples/stripline_50ohm.py is where that "
+            "figure is transcribed; set it and build the document again"
+        )
+
+    def test_the_note_is_the_one_its_script_writes(self, document):
+        """The prose in the binary, against the prose in the script.
+
+        The script's note can be rewritten while every other check here goes on
+        passing, because the model in the file is still current. Rebuilding the
+        document is the fix, and this is what says it is due.
+
+        Read out of the source rather than imported: importing the script runs
+        FreeCAD, which this file is built to do without.
+        """
+        script = ast.parse((EXAMPLES / "stripline_50ohm.py").read_text(encoding="utf-8"))
+        written = {
+            target.id: node.value.value
+            for node in script.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant)
+        }
+        width, separation = self.cross_section(document)
+        expected = written["NOTE"].format(
+            width=width,
+            separation=separation,
+            length=float(properties_of(document, "Fill")["Length"]),
+            shield=float(properties_of(document, "Fill")["Width"]),
+            impedance=written["EXACT_IMPEDANCE"],
+        )
+        assert properties_of(document, "ReadMe")["Text"] == expected, (
+            "the note in stripline_50ohm.FCStd is not the note its script now "
+            "writes; build the document again"
+        )
+
+    def test_the_settings_the_note_names_are_settings_in_the_file(self, document):
+        """The advice the note gives has to be followable in the tree it ships
+        in: it names properties to move, and a property since renamed leaves
+        that pointing at nothing. Bare identifiers only - the note also quotes
+        an engine message verbatim, which is not a name in anything.
+        """
+        text = properties_of(document, "ReadMe")["Text"]
+        named = set(re.findall(r"`([A-Za-z]+)`", text))
+        carried = {
+            prop.get("name")
+            for prop in ElementTree.fromstring(document["Document.xml"]).iter("Property")
+        }
+        assert named, "the note names no property at all, so it tells a reader nothing to do"
+        assert named <= carried, (
+            f"the note in stripline_50ohm.FCStd names {sorted(named - carried)}, which "
+            "no object in the document carries - the advice it gives cannot be followed"
+        )
+
+    def test_the_line_is_shielded_and_absorbs_only_at_its_ends(self, document):
+        """The enclosure, drawn nowhere and the reason the line is exact: a
+        stripline is enclosed by conductor, so nothing radiates and no PML tuned
+        for another wave impedance reflects anything back. Set a conducting wall
+        to absorb and it stops being a ground plane.
+        """
+        for name, expected in (
+            ("BoundaryXMin", "PML"),
+            ("BoundaryXMax", "PML"),
+            ("BoundaryYMin", "PEC"),
+            ("BoundaryYMax", "PEC"),
+            ("BoundaryZMin", "PEC"),
+            ("BoundaryZMax", "PEC"),
+        ):
+            assert enum_of(document, "EMSolverOpenEMS", name) == expected
+
+    def test_nothing_stands_between_the_drawing_and_the_walls(self, document):
+        """Air outside a conducting wall is cells spent where the wall keeps the
+        field out - and it moves the shield away from where it was drawn, which
+        is the dimension the parasitic cutoff below is set by."""
+        for axis in ("Y", "Z"):
+            for side in ("Min", "Max"):
+                assert enum_of(document, "EMMeshPolicy", f"Padding{axis}{side}") == "Air"
+                assert int(properties_of(document, "EMMeshPolicy")[f"AirCells{axis}{side}"]) == 0
+
+    def test_the_line_runs_out_through_the_absorber(self, document):
+        """Give it air at its ends instead and it radiates off an open circuit,
+        and every impedance read from it is contaminated by the reflection."""
+        for side in ("Min", "Max"):
+            assert enum_of(document, "EMMeshPolicy", f"PaddingX{side}") == "Through"
+
+    def test_the_shield_stays_narrow_enough_to_be_one(self, document):
+        """``MSLPort`` drives from the strip to one ground plane, which is
+        asymmetric about the plane a stripline is symmetric about. The even half
+        of that drive cannot become a second TEM mode - the enclosure is one
+        conductor - so it goes into the shield's own waveguide modes, whose
+        cutoff is set by the shield's width. Widening the box to be generous to a
+        reference that describes infinite planes drops that cutoff into the band,
+        and the probes read a beat rather than a line.
+
+        Asked of ``tests/stripline.py``, which owns the rule: a copy of the
+        expression could lose the fill term, which does nothing at vacuum and
+        everything if this example ever took a laminate.
+        """
+        shield = float(properties_of(document, "Fill")["Width"])
+        top = float(properties_of(document, "EMAnalysis")["FrequencyStop"])
+        cutoff = stripline.parasitic_cutoff(
+            shield, float(properties_of(document, "Vacuum")["Permittivity"])
+        )
+        assert top < cutoff, (
+            f"the band runs to {top / 1e9:.4g} GHz and this shield's first "
+            f"waveguide mode cuts on at {cutoff / 1e9:.4g} GHz"
+        )
+
+    def test_the_port_is_referenced_to_the_line_it_measures(self, document):
+        """Against fifty ohms instead, ``|S11|`` says how near fifty the line is
+        rather than how little it reflects - and how little it reflects is the
+        one reading here that says the absorber is doing its job."""
+        assert enum_of(document, "Port1", "ReferencedTo") == "Port impedance"

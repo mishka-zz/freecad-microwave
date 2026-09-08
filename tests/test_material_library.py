@@ -367,11 +367,12 @@ class TestTheBundledCatalog:
                 assert entry.measured_at > 0, entry.id
 
 
-class TestThingsThatUsedToBeSilent:
+class TestFailuresThatCouldPassInSilence:
     def test_a_file_that_is_not_utf8_is_a_failure_not_an_exception(self, tmp_path):
-        """``UnicodeDecodeError`` is a ValueError, not an OSError, so it used to
-        escape ``load_library``'s handler and take down every other catalog -
-        which is exactly what that function promises cannot happen."""
+        """``UnicodeDecodeError`` is a ValueError, not an OSError, so a handler
+        catching only the latter lets it escape ``load_library`` and take down
+        every other catalog - which is what that function promises cannot
+        happen."""
         (tmp_path / "latin.toml").write_bytes(
             'schema = 1\n[catalog]\nid = "x"\nname = "Caf\xe9"\nversion = "1"\n'.encode("latin-1")
         )

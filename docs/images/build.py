@@ -24,6 +24,8 @@ those - and nothing here is solved.
 
 import contextlib
 import os
+import pathlib
+import struct
 import time
 
 import FreeCAD
@@ -174,12 +176,38 @@ def lifted(obj):
         obj.Placement.Base = base
 
 
+#: PNG chunks carrying text rather than pixels. ``saveImage`` writes the file's
+#: own absolute path into ``Title``, which on a published repository is the
+#: author's home directory and username, and the camera matrix into
+#: ``Description``. All four are ancillary: a decoder that drops them decodes
+#: the same image.
+_TEXT_CHUNKS = (b"tEXt", b"zTXt", b"iTXt")
+
+
+def _strip_text(path):
+    """Drop every text chunk from a PNG, keeping the pixels byte for byte."""
+    data = pathlib.Path(path).read_bytes()
+    kept = [data[:8]]
+    at = 8
+    while at < len(data):
+        length = struct.unpack(">I", data[at : at + 4])[0]
+        kind = data[at + 4 : at + 8]
+        end = at + 12 + length
+        if kind not in _TEXT_CHUNKS:
+            kept.append(data[at:end])
+        at = end
+        if kind == b"IEND":
+            break
+    pathlib.Path(path).write_bytes(b"".join(kept))
+
+
 def save(name, width=1000, height=560):
     path = os.path.join(HERE, name)
     with lifted(FreeCAD.ActiveDocument.getObject("Trace")):
         for _ in range(3):
             FreeCADGui.updateGui()
         view().saveImage(path, width, height, "White")
+    _strip_text(path)
     print(f"wrote {name} ({os.path.getsize(path)} bytes)")
 
 

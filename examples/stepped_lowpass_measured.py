@@ -13,7 +13,7 @@ from 0 to 10 GHz.
 Why this one and not ``stepped_lowpass_synthesised.FCStd``
 ----------------------------------------------------------
 
-They answer different questions and the difference is the point of having both.
+They answer different questions, which is why both are shipped.
 
 Its sibling is synthesised here, by the textbook route, and exists to show that
 route failing - the corner low, the stopband shallow, the response re-entrant,
@@ -48,13 +48,13 @@ the published constants they are.
 What the paper does not give
 -----------------------------
 
-Three things, and each is a choice made here rather than a fact taken from it:
+Each of these is a choice made here rather than a fact taken from the paper:
 
 - **the feed lines.** Table 1 is the filter alone. Figure 2 shows a board with an
   SMA at each end, and neither the lead length nor the board outline is stated.
-  So the leads are this repository's own 50 ohm line at the length the other
-  examples use, which is long enough for the port's evanescent field to have
-  gone before the first step.
+  So the leads are this repository's own 50 ohm line at ``LEAD_LENGTH``, the
+  same length the synthesised board beside it uses, which is long enough for
+  the port's evanescent field to have gone before the first step.
 - **the copper.** No thickness is given; one ounce, at annealed copper's
   conductivity, as everywhere else here.
 - **the laminate.** ``eps_r = 4.4`` and ``tan_d = 0.02`` are FR4's nominal
@@ -72,8 +72,10 @@ dissipation at the corner and understates it at the top.
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
-    /Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd \\
-        examples/stepped_lowpass_measured.py
+    freecadcmd examples/stepped_lowpass_measured.py
+
+``freecadcmd`` ships inside the FreeCAD installation. On macOS it is
+``FreeCAD.app/Contents/Resources/bin/freecadcmd``.
 
 It writes beside itself. Set ``OUT`` to put the document somewhere else.
 """
@@ -169,8 +171,9 @@ def geometry(doc):
     """What the user draws: a board, a ground plane and the line above it.
 
     Both conductors are faces rather than solids, as in the other examples, and
-    each section is its own sheet butted against its neighbour - translation
-    proves every shape fills its bounding box, which a stepped trace does not.
+    each section is its own sheet butted against its neighbour. Translation cuts
+    a stepped outline into rectangles by itself, so this says the sections in
+    the file rather than leaving them to be read back out of one.
     """
     board = doc.addObject("Part::Box", "Substrate")
     board.Length, board.Width, board.Height = LENGTH, BOARD, HEIGHT

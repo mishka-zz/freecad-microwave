@@ -1,169 +1,167 @@
-# Spending a length across three axes
+# Cell allocation across three axes
 
-When something in a drawing is 0.2 mm thick and the grid has to resolve it, how
-large may a cell be? On a cubic grid the answer is obvious and useless. This
-page derives the answer for a grid whose three axes are sized independently,
-which is the grid openEMS actually solves on.
+When resolving a geometric feature of thickness $t$ on an anisotropic Cartesian
+grid, cell dimensions $h_x, h_y, h_z$ along each axis must be chosen
+appropriately. In openEMS, grid coordinates are specified independently for each
+axis. This document derives the cell allocation criteria required to resolve
+geometric features and maintain physical connectivity under Yee point sampling.
 
-## The setting
+## Simulation grid and point sampling
 
-openEMS is an FDTD solver. It divides space into a rectilinear grid - a stack of
-boxes whose x, y and z sizes are each chosen separately - and steps the electric
-and magnetic fields forward in time on it. Nothing here is about how that
-stepping works. It is about one question asked before any of it: given a length
-in the drawing that the simulation must not miss, what does that length demand
-of each axis?
+In FDTD, openEMS discretizes space on a rectilinear Yee grid with independent cell
+spacings $h_x, h_y, h_z$. 
 
-Write `h_x`, `h_y`, `h_z` for the cell sizes and `t` for the length. A rule
-relating them is what this page is for.
+For electric field components directed along axis $n$, openEMS samples material
+properties at a single point whose other two coordinates lie on primary grid lines
+and whose $n$-th coordinate lies at the cell midpoint (`Operator::GetYeeCoords`,
+`openEMS/FDTD/operator.cpp:183`).
 
-## Everything follows from point sampling
+Because conductors are evaluated by point sampling rather than volumetric
+integration, a conductor feature that contains no Yee sample points will be
+omitted from the discrete model. Consequently, cell dimensions must be bounded to
+guarantee that sample points fall within conductor boundaries.
 
-openEMS decides what material a cell is made of by looking at **one point**. For
-the electric-field component pointing along axis `n`, it reads the material at
-the point whose other two coordinates lie exactly on grid lines, and whose `n`th
-coordinate is the midpoint of the cell (`Operator::GetYeeCoords`,
-`openEMS/FDTD/operator.cpp:182`, with the dual line the arithmetic mean of its
-neighbours).
-
-That is the whole mechanism, and every rule below is a consequence of it. If a
-sliver of metal happens to contain none of those sample points, openEMS does not
-model a thin conductor - it models no conductor at all, finishes cleanly, and
-reports about a different device.
-
-Dielectrics work differently: openEMS averages material over the cell
-(`Operator::AverageMatQuarterCell`, `openEMS/FDTD/operator.cpp:1447`) rather
-than sampling it, so none of the sampling argument applies to them. They get
-their own treatment at the end.
+Dielectric materials are handled differently: openEMS averages dielectric
+permittivity over each quarter cell (`Operator::AverageMatQuarterCell`,
+`openEMS/FDTD/operator.cpp:1437`). Dielectric layer resolution is addressed in
+the dielectric section below.
 
 ## The basic inequality
 
-Take a slab of thickness `t` whose faces are perpendicular to a unit vector `m`.
-Take the point at the middle of the slab and round each of its coordinates to
-the nearest sample coordinate on that axis. Each coordinate moves by at most
-`h_i / 2`, so the position along `m` moves by at most
+Consider a slab of thickness $t$ whose surface normal is unit vector $\mathbf{m}$.
+Rounding the center of the slab to the nearest Yee sample coordinate on each axis
+shifts position along $\mathbf{m}$ by at most:
 
-    sum_i |m_i| h_i / 2
+$$\frac{1}{2} \sum_i |m_i| h_i$$
 
-If that is no more than `t/2`, the rounded point is still inside the slab. So
+To guarantee that the sample point remains inside the slab, this displacement must
+not exceed $t/2$. Therefore, the sufficient condition is:
 
-    sum_i |m_i| h_i <= t
+$$\sum_i |m_i| h_i \le t$$
 
-is sufficient. Reading `h_i` as an upper bound on the local cell size rather
-than one particular cell keeps this true where cells vary in size: along a
-component's own axis the sample spacing is the dual one, half the sum of the two
-neighbouring cells, which is bounded by the larger of them.
+Here $h_i$ represents the local cell size upper bound. Because Yee sample points
+for field components along axis $i$ are spaced at dual-grid intervals
+$(h_{i,k} + h_{i,k+1})/2 \le \max(h_{i,k}, h_{i,k+1})$, this inequality holds for
+non-uniform grids. This bound is independent of absolute grid origin or translation.
 
-Notice what the argument never mentions: where the grid *starts*. The guarantee
-does not depend on the grid's offset, so refining toward it always helps and
-never has to be searched for.
+## Directional criteria
 
-## Two questions, not one
+The inequality above applies across different direction sets depending on the
+geometric condition being enforced:
 
-The inequality above gets asked in two different directions, because two
-different things can go wrong.
+1. **Separation (Maintaining conductor gaps)**:
+   A gap between two conductors can only close along its surface normal $\mathbf{m}$.
+   Evaluating the inequality along $\mathbf{m}$:
+   - For axis-aligned faces, $m_i = 0$ on two axes, so only the normal axis is
+     constrained. Transverse cell dimensions remain unconstrained.
+   - For diagonal faces, all three axes contribute, requiring approximately cubic
+     cells.
 
-**Does the gap stay open?** A gap between two conductors can only close along
-its own normal, so this is the inequality evaluated at that normal. An
-axis-aligned face has `m_i = 0` on two axes and those drop out of the sum
-entirely - which is why ordinary rectangular geometry constrains only its own
-axis, and why cells may be long and thin there at no cost. A diagonal face puts
-all three axes into the sum, so cells come out near-cubic where the geometry is
-diagonal and nowhere else.
+2. **Connection (Maintaining conductor continuity)**:
+   In openEMS, conducting edges must form continuous electrical paths. Conductor
+   boundaries are discretized by setting tangential electric field edges to zero
+   (`Operator::CalcPEC_Range`, `openEMS/FDTD/operator.cpp:2029`). Two discrete
+   edges conduct current between them only if they share a Yee grid node. A thin
+   diagonal wire sampled without adequate cell resolution can break into isolated
+   corner-touching cells, creating an electrical open circuit.
+   Ensuring conductor continuity requires satisfying the condition in all possible
+   directions. By the Cauchy-Schwarz inequality, the maximum of
+   $\sum_i |m_i| h_i$ over all unit vectors $\mathbf{m}$ is $\sqrt{\sum_i h_i^2}$.
+   The continuity condition is therefore:
 
-**Does the conductor still conduct?** This one has no direction. A sample
-landing inside a conductor is not enough: openEMS zeroes field *edges*
-(`Operator::CalcPEC_Range`, `openEMS/FDTD/operator.cpp:2045`), and two zeroed
-edges carry current between them only if they share a node. A thin diagonal wire can therefore be sampled into a
-chain of cells that touch at corners only, which is electrically an open
-circuit. What is actually wanted is that the conductor contain a whole
-cell-sized neighbourhood along its length - the same expression, but at its
-worst direction. By Cauchy-Schwarz the largest that `sum_i |m_i| h_i` can be
-over all unit `m` is `sqrt(sum_i h_i^2)`, so the rule is
+   $$\sqrt{\sum_i h_i^2} \le t$$
 
-    sqrt(sum_i h_i^2) <= t
+3. **Edge singularities**:
+   Sharp geometric edges create electromagnetic field singularities with steep
+   gradients perpendicular to the edge tangent $\boldsymbol{\tau}$, but zero gradient
+   along the tangent. The inequality is evaluated over the circle of unit vectors
+   orthogonal to $\boldsymbol{\tau}$ ($\mathbf{u} \cdot \boldsymbol{\tau} = 0$).
+   This directional formulation ensures rotation invariance: rotating the edge
+   in space produces consistent cell sizes regardless of grid alignment.
 
-Because both are stated against the same `t`, they can be compared, and
-connection is the stronger of the two: satisfy it and separation holds at every
-normal at once, by Cauchy-Schwarz again. They coincide only at a body diagonal,
-where the cell is cubic and the two say the same thing.
+   The criterion is stated over a plane rather than over a named pair of
+   directions, and the difference is not cosmetic. A demand written per face
+   normal bounds each normal and leaves the direction between the two faces
+   free: at a right angle that direction costs the ordinary diagonal price,
+   and on a nearly closed blade it is unbounded. Two drawings of one wedge
+   differing only by a rotation would then mesh several times apart, and
+   furthest apart where the singularity is strongest.
 
-## One inequality, three unknowns
+These three criteria form a hierarchy: satisfying the connection criterion guarantees
+that the edge criterion holds for any tangent $\boldsymbol{\tau}$, which in turn
+guarantees that separation holds along any normal orthogonal to the edge.
 
-Either rule is a single inequality in three variables, so on its own it does not
-determine an answer - it needs something to minimise. The choice made here is a
-weighted count of grid lines, `sum_i w_i / h_i`, which is what a finer axis
-costs.
+## Cell size optimization across axes
 
-With a Lagrange multiplier `lambda`:
+Each criterion provides a constraint on $h_x, h_y, h_z$. To determine specific
+values, the mesher minimizes a cost metric representing grid density:
+$\sum_i w_i / h_i$, which is what a finer axis costs in grid lines. Every
+weight in the mesher is one, and no caller varies them; the weighted form below
+shows what the equal-weight case drops.
 
-- **Separation.** Differentiating `sum_i w_i/h_i + lambda(sum_i |m_i| h_i - t)`
-  gives `h_i = sqrt(w_i / (lambda |m_i|))`. Substituting back so the constraint
-  is exactly tight gives
+Using Lagrange multipliers:
 
-      h_i = t sqrt(w_i / |m_i|) / sum_j sqrt(w_j |m_j|)
+- **Separation constraint** ($\sum_i |m_i| h_i = t$):
+  $$h_i = \frac{t \sqrt{w_i / |m_i|}}{\sum_j \sqrt{w_j |m_j|}}$$
 
-- **Connection.** Against `sum_i h_i^2 = t^2` the same procedure gives
-  `-w_i/h_i^2 = 2 lambda h_i`, so `h_i^3` is proportional to `w_i`, and making
-  the constraint tight gives
+- **Connection constraint** ($\sum_i h_i^2 = t^2$):
+  $$h_i = \frac{t w_i^{1/3}}{\sqrt{\sum_j w_j^{2/3}}}$$
+  With equal weights ($w_i = 1$), this yields $h_i = t / \sqrt{3}$ on all three
+  axes, corresponding to a cubic cell whose space diagonal equals $t$.
 
-      h_i = t w_i^(1/3) / sqrt(sum_j w_j^(2/3))
+- **Edge constraint** ($\max_{\mathbf{u} \cdot \boldsymbol{\tau} = 0} \sum_i |u_i| h_i \le t$):
+  Evaluating the maximum over the orthogonal circle yields the closed form:
+  $$\max_{\mathbf{u} \cdot \boldsymbol{\tau} = 0} \sum_i |u_i| h_i = \sqrt{\sum_i h_i^2 - \min_{\mathbf{s} \in \{-1, 1\}^3} \left( \sum_i s_i h_i |\tau_i| \right)^2}$$
+  The constraint is a family, one separation per direction on the circle, so the
+  multiplier route would need the active directions and those move with the
+  tangent. The mesher fixes the shape of the answer instead and buys feasibility
+  with one scalar. It states the separation profile against the largest share
+  $|u_i|$ the circle reaches on each axis, $c_i = \sqrt{1 - \tau_i^2}$, giving
+  $g_i = 1 / \sqrt{c_i}$, and scales $g$ until the maximum above equals $t$.
 
-In the code every weight is one, which collapses these to the two functions
-`separation` and `connection`. The general form is written down here because it
-is what those specialise, not because a caller may vary it: a weight would carry
-the fact that a line on one axis costs a whole plane of cells, whose size is the
-product of the other two axes, and nothing in the workbench measures that. A
-parameter with nothing to do is worse than the formula it hides.
+  The scale follows from the criterion: any profile is feasible once scaled, and
+  tightness is what the criterion asks for. The profile is a judgement. This one
+  was chosen by pricing candidates against the numerically optimal line count
+  over random tangents, which it tracks to within a few percent. For an
+  axis-aligned edge the criterion is connection in the plane and the allocation
+  is exact: $t / \sqrt{2}$ on the two transverse axes, leaving the tangent axis
+  unconstrained.
 
-At equal weights, connection reduces to `t / sqrt(3)` on every axis - the cell
-whose body diagonal is exactly `t`, which reads simply as *a cell fits inside
-the feature*.
+### Formulation continuity
 
-## Why not minimise the cell count
+An alternative approach of minimizing total cell count $\prod_i (1 / h_i)$ leads to
+allocating $h_i = t / (k |m_i|)$ only across the $k$ non-zero normal components.
+However, this piecewise formulation is discontinuous: a face tilted by a fraction of
+a degree jumps from one active axis to two, abruptly halving the cell size.
+CAD models routinely contain slight misalignments from geometric tolerances. The
+formulation chosen here is continuous as $m_i \to 0$, avoiding mesh instabilities.
 
-The obvious alternative is to minimise the total number of cells, which gives an
-equal share among only the axes the normal actually touches:
-`h_i = t / (k |m_i|)` over the `k` axes where `m_i` is nonzero.
+## Dielectric layer discretization
 
-That is discontinuous, and the discontinuity is not academic. A face a
-thousandth of a degree off axis goes from one active axis to two, and the answer
-halves. Geometry arriving from a CAD kernel is never exactly axis-aligned, so
-imperfect input is a requirement rather than an edge case, and continuity
-outranks the cell count. The chosen objective is continuous as `m_i` approaches
-zero - with a square-root cusp there rather than a smooth one, which is worth
-knowing when reading its tests.
+Unlike conductors, dielectric materials are not point-sampled; openEMS volume-averages
+permittivity across each cell. For thin dielectric layers, the numerical requirement
+is to resolve field variations across the layer with a specified number of cells $n$.
 
-## Counting cells instead of fitting one
+For a planar dielectric layer of thickness $t$ and normal $\mathbf{m}$, the layer's
+spatial extent along axis $i$ is $t / |m_i|$. Placing $n$ cells along this span would
+suggest setting $h_i = t / (n |m_i|)$.
 
-Everything above asks that a single cell *fit* somewhere, which is what point
-sampling needs. A dielectric is not point-sampled - openEMS averages it over the
-cell - so a thin dielectric asks for something else entirely: that the field
-varying *across* the layer be carried by more than one cell. That is a count.
+However, grid planes on two axes coincide wherever those axes carry the same
+pitch, which the allocation above produces whenever their normal components are
+equal. A ray traversing a layer tilted at 45° then crosses the planes of both
+axes at the same points, encountering half the anticipated cell count.
 
-A slab of thickness `t` and normal `m` spans `t / |m_i|` along axis `i`, so
+To guarantee that at least $n$ distinct Yee cells span the layer regardless of grid
+orientation or coordinate alignment, the allocation is scaled to the dominant axis
+component:
 
-    h_i = t / (n |m_i|)
+$$h_i = \frac{t \max_j (m_j^2)}{n |m_i|}$$
 
-puts `n` cells across that span on every axis at once. Walking along the normal,
-the axis-`i` planes go by at `|m_i| / h_i` per unit length, so altogether they
-arrive at `sum_i |m_i|/h_i = n sum_i m_i^2 / t = n/t`. The pitch along the normal
-is exactly `t/n`, whatever the normal is and wherever the grid sits. At an
-axis-aligned normal this is `t/n` on that axis and nothing on the other two,
-which is exactly the rule an axis-aligned box already gets - so a layer drawn
-curved is counted the same as the same layer drawn flat.
+Along the dominant axis $k$, the projected thickness is $t |m_k|$ and the cell size is:
+$$h_k = \frac{t m_k^2}{n |m_k|} = \frac{t |m_k|}{n}$$
+This ensures that the layer is spanned by at least $n$ cells along the dominant axis
+under any grid translation. For axis-aligned layers ($\max_j (m_j^2) = 1$), this
+formulation reduces exactly to $h_k = t / n$.
 
-This expression has the shape of the rejected one above but not its fault, and
-the difference is worth reading twice. Its divisor is a count somebody asked
-for, where the rejected one's was the number of axes the normal happened to
-touch. A declared number does not jump when a face tilts, so `t / (n |m_i|)` is
-continuous: it releases an axis by sending it to infinity as `m_i` goes to zero,
-rather than by redistributing what that axis was holding.
-
-**A pitch is not a tally.** Where a slab's faces land on grid lines - which is
-what a box gets and a triangulation never does - `n` cells lie across it and
-that is the end of it. Off axis the pitch is still exactly `t/n`, but the planes
-that any *particular* ray through the layer meets are that rate realised on three
-coarser axis pitches, so where the grid happens to sit decides whether that ray
-meets one fewer. The count is delivered as a spacing, not as a promise about any
-single line through the layer.
+The mesh report verifies layer resolution by casting rays across the completed
+non-uniform mesh, confirming cell counts against the generated grid.

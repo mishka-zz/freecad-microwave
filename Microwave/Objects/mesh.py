@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Any
+
 import FreeCAD
 
 from ._vp_hook import ViewProviderRestored
@@ -9,48 +14,48 @@ from ._vp_hook import ViewProviderRestored
 class EMMeshRegion(ViewProviderRestored):
     """Local sizing: change how big the elements around this geometry are.
 
-    Absolute lengths, where ``EMMeshPolicy`` is per wavelength. Global
-    sizing resolves the *wave*, whose scale is lambda; a region resolves a
-    *feature*, whose scale is millimetres. Upstream openEMS agrees: every local
-    override in its tutorials is a length or a divisor of the bulk, never a
+    Sizes here are absolute lengths, where ``EMMeshPolicy`` is per wavelength.
+    Global sizing resolves the wave, whose scale is lambda, and a region
+    resolves a feature, whose scale is millimetres. openEMS spells it the same
+    way: ``MSL_Losses.m`` sets its local overrides as lengths and never as a
     cells-per-wavelength figure.
 
-    It points both ways, and the two directions are not mirror images.
+    The object points in both directions, and the two are not mirror images.
 
-    ``Refine`` covers a **box** - the bounding box of what it names - and asks
-    for elements no larger than ``ElementSize`` anywhere inside it. Asking for
-    something coarser than the mesher's own ceiling is refused by name, because
-    a refinement that coarsens is a contradiction rather than a request.
+    ``Refine`` covers a box - the bounding box of what it names - and asks for
+    elements no larger than ``ElementSize`` anywhere inside it. Asking for
+    something coarser than the mesher's own ceiling is refused by name. A
+    refinement that coarsens is a contradiction rather than a request.
 
-    ``MinElementsAcross`` beside it asks for a **count**, and a count is spent on
-    each axis against that axis' own span. So it costs nothing along a direction
-    the box is long in, and it is the way to resolve something narrow without
-    refining everything level with it. It reaches every axis the box has extent
-    on, a thickness included.
+    ``MinElementsAcross`` beside it asks for a count, and a count is spent on
+    each axis against that axis' own span. It therefore costs nothing along a
+    direction the box is long in, and it is the way to resolve something narrow
+    without refining everything level with it. It reaches every axis the box has
+    extent on, a thickness included.
 
-    ``Coarsen`` attaches to the **object**, and lets that object's own demands
-    settle for ``ElementSize`` rather than the size they would otherwise ask
-    for. It is deliberately not a box. A rectilinear grid is separable, so a box
-    spends itself on a slab through the model along each axis: a refinement that
-    overshoots that way hands out elements nobody asked for, while the opposite
-    would take them away from whatever else happens to lie level with the box,
-    anywhere in the model. Naming the object cannot reach past it.
+    ``Coarsen`` attaches to the object, and lets that object's own demands settle
+    for ``ElementSize`` rather than the size they would otherwise ask for. It is
+    not a box. A rectilinear grid is separable, so a box spends itself on a slab
+    through the model along each axis. A refinement that overshoots that way
+    hands out elements nobody asked for, and coarsening that way would take
+    elements from whatever else lies level with the box, anywhere in the model.
+    Naming the object cannot reach past it.
 
-    What ``Coarsen`` never moves is where the elements *are*. Faces, port planes
-    and sheets are pinned whatever the sizing says, so the geometry the solver
-    is given is the geometry that was drawn; what changes is how many elements
-    are spent following it. Nor can it coarsen past the global ceiling, which
-    bounds every element in the model.
+    ``Coarsen`` never moves where the elements are. Faces, port planes and
+    sheets are pinned whatever the sizing says, so the solver is given the
+    geometry that was drawn, and what changes is how many elements are spent
+    following it. It also cannot coarsen past the global ceiling, which bounds
+    every element in the model.
 
-    What it gives up is everything that geometry was asking for, and not only
-    the bulk size: a conductor's edge treatment, a dielectric's own element
-    count, a curve's fidelity. A gap between the coarsened object and something
-    else is the exception and stays, because a separation belongs to both and
-    one of them settling for less is not the other agreeing.
+    It gives up everything that geometry was asking for, and not only the bulk
+    size: a conductor's edge treatment, a dielectric's own element count, a
+    curve's fidelity. A gap between the coarsened object and something else is
+    the exception and stays. A separation belongs to both objects, so
+    coarsening one does not coarsen the gap between them.
 
-    Neutral, like every object in this layer: "element" covers an FDTD cell, a
-    MoM segment and an FEM tetrahedron, and all three meshers size locally. What
-    each backend does with it is its own business.
+    This object is neutral, like every object in this layer. "Element" covers an
+    FDTD cell, a MoM segment and an FEM tetrahedron, and all three meshers size
+    locally. Each backend decides what to do with it.
     """
 
     def __init__(self, obj):
@@ -63,8 +68,8 @@ class EMMeshRegion(ViewProviderRestored):
         )
         obj.Mode = ["Refine", "Coarsen"]
 
-        # LinkSubList, matching EMMaterialBinding.References: a refinement
-        # region is just as likely to be aimed at a face as at a whole solid.
+        # LinkSubList, matching EMMaterialBinding.References. A refinement
+        # region is as likely to be aimed at a face as at a whole solid.
         obj.addProperty(
             "App::PropertyLinkSubList",
             "References",
@@ -84,11 +89,11 @@ class EMMeshRegion(ViewProviderRestored):
         )
         obj.ElementSize = 0.0
 
-        # Zero inherits EMMeshPolicy.MinElementsAcross, whose value this takes
-        # but whose rule it does not: the global count is dielectrics only, so
-        # a region is also how a conductor gets a count when one is genuinely
-        # wanted. And a 50 um bond layer and a 1.6 mm core want different
-        # counts, which one global integer cannot express either.
+        # Zero inherits EMMeshPolicy.MinElementsAcross. It takes that value but
+        # not that rule: the global count covers dielectrics only, so a region is
+        # also how a conductor gets a count when one is wanted. A 50 um bond
+        # layer and a 1.6 mm core also want different counts, which one global
+        # integer cannot express.
         obj.addProperty(
             "App::PropertyInteger",
             "MinElementsAcross",
@@ -122,24 +127,30 @@ class EMMeshRegion(ViewProviderRestored):
 class EMMeshPolicy(ViewProviderRestored):
     """Mesh policy: solver-neutral intent, in the vocabulary every mesher shares.
 
-    "Element" rather than "cell" throughout, deliberately. A cell is FDTD's
-    word, a segment is MoM's and a tetrahedron is FEM's, and this object is
-    read by all three - naming it after the first backend is exactly what the
-    adapter architecture exists to avoid. Inside ``Solvers/openems/`` the FDTD
-    words are correct and are used.
+    "Element" rather than "cell" throughout. A cell is FDTD's word, a segment is
+    MoM's and a tetrahedron is FEM's, and all three backends read this object,
+    so it is not named after any one of them. Inside ``Solvers/openems/`` the
+    FDTD words are correct and are used.
 
-    Sizing is **per wavelength, never in millimetres**, and that is load-
-    bearing. A remembered millimetre value silently under-resolves the moment
-    the permittivity or the frequency is raised. Local refinement is the
-    opposite - absolute - because it resolves a *feature*, whose scale is
-    millimetres, rather than the *wave*, whose scale is lambda. See
-    ``EMMeshRegion``.
+    Sizing is per wavelength and never in millimetres. A remembered millimetre
+    value silently under-resolves the moment the permittivity or the frequency
+    is raised. Local refinement is absolute instead, because it resolves a
+    feature, whose scale is millimetres, rather than the wave, whose scale is
+    lambda. See ``EMMeshRegion``.
 
     The defaults are openEMS' own, from ``MSL_Losses.m``: bulk elements at
     lambda/20 in the slowest material in the model, conductor edges six times
-    finer. The *refinement* is the load-bearing part - at the same element
-    count, coarsening it to a third moves the microstrip gate's extracted
-    impedance by more than the whole tolerance. See ``tests/test_solver.py``.
+    finer. The refinement is what resolves the field at a conductor edge, which
+    is where a planar line's impedance is set and where the bulk size does not
+    reach.
+
+    How far a coarser refinement reaches is bounded by the mesher rather than
+    here. A conductor's width is held to a share of itself whatever this asks
+    for, so below some refinement the width rule sizes a narrow trace and
+    coarsening further stops changing the mesh across it.
+    ``tests/test_acceptance_microstrip.py`` solves one such line across the range
+    this property is meant to be moved over, prints where the two rules part
+    company and prints what that range costs against what the gate can see.
     """
 
     def __init__(self, obj):
@@ -150,9 +161,9 @@ class EMMeshPolicy(ViewProviderRestored):
             "Elements per wavelength in the slowest material, at the top of the band",
         )
         obj.ElementsPerWavelength = 20.0
-        # A float, not an integer: bisecting to 3 or 4.5 during a convergence
-        # study is ordinary work, and a whole step is a large move on the knob
-        # this class's docstring calls the load-bearing one.
+        # A float rather than an integer, because bisecting the default during a
+        # convergence study is ordinary work and the first bisection is not a
+        # whole number.
         obj.addProperty(
             "App::PropertyFloat",
             "EdgeRefinement",
@@ -161,9 +172,9 @@ class EMMeshPolicy(ViewProviderRestored):
         )
         obj.EdgeRefinement = 6.0
 
-        # One ratio, not three. Per-axis grading is rectilinear-specific and so
-        # does not belong on a neutral object; the mesher still takes a triple,
-        # so this can be re-expanded if a model ever needs it.
+        # One ratio rather than three. Per-axis grading is rectilinear-specific
+        # and does not belong on a neutral object. The mesher still takes a
+        # triple, so this can be re-expanded if a model ever needs it.
         obj.addProperty(
             "App::PropertyFloat",
             "MaxGrowthRatio",
@@ -173,10 +184,10 @@ class EMMeshPolicy(ViewProviderRestored):
         obj.MaxGrowthRatio = 1.3
 
         # MSL_Losses.m spans its substrate with linspace(0, thickness, 10). A
-        # thin substrate carries the whole field, so one element across it is
-        # not an approximation, it is a different problem. Dielectrics only:
-        # a conductor has no field inside it to sample, and spanning a foil
-        # with this count sets the smallest element in the model.
+        # thin substrate carries the whole field, so one element across it
+        # states a different problem rather than approximating this one.
+        # Dielectrics only: a conductor has no field inside it to sample, and
+        # spanning a foil with this count sets the smallest element in the model.
         obj.addProperty(
             "App::PropertyInteger",
             "MinElementsAcross",
@@ -185,10 +196,36 @@ class EMMeshPolicy(ViewProviderRestored):
         )
         obj.MinElementsAcross = 9
 
-        # Zero means "derive it". This is a floor against degenerate geometry -
-        # a 1 um sliver from a CAD boolean sets the timestep for the whole
-        # simulation - and not a way to shape the grid: set anywhere near the
-        # element sizes it starts refusing features the user is entitled to mesh.
+        # Zero asks for nothing. A curved surface reaches a solver as flat facets
+        # whose chords lie off the arc, and the CAD kernel decides for itself how
+        # close it comes to the drawing: wide bands of requests come back as one
+        # mesh. Setting this holds the surface to a distance instead, and refuses
+        # where that distance cannot be reached rather than quietly missing it.
+        #
+        # A length rather than a share of anything. How evenly the surface is
+        # parameterised sets what leaving the kernel's own band costs, so one
+        # share of a radius costs very different work on two shapes. The run also
+        # reports the departure as a length, so what is asked for and what comes
+        # back are comparable.
+        #
+        # This is not the fidelity the mesh is held to. That one is a share of a
+        # radius, and it governs where elements go rather than what shape they
+        # are laid on.
+        obj.addProperty(
+            "App::PropertyLength",
+            "CurveTolerance",
+            "Mesh",
+            "How far a curved surface may be solved from where it was drawn"
+            " (0 = whatever the CAD kernel gives unasked). Costs facets, and"
+            " refuses if it cannot be reached",
+        )
+        obj.CurveTolerance = 0.0
+
+        # Zero means derive it. This is a floor against degenerate geometry: a
+        # 1 um sliver from a CAD boolean sets the timestep for the whole
+        # simulation. It is not a way to shape the grid. Set anywhere near the
+        # element sizes, it starts refusing features the user is entitled to
+        # mesh.
         obj.addProperty(
             "App::PropertyLength",
             "MinElementSize",
@@ -197,12 +234,12 @@ class EMMeshPolicy(ViewProviderRestored):
         )
         obj.MinElementSize = 0.0
 
-        # 8 is also openems.write.DEFAULT_PADDING, and the element is the one
-        # air is meshed at - the bulk size in vacuum - so eight of them is
-        # eight ElementsPerWavelength-ths of a free-space wavelength at the top
-        # of the band, 0.4 of one at the 20 above, whatever the substrate is.
-        # The calibration against openEMS' own tutorials is on that constant; a
-        # test asserts the two stay equal, since this layer may not import an
+        # 8 is also openems.plan.DEFAULT_PADDING. The element is the one air is
+        # meshed at - the bulk size in vacuum - so eight of them is eight
+        # ElementsPerWavelength-ths of a free-space wavelength at the top of the
+        # band, and 0.4 of one at the 20 above, whatever the substrate is. The
+        # calibration against openEMS' own tutorials sits on that constant. A
+        # test asserts the two stay equal, because this layer may not import an
         # adapter.
         for axis in ["X", "Y", "Z"]:
             for side in ["Min", "Max"]:
@@ -216,8 +253,8 @@ class EMMeshPolicy(ViewProviderRestored):
                 )
                 setattr(obj, pname, 8)
 
-        # Per-face, and deliberately not inferred: what Through does to the
-        # domain, and why a line needs it, is in openems.policy._padding.
+        # Per-face, and not inferred. What Through does to the domain, and why a
+        # line needs it, is in openems.policy._padding.
         for axis in ["X", "Y", "Z"]:
             for side in ["Min", "Max"]:
                 pname = f"Padding{axis}{side}"
@@ -242,8 +279,8 @@ class EMMeshPolicy(ViewProviderRestored):
         return None
 
 
-def createEMMeshPolicy(doc=None):
-    """The mesh policy, unowned. Filing it away is the analysis's job."""
+def createEMMeshPolicy(doc: Any = None) -> Any:
+    """The mesh policy, unowned. The analysis files it away."""
     doc = doc or FreeCAD.ActiveDocument
 
     obj = doc.addObject("App::FeaturePython", "EMMeshPolicy")
@@ -256,25 +293,25 @@ def createEMMeshPolicy(doc=None):
     return obj
 
 
-def references_from(selection):
+def references_from(selection: Iterable[Any]) -> list[tuple[Any, list[str]]]:
     """What a link may be aimed at, out of whatever the user had picked.
 
     Read by both objects that point at geometry: a refinement region and a
     material binding.
 
-    Geometry only. A refinement region resolves a *feature*, and a material is
+    Geometry only. A refinement region resolves a feature, and a material is
     what a solid is made of, so pointing either at a mesh policy or at a study
-    is meaningless - and pointing one at its own analysis closes a cycle in
-    FreeCAD's dependency graph: group membership is itself a link, so container
-    to member and member back to container. FreeCAD then prints *"The graph
-    must be a DAG"* and stops being able to order the recompute. Nothing warns;
-    the model just quietly stops settling.
+    means nothing. Pointing one at its own analysis closes a cycle in FreeCAD's
+    dependency graph, because group membership is itself a link: container to
+    member, and member back to container. FreeCAD then prints "The graph must be
+    a DAG" and cannot order the recompute. Nothing warns, and the model quietly
+    stops settling.
 
-    ``[""]`` and not ``[]`` for a whole object. A ``LinkSubList`` entry with an
-    empty sub-element list is dropped by FreeCAD on assignment, silently, and
-    the object is then left referencing nothing.
+    A whole object is written ``[""]`` rather than ``[]``. FreeCAD silently
+    drops a ``LinkSubList`` entry with an empty sub-element list on assignment,
+    leaving the object referencing nothing.
     """
-    references = []
+    references: list[tuple[Any, list[str]]] = []
     for chosen in selection:
         obj = getattr(chosen, "Object", chosen)
         if not _is_geometry(obj):
@@ -283,11 +320,12 @@ def references_from(selection):
     return references
 
 
-def _is_geometry(obj):
+def _is_geometry(obj: Any) -> bool:
     """Something a user drew, rather than something this workbench made.
 
-    The ``Shape`` test alone is not enough: ``EMMeshPreview`` is a
-    ``Part::FeaturePython`` and has one, and it is a group member like any other.
+    The ``Shape`` test alone is not enough. ``EMMeshPreview`` is a
+    ``Part::FeaturePython``, so it has a shape, and it is a group member like
+    any other.
     """
     from .kinds import is_ours
 
@@ -298,7 +336,7 @@ def _is_geometry(obj):
     return getattr(obj, "Shape", None) is not None
 
 
-def createEMMeshRegion(doc=None):
+def createEMMeshRegion(doc: Any = None) -> Any:
     doc = doc or FreeCAD.ActiveDocument
     obj = doc.addObject("App::FeaturePython", "EMMeshRegion")
     EMMeshRegion(obj)

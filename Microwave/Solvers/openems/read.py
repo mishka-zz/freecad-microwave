@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-"""Native output back into results. Runs in FreeCAD; numpy and stdlib only.
+"""Native output back into results. Runs in FreeCAD, on numpy and the standard
+library alone.
 
-The objects here are the adapter's side of the boundary: still openEMS-shaped
-but no longer openEMS-dependent. Turning them into the neutral result objects -
-``EMSParameters`` on an ``skrf.Network`` substrate, and friends - is the
-document layer's job, and needs skrf, which this does not.
+The objects here are the adapter's side of the boundary: still openEMS-shaped,
+and no longer openEMS-dependent. Turning them into the neutral result objects,
+such as ``EMSParameters`` on an ``skrf.Network`` substrate, is the document
+layer's job. That needs skrf, which this module does not import.
 """
 
 from __future__ import annotations
@@ -42,10 +43,10 @@ class PortResult:
     def impedance(self) -> np.ndarray:
         """Characteristic impedance magnitude, in ohms.
 
-        This is openEMS' ``sqrt(Et*dEt / (Ht*dHt))`` - the voltage-current
-        definition, sampled at one measurement plane. It is genuinely
-        frequency-dependent for a microstrip, so comparing it against a
-        quasi-static closed form is only valid at the bottom of the band.
+        This is openEMS' ``sqrt(Et*dEt / (Ht*dHt))``, the voltage-current
+        definition, sampled at one measurement plane. It is frequency-dependent
+        for a microstrip, so comparing it against a quasi-static closed form is
+        valid only at the bottom of the band.
         """
         return np.abs(self.z0)
 
@@ -84,7 +85,7 @@ class Results:
     def reproducible(self) -> bool:
         """Whether this run would give the same numbers again.
 
-        False when energy termination was used - openEMS evaluates that
+        It is False where energy termination was used. openEMS evaluates that
         criterion on a wall-clock timer, so the run length depends on machine
         load. Anything comparing two results has to check this first.
         """
@@ -104,8 +105,9 @@ class Results:
     def smallest_response(self) -> float:
         """The smallest magnitude in S the study that ran this said it reads.
 
-        One is full scale, which is what a study declaring nothing was held to,
-        and what :attr:`tail_share` has to be weighed against to mean anything.
+        One is full scale, and a study declaring nothing was held to that.
+        :attr:`tail_share` has to be weighed against this value to mean
+        anything.
         """
         return float(self.provenance.get("smallest_response", 1.0))
 
@@ -146,8 +148,8 @@ def read(directory: str | Path) -> Results:
     except KeyError as error:
         raise ResultsError(f"{path} is missing {error}") from error
     except (TypeError, ValueError, AttributeError) as error:
-        # A key that is present but holds the wrong thing - a port numbered
+        # A key that is present but holds the wrong thing: a port numbered
         # 'one', a frequency of 'dc', a list where the ports belong. Catching
-        # only the absent key leaves a type fault arriving as a traceback, or as
-        # an "is missing" that is not true.
+        # only the absent key would let a type fault arrive as a traceback, or
+        # as an "is missing" that is not true.
         raise ResultsError(f"{path} is not the results of a run: {error}") from error

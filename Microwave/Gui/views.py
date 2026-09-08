@@ -3,22 +3,23 @@
 
 """What a stored result can be shown as, and what it cannot.
 
-Glue like :mod:`.results`, and Qt-free for its reason: it reads the document for
-geometry and the result layer for numbers, and everything it decides is decided
-without a display. The chart modules take what it returns and draw it.
+This module is glue like :mod:`.results`, and it is Qt-free for the same
+reason. It reads the document for geometry and the result layer for numbers,
+and it decides everything without a display. The chart modules take what it
+returns and draw it.
 
-The one derivation here is the **distance axis**, and it is the reason this
-module exists rather than the chart calling ``tdr`` directly. A step response
-comes back against time; putting it on a board needs a velocity, a velocity
-needs a separation between two reference planes, and a result object holds no
-geometry at all. So the two halves have to be brought together somewhere, and
-that somewhere knows both a FreeCAD document and an ``SParameters``.
+The one derivation here is the distance axis, and it is why this module exists
+rather than the chart calling ``tdr`` directly. A step response comes back
+against time. Putting it on a board needs a velocity, a velocity needs a
+separation between two reference planes, and a result object holds no geometry
+at all. The two halves have to be brought together somewhere, and that
+somewhere knows both a FreeCAD document and an ``SParameters``.
 
-A missing distance axis is **not** an error. The trace against time is the
-measurement; distance is a convenience laid over it, and a study that cannot
-support one is an ordinary study. So :class:`ImpedanceView` carries the reason
-instead of raising it, and the chart says so where the axis would have been
-offered.
+A missing distance axis is not an error. The trace against time is the
+measurement, and distance is derived from it. :class:`ImpedanceView` carries
+the
+reason instead of raising it, and the chart states it where the axis would have
+been offered.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from .. import portbox
 from ..Objects.analysis import analysis_of, members
 from ..Objects.port_shape import port_box
 from ..Objects.results import load
@@ -34,7 +36,7 @@ from ..Results.sparameters import ResultError
 
 
 class ViewError(ValueError):
-    """The document does not hold what a view needs, and the message says what."""
+    """The document does not hold what a view needs. The message names what."""
 
 
 @dataclass(frozen=True)
@@ -52,10 +54,9 @@ class ImpedanceView:
 def traceable_ports(result) -> list[int]:
     """Every port of ``result`` a step response could be taken at, in order.
 
-    Answers "what should the menu offer", so it asks :mod:`~..Results.tdr`
-    itself rather than reproducing its conditions - a second copy of the rule is
-    the one that eventually disagrees, and here it would disagree by offering a
-    menu entry that refuses when pressed.
+    This answers what the menu should offer, so it asks :mod:`~..Results.tdr`
+    itself rather than reproducing that module's conditions. A restatement
+    here could offer a menu entry that refuses when pressed.
     """
     found = []
     for number in result.port_numbers:
@@ -70,10 +71,10 @@ def traceable_ports(result) -> list[int]:
 def impedance_view(holder, port: int) -> ImpedanceView:
     """The impedance profile at ``port`` of the matrix stored in ``holder``.
 
-    Raises :class:`~..Results.sparameters.ResultError` when there is no trace to
-    draw - which is every case :mod:`~..Results.tdr` refuses by name, and each
-    of those messages says what to change. A trace that exists but cannot be put
-    on a distance axis comes back with the reason on it instead.
+    Raises :class:`~..Results.sparameters.ResultError` when there is no trace
+    to draw. That covers every case :mod:`~..Results.tdr` refuses by name, and
+    each of those messages says what to change. A trace that exists but cannot
+    be put on a distance axis comes back with the reason on it instead.
     """
     result = load(holder)
     trace = tdr.step_response(result, port)
@@ -88,7 +89,7 @@ def impedance_view(holder, port: int) -> ImpedanceView:
 def _velocity(holder, result, port: int) -> float:
     """Propagation velocity in m/s, measured from this study's own transmission.
 
-    Nothing is typed by hand and nothing is assumed about the substrate: the
+    Nothing is typed by hand and nothing is assumed about the substrate. The
     delay comes out of the same solve the trace does, and the length it divides
     into comes off the drawing. A velocity factor guessed from a permittivity
     would put a plausible scale on the axis and be wrong by whatever the
@@ -120,19 +121,18 @@ def _velocity(holder, result, port: int) -> float:
     return tdr.velocity(result, other, port, separation)
 
 
-def port_boxes(holder) -> dict[int, object]:
+def port_boxes(holder) -> dict[int, portbox.PortBox]:
     """Every port of ``holder``'s study that has a box, by port number.
 
     A port that is not configured enough to have one is left out rather than
-    refused: :func:`~..Objects.port_shape.port_box` returns ``None`` for it, and
-    the adapter says loudly what is wrong with it when the user asks for a solve.
-    Drawing a chart is not the place to raise it a second time.
+    refused. :func:`~..Objects.port_shape.port_box` returns ``None`` for it,
+    and the adapter says loudly what is wrong with it when the user asks for a
+    solve. Drawing a chart is not the place to raise it a second time.
 
-    Which members are ports is left to ``port_box``, which answers ``None`` for
-    everything that is not one. A separate "is this a port" test beside it would
-    be a second copy of the same question, and the copy is the one that
-    eventually disagrees - here, by asking for the ``Number`` of something that
-    has none.
+    ``port_box`` decides which members are ports, and answers ``None`` for
+    everything that is not one. A separate test for whether a member is a port
+    would restate what ``port_box`` already decides, and would ask for the
+    ``Number`` of something that has none.
     """
     analysis = analysis_of(holder)
     if analysis is None:

@@ -22,10 +22,10 @@ different name at each point. The measurement is a voltage integrated across the
 annulus, so both of its walls have to move - which is what
 :func:`test_the_sequence_refines_both_walls_of_the_annulus` holds.
 
-One resolution is also solved at several alignments against its own grid, which
-is the same fixture read the other way round: there the mesh has to be the mesh
-it was and only its position may move, or what those cases measure is not the
-alignment.
+Each end of the sequence is also solved at several alignments against its own
+grid, which is the same fixture read the other way round: there the mesh has to
+be the mesh it was and only its position may move, or what those cases measure
+is not the alignment.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ import itertools
 import json
 import math
 import os
-import subprocess
 
 import numpy as np
 import pytest
@@ -42,7 +41,7 @@ import pytest
 from Microwave.Solvers.openems.model import Problem
 from Microwave.Solvers.openems.report import timestep_bound
 from tests import coax
-from tests.conftest import _freecadcmd
+from tests.conftest import draw_cases
 
 PROBE = os.path.join(os.path.dirname(__file__), "coax_probe.py")
 
@@ -158,33 +157,15 @@ def test_the_resolutions_are_evenly_spread():
 
 @pytest.fixture(scope="module")
 def envelopes(tmp_path_factory):
-    """Draw every case under a real FreeCAD, once.
+    """Draw every case under a real FreeCAD, once, and read what it wrote.
 
-    The exit status is not consulted: ``freecadcmd`` segfaults in Qt's teardown
-    after everything has been written, so judging the run by its status would
-    fail it for finishing. What is judged is the manifest.
+    The envelope rather than the directory, because nothing here solves: what
+    this file scores is the drawing and the grid planned from it.
     """
-    binary = _freecadcmd()
-    if binary is None:
-        pytest.skip("no freecadcmd on this machine, so the CAD kernel is unreachable")
-
-    out = tmp_path_factory.mktemp("coax")
-    result = subprocess.run(
-        [binary, PROBE],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "COAX_OUT": str(out)},
-        cwd=os.path.dirname(os.path.dirname(PROBE)),
-    )
-    manifest = out / "manifest.json"
-    if not manifest.exists():
-        raise AssertionError(
-            "the coax probe wrote no manifest, so it died before it finished.\n"
-            f"stdout:\n{result.stdout[-4000:]}\n\nstderr:\n{result.stderr[-4000:]}"
-        )
+    drawn = draw_cases(PROBE, tmp_path_factory.mktemp("coax"), "COAX_OUT")
     return {
-        name: json.loads((out / name / "openems.json").read_text())
-        for name in json.loads(manifest.read_text())["cases"]
+        name: json.loads((directory / "openems.json").read_text())
+        for name, directory in drawn.items()
     }
 
 
@@ -196,16 +177,17 @@ def sequence(envelopes):
     return found
 
 
-@pytest.fixture(scope="module")
-def alignments(envelopes):
-    """One resolution's cases, the drawing's own alignment first.
+@pytest.fixture(scope="module", params=coax.REPLICATED_AT, ids=lambda steps: f"fine-{steps}")
+def alignments(envelopes, request):
+    """One replicated resolution's cases, the drawing's own alignment first.
 
     Named by the offset they were built at, so a case that reached the solver as
     something other than what it is called says so here rather than in a rate
     fitted through it.
     """
-    found = [((0.0, 0.0), envelopes[f"fine-{coax.REPLICATED_AT}"])]
-    found += [(offset, envelopes[coax.phase_case(offset)]) for offset in coax.LATTICE_PHASES]
+    steps = request.param
+    found = [((0.0, 0.0), envelopes[f"fine-{steps}"])]
+    found += [(offset, envelopes[coax.phase_case(steps, offset)]) for offset in coax.LATTICE_PHASES]
     return found
 
 
@@ -386,11 +368,12 @@ def test_the_lattice_lands_where_it_was_asked_to(alignments, wall):
 
 
 def _records(sequence):
-    """Each run's length in seconds, as a lower bound.
+    """Each run's length in seconds, as an estimate.
 
-    ``timestep_bound`` assumes vacuum, and a material only ever permits a longer
-    step, so every figure here is under what openEMS will actually run - which
-    is the safe direction for both things asked of it below.
+    ``timestep_bound`` estimates openEMS' step rather than bounding it, and runs
+    land on both sides of it - so these are what each run recorded to within a
+    few per cent, and the case below that asks a record to outlast a journey is
+    asking it with that much slack rather than with none.
     """
     found = []
     for steps, case in sequence:
@@ -403,7 +386,7 @@ def _records(sequence):
             )
         )
     print(
-        "COAX record at least "
+        "COAX record about "
         + ", ".join(f"{steps} steps: {span * 1e9:.3f} ns" for steps, span in found)
     )
     return found
@@ -435,7 +418,7 @@ def test_every_run_outlasts_the_pulse_crossing_the_port(sequence):
     crossing = coax.PROBE_SEPARATION / coax.velocity()
     for steps, span in _records(sequence):
         assert span > crossing, (
-            f"at {steps} conductor steps the run covers at least "
+            f"at {steps} conductor steps the run covers about "
             f"{span * 1e9:.3f} ns and the wave takes {crossing * 1e9:.3f} ns to "
             "reach the probes, so nothing here says they saw it"
         )

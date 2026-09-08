@@ -3,33 +3,34 @@
 
 """Where a solid is, answered for many points at once.
 
-:mod:`~.verify` models how openEMS turns a shape into zeroed Yee edges and is
-told where the shape is; this is the other half. The two are apart on purpose:
-the connectivity rule is about the grid and holds whatever the shape, this is
-about the shape and holds whatever the grid.
+:mod:`~.verify` models how openEMS turns a shape into zeroed Yee edges, and it
+is told where the shape is. This module is one such answer. The two are kept
+apart because the connectivity rule is about the grid and holds whatever the
+shape is, while this is about the shape and holds whatever the grid is.
 
-Each form a solid arrives in is answered by its own question, none a special case
-of the others. A box is a comparison. A sheet bounds an *area* on one plane, so a
+Each form a solid arrives in gets its own question, and none is a special case
+of the others. A box is a comparison. A sheet bounds an area on one plane, so a
 point is in it when it lies on that plane and inside the outline there. A
-triangulated solid bounds a *volume* and is asked by the winding number: the
-solid angle its boundary subtends at the point, a full turn seen from inside and
+triangulated solid bounds a volume and is asked by the winding number: the solid
+angle its boundary subtends at the point, a full turn seen from inside and
 nothing from outside.
 
-The winding number rather than a cast ray, because a ray needs a rule for
-grazing an edge or passing through a vertex, and each is a coin toss between two
-answers a whole cell apart. Solid angle has no such case away from the surface:
-every triangle contributes a continuous quantity and the sum is exact for a
-closed surface. It is also branch-free, so it applies to a whole grid at once.
+The winding number is used rather than a cast ray. A ray needs a rule for
+grazing an edge or passing through a vertex, and each of those is a coin toss
+between two answers a whole cell apart. Solid angle has no such case away from
+the surface. Every triangle contributes a continuous quantity, and the sum is
+exact for a closed surface. It is also branch-free, so it applies to a whole
+grid at once.
 
-**The surface itself is asked separately, and it is not a corner case.** A point
-*on* the boundary sees the interior angle there - a half turn on a face, the
-dihedral angle on an edge, a corner's own angle at a vertex - every one of them
-under the full turn that means inside. Nor is that an exotic input: the mesher
-pins a grid line on both faces of any conductor thinner than the metal
+The surface itself is asked separately. A point on the boundary sees the
+interior angle there - a half turn on a face, the dihedral angle on an edge, a
+corner's own angle at a vertex - and every one of those is under the full turn
+that means inside. Such a point is ordinary input rather than an exotic one. The
+mesher pins a grid line on both faces of any conductor thinner than the metal
 resolution, so every sample point along a foil lands exactly on the surface, and
-read by angle alone a well resolved trace comes back as a chain of islands. So a
-point on a triangle is found by asking that directly - coplanar with it, and
-within it - and the angle decides only what the surface does not.
+read by angle alone a well resolved trace comes back as a chain of islands. A
+point on a triangle is therefore found by asking that directly - coplanar with
+it, and within it - and the angle decides only what the surface does not.
 
 Nothing here imports openEMS, CSXCAD or FreeCAD.
 """
@@ -37,53 +38,74 @@ Nothing here imports openEMS, CSXCAD or FreeCAD.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
+import numpy.typing as npt
+
+from .model import Solid
 
 __all__ = ["contains", "work"]
 
 DIMENSIONS = 3
 
-#: Corners of a triangle. Not ``DIMENSIONS``, which it equals and is not.
+#: Corners of a triangle. It equals ``DIMENSIONS`` and counts a different thing.
 _CORNERS = 3
 
 #: How far off its plane a point may be and still count as on it, in mm. A
 #: sheet is modelled at one plane and the mesher anchors a grid line there, so
-#: the points that ought to be on it are on it exactly; this is for the
-#: arithmetic that moved them, not for a sheet drawn somewhere else.
+#: the points that ought to be on it are on it exactly. This tolerance covers
+#: the arithmetic that moved them. It does not cover a sheet drawn somewhere
+#: else.
 ON_THE_PLANE = 1e-9
 
 #: Point-triangle pairs held in memory at once. The work is a sum over every
-#: triangle for every point, so it is the product that has to be done and only
-#: the memory that has to be bounded: a pair costs several three-vectors of
-#: double at once, and the loop above it keeps the total flat however many
-#: points are asked about.
+#: triangle for every point, so the whole product has to be computed and only
+#: the memory has to be bounded. A pair costs several three-vectors of double at
+#: once, and the loop above it keeps the total flat however many points are
+#: asked about.
 _CHUNK = 1 << 19
+
+#: How short a turn vector is before its direction is rounding rather than a
+#: reading, relative to the two lengths whose cross product it is. A point on
+#: the line of an edge makes that edge's turn vector zero, and the arithmetic
+#: that reaches it leaves a few units in the last place of the product behind.
+#: Below this the vector has no direction to agree or disagree with, and the
+#: pair it is not in decides.
+#:
+#: Derived from the arithmetic rather than read off a shape: a double carries
+#: about sixteen figures, the cross product spends a few of them on its
+#: products and its subtraction, and this stands four decades clear of what is
+#: left. Measured over a bar turned into the grid, the answer does not move
+#: anywhere between four decades under this and ten decades over it, so it does
+#: not sit on a cliff. Nothing here brackets it from above.
+_A_TURN_IS_ZERO = 1e-12
 
 #: How far off a triangle's plane a point may be and still be on it, relative to
 #: the triangle's own size. The quantity compared is a determinant against the
-#: product of three lengths, which is the distance to the plane over the
+#: product of three lengths. That ratio is the distance to the plane over the
 #: triangle's scale, so the tolerance is dimensionless and means the same for a
 #: millimetre of foil and a metre of waveguide.
 _ON_THE_SURFACE = 1e-9
 
 
-def work(solid, count: int) -> int:
+def work(solid: Solid, count: int) -> int:
     """Triangle evaluations answering ``count`` points about ``solid`` would cost.
 
-    A caller with a whole grid to sample needs to know this *before* sampling,
-    because the honest answer for a shape whose surface is large enough is that
-    it was not looked at. Zero for a box, which is a comparison per axis and
-    costs nothing whatever the shape's detail.
+    A caller with a whole grid to sample needs this before sampling. For a shape
+    with a large enough surface, the honest answer is that it was not looked at.
+    A box costs zero: it is a comparison per axis, whatever the shape's detail.
     """
     return count * len(solid.faces) if solid.is_mesh else 0
 
 
-def contains(solid, points, vertices=None) -> np.ndarray:
+def contains(
+    solid: Solid, points: npt.ArrayLike, vertices: Sequence[Sequence[float]] | None = None
+) -> np.ndarray:
     """Which of ``points`` the solid holds. ``points`` is ``(N, 3)``.
 
-    The boundary counts as inside, which is the answer that keeps a face flush
-    against another solid from falling between the two.
+    The boundary counts as inside. A face flush against another solid then lies
+    in both of them rather than falling between the two.
 
     :param vertices: The triangulation's points to read in place of the solid's
         own, for a caller asking about the surface that reaches the engine
@@ -101,21 +123,22 @@ def contains(solid, points, vertices=None) -> np.ndarray:
     return _in_box(solid, points)
 
 
-def _in_box(solid, points: np.ndarray) -> np.ndarray:
+def _in_box(solid: Solid, points: np.ndarray) -> np.ndarray:
     lower = np.asarray(solid.lower, dtype=float)
     upper = np.asarray(solid.upper, dtype=float)
     return np.all((points >= lower) & (points <= upper), axis=1)
 
 
-def _in_outline(solid, points: np.ndarray) -> np.ndarray:
+def _in_outline(solid: Solid, points: np.ndarray) -> np.ndarray:
     """On the sheet's plane, and inside one of the triangles covering it.
 
     The triangles tile the area with the holes already left out, so a point in
-    any one of them is on the metal and a point in none of them is not - a
-    letter's counter and an annulus both come out right without the outline
-    ever being treated as a contour.
+    any one of them is on the metal and a point in none of them is not. A
+    letter's counter and an annulus both come out right, and the outline is
+    never treated as a contour.
     """
     axis = solid.sheet_normal
+    assert axis is not None  # only a sheet has an outline to be inside
     across = [dim for dim in range(DIMENSIONS) if dim != axis]
     on_plane = np.abs(points[:, axis] - solid.lower[axis]) <= ON_THE_PLANE
     if not on_plane.any():
@@ -149,18 +172,19 @@ def _side(start: np.ndarray, end: np.ndarray, points: np.ndarray) -> np.ndarray:
     return along[None, :, 0] * offset[:, :, 1] - along[None, :, 1] * offset[:, :, 0]
 
 
-def _in_surface(solid, points: np.ndarray, vertices) -> np.ndarray:
+def _in_surface(
+    solid: Solid, points: np.ndarray, vertices: Sequence[Sequence[float]] | None
+) -> np.ndarray:
     """Enclosed by the boundary, or on it.
 
-    One full turn of solid angle for a point the surface encloses and none for
-    one it does not, so away from the surface the two are a whole turn apart and
-    half of one is the only threshold that is not a choice. On the surface the
+    A point the surface encloses sees one full turn of solid angle, and a point
+    outside sees none. Away from the surface the two are a whole turn apart, so
+    half a turn is the only threshold that is not a choice. On the surface the
     angle is the interior angle there, which is under the threshold from either
-    side, so that case is decided by :func:`_on_the_surface` instead.
+    side, so :func:`_on_the_surface` decides that case instead.
 
     The surface has already been held to being closed and consistently oriented
-    on its way into the envelope, which is what makes the sum exact rather than
-    approximate.
+    on its way into the envelope, so the sum is exact rather than approximate.
     """
     corners = np.asarray(vertices, dtype=float)[np.asarray(solid.faces, dtype=int)]
     held = np.empty(len(points), dtype=bool)
@@ -177,10 +201,10 @@ def _solid_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     """The solid angle each point sees the whole surface subtend.
 
     Van Oosterom and Strackee's expression for one triangle, summed. It gives
-    the *half* angle as an arctangent of two quantities that are both
-    well-behaved as the triangle shrinks, so a surface's fine detail costs
-    accuracy in neither: taking ``atan2`` of the pair rather than a ratio is
-    what keeps the branch right through a half turn as well.
+    the half angle as an arctangent of two quantities that are both well-behaved
+    as the triangle shrinks, so a surface's fine detail costs accuracy in
+    neither. Taking ``atan2`` of the pair rather than a ratio also keeps the
+    branch right through a half turn.
     """
     lengths = [np.linalg.norm(vector, axis=-1) for vector in (a, b, c)]
     numerator = np.einsum("...i,...i->...", a, np.cross(b, c))
@@ -197,19 +221,37 @@ def _on_the_surface(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     """Whether each point lies on one of the triangles, given its corners about it.
 
     Two conditions, both stated in the same three vectors the angle uses. The
-    point is in the triangle's *plane* where the volume they span is zero, taken
-    against the product of their lengths so that the comparison is a distance
-    over the triangle's own size. It is within the triangle where the three
-    corners are seen in a consistent rotational order, which is what these cross
-    products agreeing in direction says - and which holds at a vertex too, where
-    one of them vanishes and agrees with everything.
+    point lies in the triangle's plane where the volume those vectors span is
+    zero, taken against the product of their lengths so the comparison is a
+    distance over the triangle's own size. The point lies within the triangle
+    where the three corners are seen in a consistent rotational order, which is
+    what these cross products agreeing in direction reports.
+
+    A turn vector is zero where the point is collinear with the edge it spans,
+    which happens at a vertex and along each edge's own line. Such a vector has
+    no direction, so it agrees with both of its neighbours and the pair it is
+    not in decides. It is recognised by :data:`_A_TURN_IS_ZERO` rather than by
+    comparing against zero exactly, because the arithmetic leaves a residue
+    whose sign is rounding: read that sign and a point on an edge falls in or
+    out according to where the body was drawn.
+
+    All three pairs are asked. Which edge of a triangulation a grid line lands
+    on follows how the shape was cut, so a predicate right about two of them is
+    right about a shape nobody chose.
     """
     lengths = [np.linalg.norm(vector, axis=-1) for vector in (a, b, c)]
     flat = np.abs(np.einsum("...i,...i->...", a, np.cross(b, c))) <= _ON_THE_SURFACE * (
         lengths[0] * lengths[1] * lengths[2]
     )
     turns = [np.cross(*pair) for pair in ((a, b), (b, c), (c, a))]
-    same_way = (np.einsum("...i,...i->...", turns[0], turns[1]) >= 0.0) & (
-        np.einsum("...i,...i->...", turns[1], turns[2]) >= 0.0
-    )
+    spans = (lengths[0] * lengths[1], lengths[1] * lengths[2], lengths[2] * lengths[0])
+    zero = [
+        np.linalg.norm(turn, axis=-1) <= _A_TURN_IS_ZERO * span
+        for turn, span in zip(turns, spans, strict=True)
+    ]
+    same_way = np.ones(flat.shape, dtype=bool)
+    for one, other in ((0, 1), (1, 2), (2, 0)):
+        same_way &= (
+            (np.einsum("...i,...i->...", turns[one], turns[other]) >= 0.0) | zero[one] | zero[other]
+        )
     return np.any(flat & same_way, axis=-1)

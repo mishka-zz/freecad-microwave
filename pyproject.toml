@@ -4,11 +4,16 @@ name = "freecad-microwave"
 # they agree; nothing derives one from the other, because this file is read by
 # tooling that must not import the package and the package must not need a
 # TOML parser to know its own version.
-version = "0.0.1"
+version = "0.0.2"
 license = "LGPL-2.1-or-later"
 license-files = ["LICENSE"]
-# tomllib, which the material catalogs read. FreeCAD 1.1.1 embeds 3.11 and
-# development runs 3.13, and CI covers both ends.
+# tomllib, which the material catalogs read, and `datetime.UTC`, which dates a
+# Touchstone header. Both arrived in 3.11. This floor does not follow from the
+# FreeCAD one: a release is built against whatever Python its packager chose,
+# so `Microwave/host_versions.py` asks about both and refuses a host failing
+# either. Development runs 3.13. `.github/workflows/tests.yml` runs the suite
+# on this floor and on that one, and `tests/test_declared_dependencies.py`
+# fails if its low end and this line differ.
 requires-python = ">=3.11"
 # Nothing installs the workbench this way - FreeCAD loads it from `Mod/`, and
 # the interpreter it loads into is not ours to install into. This list is here
@@ -22,7 +27,12 @@ requires-python = ">=3.11"
 dependencies = ["numpy", "scipy", "pandas", "typing_extensions"]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+# The tools, and the two of them whose output is a gate carry the version CI
+# runs. Not tidiness: a formatter is a gate that rewrites, so a contributor on a
+# newer ruff commits what it reflowed and the pinned job goes red on a tree they
+# were told was clean. test_declared_dependencies.py holds the two in step.
+# pytest floats with the libraries, and that file says why.
+dev = ["pytest", "ruff==0.15.22", "mypy==2.3.1"]
 # The chart, and only the chart. Everything else - modelling, meshing,
 # pre-flight, solving, Touchstone - runs without it, so a refusal at the plot
 # is the whole cost of not having it. Deliberately not in the CI install: the
@@ -35,6 +45,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "slow: runs a real solve or a real FreeCAD; deselect with -m 'not slow'",
+    "release: runs before a release, not before a commit; deselect with -m 'slow and not release'",
 ]
 
 [tool.ruff]
@@ -61,3 +72,99 @@ ignore = [
 "InitGui.py" = ["F821"]
 # The document layer's public surface. Every name is re-exported on purpose.
 "Microwave/Objects/__init__.py" = ["F401"]
+
+# The counterpart to the linter: ruff says how the code is written, mypy says
+# whether it agrees with itself. `mypy` with no arguments checks what `files`
+# names below, which is what CI runs.
+[tool.mypy]
+# No `python_version`, deliberately. Pinning it to the floor `requires-python`
+# declares is the useful setting and it is not available: numpy's stubs are
+# written in syntax above that floor from some release on - measured, mypy
+# refuses `numpy/__init__.pyi` outright with *"Type statement is only supported
+# in Python 3.12 and greater"* and then checks nothing at all - and CI installs
+# numpy unpinned, so setting it would leave this job hostage to a release
+# nobody here chose. The floor is covered where it can be: the fast suite runs
+# on it. What is left here is the interpreter the checker happens to run under.
+#
+# The one thing that does depend on this is `Microwave/host_versions.py`,
+# which has to import on a host too old for anything else - so its annotations
+# are deferred, and it says so.
+#
+# `Microwave` and not `tests` as well: the suite is the larger surface by far
+# and almost none of it is annotated, so pointing the checker at it would be a
+# separate piece of work rather than a stricter setting.
+files = ["Microwave"]
+# Vendored scikit-rf, for the reason ruff excludes it: upstream's types are
+# upstream's business, and a version bump must stay readable.
+exclude = "^Microwave/_vendor/"
+# About the checker checking itself. An ignore that has stopped being needed is
+# a silenced error nobody will look at again; a section naming a module that has
+# been renamed silently stops applying, and the sections below are the whole
+# configuration.
+#
+# The unused-ignore one fails the run. The unused-section one only prints a note
+# and leaves the exit status at zero, so it is not a gate on its own - what
+# holds a renamed module is `tests/test_type_checking.py`, and this is here to
+# say which section in the same run.
+warn_unused_ignores = true
+warn_unused_configs = true
+warn_redundant_casts = true
+# Strict by default, so a module added tomorrow lands on the annotated side
+# unless somebody writes down why it does not. The exemptions are below and
+# each says what it is.
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+# Not resolvable where the checker runs. FreeCAD, its Gui, its bundled PySide
+# and its `Plot` window are the application; the engine's bindings mean
+# building openEMS; and scikit-rf is reached through `_vendor`, which is
+# excluded above. What this buys is that a name from one of them is `Any`
+# rather than an error - the import is not the thing being checked, the code
+# around it is. The list is what is actually unresolvable, and no more:
+# matplotlib is absent because this tree never imports it, reaching it only
+# through FreeCAD's own plot window.
+[[tool.mypy.overrides]]
+module = [
+    "FreeCAD",
+    "FreeCADGui",
+    "Part",
+    "Plot",
+    "pivy.*",
+    "PySide.*",
+    "openEMS.*",
+    "CSXCAD.*",
+    "skrf.*",
+]
+ignore_missing_imports = true
+
+# The layers that handle FreeCAD document objects, which are attribute bags:
+# a `App::FeaturePython` carries whatever properties were added to it, so
+# there is no type to state and writing `Any` on every hook would say nothing
+# a reader does not already know. Their annotated functions are still checked
+# - this only stops the checker demanding annotations that would be empty.
+#
+# Incomplete is allowed here for the same reason and it is the common case:
+# `def execute(self, obj) -> None` states the one thing worth stating, and
+# completing it would only put `Any` where the sentence above already is.
+[[tool.mypy.overrides]]
+module = [
+    "Microwave.Commands",
+    "Microwave.Gui.*",
+    "Microwave.Objects.*",
+    "Microwave.ViewProviders.*",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+# The parts of the document layer that are not that. These compute geometry
+# and answer questions about it, they are driven by tests with no CAD kernel
+# present, and their arguments and returns are ordinary values - so an
+# exemption written for attribute bags does not cover them. An exact module
+# name outranks the wildcard above.
+[[tool.mypy.overrides]]
+module = [
+    "Microwave.Objects.kinds",
+    "Microwave.Objects.port_setup",
+    "Microwave.Objects.port_shape",
+]
+disallow_untyped_defs = true

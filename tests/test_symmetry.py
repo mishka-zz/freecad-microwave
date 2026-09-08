@@ -16,8 +16,7 @@ grid check is that geometry and grid can disagree.
 import numpy as np
 
 from Microwave.Gui.symmetry import mirror_warnings
-from Microwave.Solvers.openems import write
-from Microwave.Solvers.openems.mesh import MeshParams
+from Microwave.Solvers.openems import plan
 from Microwave.Solvers.openems.model import (
     Frequency,
     Material,
@@ -25,6 +24,7 @@ from Microwave.Solvers.openems.model import (
     Problem,
     Solid,
 )
+from Microwave.Solvers.openems.regions import MeshParams
 
 AIR = Material(name="Air", kind="dielectric", epsilon=1.0)
 METAL = Material(name="Metal", kind="pec")
@@ -61,7 +61,7 @@ def line(port_overrides=(), solids=None, span=(-20.0, 20.0)):
     ports = tuple(ports)
 
     params = MeshParams(metal_res=1.0, dielectric_res=2.0, min_lines=4, pml_cells=8)
-    grid = write.plan_grid(solids, ports, materials, params, ((8, 8), (8, 8), (8, 8)))
+    grid = plan.plan_grid(solids, ports, materials, params, ((8, 8), (8, 8), (8, 8)))
     return Problem(
         title="line",
         frequency=Frequency(1e9, 10e9, 51),

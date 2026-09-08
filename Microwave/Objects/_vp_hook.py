@@ -3,20 +3,26 @@
 
 """Where the document layer meets the GUI, without importing it.
 
-Every hook here exists because a document object needs something done that it
-must not know how to do itself: attaching a view provider, redrawing a mesh
-preview, deciding whether a preview still describes its document. The last two
-mean reading the model through a *solver adapter*, and a solver-neutral document
-object that reaches for openEMS breaks the layering rule in one line.
+Each hook here covers something a document object must not do itself: attaching
+a view provider, and redrawing a mesh preview. The redraw reaches a solver
+adapter, and a solver-neutral document object that reaches for openEMS breaks
+the layering rule in one line.
 
-So the GUI layer registers a callable here at import, and the document objects
-call whatever is registered. **Unset is a supported state**, not a degraded one:
-under ``freecadcmd``, in the test suite, and on a machine with no GUI at all,
-nothing registers, nothing redraws, and nothing breaks.
+The GUI layer registers a callable here at import, and the document objects call
+whatever is registered. Unset is a supported state. Under ``freecadcmd``, in the
+test suite, and on a machine with no GUI at all, nothing registers, nothing
+redraws, and nothing breaks.
 
-:class:`ViewProviderRestored` is the other direction - a document restored from
-a file written headlessly has no view provider, and the mixin puts one back.
+:class:`ViewProviderRestored` runs the other way. A document restored from a
+file written headlessly has no view provider, and the mixin puts one back. It
+puts back the property statuses ``Objects/staleness.py`` describes as well, for
+the same reason: a file holds what its class declared on the day it was
+written.
 """
+
+from collections.abc import Collection
+
+from .staleness import stop_quiet_properties_touching
 
 VIEW_PROVIDER_INJECTOR = None
 
@@ -34,22 +40,6 @@ def redraw_preview(obj):
     """Call the registered redraw, if the GUI layer registered one."""
     if PREVIEW_REDRAW:
         PREVIEW_REDRAW(obj)
-
-
-#: Set by the GUI layer: decides whether a preview still describes its document.
-PREVIEW_STATUS = None
-
-
-def register_preview_status(check):
-    global PREVIEW_STATUS
-    PREVIEW_STATUS = check
-
-
-def preview_status(obj):
-    """The registered verdict, or ``None`` when nothing registered one."""
-    if PREVIEW_STATUS:
-        return PREVIEW_STATUS(obj)
-    return None
 
 
 def register_view_provider_injector(injector):
@@ -73,23 +63,25 @@ def restore_view_provider(obj, kind):
     no ViewObject at all, so opening it in the GUI leaves every object on
     FreeCAD's default view provider: no icon, no ``claimChildren``, and no
     ``doubleClicked``, which is the only thing that opens the simulation panel.
-    The document is intact and translates fine; it just looks broken.
+    The document is intact and translates correctly, and only its appearance is
+    wrong.
 
-    Objects saved from the GUI already carry their proxy, and are left alone -
-    replacing a live view provider mid-restore would drop whatever display state
+    Objects saved from the GUI already carry their proxy, and are left alone.
+    Replacing a live view provider mid-restore would drop whatever display state
     it holds.
     """
     view_object = getattr(obj, "ViewObject", None)
     if view_object is None:
         return False  # console mode: nothing to attach to, and nothing to fix
-    # A view provider already? Leave it. Anything else - including whatever
-    # FreeCAD puts in an unset Proxy property - is a gap to fill. Testing for
-    # "not None" would be a bet on what FreeCAD leaves in an unset property.
+    # An object that already has a view provider is left alone. Anything else,
+    # including whatever FreeCAD puts in an unset Proxy property, is a gap to
+    # fill. Testing for "not None" would be a bet on what FreeCAD leaves in an
+    # unset property.
     #
-    # By suffix, not by prefix. The question is "is there a provider here at
-    # all?", and a provider from another workbench is just as much a reason to
-    # leave the object alone as this workbench's - replacing a live one mid-session
-    # drops whatever display state it holds.
+    # The test is on the suffix rather than the prefix, so it also matches a
+    # provider from another workbench. Such a provider is as good a reason to
+    # leave the object alone as one of this workbench's: replacing a live one
+    # mid-session drops whatever display state it holds.
     if type(getattr(view_object, "Proxy", None)).__name__.endswith("ViewProvider"):
         return False
     inject_view_provider(obj, kind)
@@ -97,17 +89,31 @@ def restore_view_provider(obj, kind):
 
 
 class ViewProviderRestored:
-    """Mixin: give a restored object its view provider back.
+    """Mixin: what a restored document object here needs putting back.
 
-    ``onDocumentRestored`` is the hook that reliably fires - measured, on
-    FreeCAD 1.1: the ``slotFinishRestoreDocument`` a document observer would
-    hang this on is never emitted by ``openDocument`` at all.
+    Both are repairs rather than behaviour: the view provider, and the status
+    that keeps a quiet property off the dependency graph.
 
-    It may nonetheless run before the ViewObject exists, in which case
-    :func:`restore_view_provider` declines and nothing happens. That is why the
-    workbench sweeps open documents again on activation; both are idempotent, so
-    whichever gets there first wins and the other is a no-op.
+    ``onDocumentRestored`` is the hook that fires reliably. Measured on FreeCAD
+    1.1: ``openDocument`` never emits the ``slotFinishRestoreDocument`` a
+    document observer would hang this on.
+
+    It may still run before the ViewObject exists, in which case
+    :func:`restore_view_provider` declines and nothing happens. The workbench
+    therefore sweeps open documents again on activation. Both routes are
+    idempotent, so whichever gets there first wins and the other is a no-op.
     """
+
+    #: Which of this class's properties move no cell. ``Objects/staleness.py``
+    #: says what the declaration is for and which way round it fails. A class
+    #: that starts declaring has to call
+    #: :meth:`declare_what_moves_no_cell` from its ``__init__`` as well: this
+    #: hook only repairs a file written before the declaration existed.
+    MOVES_NO_CELL: Collection[str] = ()
+
+    def declare_what_moves_no_cell(self, obj):
+        stop_quiet_properties_touching(obj, type(self).MOVES_NO_CELL)
 
     def onDocumentRestored(self, obj):
         restore_view_provider(obj, type(self).__name__)
+        self.declare_what_moves_no_cell(obj)

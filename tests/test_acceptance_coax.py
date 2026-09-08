@@ -31,24 +31,42 @@ impedance is the same at every frequency, a TEM line having no dispersion.
 
 What is scored:
 
-**The answer at every mesh**, against :data:`TEM_ACCURACY`. Held at the coarsest
-cell as well as the finest, so it is a claim about curved conductors rather than
-about one mesh.
+**The answer, against the uncertainty the study itself computed.** The whole
+sequence is turned into a band by :mod:`tests.convergence`, and the closed form
+has to be inside it. That is a different claim from a percentage written down by
+hand, and a harder one to satisfy by accident: the band narrows as the study gets
+better, so agreement stops counting as evidence the moment the sequence stops
+supporting it.
 
-**The rate.** openEMS decides a metal edge on one sampled point, so a curved
-conductor arrives inscribed on the grid and the leading error is proportional to
-the cell; what is handed over is grown by half a cell to answer for that - see
-:mod:`Microwave.Solvers.openems.staircase`. Refining then has to buy more than it
-costs, and an exponent above one is what says so. A correction of the wrong size
-leaves a first-order term behind and the exponent falls back towards one.
+**That refining always helps, and no exponent.** openEMS decides a metal edge on
+one sampled point, so a curved conductor arrives inscribed on the grid and the
+leading error is proportional to the cell; what is handed over is grown by half a
+cell to answer for that - see :mod:`Microwave.Solvers.openems.staircase`. First
+order is not a figure chosen here: a Yee scheme is second order in the cell where
+the field is smooth, and staircasing a curved conducting boundary is the term
+that takes it back to first - Cangellaris and Wright, *Analysis of the numerical
+error caused by the stair-stepped approximation of a conducting boundary in FDTD
+simulations of electromagnetic phenomena*, IEEE Transactions on Antennas and
+Propagation 39(10), 1518-1525.
+
+The growth changes what that term is worth and does not remove it, so an error
+falling faster than the cell was never what a working correction would show. The
+exponent is printed with the two things that bound it - the standard error of its
+own fit, and the rates the replicated ends give across every pairing of their
+alignments - and neither leaves it clear of first order.
 
 **Where the lattice falls.** A cell size fixes how big the cells are and not
-where they sit, so one solve per resolution varies both at once. One resolution
-is therefore solved again at other alignments against its own grid. What that
-spans is scored on its own, and it is scored against the trend - refining has to
-outrun sliding, or the sequence is not measuring the cell. It is also the error
-bar on the exponent, and there it is reported rather than asserted: this
-sequence does not clear it, and the rate test says what that means.
+where they sit, so one solve per resolution varies both at once. Each end of the
+sequence is therefore solved again at other alignments against its own grid. What
+that spans is scored on its own at each end, and the wider of the two is scored
+against the trend - refining has to outrun sliding, or the sequence is not
+measuring the cell.
+
+Both ends rather than one, because the span at the end a rate is read *to* cannot
+be argued from the end it is read *from*. Sampling can displace a boundary by at
+most a cell, which bounds the span and says nothing about how it falls - and on
+this line, measured, it does not fall: half the cell leaves it the same size.
+So nothing is carried between the ends.
 
 **What share of it the two walls carry.** The same conductors, grown the same
 half cell, priced by geometry alone as electrostatics on the cross-section. It
@@ -65,7 +83,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 
 import numpy as np
 import pytest
@@ -73,11 +90,22 @@ import pytest
 from Microwave.Solvers.openems import preflight, read, residual, run
 from Microwave.Solvers.openems.model import Problem
 from Microwave.Solvers.openems.staircase import GROWN_BY
-from tests import coax, convergence, staircase_model
+from tests import coax, convergence, solving, staircase_model
 from tests.analytic import reference
-from tests.conftest import _freecadcmd
+from tests.conftest import draw_cases
 
 pytestmark = pytest.mark.slow
+
+#: Every case, as parameters. A property of one solved line is asserted at all of
+#: them and solved at one, :data:`~tests.coax.NOMINAL` being the operating point
+#: and the rest a study.
+EVERY_CASE = solving.parameters(coax.cases(), coax.NOMINAL)
+
+#: The refinement's own cases, as parameters. What is asserted at each of them is
+#: a property of one mesh rather than of the sequence, so it is the sequence's
+#: coarsest that a run not doing the study holds.
+REFINED_AT = solving.parameters([f"fine-{steps}" for steps in coax.CONDUCTOR_STEPS], coax.NOMINAL)
+assert len(REFINED_AT) > 1, "a rate needs more than one resolution in it"
 
 PROBE = os.path.join(os.path.dirname(__file__), "coax_probe.py")
 
@@ -88,24 +116,6 @@ PROBE = os.path.join(os.path.dirname(__file__), "coax_probe.py")
 #: what they would add is the noisiest estimate of a number that is the same at
 #: every frequency.
 MEASURED_ABOVE = 1.0 / coax.RECORD_SECONDS
-
-#: What an impedance read across a curved conductor is claimed to be good for, as
-#: a share of the answer, at any cell in this sequence. It is a statement about
-#: this workbench rather than about the reference, which is exact - so the bar is
-#: ours to keep, and holding it at the coarsest cell is what stops it drifting
-#: into a claim about one mesh.
-#:
-#: Looser than the sphere's by a long way, and the drawing says why: the coarsest
-#: cell here is a fifth of the inner conductor's radius, where the sphere's is a
-#: sixteenth of its own, and the impedance divides by that radius rather than
-#: multiplying by it.
-TEM_ACCURACY = 0.10
-
-#: How fast the error has to fall as the cell shrinks. Above one is the whole
-#: claim: a boundary decided by an uncorrected rounding is first order, so
-#: anything better says the rounding was dealt with rather than merely made
-#: smaller.
-FASTER_THAN = 1.0
 
 #: How far the impedance may vary across the band, as a share of its mean. A TEM
 #: line has no dispersion at all, so this is scored against nothing but the
@@ -127,19 +137,33 @@ MATCHED = 0.02
 #: share of it tightens every time the thing it watches improves.
 POLYGON_SHARE = 0.05
 
+#: How far past what the reported departures account for the impedance may move,
+#: as a share of that figure.
+#:
+#: The bound itself is arithmetic - two walls moved by their reported distances
+#: move ``ln(b/a)`` by exactly that much - so what this allows for is what sits
+#: around it: the report is a mean over each surface where the closed form wants
+#: the wall the probes read, and the answer carries the lattice's own
+#: registration on top. A slack rather than a factor.
+DEPARTURE_OVERSHOOT = 0.25
+
 #: How far apart the same mesh may answer when it is slid under the drawing, as
 #: a share of what a whole cell of displacement is worth.
 #:
 #: A wall decided by sampling is somewhere else once the lines are somewhere
 #: else, and a *flat* wall on a lattice moves a whole cell as the lattice slides
-#: a whole cell under it. A round one does not: it meets the grid at every phase
-#: at once around its own circumference, so what slides is which part of it is
-#: caught rather than all of it, and the radius the field sees barely moves. A
+#: a whole cell under it. A round one moves less than all of it: the circle meets
+#: the grid at every phase at once around itself, so what a slide changes is
+#: which part of the wall is caught rather than where the whole of it sits. A
 #: fraction of a cell is that property, and it is what says the answer belongs to
 #: the drawing rather than to where the grid happened to fall.
 #:
-#: It is also the error bar on everything else read off this sequence, one solve
-#: per resolution being one alignment per resolution.
+#: A fraction and not a vanishing one. The circle is the *cross-section* of a
+#: cylinder, and a cylinder shows the grid the same circle at every height, so
+#: nothing about the sampling averages along the line - which is why nothing here
+#: assumes the span falls as the cell does. It is held at each end of the
+#: sequence separately for that reason, and a bar written as a share of a cell's
+#: worth tightens as the sequence refines, the worth falling with the cell.
 LATTICE_SHARE = 0.25
 
 #: How far the grid reaches when the walls are priced on their own, in mm. The
@@ -173,97 +197,99 @@ TREND_OVER_LATTICE = 3.0
 
 @pytest.fixture(scope="module")
 def envelopes(tmp_path_factory):
-    """Draw every case under a real FreeCAD, once.
+    """Draw every case under a real FreeCAD, once."""
+    return draw_cases(PROBE, tmp_path_factory.mktemp("coax"), "COAX_OUT")
 
-    The exit status is not consulted: ``freecadcmd`` segfaults in Qt's teardown
-    after everything has been written, so judging the run by its status would
-    fail it for finishing. What is judged is the manifest.
-    """
-    binary = _freecadcmd()
-    if binary is None:
-        pytest.skip("no freecadcmd on this machine, so the CAD kernel is unreachable")
 
-    out = tmp_path_factory.mktemp("coax")
-    result = subprocess.run(
-        [binary, PROBE],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "COAX_OUT": str(out)},
-        cwd=os.path.dirname(os.path.dirname(PROBE)),
+def _solve(name: str, envelopes, interpreter):
+    """One case, read off the envelope the kernel drew and solved."""
+    directory = envelopes[name]
+    envelope = directory / "openems.json"
+    problem = Problem.from_dict(json.loads(envelope.read_text()))
+    preflight.refuse_if_blocked(preflight.check(problem))
+    run.run(str(envelope), interpreter=interpreter)
+    # Written beside the envelope rather than in it: the departure is a fact
+    # about the drawing, the driver never sees one, and a field nothing on that
+    # side reads would move the digest a result is matched on.
+    departures = json.loads((directory / "departures.json").read_text())
+    return (problem, read.read(str(directory)), departures)
+
+
+def _measure(name: str, solved):
+    """One case as the impedance it answered with, and the cell it answered on."""
+    problem, result, departures = solved(name)
+    want = coax.impedance()
+    in_band = np.asarray(result.frequency) >= MEASURED_ABOVE
+    assert in_band.any(), (
+        f"{name}: nothing in the sweep reaches {MEASURED_ABOVE / 1e6:.0f} MHz, "
+        "so there is no bin with a whole cycle in the record to read"
     )
-    manifest = out / "manifest.json"
-    if not manifest.exists():
-        raise AssertionError(
-            "the coax probe wrote no manifest, so it died before it finished.\n"
-            f"stdout:\n{result.stdout[-4000:]}\n\nstderr:\n{result.stderr[-4000:]}"
-        )
-    return {name: out / name for name in json.loads(manifest.read_text())["cases"]}
+    impedance = np.asarray(result.port(1).impedance)[in_band]
+    line = {
+        "cell": coax.annulus_cell(problem.grid.x),
+        "impedance": float(np.mean(impedance)),
+        "flatness": float(np.ptp(impedance) / np.mean(impedance)),
+        "reflection": float(np.max(np.abs(result.s(1, 1)[in_band]))),
+        "tail": result.tail_share,
+        # How far the run said the metal it solved stands from the metal drawn,
+        # in mm, by conductor. Both of them, because the impedance reads both
+        # walls and the closed form scoring it adds a contribution per wall.
+        "departure": {name: abs(value) for name, value in departures.items()},
+    }
+    line["error"] = (line["impedance"] - want) / want
+    departed = [(name, value) for name, value in line["departure"].items() if value]
+    print(
+        f"GATE coax {name}: cell {line['cell']:.4f} mm, "
+        f"Z {line['impedance']:.4f} ohm against {want:.4f} "
+        f"({100 * line['error']:+.3f} %), flat to {100 * line['flatness']:.3f} %, "
+        f"|S11| below {line['reflection']:.4f}, "
+        f"tail {max(line['tail'].values()):.2e} of {residual.WANTED:.0e}, "
+        + ", ".join(f"{name} {value:.3e} mm off the drawing" for name, value in sorted(departed))
+    )
+    return line
 
 
 @pytest.fixture(scope="module")
 def solved(envelopes, interpreter):
-    found = {}
-    for name, directory in sorted(envelopes.items()):
-        envelope = directory / "openems.json"
-        problem = Problem.from_dict(json.loads(envelope.read_text()))
-        preflight.refuse_if_blocked(preflight.check(problem))
-        run.run(str(envelope), interpreter=interpreter)
-        found[name] = (problem, read.read(str(directory)))
-    return found
+    """Each case, solved when something asks for it and once."""
+    return solving.Cases(lambda name: _solve(name, envelopes, interpreter))
 
 
 @pytest.fixture(scope="module")
-def measured(solved):
-    """Each case as the impedance it answered with, and the cell it answered on."""
-    want = coax.impedance()
-    found = {}
-    for name, (problem, result) in sorted(solved.items()):
-        in_band = np.asarray(result.frequency) >= MEASURED_ABOVE
-        assert in_band.any(), (
-            f"{name}: nothing in the sweep reaches {MEASURED_ABOVE / 1e6:.0f} MHz, "
-            "so there is no bin with a whole cycle in the record to read"
-        )
-        impedance = np.asarray(result.port(1).impedance)[in_band]
-        found[name] = {
-            "cell": coax.annulus_cell(problem.grid.x),
-            "impedance": float(np.mean(impedance)),
-            "flatness": float(np.ptp(impedance) / np.mean(impedance)),
-            "reflection": float(np.max(np.abs(result.s(1, 1)[in_band]))),
-            "tail": result.tail_share,
-        }
-        found[name]["error"] = (found[name]["impedance"] - want) / want
-        line = found[name]
-        print(
-            f"GATE coax {name}: cell {line['cell']:.4f} mm, "
-            f"Z {line['impedance']:.4f} ohm against {want:.4f} "
-            f"({100 * line['error']:+.3f} %), flat to {100 * line['flatness']:.3f} %, "
-            f"|S11| below {line['reflection']:.4f}"
-        )
-    return found
+def measure(solved):
+    """Each case as it is asked for, measured once and kept."""
+    return solving.Cases(lambda name: _measure(name, solved))
 
 
 @pytest.fixture(scope="module")
-def sequence(measured):
+def sequence(measure):
     """The one triangulation, coarsest cell first."""
-    found = [measured[f"fine-{steps}"] for steps in sorted(coax.CONDUCTOR_STEPS)]
+    found = [measure(f"fine-{steps}") for steps in sorted(coax.CONDUCTOR_STEPS)]
     assert len(found) > 1, "a rate needs more than one resolution in it"
     return found
 
 
 @pytest.fixture(scope="module")
-def replicated(measured):
-    """One resolution of the sequence, solved at several alignments.
+def replicated(measure):
+    """Each end of the sequence, solved at several alignments, coarsest first.
 
     The sequence's own case is the alignment the drawing came out at, so it is
-    the first of these rather than a case of its own.
+    the first of each of these rather than a case of its own - and it is the one
+    whose cell labels the whole set, the others being that mesh in another place.
+
+    That they *are* that mesh is held off the envelopes by ``test_coax_fixture``,
+    on every axis and before anything is solved. It is not held here on the cell
+    at a wall, which a translation does not keep: a wall sits in whichever cell
+    it falls in, the mesh is graded rather than uniform there, and half a cell of
+    slide can carry a wall across a line into a neighbour a tenth wider. That is
+    a fact about which cell is being named and not about what the run did.
     """
-    found = [measured[f"fine-{coax.REPLICATED_AT}"]]
-    found += [measured[coax.phase_case(offset)] for offset in coax.LATTICE_PHASES]
-    cells = {round(line["cell"], 9) for line in found}
-    assert len(cells) == 1, (
-        f"the alignments came out on different cells - {sorted(cells)} mm - so what "
-        "separates their answers is the mesh as well as where it fell"
-    )
+    found = {}
+    for steps in sorted(coax.REPLICATED_AT):
+        lines = [measure(f"fine-{steps}")]
+        lines += [measure(coax.phase_case(steps, offset)) for offset in coax.LATTICE_PHASES]
+        found[steps] = lines
+    assert len(found) > 1, "a band needs more than one resolution to be measured at"
     return found
 
 
@@ -276,27 +302,30 @@ def _lattice_spread(replicated) -> float:
     return float(np.ptp([line["impedance"] for line in replicated]) / coax.impedance())
 
 
-def _worst_alignment(sequence, replicated) -> list[float]:
-    """Each point of the sequence moved to whichever alignment lowers the rate.
+def _ends(replicated) -> tuple[list, list]:
+    """The coarse end's alignments and the fine end's."""
+    steps = sorted(replicated)
+    return replicated[steps[0]], replicated[steps[-1]]
 
-    A point is one solve, so it is one alignment, and where in its own spread
-    that alignment landed is not known - at the resolution that was replicated
-    the sequence's own alignment turns out to be at the end of it. So the reach
-    either way is the whole spread and not half of it: half would be a band
-    hung off the middle, and the middle is exactly what a single solve does not
-    give. Carried from the resolution the spread was measured at to the rest in
-    proportion to the cell, because that is what it is a property of - how far
-    sampling can move a boundary is bounded by the cell it is sampled on.
 
-    The fitted exponent is linear in each point's logarithm, so the lowest one
-    the band admits is at a corner of it - raise the error where the cell is
-    below the middle of the sequence, lower it where it is above.
+def _pairings(replicated) -> np.ndarray:
+    """The rate between every alignment of one end and every alignment of the
+    other, as exponents of the cell.
+
+    Nothing here is averaged and nothing is carried anywhere. Each figure is the
+    rate between two answers the run produced, so the range is what the ends
+    would have given had either been solved at another of the alignments beside
+    it - which is the question one solve per resolution cannot answer, a solve
+    being one place the lattice fell.
+
+    The alignments solved and not the lattice: the offsets are the extremes of
+    the region it moves in rather than an even sample of it, so a range is what
+    they estimate and a mean is not.
     """
-    cells = np.array([line["cell"] for line in sequence])
-    band = _lattice_spread(replicated) * cells / replicated[0]["cell"]
-    raised = np.log(cells) < np.log(cells).mean()
-    errors = np.abs([line["error"] for line in sequence])
-    return list(errors + np.where(raised, 1.0, -1.0) * band)
+    coarse, fine = _ends(replicated)
+    arm = np.log(coarse[0]["cell"] / fine[0]["cell"])
+    errors = (np.abs([line["error"] for line in coarse]), np.abs([line["error"] for line in fine]))
+    return np.log(errors[0][:, None] / errors[1][None, :]) / arm
 
 
 # ---------------------------------------------------------------------------
@@ -315,25 +344,24 @@ def test_the_record_is_long_enough_to_leave_a_band():
     )
 
 
-def test_the_run_outlasted_its_own_signal(measured):
+@pytest.mark.parametrize("name", EVERY_CASE)
+def test_the_run_outlasted_its_own_signal(measure, name):
     """The line is infinite, so the whole of the signal is the source's pulse
     going past the probes once. What is left in the port when the record stops
     says whether it did."""
-    worst = max(max(line["tail"].values()) for line in measured.values())
-    print(f"\nGATE coax worst tail share = {worst:.2e}, bound {residual.WANTED:.0e}")
-    for name, line in measured.items():
-        assert residual.unfinished(line["tail"]) is None, name
+    assert residual.unfinished(measure(name)["tail"]) is None, name
 
 
-def test_the_line_never_reflects(measured):
+@pytest.mark.parametrize("name", EVERY_CASE)
+def test_the_line_never_reflects(measure, name):
     """It runs out through the absorber at both ends, so it has no end to reflect
     off - and an impedance read off a line that does is the line plus whatever
     came back."""
-    for name, line in measured.items():
-        assert line["reflection"] < MATCHED, (
-            f"{name}: |S11| reaches {line['reflection']:.4f}, so the line is "
-            "terminated somewhere rather than running out through the absorber"
-        )
+    line = measure(name)
+    assert line["reflection"] < MATCHED, (
+        f"{name}: |S11| reaches {line['reflection']:.4f}, so the line is "
+        "terminated somewhere rather than running out through the absorber"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -341,40 +369,103 @@ def test_the_line_never_reflects(measured):
 # ---------------------------------------------------------------------------
 
 
-def test_the_impedance_is_the_same_at_every_frequency(measured):
+@pytest.mark.parametrize("name", EVERY_CASE)
+def test_the_impedance_is_the_same_at_every_frequency(measure, name):
     """A TEM line has no dispersion: one impedance, exactly, across the whole
     band. Anything that varies with frequency here is the discretisation, a
     higher mode the probes did not outrun, or a reflection - and none of those is
     in the closed form this is scored against."""
-    for name, line in measured.items():
-        assert line["flatness"] < FLAT_ENOUGH, (
-            f"{name}: the impedance ranges over {100 * line['flatness']:.3f} % of "
-            f"its mean across the band, and a TEM line has no dispersion at all"
-        )
-
-
-def test_every_mesh_answers_within_what_a_curved_tem_line_claims(measured):
-    """Including the coarsest, so this is a claim about curved conductors and not
-    about one lucky mesh."""
-    for name, line in measured.items():
-        assert abs(line["error"]) < TEM_ACCURACY, (
-            f"{name}: {100 * line['error']:+.3f} % from the closed form at a cell "
-            f"of {line['cell']:.4f} mm, against a claim of {100 * TEM_ACCURACY:g} %"
-        )
-
-
-def test_refining_the_cell_always_helps(sequence):
-    """Assumption-free, and it has to hold before a rate is worth reading: a
-    sequence that stops improving is one converging on something other than the
-    drawing, whatever exponent can be fitted through it."""
-    assert convergence.falls_with_every_refinement(
-        [line["cell"] for line in sequence], [line["error"] for line in sequence]
-    ), "a coarser cell answered better than a finer one: " + ", ".join(
-        f"{line['cell']:.4f} mm -> {100 * line['error']:+.3f} %" for line in sequence
+    line = measure(name)
+    assert line["flatness"] < FLAT_ENOUGH, (
+        f"{name}: the impedance ranges over {100 * line['flatness']:.3f} % of "
+        f"its mean across the band, and a TEM line has no dispersion at all"
     )
 
 
-def test_where_the_lattice_falls_is_worth_a_fraction_of_a_cell(replicated):
+def test_the_closed_form_is_inside_the_uncertainty_the_study_computed(sequence):
+    """The gate on the answer, and the one thing a rate cannot ask.
+
+    A sequence can refine perfectly onto the wrong number - the exponent says the
+    discretisation is behaving and says nothing about *where* it is heading. This
+    asks the other question, and on this drawing it is the sharper one: two round
+    walls, neither on a grid line, with the answer dividing by the smaller radius.
+    A wall that reaches the engine the wrong size gives a wrong impedance that
+    converges just as tidily as a right one.
+    """
+    want = coax.impedance()
+    estimate = convergence.uncertainty_of(
+        [line["cell"] for line in sequence], [line["impedance"] for line in sequence]
+    )
+    off = (estimate.finest - want) / want
+    print(
+        f"\nGATE coax band: {estimate.finest:.4f} ohm against {want:.4f} "
+        f"({100 * off:+.3f} %), uncertainty +/-{100 * estimate.uncertainty / want:.3f} % "
+        f"at order {estimate.order:.2f} by the {estimate.expansion} expansion, "
+        f"safety {estimate.safety:g}; refinement heads for {estimate.limit:.4f} ohm "
+        f"({100 * (estimate.limit - want) / want:+.3f} %)"
+    )
+    assert estimate.readable, (
+        f"the fit scatters by {estimate.scatter:.4g} ohm against a data range of "
+        f"{estimate.data_range:.4g} ohm, so this sequence is measuring where the "
+        "cells fell rather than how big they are"
+    )
+    assert estimate.covers(want), (
+        f"{100 * off:+.3f} % from the closed form against an uncertainty of "
+        f"{100 * estimate.uncertainty / want:.3f} %, so refinement is heading "
+        f"somewhere the closed form is not - it reaches {estimate.limit:.4f} ohm "
+        f"and Laplace's equation gives {want:.4f} ohm"
+    )
+
+
+def test_refining_the_cell_always_helps(sequence, replicated):
+    """Assumption-free, and it is the whole of what this sequence says about the
+    rate: a sequence that stops improving is one converging on something other
+    than the drawing, whatever exponent can be fitted through it.
+
+    The exponent is printed and nothing is asserted about it. A conducting
+    boundary decided by an uncorrected rounding is first order in the cell, and
+    the half-cell growth changes what that term is worth rather than removing it
+    - so a rate above one was never what a working correction would show here.
+    What the sequence can separate is printed beside the exponent: the standard
+    error of the slope, and the rates the two replicated ends give when each of
+    their alignments is paired with each of the other's. Neither leaves the figure
+    clear of first order - the standard error is a large share of the distance to
+    it, and the pairings reach below it - which is what makes the exponent a
+    reported figure here rather than a bar.
+
+    Sliding the grid is why. Each point of the fit is one solve and so one place
+    the lattice fell, and consecutive pairs of them give interval rates on either
+    side of the fit rather than about it.
+
+    Which is a limit on what is asserted here too, and it is worth stating rather
+    than reading into the word "assumption-free". This says the solves in this
+    sequence fall; it does not say the same sequence at other alignments would.
+    Two neighbours in the middle can sit closer together than sliding either of
+    them is worth, and the ``GATE`` lines print both quantities for a reader to
+    put side by side. What is free of that is
+    ``test_the_trend_outruns_the_lattice``, which compares the whole sequence's
+    fall against a span that was measured.
+    """
+    cells = [line["cell"] for line in sequence]
+    errors = [line["error"] for line in sequence]
+    pairings = _pairings(replicated)
+    coarse, fine = _ends(replicated)
+    print(
+        f"\nGATE coax order: the error falls as the cell to the power "
+        f"{convergence.order_of(cells, errors):.2f}, give or take "
+        f"{convergence.order_uncertainty(cells, errors):.2f} on the fit's own scatter; "
+        f"between {pairings.min():.2f} and {pairings.max():.2f} across the "
+        f"{pairings.size} pairings of an alignment at {coarse[0]['cell']:.4f} mm with "
+        f"one at {fine[0]['cell']:.4f} mm"
+    )
+    assert convergence.falls_with_every_refinement(cells, errors), (
+        "a coarser cell answered better than a finer one: "
+        + ", ".join(f"{line['cell']:.4f} mm -> {100 * line['error']:+.3f} %" for line in sequence)
+    )
+
+
+@pytest.mark.parametrize("steps", sorted(coax.REPLICATED_AT))
+def test_where_the_lattice_falls_is_worth_a_fraction_of_a_cell(replicated, steps):
     """The same mesh, slid under the drawing.
 
     A cell size says how big the cells are and nothing about where they fall,
@@ -386,15 +477,25 @@ def test_where_the_lattice_falls_is_worth_a_fraction_of_a_cell(replicated):
     Here it is the free variable: every case carries the same drawing, the same
     cells and the same count of steps, and differs in where the lines sit against
     the model. Against the *model* rather than against the metal, because the
-    port snaps to the grid too - its probes and its current loops land on
-    whichever lines are nearest, so what this spans is everything a mesh's
-    position reaches, which is also exactly what the sequence's own points carry.
+    port snaps to the grid too - its voltage probes reach out along a transverse
+    ray and its current loops close around one, so both land on whichever lines
+    are nearest in the plane these offsets move.
+
+    That plane is the whole of the free variable; the axis along the line is left
+    out because nothing varies there. The drawing is a cylinder, so it shows the
+    grid the same cross-section at every height, and the two positions along it
+    that would register - the source and the measurement plane - are given lines
+    of their own by ``Port.wanted_lines`` rather than snapped to whatever is
+    nearest. The reading is a ratio a travelling wave cancels out of whatever
+    the probe triplet's spacing, which holds only while the line is matched -
+    ``test_the_line_never_reflects`` is what asserts that.
     """
-    spread = _lattice_spread(replicated)
-    worth = coax.displacement_worth(replicated[0]["cell"])
+    lines = replicated[steps]
+    spread = _lattice_spread(lines)
+    worth = coax.displacement_worth(lines[0]["cell"])
     print(
-        f"\nGATE coax lattice: {len(replicated)} alignments at "
-        f"{replicated[0]['cell']:.4f} mm answer {100 * spread:.3f} % apart, against "
+        f"\nGATE coax lattice: {len(lines)} alignments at "
+        f"{lines[0]['cell']:.4f} mm answer {100 * spread:.3f} % apart, against "
         f"{100 * worth:.3f} % for a whole cell of displacement"
     )
     assert spread < LATTICE_SHARE * worth, (
@@ -412,12 +513,11 @@ def test_the_trend_outruns_the_lattice(sequence, replicated):
     along with it. So refining has to buy several times what sliding does, or the
     trend is the lattice wearing a cell size's name.
 
-    It compares two spans at the resolutions they were measured at and carries
-    neither anywhere, which is what makes it the assumption-free half of this
-    pair - the exponent below has to extrapolate the alignment to the
-    resolutions that were not replicated.
+    Against the widest span measured rather than either end's own: the trend is
+    read across the whole sequence, so what it has to beat is the most the
+    lattice moves anywhere in it.
     """
-    spread = _lattice_spread(replicated)
+    spread = max(_lattice_spread(lines) for lines in replicated.values())
     trend = abs(sequence[0]["error"]) - abs(sequence[-1]["error"])
     print(
         f"\nGATE coax trend: refining the cell moved the answer {100 * trend:.3f} %, "
@@ -431,53 +531,52 @@ def test_the_trend_outruns_the_lattice(sequence, replicated):
     )
 
 
-def test_the_error_falls_faster_than_the_cell(sequence, replicated):
-    """The gate on the staircase correction, read through an impedance instead of
-    a resonance.
+def test_sliding_the_grid_moves_the_answer_more_than_redrawing_it_does(replicated, measure):
+    """That the alignments are a measurement and not one case solved again.
 
-    A conducting boundary decided by an uncorrected rounding is first order in
-    the cell. Anything faster says the rounding is gone rather than merely
-    smaller - and a correction of the wrong size cannot pass this, because what
-    it leaves behind is proportional to the cell again.
+    A slide that never reached the solver would leave identical answers and a
+    span of nothing, and every bar a span is held *under* would pass on it. What
+    it is held over is this gate's own floor for two inputs that should answer
+    alike: the same line triangulated coarsely and finely, which is a different
+    polyhedron on the same mesh and is what
+    ``test_one_line_drawn_two_ways_answers_the_same`` scores. That floor is
+    measured at the finest cell, where the grid contributes least and the two
+    triangulations differ most, so it is the largest this gate has - and it is
+    taken against the closed form here rather than against the finer answer, as
+    that test takes it, so that it is in the units the spans are in.
 
-    Both walls of the annulus are refined together, so the exponent is against one
-    cell rather than against a mesh that moved in one place. That is a property of
-    the fixture and ``test_the_two_walls_are_refined_together`` is what holds it.
-
-    **It is one alignment per point, and the band that admits is printed beside
-    it rather than asserted, because this sequence does not clear it.** Each
-    point is one solve and so one place the lattice happened to fall; the
-    exponent is fitted through those, and consecutive pairs of them give interval
-    rates either side of the fit because the difference between two neighbours is
-    the smaller quantity. Let every point reach as far as
-    ``test_where_the_lattice_falls_is_worth_a_fraction_of_a_cell`` measures - the
-    whole spread, since a single solve does not say where in that spread it
-    landed - and the exponent the corner of that band admits falls to either side
-    of this bar. So what the figure states is the sequence at the alignments it
-    was solved at, and what would make it a statement about the method is
-    replicating the alignment at more than one resolution - which is not the same
-    as adding another resolution, and costs more.
-
-    What holds regardless is beside it. ``test_the_trend_outruns_the_lattice``
-    says refining outruns sliding, and ``test_refining_the_cell_always_helps``
-    needs no exponent at all.
+    The two spans are printed side by side because what they do between the ends
+    is the thing no mechanism gives. Sampling can displace a boundary by at most
+    a cell, which says the span cannot grow without bound and does not say it
+    falls; here it does not fall. Printed against what carrying the coarse span
+    to the fine cell in proportion would predict, and not as an exponent through
+    the two, two points lying on their own line whatever they are.
     """
-    cells = [line["cell"] for line in sequence]
-    order = convergence.order_of(cells, [line["error"] for line in sequence])
-    worst = convergence.order_of(cells, _worst_alignment(sequence, replicated))
+    coarse, fine = _ends(replicated)
+    spreads = [_lattice_spread(coarse), _lattice_spread(fine)]
+    cells = [coarse[0]["cell"], fine[0]["cell"]]
+    finest = max(coax.CONDUCTOR_STEPS)
+    redrawn = (
+        abs(measure(f"coarse-{finest}")["impedance"] - measure(f"fine-{finest}")["impedance"])
+        / coax.impedance()
+    )
     print(
-        f"\nGATE coax order: the error falls as the cell to the power {order:.2f}, "
-        f"{worst:.2f} under the worst alignment the band admits, "
-        f"from {100 * sequence[0]['error']:+.3f} % at {sequence[0]['cell']:.4f} mm "
-        f"to {100 * sequence[-1]['error']:+.3f} % at {sequence[-1]['cell']:.4f} mm"
+        f"\nGATE coax lattice span: sliding the grid is worth {100 * spreads[0]:.3f} % at "
+        f"{cells[0]:.4f} mm and {100 * spreads[1]:.3f} % at {cells[1]:.4f} mm, against "
+        f"{100 * spreads[0] * cells[1] / cells[0]:.3f} % for carrying the first in "
+        f"proportion to the cell; redrawing the line on one mesh is worth "
+        f"{100 * redrawn:.4f} %"
     )
-    assert order > FASTER_THAN, (
-        f"the error falls as the cell to the power {order:.2f}, which is what an "
-        "uncorrected rounding at the conductor's surface would give"
-    )
+    for cell, spread in zip(cells, spreads):
+        assert spread > redrawn, (
+            f"at {cell:.4f} mm the alignments span {100 * spread:.3f} %, and redrawing "
+            f"the line on one mesh moves it {100 * redrawn:.4f} % - so sliding the grid "
+            "is not what separates these answers"
+        )
 
 
-def test_the_two_walls_carry_a_share_of_what_the_gate_reads(sequence):
+@pytest.mark.parametrize("name", REFINED_AT)
+def test_the_two_walls_carry_a_share_of_what_the_gate_reads(measure, name):
     """How much of the gate's own distance from the closed form the conductors'
     surfaces account for, priced by geometry alone.
 
@@ -506,43 +605,42 @@ def test_the_two_walls_carry_a_share_of_what_the_gate_reads(sequence):
     way the gate reads it, and they are not a negligible part of it.
     """
     ideal = reference.coaxial_impedance(coax.INNER_RADIUS, coax.OUTER_RADIUS, 1.0)
-    priced = []
-    for line in sequence:
-        cell = line["cell"]
-        # Vacuum, and read as a ratio: one permittivity used throughout drops
-        # out of a fractional error, and the fill is not what is being priced.
-        over = [
-            staircase_model.impedance(
-                *(staircase_model.uniform(cell, WALLS_SPAN, offset) for offset in phase),
-                coax.INNER_RADIUS + GROWN_BY * cell,
-                coax.OUTER_RADIUS - GROWN_BY * cell,
-            )
-            / ideal
-            - 1.0
-            for phase in WALLS_AT
-        ]
-        priced.append(float(np.mean(over)))
-    print(
-        "\nGATE coax walls: "
-        + ", ".join(
-            f"{line['cell']:.4f} mm: {100 * wall:+.3f} % of the {100 * line['error']:+.3f} % solved"
-            for line, wall in zip(sequence, priced)
+    line = measure(name)
+    cell = line["cell"]
+    # Vacuum, and read as a ratio: one permittivity used throughout drops out of
+    # a fractional error, and the fill is not what is being priced.
+    wall = float(
+        np.mean(
+            [
+                staircase_model.impedance(
+                    *(staircase_model.uniform(cell, WALLS_SPAN, offset) for offset in phase),
+                    coax.INNER_RADIUS + GROWN_BY * cell,
+                    coax.OUTER_RADIUS - GROWN_BY * cell,
+                )
+                / ideal
+                - 1.0
+                for phase in WALLS_AT
+            ]
         )
     )
-    for line, wall in zip(sequence, priced):
-        assert wall * line["error"] > 0.0, (
-            f"at {line['cell']:.4f} mm the walls alone move the impedance "
-            f"{100 * wall:+.3f} % and the gate reads {100 * line['error']:+.3f} %, so what "
-            "the grid does to the conductors is not what the run is answering with"
-        )
-        assert abs(wall) > WALLS_CARRY * abs(line["error"]), (
-            f"at {line['cell']:.4f} mm the walls account for {100 * wall:+.3f} % of the "
-            f"{100 * line['error']:+.3f} % the gate reads, which is not a share of it - so "
-            "the sequence is measuring something other than where the conductors landed"
-        )
+    print(
+        f"\nGATE coax walls {name}: at {cell:.4f} mm the walls alone are "
+        f"{100 * wall:+.3f} % of the {100 * line['error']:+.3f} % solved"
+    )
+    assert wall * line["error"] > 0.0, (
+        f"at {cell:.4f} mm the walls alone move the impedance "
+        f"{100 * wall:+.3f} % and the gate reads {100 * line['error']:+.3f} %, so what "
+        "the grid does to the conductors is not what the run is answering with"
+    )
+    assert abs(wall) > WALLS_CARRY * abs(line["error"]), (
+        f"at {cell:.4f} mm the walls account for {100 * wall:+.3f} % of the "
+        f"{100 * line['error']:+.3f} % the gate reads, which is not a share of it - so "
+        "the sequence is measuring something other than where the conductors landed"
+    )
 
 
-def test_one_line_drawn_two_ways_answers_the_same(measured):
+@pytest.mark.release
+def test_one_line_drawn_two_ways_answers_the_same(measure):
     """No reference, no error bar. The two are the same line at the same mesh and
     a different polyhedron, so anything the polygonisation carries shows up here
     and nowhere else.
@@ -553,7 +651,7 @@ def test_one_line_drawn_two_ways_answers_the_same(measured):
     the surface it was approximated by.
     """
     finest = max(coax.CONDUCTOR_STEPS)
-    fine, coarse = measured[f"fine-{finest}"], measured[f"coarse-{finest}"]
+    fine, coarse = measure(f"fine-{finest}"), measure(f"coarse-{finest}")
     apart = abs(coarse["impedance"] - fine["impedance"]) / fine["impedance"]
     a_cell = coax.displacement_worth(fine["cell"])
     print(
@@ -565,4 +663,61 @@ def test_one_line_drawn_two_ways_answers_the_same(measured):
         f"rather than {coax.FINENESSES['fine']:g} moved the impedance "
         f"{100 * apart:.4f} %, which is not small beside the "
         f"{100 * a_cell:.3f} % a cell of displacement is worth"
+    )
+
+
+@pytest.mark.release
+def test_the_run_says_how_far_off_the_drawing_it_solved_and_the_figure_converts(measure):
+    """The reported departure, held to being a bound on what it cost.
+
+    The impedance goes as ``ln(b/a)``, so moving each wall by its own reported
+    distance moves the answer by an amount :func:`coax.walls_worth` states in
+    closed form. That is a bound and not a prediction: a cell's material is
+    decided by sampling one point in it, so a surface standing a small fraction
+    of a cell off changes which cells are metal only where it crosses a sampling
+    point, and a polygonisation much finer than the cell falls mostly between the
+    samples.
+
+    So what is asserted is the direction that can be wrong in a way that matters.
+    An answer moving further than the reported distance accounts for is a report
+    that understated what the surface did; the gap the other way is the grid
+    declining to resolve a difference, and is printed rather than bounded.
+
+    Here and not on a cavity gate: a resonance integrates a wall over a whole
+    surface, where a coaxial impedance is first order in a local radius and this
+    fixture is scored against the radii that were drawn rather than against the
+    polyhedron the engine was handed.
+
+    The two solves already happen for the test above. This costs none.
+    """
+    finest = max(coax.CONDUCTOR_STEPS)
+    fine, coarse = measure(f"fine-{finest}"), measure(f"coarse-{finest}")
+    # Each conductor against itself, because the closed form adds a term per
+    # wall and each wall is triangulated against its own radius. Taking one
+    # figure for both would put the inner conductor's displacement where the
+    # shield's belongs.
+    walls = {
+        name: coarse["departure"].get(name, 0.0) - fine["departure"].get(name, 0.0)
+        for name in coax.CONDUCTORS
+    }
+    assert all(moved > 0.0 for moved in walls.values()), (
+        "each conductor should stand further from the drawing at the coarser "
+        f"triangulation than at the finer one, and they moved {walls}"
+    )
+    # Both surfaces are inscribed at both triangulations, so what separates the
+    # two answers is the difference rather than either figure on its own.
+    predicted = coax.walls_worth(walls[coax.INNER], walls[coax.SHIELD])
+    moved = (coarse["impedance"] - fine["impedance"]) / fine["impedance"]
+    print(
+        f"\nGATE coax departure: refining the surface pulled {coax.INNER} in by "
+        f"{walls[coax.INNER]:.3e} mm and {coax.SHIELD} by {walls[coax.SHIELD]:.3e} mm "
+        f"- at most {100 * predicted:+.4f} % of the impedance, on a cell of "
+        f"{fine['cell']:.4f} mm; the solves moved {100 * moved:+.4f} %"
+    )
+    assert abs(moved) <= predicted * (1.0 + DEPARTURE_OVERSHOOT), (
+        f"the run says its conductors moved {walls} between the two "
+        f"triangulations, which is worth at most {100 * predicted:+.4f} % of the "
+        f"impedance - and the solves moved {100 * moved:+.4f} %. An answer that "
+        "moves further than the reported distance can account for is a report "
+        "that understated what the surface did"
     )

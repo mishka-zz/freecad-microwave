@@ -1,119 +1,119 @@
 # Building one S-matrix out of several runs
 
-A time-domain solver drives one port at a time. Each run gives one *column* of
-the scattering matrix, and an N-port needs N of them. This page is about putting
-those columns together: what makes them comparable, what a user's declaration of
-symmetry buys, and why the obvious way of spending it is wrong.
+In time-domain FDTD, multi-port S-parameters are obtained by exciting each port
+sequentially. Each simulation run yields one column of the $N \times N$
+scattering matrix $[S]$. This page describes the procedure for assembling
+independent port runs into a unified S-matrix, handling incomplete sweeps, and
+enforcing mirror symmetry across ports with field-extracted characteristic
+impedances.
 
 ## A column, and what it is measured against
 
-Column *j* comes from the run that excited port *j*. For the columns to belong to
-one matrix they must describe one structure, which is guaranteed by re-exciting a
-single translation rather than by trusting a list of solves.
+Column *j* comes from the run that excited port *j*. For the columns to belong
+to one matrix they must describe one structure, which is guaranteed by
+re-exciting a single translation rather than by trusting a list of solves.
 
-They must also agree about what each port's impedance *is*, and this is where the
-difficulty starts. A lumped port's reference impedance is the resistance the user
-typed, and two of them agree exactly. A microstrip port does not have one typed:
-it **measures** its own characteristic impedance from its probe fields. So the two
-ends of a line that is genuinely symmetric come back slightly different, every
-time, as a matter of numerical noise rather than of physics.
+They must also agree about what each port's impedance *is*. A lumped port's
+reference impedance is the resistance specified by the user, and matches
+identically across ports. A microstrip port measures its characteristic
+impedance dynamically from simulated probe fields, so two ports on an
+identical symmetric line exhibit minor numerical differences in extracted
+impedance.
 
-Fewer runs than ports is allowed and is not a degraded result. Driving one port
-of a two-port measures S11 and S21 exactly, which is what a one-path VNA gives.
-The undriven columns come back `nan`, and marking them `nan` rather than zero is
-the point: a zero is a number that will be plotted.
+Incomplete sweeps with fewer runs than ports are supported. Driving one port
+of a two-port measures $S_{11}$ and $S_{21}$. Undriven columns are populated
+with `nan` to indicate unmeasured terms.
 
-## What a declared mirror buys
+## Applying mirror symmetry
 
-Reciprocity - S12 = S21 - holds for every material this workbench can express,
-and it is not enough. It fills the off-diagonal and leaves S22 unknown, so it
-completes nothing on its own.
+For passive, isotropic media, reciprocity guarantees $S_{12} = S_{21}$. However,
+reciprocity alone leaves $S_{22}$ undetermined when only Port 1 is excited.
 
-The mirror is the part that is the *user's claim*: that the device is its own
-image about the plane between its two ports, and that the two ports are
-identical. Under it S22 = S11, the missing column is determined, and a symmetric
-two-port costs one solve instead of two.
+Declaring `Symmetry = Mirror` asserts that the device geometry and ports are
+mirror-symmetric about the transverse center plane between Port 1 and Port 2.
+Under mirror symmetry, $S_{22} = S_{11}$, allowing the full 2-port S-matrix
+to be determined from a single simulation of Port 1.
 
-It is declared rather than measured because no geometry check can make it. A
-board symmetric to within a via's placement is symmetric for this purpose, and
-nothing in the drawing says so.
+Mirror symmetry is declared explicitly by the user because geometric heuristics
+cannot determine whether minor geometric asymmetries (such as via placement)
+are intentionally negligible for RF analysis.
 
-## Why the copy cannot be made in the measured basis
+## Reference impedance alignment across ports
 
-Both identities need the two ports at **one** reference impedance. The two
-measured impedances differ slightly, so copying S11 into S22 while each port sits
-at its own measurement means copying between two different bases.
+Enforcing $S_{22} = S_{11}$ requires both ports to be defined relative to an
+identical reference impedance. Because microstrip ports extract characteristic
+impedance from local numerical field distributions, their extracted values
+differ slightly. Copying $S_{11}$ directly into $S_{22}$ while Port 1 and
+Port 2 have different reference impedances would combine parameters across
+inconsistent bases.
 
-The renormalisation that happens afterwards then moves the two diagonal terms by
-different amounts, and undoes the copy. It is a small absolute perturbation. It
-hides completely in a passband, where the terms are large, and it dominates in a
-reflection null, where they are not - which is exactly where a filter is read.
+Subsequent renormalization to a fixed impedance (such as 50 Ω) would shift the
+two reflection coefficients by unequal amounts, violating symmetry. While this
+effect is small in passbands, it introduces noticeable errors at deep reflection
+nulls in filter responses.
 
-## So the basis is made, not assumed
+## Renormalization to a common reference base
 
-The driven port is renormalised to the **undriven port's** measured impedance,
-and the copy is made there.
+To maintain symmetry, the driven port's S-parameters are first renormalized to
+the measured reference impedance of the unexcited port. The symmetry copy is
+then performed in this common impedance basis.
 
-That particular move is the one the missing column cannot affect. Renormalising
-with `G = diag(g, 0)` - a change at the driven port only - the driven column of
+The basis is the undriven port's rather than the driven one's for two reasons.
+A mirror declares the two ports to be one port, so under it they carry one
+impedance and the gap between the two measurements is noise; choosing either is
+choosing one of two estimates of a single quantity, not making an approximation.
+And this is the one move the missing column cannot affect. With
+$G = \text{diag}(g_1, 0)$ the transform below leaves the undriven port at
+identity, so it reads no term from the column that was never measured;
+renormalizing that port instead would need $S_{22}$, which is what the copy is
+about to supply.
 
-    A^-1 (S - G*) (I - G S)^-1 A*
-
-depends on the driven column alone. The undriven column is `nan` and stays out of
-it. The caller's own renormalisation afterwards moves both columns together, by
-which time both are known.
-
-Under a mirror the two ports are one port, so they have one impedance, and
-choosing the undriven port's measurement as that impedance is not an
-approximation in the model - it is picking one of two noisy estimates of a single
-quantity.
+Subsequent user-specified renormalization shifts both ports by identical
+amounts, preserving the symmetry relationship exactly.
 
 ## An undriven port keeps its own impedance
 
-The same algebra settles a second question, about a matrix that is simply
-incomplete rather than symmetric.
+When renormalizing an incomplete matrix to a specified reference impedance,
+undriven ports retain their original characteristic impedance, making the
+renormalization operator for those ports the identity.
 
-When the caller asks for every port to be reported against some reference, an
-undriven port is left at its own impedance regardless. Its renormalisation is
-then the identity. That is not a convenience taken because the alternative is
-awkward - it is the only available answer, and it happens to be exact.
+Formally, with the diagonal matrix $G = \text{diag}(g_1, 0)$, column 1 of:
 
-With `G = diag(g1, 0)`, column 1 of
+$$A^{-1} (S - G^*) (I - G S)^{-1} A^*$$
 
-    A^-1 (S - G*) (I - G S)^-1 A*
+depends strictly on column 1 of $[S]$. The driven columns of an incomplete matrix
+are therefore rigorously referenced to the requested impedance without depending
+on unmeasured terms from missing columns. Renormalizing undriven ports would
+require knowledge of $S_{22}$, which was not measured.
 
-depends only on column 1 of `S`. So the driven columns of an incomplete matrix
-come out *exactly* referenced to what the caller asked for, with nothing faked
-and nothing borrowed from the missing column. Renormalising the undriven port as
-well would move those columns, and doing it would genuinely require S22, which
-was never measured.
+In implementation, scikit-rf renormalizes scattering parameters via impedance
+parameters: `z2s(s2z(...))`. Numerical tests verify that populating unmeasured
+columns with placeholder values does not alter the transformed values of driven
+columns.
 
-That is the derivation and not the implementation. scikit-rf renormalises through
-Z-parameters, `z2s(s2z(...))`, reaching the same answer by a different route - so
-the independence was confirmed against the library rather than against the
-algebra, by filling the unmeasured column with zeros, with random values, and
-with a large constant, and checking the driven columns did not move.
+For this reason, unmeasured transmission coefficients in undriven columns are
+temporarily set to zero during intermediate impedance conversion, and restored to
+`NaN` upon completion. Passing `NaN` directly into matrix inversion routines (such
+as `s2z`) causes linear algebra solver exceptions. Any `NaN` values encountered in
+columns corresponding to actively driven ports indicate a numerical failure and
+raise an exception.
 
-The same argument is why the raw amplitude ratios fill undriven columns with
-**zero rather than `nan`**, and blank them again afterwards. A `nan` does not
-stay where it is put: it reaches the inverse inside `s2z` and returns as a linear
-algebra error, minutes after the solve, from inside a library, naming nothing
-about the model. A `nan` among the columns that *were* driven is a real fault and
-is refused by name instead.
+## Characteristic impedance discrepancy between symmetric ports
 
-## The disagreement is evidence, not an error bar
+The difference between the two ports' numerically extracted reference impedances
+is retained as diagnostic output. This metric indicates whether the declared
+mirror symmetry holds: a significant discrepancy indicates physical or meshing
+asymmetry.
 
-The gap between the two ports' measured impedances is returned rather than
-discarded, and it is evidence about whether the *declaration* is credible. A
-large gap means the structure probably is not the mirror it was declared to be.
+This discrepancy does not represent an uncertainty bound on $[S]$. For a truly
+symmetric device, both ports share an identical physical characteristic impedance,
+and the discrepancy represents discretization noise between independent probe
+extractions.
 
-It is not an error bar on S. Two ports of a true mirror have one characteristic
-impedance, and the gap is two estimates of it rather than a real asymmetry.
+## Point-wise numerical failures across frequency sweeps
 
-## A point can fail without the sweep failing
-
-Where the runs disagree about a port's reference impedance by more than the
-tolerance, that frequency point comes back `nan` and is named. The impedance
-extraction goes indeterminate near a standing-wave null and nowhere else, so the
-failure is genuinely a property of the point rather than of the run, and
-discarding the sweep for it would throw away a good answer either side.
+If the extracted reference impedances between symmetric ports diverge beyond the
+specified tolerance at specific frequencies, those individual points are marked
+as `NaN` and reported. Numerical impedance extraction can become ill-conditioned
+near standing-wave nulls. Confining `NaN` flags to affected frequency points
+preserves valid simulation results across the remainder of the sweep.

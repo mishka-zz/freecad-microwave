@@ -39,12 +39,21 @@ SELF = pathlib.Path(__file__).resolve()
 #: dashes and are not listed.
 TYPOGRAPHIC = re.compile(r"[—–−]")
 
-#: A run of two or three, starting the line or with whitespace before it, and no
-#: word character, ``>`` or further hyphen after. Excludes ``--build-only``,
-#: ``-->``, ``<--``. The line start counts: a wrapped sentence puts its dash in
-#: column 0 as readily as mid-line, and a rule that only looked behind for
-#: whitespace let every one of those through.
-PROSE = re.compile(r"(?:^|(?<=\s))-{2,3}(?![\w>-])")
+#: A run of two or three used as punctuation, in each of the shapes it takes.
+#:
+#: **Standing alone**: opening the line or after whitespace, with none of a word
+#: character, ``>`` or a further hyphen after it - which is what excludes
+#: ``--build-only``, ``-->`` and ``<--``. The line start counts, a wrapped
+#: sentence putting its dash in column 0 as readily as mid-line.
+#:
+#: **Opening a continued string literal**: a quote before and whitespace after,
+#: which is where a message split across two literals puts its dash. The
+#: whitespace is what tells it from a ``"--"`` that is a value - matplotlib
+#: spells a dashed linestyle that way.
+#:
+#: **Closed up between two words**: ``1.5--5.5``, ``Hammerstad--Bekkadal``. It
+#: can be nothing else there, a flag never having a word character before it.
+PROSE = re.compile(r"(?:^|(?<=\s))-{2,3}(?![\w>-])|(?<=[\"'])-{2,3}(?=\s)|(?<=\w)-{2,3}(?=\w)")
 
 #: A drawn rule: a section banner, a table separator, an RST underline.
 RULE = re.compile(r"-{4,}")

@@ -122,6 +122,7 @@ def panel(panel_module, **attributes):
     instance.logged = []
     instance.status = []
     instance.problems = []
+    instance.geometry_lines = []
     # A study that declares no symmetry, which is the default and what most of
     # these tests are about. Override by passing ``analysis=``.
     instance.analysis = type("Study", (), {"Symmetry": "None"})()
@@ -169,7 +170,9 @@ class TestWhereTheRunsGo:
         monkeypatch.setattr(
             panel_module.write,
             "write",
-            lambda problem, directory: written.append(directory) or f"{directory}/e.json",
+            lambda problem, directory, report=(): (
+                written.append(directory) or f"{directory}/e.json"
+            ),
         )
         subject = panel(panel_module)
 
@@ -183,7 +186,9 @@ class TestWhereTheRunsGo:
 
     def test_a_single_port_run_is_not_a_special_case(self, panel_module, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            panel_module.write, "write", lambda problem, directory: f"{directory}/e.json"
+            panel_module.write,
+            "write",
+            lambda problem, directory, report=(): f"{directory}/e.json",
         )
         subject = panel(panel_module)
 
@@ -193,7 +198,9 @@ class TestWhereTheRunsGo:
 
     def test_the_log_says_where_each_envelope_went(self, panel_module, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            panel_module.write, "write", lambda problem, directory: f"{directory}/e.json"
+            panel_module.write,
+            "write",
+            lambda problem, directory, report=(): f"{directory}/e.json",
         )
         subject = panel(panel_module)
 
@@ -644,12 +651,14 @@ class TestTheLogSaysWhatWroteIt:
 class TestTheVerdictCheckPaints:
     """Check's headline must not contradict its own log.
 
-    It used to: the amber test was ``"warning" not in`` the *rendered* label, so
-    every verdict phrased any other way was painted over in green - including
-    "no S-matrix will be stored", which is the one most worth reading.
+    Testing the *rendered* label for the word "warning" paints every verdict
+    phrased any other way green - including "no S-matrix will be stored", which
+    is the one most worth reading.
     """
 
-    def translate_returning(self, panel_module, monkeypatch, driven, all_ports, findings=()):
+    def translate_returning(
+        self, panel_module, monkeypatch, driven, all_ports, findings=(), said=()
+    ):
         """Drive the real ``translate`` with the document and pre-flight stubbed."""
         problems = []
         for number in driven:
@@ -657,7 +666,11 @@ class TestTheVerdictCheckPaints:
             problem.ports = [Port(n) for n in all_ports]
             problems.append(problem)
 
-        monkeypatch.setattr(panel_module.document, "sweep", lambda analysis: problems)
+        # One call, because one translation produces both - a panel asking
+        # twice would read a document that may have moved between the two.
+        monkeypatch.setattr(
+            panel_module.document, "sweep_and_report", lambda analysis: (problems, list(said))
+        )
         monkeypatch.setattr(panel_module.preflight, "check", lambda problem: list(findings))
         monkeypatch.setattr(panel_module.preflight, "refusals", lambda f: [])
 
@@ -665,6 +678,43 @@ class TestTheVerdictCheckPaints:
         subject.update_mesh_label = lambda: None
         subject.log_view = MagicMock()
         return subject
+
+    def test_what_the_shapes_lost_is_said_in_the_log(self, panel_module, monkeypatch):
+        """Check is where the minutes are decided, so a difference between what
+        was drawn and what the solver will be given has to be readable there."""
+        subject = self.translate_returning(
+            panel_module,
+            monkeypatch,
+            [1],
+            [1],
+            said=["Shell is solved 0.003 mm inside the drawing."],
+        )
+
+        panel_module.SimulationTaskPanel.on_check(subject)
+
+        assert any("0.003 mm inside" in line for line in subject.logged)
+
+    def test_and_it_goes_into_every_run_directory_the_sweep_writes(
+        self, panel_module, tmp_path, monkeypatch
+    ):
+        """A directory meant to be attachable to a bug report on its own has to
+        carry it, and it is one fact about the drawing rather than one per run.
+        """
+        written = []
+        monkeypatch.setattr(
+            panel_module.write,
+            "write",
+            lambda problem, directory, report=(): (
+                written.append(list(report)) or f"{directory}/e.json"
+            ),
+        )
+        subject = panel(panel_module, geometry_lines=["Shell is solved 0.003 mm inside."])
+
+        panel_module.SimulationTaskPanel.write_envelopes(
+            subject, [Problem(1), Problem(2)], str(tmp_path)
+        )
+
+        assert written == [["Shell is solved 0.003 mm inside."]] * 2
 
     def test_a_clean_model_is_green(self, panel_module, monkeypatch):
         subject = self.translate_returning(panel_module, monkeypatch, [1, 2], [1, 2])

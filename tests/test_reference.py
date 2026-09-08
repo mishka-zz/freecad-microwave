@@ -20,8 +20,9 @@ three kinds that are not:
 
 import numpy as np
 import pytest
-from scipy.special import spherical_jn
+from scipy.special import jv, jvp, spherical_jn
 
+from tests import staircase_model
 from tests.analytic import reference
 
 
@@ -84,11 +85,10 @@ class TestTheTwoBranchesUseOneConstant:
     """The reference is what every microstrip claim in this repository rests on,
     so an inconsistency inside it is worth more than one in the code.
 
-    The wide branch used ``Z_FREE_SPACE`` (mu0*c, 376.730) and the narrow branch
-    the literal ``60.0``, which implies 120*pi (376.991). That is a 0.069 % step
-    from nothing but a choice of constant, in a reference the microstrip gate
-    quotes its margin against. Nothing pinned the narrow branch, so nothing caught
-    it.
+    Both branches must reach for one free-space impedance. The literal ``60.0``
+    implies 120*pi rather than mu0*c, and mixing the two puts a step into the
+    reference from nothing but a choice of constant - in the very number the
+    microstrip gate quotes its margin against.
     """
 
     def test_the_free_space_impedance_is_the_exact_one(self):
@@ -399,3 +399,305 @@ class TestASphereIsAskedOnlyForModesItHas:
                 reference.spherical_cavity_frequency(**bad)
         with pytest.raises(ValueError, match="eps_r"):
             reference.spherical_cavity_frequency(10.0e-3, eps_r=0.0)
+
+
+class TestStriplineImpedance:
+    """The stripline formula is exact, so what these check is transcription -
+    and unlike Hammerstad, an error here cannot hide inside a reference's own
+    uncertainty, because there isn't one.
+
+    The strong one is the Laplace solve: a conformal mapping and a finite-volume
+    potential solve are two derivations of the same quantity sharing no
+    arithmetic, so agreement between them is not the formula restated.
+    """
+
+    #: Where the ground planes' own influence has died. Asserted rather than
+    #: assumed by ``test_the_shield_is_not_in_the_answer``.
+    WALL = 16.0
+
+    def test_a_laplace_solve_of_the_same_cross_section_converges_onto_it(self):
+        """The whole reason this reference can be trusted.
+
+        Scored as a sequence rather than at one mesh, because a single grid
+        agreeing says as much about the grid as about the formula. What is
+        asserted is that refining always helps and that the trend arrives: the
+        error is first order here - a zero-thickness strip puts a field
+        singularity at its edge and a finite-volume scheme resolves that
+        slowly - so successive errors halve, and extrapolating on the ratio the
+        run itself reports lands far closer than any of the meshes solved.
+        """
+        for ratio in (0.5, 1.0, 2.0):
+            exact = reference.stripline_impedance(ratio, 1.0)
+            solved = [
+                staircase_model.stripline_impedance(ratio, 1.0, n, self.WALL) for n in (20, 40, 80)
+            ]
+            errors = [abs(value / exact - 1.0) for value in solved]
+
+            assert errors == sorted(errors, reverse=True), (
+                f"W/b = {ratio}: refining the cross-section stopped helping, {errors}"
+            )
+            assert errors[-1] < 0.01, f"W/b = {ratio}: finest mesh is {100 * errors[-1]:.3f}% out"
+
+            # An order of magnitude inside the finest mesh solved, which is what
+            # makes this a statement about where the sequence is going rather
+            # than about how close it got.
+            steps = np.diff(solved)
+            limit = solved[-1] + steps[-1] / (steps[0] / steps[1] - 1.0)
+            assert limit == pytest.approx(exact, rel=1e-3, abs=0.0), (
+                f"W/b = {ratio}: the sequence is converging on {limit:.5f}, not {exact:.5f}"
+            )
+
+    def test_the_shield_is_not_in_the_answer(self):
+        """The Laplace solve needs a box and the formula describes two infinite
+        planes, so the box has to be far enough out to be absent.
+
+        Doubling it does not move the answer at all, which is not a coincidence
+        and not a tautology: the outer grid grows from the strip's own edge cell
+        and is therefore identical for both, so the wider box is the narrower one
+        with lines added where the field has decayed below what a double can
+        carry. Anything reading a difference here would be reading the grid.
+        """
+        near = staircase_model.stripline_impedance(1.0, 1.0, 40, self.WALL)
+        far = staircase_model.stripline_impedance(1.0, 1.0, 40, 2 * self.WALL)
+        assert near == pytest.approx(far, rel=1e-12, abs=0.0)
+
+    def test_a_wide_strip_is_two_parallel_plates_in_parallel(self):
+        """Independently derived, and it is where fringing goes away: a wide
+        strip sees a plane half a separation off on each side, and the two
+        capacitances add. ``parallel_plate_impedance`` comes from a plate rather
+        than from an elliptic integral, so this is two derivations meeting.
+
+        It also covers the strip widths where the obvious spelling of this
+        formula returns a confident zero - ``tanh`` saturates to exactly one and
+        ``K(1)`` is infinite, so a strip a dozen separations wide reads as a
+        short. Anything asserting only near ``W = b`` passes over that.
+        """
+        previous = None
+        for ratio in (4.0, 10.0, 40.0, 200.0):
+            plates = 0.5 * reference.parallel_plate_impedance(ratio, 0.5, 1.0)
+            apart = abs(reference.stripline_impedance(ratio, 1.0) / plates - 1.0)
+            assert previous is None or apart < previous, (
+                f"W/b = {ratio}: fringing stopped receding, {apart} against {previous}"
+            )
+            previous = apart
+        assert previous < 0.005, f"the widest strip is still {100 * previous:.2f}% off a plate"
+
+    def test_only_the_ratio_of_the_two_lengths_matters(self):
+        one = reference.stripline_impedance(0.8, 1.6)
+        for scale in (0.01, 3.0, 500.0):
+            assert reference.stripline_impedance(0.8 * scale, 1.6 * scale) == pytest.approx(
+                one, rel=1e-12, abs=0.0
+            )
+
+    def test_a_dielectric_lowers_it_by_the_root(self):
+        """A TEM line, so the fill enters exactly once and nowhere else. This is
+        what a microstrip cannot do, and why it has no exact form: there the
+        field is split between substrate and air and no single root describes
+        it."""
+        for eps_r in (2.2, 4.4, 10.2):
+            assert reference.stripline_impedance(1.0, 1.6, eps_r) == pytest.approx(
+                reference.stripline_impedance(1.0, 1.6) / np.sqrt(eps_r), rel=1e-12, abs=0.0
+            )
+
+    def test_a_wider_strip_carries_less(self):
+        held = [reference.stripline_impedance(width, 1.0) for width in (0.1, 0.5, 1.0, 3.0, 9.0)]
+        assert held == sorted(held, reverse=True)
+
+    def test_a_strip_too_narrow_to_map_is_refused_too(self):
+        """The other end of the same failure, and the one that is easy to leave
+        out: a strip this narrow drives the modulus itself below what a float
+        holds, where the wide case drives its complement there. Left ungated it
+        returns an infinity rather than raising."""
+        with pytest.raises(ValueError, match="not computable"):
+            reference.stripline_impedance(1e-170, 1.0)
+
+    def test_a_strip_too_wide_to_map_is_refused_rather_than_answered(self):
+        """The failure this function is written to avoid, at the one width where
+        it is unavoidable. A quotient of elliptic integrals that has lost its
+        complementary modulus returns zero, and zero ohms is a short circuit
+        rather than an error."""
+        with pytest.raises(ValueError, match="not computable"):
+            reference.stripline_impedance(240.0, 1.0)
+
+    def test_a_stripline_has_a_width_a_separation_and_a_fill(self):
+        for bad in ({"width": 0.0}, {"width": -1.0}, {"separation": 0.0}, {"eps_r": 0.0}):
+            with pytest.raises(ValueError):
+                reference.stripline_impedance(**{"width": 1.0, "separation": 1.0, **bad})
+
+    def test_a_fill_thinner_than_vacuum_is_refused(self):
+        """Positive is not the condition - a permittivity below one describes no
+        dielectric, and it would return a number rather than say so. The
+        microstrip form in this module refuses it; this one has to agree."""
+        with pytest.raises(ValueError, match="eps_r must be >= 1"):
+            reference.stripline_impedance(1.0, 1.0, 0.5)
+
+
+class TestACylinderResonatesWhereItsWallConditionIsMet:
+    """The roots come from scipy, so what these check is that the right zeros
+    were asked for - that the family is the one the mode needs, and that the
+    index counts from where it is claimed to."""
+
+    def test_each_root_solves_the_condition_it_came_from(self):
+        for order in (0, 1, 2):
+            for root in (1, 2, 3):
+                electric = reference.circular_cavity_root(order, root, "TM")
+                assert jv(order, electric) == pytest.approx(0.0, abs=1e-12)
+                magnetic = reference.circular_cavity_root(order, root, "TE")
+                assert jvp(order, magnetic) == pytest.approx(0.0, abs=1e-12)
+
+    def test_the_two_families_meet_where_the_derivative_is_the_next_order(self):
+        """``J_0' = -J_1`` exactly, so the TE ladder at order zero and the TM
+        ladder at order one are the same numbers.
+
+        Not independent arithmetic: scipy reaches both through one routine and
+        hands back identical floats. What it does pin is the *dispatch* - which
+        family each mode is looked up in, and at which order - and that is the
+        step in this module rather than in scipy."""
+        for root in (1, 2, 3, 4):
+            assert reference.circular_cavity_root(0, root, "TE") == pytest.approx(
+                reference.circular_cavity_root(1, root, "TM"), rel=1e-12, abs=0.0
+            )
+
+    def test_the_first_root_is_the_first(self):
+        """An off-by-one returns a genuine resonance of the same cavity, so
+        every check that only asks the condition passes straight through it.
+        Both functions are one at the origin and turn over once before their
+        first zero, so nothing crosses below it."""
+        for kind, condition in (("TM", jv), ("TE", jvp)):
+            first = reference.circular_cavity_root(0, 1, kind)
+            below = condition(0, np.linspace(first / 1000.0, first * 0.999, 400))
+            assert (below > 0.0).all() if kind == "TM" else (below < 0.0).all()
+
+    def test_roots_climb_with_both_indices(self):
+        """Both ladders in the root index, and both in the order - except at the
+        one place the order does not climb, which is its own test below."""
+        for kind, orders in (("TM", (0, 1, 2)), ("TE", (1, 2, 3))):
+            for order in orders:
+                by_root = [reference.circular_cavity_root(order, root, kind) for root in (1, 2, 3)]
+                assert by_root == sorted(by_root) and len(set(by_root)) == len(by_root)
+            for root in (1, 2):
+                by_order = [reference.circular_cavity_root(order, root, kind) for order in orders]
+                assert by_order == sorted(by_order) and len(set(by_order)) == len(by_order)
+
+    def test_the_orders_interlace(self):
+        """Consecutive orders' zeros separate each other, which places every
+        root of one ladder between two of its neighbour and cannot hold if
+        either index has slipped."""
+        for kind, orders in (("TM", (0, 1, 2)), ("TE", (1, 2))):
+            for order in orders:
+                for root in (1, 2):
+                    below = reference.circular_cavity_root(order, root, kind)
+                    above = reference.circular_cavity_root(order, root + 1, kind)
+                    assert below < reference.circular_cavity_root(order + 1, root, kind) < above
+
+    def test_the_te_ladder_dips_at_the_first_order(self):
+        """The exception, and it is the reason the lowest TE mode of a cylinder
+        has azimuthal variation.
+
+        ``J_0'`` vanishes at the origin, and that is not a mode - so the first
+        root counted for order zero is really the second turning point, while
+        order one's is its first. The ladder therefore starts high, dips, and
+        climbs from there. Anything reading the lowest TE mode off order zero
+        gets a mode well above the one that is actually there.
+        """
+        ladder = [reference.circular_cavity_root(order, 1, "TE") for order in (0, 1, 2, 3)]
+        assert ladder[1] == min(ladder)
+
+
+class TestWhatACylindricalCavitysFrequencyDependsOn:
+    RADIUS = 15.0e-3
+
+    def test_a_mode_with_no_axial_variation_ignores_the_height(self):
+        """The whole reason a pillbox is worth gating on: one measured quantity,
+        one dimension in it, and the flat ends out of the comparison."""
+        heights = [self.RADIUS / 4, self.RADIUS, 2.0 * self.RADIUS]
+        answers = [reference.circular_cavity_frequency(self.RADIUS, height) for height in heights]
+        assert len(set(answers)) == 1
+
+    def test_and_one_with_axial_variation_does_not(self):
+        taller = [
+            reference.circular_cavity_frequency(self.RADIUS, height, axial=1)
+            for height in (5.0e-3, 10.0e-3, 20.0e-3)
+        ]
+        assert taller == sorted(taller, reverse=True)
+
+    def test_the_two_wavenumbers_add_in_quadrature(self):
+        """Stated as the axial term on its own - a half-wave standing between
+        the ends is a resonance of the length alone, at ``c / 2d`` - which is
+        how the axial index enters and is not how it is computed."""
+        height = 12.0e-3
+        for axial in (1, 2, 3):
+            flat = reference.circular_cavity_frequency(self.RADIUS, height)
+            raised = reference.circular_cavity_frequency(self.RADIUS, height, axial=axial)
+            standing = axial * reference.SPEED_OF_LIGHT / (2 * height)
+            assert raised**2 == pytest.approx(flat**2 + standing**2, rel=1e-12, abs=0.0)
+
+    def test_only_the_radius_scales_the_flat_mode(self):
+        small = reference.circular_cavity_frequency(5.0e-3, 20.0e-3)
+        large = reference.circular_cavity_frequency(10.0e-3, 20.0e-3)
+        assert small / large == pytest.approx(2.0, rel=1e-12, abs=0.0)
+
+    def test_and_the_fill_slows_it_by_the_square_root(self):
+        plain = reference.circular_cavity_frequency(self.RADIUS, 10.0e-3)
+        filled = reference.circular_cavity_frequency(self.RADIUS, 10.0e-3, eps_r=2.1)
+        assert filled == pytest.approx(plain / np.sqrt(2.1), rel=1e-12, abs=0.0)
+
+    def test_a_cylinder_taller_than_it_is_wide_stops_being_dominated_by_the_flat_mode(self):
+        """Where the gate's own height limit comes from. TE111 falls as the
+        cavity is stretched and the flat TM mode does not, so the two cross, and
+        past that a reading aimed at the lowest line is aimed at a different
+        mode. Placed by solving for the crossing rather than by a ratio written
+        down: it is where the axial term makes up the difference between the two
+        radial roots.
+        """
+        flat = reference.circular_cavity_root(0, 1, "TM")
+        tilted = reference.circular_cavity_root(1, 1, "TE")
+        crossing = self.RADIUS * np.pi / np.sqrt(flat**2 - tilted**2)
+        for height, dominant in ((crossing * 0.99, "TM"), (crossing * 1.01, "TE")):
+            answers = {
+                kind: reference.circular_cavity_frequency(
+                    self.RADIUS, height, order=order, root=1, axial=axial, kind=kind
+                )
+                for kind, order, axial in (("TM", 0, 0), ("TE", 1, 1))
+            }
+            assert min(answers, key=answers.get) == dominant
+        assert reference.circular_cavity_frequency(self.RADIUS, crossing) == pytest.approx(
+            reference.circular_cavity_frequency(self.RADIUS, crossing, order=1, axial=1, kind="TE"),
+            rel=1e-12,
+            abs=0.0,
+        )
+
+
+class TestACylinderIsAskedOnlyForModesItHas:
+    def test_a_te_mode_needs_a_half_wave_along_the_axis(self):
+        """Its axial field is a sine of the axial index, so without one there is
+        nothing left. TM's is the cosine, and that mode is the one a gate reads."""
+        with pytest.raises(ValueError, match="no field at all"):
+            reference.circular_cavity_frequency(10.0e-3, 10.0e-3, order=1, kind="TE")
+        assert reference.circular_cavity_frequency(10.0e-3, 10.0e-3, kind="TM") > 0.0
+
+    def test_the_axially_symmetric_mode_is_one_a_cylinder_has(self):
+        """Unlike a sphere, which refuses order zero: there the field would have
+        to be radial with nothing curling it, and here it is the dominant mode."""
+        assert reference.circular_cavity_root(order=0) > 0.0
+
+    def test_indices_are_counted_where_they_are_claimed_to_be(self):
+        with pytest.raises(ValueError, match="root index"):
+            reference.circular_cavity_root(root=0)
+        with pytest.raises(ValueError, match="azimuthal order"):
+            reference.circular_cavity_root(order=-1)
+        with pytest.raises(ValueError, match="axial half-waves"):
+            reference.circular_cavity_frequency(10.0e-3, 10.0e-3, axial=-1)
+
+    def test_a_cylinder_carries_no_tem_mode_to_ask_for(self):
+        with pytest.raises(ValueError, match="mode family"):
+            reference.circular_cavity_root(kind="TEM")
+
+    def test_a_cavity_has_two_sizes_and_a_fill(self):
+        """The height is asked for even by the mode that does not use it, so
+        that what a cavity is stays one thing whichever mode is read off it."""
+        for bad in ({"radius": 0.0, "height": 1.0e-3}, {"radius": 1.0e-3, "height": -1.0e-3}):
+            with pytest.raises(ValueError, match="radius|height"):
+                reference.circular_cavity_frequency(**bad)
+        with pytest.raises(ValueError, match="eps_r"):
+            reference.circular_cavity_frequency(10.0e-3, 10.0e-3, eps_r=0.0)

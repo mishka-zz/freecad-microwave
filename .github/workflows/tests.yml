@@ -26,9 +26,18 @@
 # are still right" - it means the adapter is still self-consistent.
 #
 # The nightly run is not for the code, which has not changed since the last push.
-# It is for everything underneath: nothing here pins a version, so `pip install
-# numpy pytest` floats, and a nightly failure is upstream drift rather than a
+# It is for everything underneath: the libraries float, so `pip install numpy
+# pytest` resolves afresh, and a nightly failure is upstream drift rather than a
 # regression.
+#
+# So what this file installs is of two kinds. A library the workbench *runs
+# against* floats, which is what the nightly is for: finding out when numpy
+# moves is the point. A tool that only *judges* the tree is pinned, because its
+# output is a gate and an unpinned gate moves under a tree nobody has touched -
+# a red build that says nothing about the code, on somebody else's release
+# schedule. Which side a package is on is read off `pyproject.toml`, where the
+# libraries and the tools are already declared apart, and
+# `tests/test_declared_dependencies.py` holds every install line here to it.
 
 name: tests
 
@@ -45,9 +54,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.11 is what FreeCAD 1.1.1 embeds (measured: 3.11.14, conda-forge);
-        # 3.13 is what development runs. The workbench has to work on both, and
-        # the two ends moving together cover what is between them.
+        # 3.11 is the floor `pyproject.toml` declares, and that file says
+        # why; 3.13 is what development runs. The workbench has to work on
+        # both, and the two ends moving together cover what is between them.
+        # `tests/test_declared_dependencies.py` fails if this list's low end
+        # and that declaration differ.
         python: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -67,15 +78,49 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install ruff
+      # Pinned, for the reason the header gives, and both halves of this job
+      # need it: a rule arrives and the tree it was written against goes red,
+      # and the formatter reflows files nobody has touched. Moving the pin is
+      # then a change somebody makes and reads the diff of. The same version is
+      # in pyproject.toml, so what a contributor runs is what this runs.
+      - run: pip install "ruff==0.15.22"
       - run: ruff check .
       - run: ruff format --check .
 
+  types:
+    # The counterpart to `lint`: ruff says how the code is written, mypy says
+    # whether it agrees with itself. The configuration, including which layers
+    # are held to what and why, is in pyproject.toml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # numpy is named because mypy does not bring it. Without it this job
+      # goes red, one import error per module that imports it - loudly, and for
+      # a reason that reads like a broken environment rather than a check that
+      # has stopped happening. Nothing else is installed, because FreeCAD, its
+      # Gui and the engine's bindings are unresolvable by design and
+      # pyproject.toml declares them so - which makes this job the one place
+      # that list is exercised against an environment that genuinely has none
+      # of them.
+      #
+      # Pinned, as the linter is and for the same reason: what a checker
+      # reports is its own release's opinion. numpy stays unpinned here even
+      # though the job would be steadier with it fixed - it is a library the
+      # workbench runs against, and the point of the nightly run is to find out
+      # when it moves.
+      - run: pip install "mypy==2.3.1" numpy
+      - run: mypy
+
   imports-stay-clean:
-    # Separate job on a deliberately bare environment. The test above already
-    # asserts this, but only about the modules it names - this one would also
-    # catch a new top-level import of something that merely happens to be
-    # installed alongside the test runner.
+    # Separate job on a deliberately bare environment. The suite asks the same
+    # question of the same modules, but against a list of what may not be
+    # imported, because the machine a test runs on has the runner's own
+    # dependencies installed. This job installs numpy and nothing else, so a
+    # module reaching for anything else fails here whether or not it is on that
+    # list.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,16 +129,11 @@ jobs:
           python-version: "3.13"
       - run: pip install numpy
       - name: Every adapter module imports without FreeCAD or openEMS
-        # Discovered, not listed: a hand-maintained list silently skips whatever
-        # was added since someone last edited it. The exclusions are the two
-        # solver-side modules, which exist to load the engine: `driver` is the
-        # entry point, and `coaxial` is a port class built out of openEMS' own.
-        # They are named in `tests/test_adapter_openems.py` as well, and a test
-        # there fails if the two lists disagree.
-        run: |
-          for path in Microwave/Solvers/openems/*.py; do
-            module=$(basename "$path" .py)
-            case "$module" in __init__|driver|coaxial) continue ;; esac
-            echo "-- $module"
-            python -c "import Microwave.Solvers.openems.$module" || exit 1
-          done
+        # The module list is `tests/import_sweep.py`, which the suite reads as
+        # well, so this job and the suite cannot come to sweep different sets.
+        # Stating it here as well would be two lists, and the one that goes
+        # stale is this one: `preflight` is a package, so a glob written for
+        # files skips it while every other module goes on being swept.
+        # This job installs nothing but numpy, so the script imports only the
+        # standard library.
+        run: python -m tests.import_sweep

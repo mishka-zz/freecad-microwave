@@ -3,27 +3,29 @@
 
 """Reading a ring off the face the user picked.
 
-A coaxial port is selected as one thing - the annular face between the inner
-conductor and the shield - because everything the port needs is in it. The two
-radii and the centre are the line, and a face that is not a ring is not a
-coaxial line, so the same reading that supplies the numbers is what refuses the
+A coaxial port is selected as one face: the annular face between the inner
+conductor and the shield. That face carries everything the port needs. The two
+radii and the centre describe the line. A face that is not a ring is not a
+coaxial line, so :func:`read` both supplies the numbers and refuses the
 pick.
 
-Only the outer radius is in a bounding box; the inner one is not, which is why
-this exists at all. Beside :mod:`Microwave.portbox` rather than under
-``Objects`` for the same mechanical reason: ``Objects/__init__`` imports
-FreeCAD, and the openEMS adapter reads the same ring and must run without it.
+A bounding box holds the outer radius and not the inner one, and reading the
+inner radius is why this module exists. It sits beside :mod:`Microwave.portbox`
+rather than under ``Objects`` for the same mechanical reason: ``Objects/__init__``
+imports FreeCAD, and the openEMS adapter reads the same ring and must run
+without it.
 
-Nothing here imports FreeCAD either. What it asks of a shape is ``Wires``, each
-wire's ``Edges``, and each edge's ``Curve`` with a ``Radius`` and a ``Center`` -
-which is what FreeCAD hands back for a face bounded by two circles, measured
-under 1.1.1. A square plate with a round hole in it answers the same call with
-one wire of four ``Line`` edges, and is refused on that.
+Nothing here imports FreeCAD either. It asks a shape for ``Wires``, each wire's
+``Edges``, and each edge's ``Curve`` with a ``Radius`` and a ``Center``. That is
+what FreeCAD hands back for a face bounded by two circles, measured under 1.1.1.
+A square plate with a round hole in it answers the same call with one wire of
+four ``Line`` edges, and is refused on that.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from .portbox import FLATNESS
 
@@ -32,7 +34,7 @@ _BOUNDARIES = 2
 
 
 class AnnulusError(ValueError):
-    """The face is not a ring, and the message says what was picked instead."""
+    """The face is not a ring. The message names what was picked instead."""
 
 
 @dataclass(frozen=True)
@@ -45,16 +47,16 @@ class Annulus:
 
     @property
     def gap(self) -> float:
-        """How far the field reaches across, which is what has to be resolved."""
+        """The distance the field reaches across. The mesh has to resolve it."""
         return self.outer - self.inner
 
 
-def _circle(wire, subject: str):
+def _circle(wire: Any, subject: str) -> tuple[float, tuple[float, float, float]]:
     """The one circle bounding this wire, or a refusal naming what it is.
 
-    A full circle arrives as a single edge, so a wire of several edges is a
-    boundary made of segments - a rectangle, a rounded slot, a polygon - and
-    none of those is a coaxial line however close to round it looks.
+    A full circle arrives as a single edge. A wire of several edges is therefore
+    a boundary made of segments - a rectangle, a rounded slot, a polygon - and
+    none of those is a coaxial line, however close to round it looks.
     """
     edges = list(getattr(wire, "Edges", ()))
     if len(edges) != 1:
@@ -75,8 +77,8 @@ def _circle(wire, subject: str):
     return float(radius), (float(centre.x), float(centre.y), float(centre.z))
 
 
-def read(shape, subject: str = "coaxial port") -> Annulus:
-    """The ring this face describes, or a refusal saying why it is not one."""
+def read(shape: Any, subject: str = "coaxial port") -> Annulus:
+    """The ring this face describes, or a refusal naming why it is not one."""
     wires = list(getattr(shape, "Wires", ()))
     if len(wires) != _BOUNDARIES:
         raise AnnulusError(

@@ -3,30 +3,30 @@
 
 """The S-matrix, as something the document owns.
 
-``EMSParameters`` is a result object, and this is it: the N×N matrix a sweep
-produced, sitting in the analysis group beside the ports it describes.
+``EMSParameters`` is the result object for it: the N×N matrix a sweep produced,
+sitting in the analysis group beside the ports it describes.
 
-Stored **in the document**, as flat lists of floats, and not as a path to a
-file beside it. A ``.s2p`` beside the document is a dangling reference the
-moment the ``.FCStd`` is moved, renamed or emailed, and it fails silently by
-showing the previous run's numbers. ``App::PropertyFloatList`` is what
-FreeCAD's own FEM result objects use for bulk numbers, saves and restores with
-everything else, and compresses down to tens of kilobytes.
+The matrix is stored in the document, as flat lists of floats, rather than as a
+path to a file beside it. A ``.s2p`` beside the document is a dangling reference
+the moment the ``.FCStd`` is moved, renamed or emailed, and it fails silently by
+showing the previous run's numbers. ``App::PropertyFloatList`` is what FreeCAD's
+own FEM result objects use for bulk numbers, saves and restores with everything
+else, and compresses inside the ``.FCStd``.
 
 Complex values are split into a real and an imaginary list rather than
-interleaved: two lists of the same length are self-evident to anything that
+interleaved. Two lists of the same length are self-evident to anything that
 opens the document by hand.
 
-**No scikit-rf here.** Round-tripping a matrix through the document is pure
-numpy, so a document full of results opens without the second the result
-library costs to import. It is reached only for a
+No scikit-rf here. Round-tripping a matrix through the document is pure numpy,
+so a document full of results opens without paying for the result library's
+import. The library is reached only for a
 :class:`~..Results.sparameters.SParameters` ``network()`` or a Touchstone file.
 
-Staleness is **not** tracked, unlike ``EMMeshPreview``. A result is stale for
-too broad a set of reasons - any material, port or band change moves the answer
-without necessarily moving a cell - for a cheap digest to cover honestly. What
-is recorded instead is the envelope digest of every run that went into the
-matrix, so the question can be answered exactly from what the object carries.
+Staleness is not tracked, unlike ``EMMeshPreview``. A result is stale for too
+broad a set of reasons for a cheap digest to cover honestly: any material, port
+or band change moves the answer without necessarily moving a cell. What is
+recorded instead is the envelope digest of every run that went into the matrix,
+so the question can be answered exactly from what the object carries.
 """
 
 import json
@@ -37,10 +37,10 @@ import numpy as np
 from ..Results.sparameters import ResultError, SParameters
 from ._vp_hook import ViewProviderRestored
 
-#: Properties holding the matrix itself. Hidden in the property editor: a
-#: 2004-element float list rendered as an editable list widget is noise, and
-#: editing one by hand could only make the object lie about a solve that
-#: happened. :func:`load` is the way to read them.
+#: Properties holding the matrix itself. Hidden in the property editor: a float
+#: list thousands of entries long, rendered as an editable list widget, is
+#: noise, and editing one by hand could only make the object misreport a solve
+#: that happened. :func:`load` is the way to read them.
 BULK = (
     "Frequency",
     "PortNumbers",
@@ -56,10 +56,10 @@ BULK = (
     "PortImpedanceImag",
 )
 
-#: Read-only, and shown: what the property editor says about a result.
+#: Read-only, and shown: what the property editor reports about a result.
 #: ``Provenance`` is here rather than hidden because it is the record that makes
-#: the result falsifiable - which solver, which version, which envelope
-#: digest. A user who cannot see it has to write a script to ask whether the
+#: the result falsifiable - which solver, which version, which envelope digest.
+#: A user who cannot see it has to write a script to find out whether the
 #: numbers in front of them came from the model in front of them.
 SUMMARY = (
     "Ports",
@@ -74,11 +74,10 @@ SUMMARY = (
 class EMSParameters(ViewProviderRestored):
     """One N×N S-matrix against frequency, referenced to a stated impedance.
 
-    Solver-neutral. openEMS produced this one, but nothing about the object says
-    so - a NEC2 or Palace adapter assembling the same
+    Solver-neutral. openEMS produced this one, and nothing about the object
+    records that. A NEC2 or Palace adapter assembling the same
     :class:`~..Results.sparameters.SParameters` stores it through the same
-    :func:`store`, and every consumer above works unchanged, which is what
-    makes a result object solver-neutral.
+    :func:`store`, and every consumer above works unchanged.
     """
 
     def __init__(self, obj):
@@ -91,9 +90,9 @@ class EMSParameters(ViewProviderRestored):
             "Data",
             "The document port number of each row and column, in order",
         )
-        # Which columns were actually measured. FDTD drives one port per run, so
-        # a study that drove port 1 only has column 1 and nothing else; the rest
-        # are stored as nan and this is what says so.
+        # Which columns were measured. FDTD drives one port per run, so a study
+        # that drove port 1 only has column 1 and nothing else. The rest are
+        # stored as nan, and this property records which they are.
         obj.addProperty(
             "App::PropertyIntegerList",
             "DrivenPorts",
@@ -106,18 +105,18 @@ class EMSParameters(ViewProviderRestored):
             "Data",
             "Columns filled from a declared symmetry rather than solved",
         )
-        # Which they are cannot be recovered from the numbers: a port asked for
-        # 50 ohm that measured 50 ohm looks identical to one referenced to
-        # itself, and a mirror's derived pair sits at neither port's own value.
+        # The numbers do not say which ports these are. A port asked for 50 ohm
+        # that measured 50 ohm looks identical to one referenced to itself, and
+        # a mirror's derived pair sits at neither port's own value.
         obj.addProperty(
             "App::PropertyIntegerList",
             "SelfReferencedPorts",
             "Data",
             "Ports reported against their own impedance rather than a number",
         )
-        # Indices into Frequency, not frequencies. A float stored and read back
-        # has to be matched against the axis to mean anything, and matching
-        # floats is exactly the operation that goes wrong once.
+        # Indices into Frequency rather than frequencies. A float stored and
+        # read back has to be matched against the axis to mean anything, and
+        # matching floats is the operation that eventually goes wrong.
         obj.addProperty(
             "App::PropertyIntegerList",
             "DiscardedPoints",
@@ -139,9 +138,10 @@ class EMSParameters(ViewProviderRestored):
             "Imaginary part of the S-matrix, flattened the same way",
         )
         # Complex, and split like every other complex array here. An undriven
-        # port keeps its own measured impedance as its reference - moving it
-        # needs the unmeasured column - and a microstrip's is genuinely
-        # complex, so a float list would quietly discard the imaginary part.
+        # port keeps its own measured impedance as its reference, because moving
+        # it needs the unmeasured column, and a microstrip's impedance is
+        # genuinely complex, so a float list would quietly discard the imaginary
+        # part.
         obj.addProperty(
             "App::PropertyFloatList",
             "ReferenceReal",
@@ -151,10 +151,10 @@ class EMSParameters(ViewProviderRestored):
         obj.addProperty(
             "App::PropertyFloatList", "ReferenceImag", "Data", "Imaginary part of the same"
         )
-        # What the solver measured at each port, which is *not* the reference
-        # the matrix is normalised to. Kept because it is the only record of
-        # what a microstrip's Z0 actually did across the band, and it cannot be
-        # recovered from a renormalised matrix.
+        # What the solver measured at each port. This is not the reference the
+        # matrix is normalised to. It is kept because it is the only record of
+        # what a microstrip's Z0 did across the band, and it cannot be recovered
+        # from a renormalised matrix.
         obj.addProperty(
             "App::PropertyFloatList",
             "PortImpedanceReal",
@@ -203,9 +203,9 @@ class EMSParameters(ViewProviderRestored):
     def execute(self, obj):
         """Nothing. A result records a solve that already happened.
 
-        Recomputing must never look like re-solving: the numbers here cost
-        minutes of FDTD, and an ``execute`` that touched them would either
-        silently discard a run or silently start one.
+        Recomputing must never look like re-solving. The numbers here cost
+        minutes of FDTD, and an ``execute`` that touched them would silently
+        discard a run or silently start one.
         """
 
     def __getstate__(self):
@@ -216,7 +216,7 @@ class EMSParameters(ViewProviderRestored):
 
 
 def createEMSParameters(doc=None):
-    """An empty result object. Filling it is :func:`store`'s job."""
+    """An empty result object. :func:`store` fills it in."""
     doc = doc or FreeCAD.ActiveDocument
     obj = doc.addObject("App::FeaturePython", "EMSParameters")
     EMSParameters(obj)
@@ -232,9 +232,9 @@ def store(obj, result: SParameters):
     """Write an assembled matrix onto the document object. Returns ``obj``.
 
     Everything is converted element by element to plain Python floats and ints
-    on the way in, and that is **load-bearing**, not tidiness. Measured on
-    FreeCAD 1.1.1: ``App::PropertyFloatList`` handed a numpy array stores *N
-    copies of its last element* - ``np.arange(5.0)`` reads back as
+    on the way in, and the conversion is required rather than tidiness. Measured
+    on FreeCAD 1.1.1: ``App::PropertyFloatList`` handed a numpy array stores N
+    copies of its last element, so ``np.arange(5.0)`` reads back as
     ``[4.0, 4.0, 4.0, 4.0, 4.0]``. The corruption carries no signature: the
     length is right, the elements are plain floats, and the last sample is
     right, so a frequency axis reopens as a flat line at the top of the band and
@@ -248,7 +248,7 @@ def store(obj, result: SParameters):
 
     obj.Frequency = [float(value) for value in frequency]
     obj.PortNumbers = [int(number) for number in result.port_numbers]
-    obj.DrivenPorts = [int(number) for number in result.driven]
+    obj.DrivenPorts = [int(number) for number in result.drivers]
     obj.DerivedPorts = [int(number) for number in result.derived]
     obj.SelfReferencedPorts = [int(number) for number in result.self_referenced]
     obj.DiscardedPoints = [int(index) for index in result.discarded]
@@ -271,21 +271,20 @@ def store(obj, result: SParameters):
 def _provenance_json(provenance: dict) -> str:
     """Provenance as JSON, and never at the cost of the matrix.
 
-    An adapter is free to record whatever it measured, and this is the one
-    field where that freedom meets a serialiser. It goes wrong by degrading
-    rather than raising:
+    An adapter records whatever it measured, and this field is where that meets
+    a serialiser. It degrades rather than raising:
 
-    * a **value** JSON cannot express becomes its ``repr`` (``default=str``);
-    * a **key** JSON cannot express is stringified before it reaches the
-      serialiser at all. ``default=`` alone covers values and not keys, so one
-      odd key raises ``TypeError`` out of ``store`` and loses a matrix that cost
-      minutes of FDTD;
-    * keys that cannot be *compared* - a ``str`` and an ``int`` in one dict -
+    * a value JSON cannot express becomes its ``repr`` (``default=str``);
+    * a key JSON cannot express is stringified before it reaches the serialiser
+      at all. ``default=`` alone covers values and not keys, so one odd key
+      raises ``TypeError`` out of ``store`` and loses a matrix that cost minutes
+      of FDTD;
+    * keys that cannot be compared - a ``str`` and an ``int`` in one dict -
       defeat ``sort_keys``. Stringifying settles that too, and the fallback
       catches whatever a nested value still manages.
 
     Integer keys come back from JSON as strings anyway. That is JSON's rule
-    rather than a loss, and :func:`load` does not pretend otherwise; doing it
+    rather than a loss, and :func:`load` treats them as strings. Stringifying
     here only makes the top level behave like every level below it.
     """
     safe = {str(key): value for key, value in provenance.items()}
@@ -298,11 +297,10 @@ def _provenance_json(provenance: dict) -> str:
 def load(obj) -> SParameters:
     """Rebuild the neutral result object from what the document holds.
 
-    Refuses loudly on a length that does not add up. A stored matrix is only
-    ever written by :func:`store`, so a mismatch means the document was edited
-    or truncated - and reshaping whatever is there would hand physics code an
-    array of the right shape and the wrong contents, which is the one failure
-    mode with no symptom.
+    Refuses loudly on a length that does not add up. Only :func:`store` writes a
+    stored matrix, so a mismatch means the document was edited or truncated.
+    Reshaping whatever is there would hand physics code an array of the right
+    shape and the wrong contents, a failure with no symptom.
     """
     frequency = np.asarray(list(obj.Frequency), dtype=float)
     numbers = tuple(int(number) for number in obj.PortNumbers)
@@ -336,12 +334,12 @@ def load(obj) -> SParameters:
         port_numbers=numbers,
         reference=reference,
         measured_impedance=measured,
-        # Empty means "every column", which is what an object filled by an
-        # older ``store`` would mean - though it will not get this far: it
-        # has no ``ReferenceReal`` either, and dies on that first. There is no
-        # migration and none is wanted before v1.0; this is only so that a
-        # hand-built object with nothing to say reads as complete rather than
-        # as empty.
+        # Empty means every column, which is what an object filled by an older
+        # ``store`` would mean. Such an object will not get this far: it has no
+        # ``ReferenceReal`` either, and fails on that first. There is no
+        # migration and none is wanted before v1.0. This is only so that a
+        # hand-built object with nothing to say reads as complete rather than as
+        # empty.
         driven=tuple(int(n) for n in obj.DrivenPorts) or None,
         derived=tuple(int(n) for n in obj.DerivedPorts),
         self_referenced=tuple(int(n) for n in obj.SelfReferencedPorts),

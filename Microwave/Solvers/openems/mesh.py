@@ -3,760 +3,109 @@
 
 """Yee-grid generation for the openEMS adapter.
 
-A pure function: region descriptions in, grid line positions out. It imports
-nothing but the standard library and numpy - no CSXCAD, no ``Simulation``, no
-FreeCAD - so it is testable without a solver and can draw a mesh preview
-inside FreeCAD's own interpreter before openEMS is even installed.
+A pure function: region descriptions in, grid line positions out. Nothing below
+this module imports CSXCAD, ``Simulation`` or FreeCAD, so the whole mesher is
+testable without a solver and can draw a preview inside FreeCAD's own
+interpreter before openEMS is installed.
 
 The grid is FDTD-specific and is not reusable by a MoM or FEM backend: NEC2
 wants wire segments and Palace wants tetrahedra, and there is no useful
-abstraction over the three. So this stays inside the openEMS adapter.
+abstraction over the three. The mesher therefore stays inside the openEMS
+adapter.
+
+Here is what runs an axis end to end, and what decides where a line may go.
+The questions it puts are answered below it. :mod:`~.regions` is what a drawing
+and a policy are, :mod:`~.metal` is what a piece of metal asks at its faces,
+:mod:`~.sizing_field` is the cell size wanted at each point and the lines it
+lays, :mod:`~.absorber` is the block at a wall, :mod:`~.grid` is the finished
+grid, and :mod:`~.sizing` is what a length lying off the axes demands of all
+three. None of them reaches back here. The domain, and what has to be
+resolved inside it, are settled above in :mod:`~.plan`.
+
+How deep one absorber cell is stays here rather than in :mod:`~.absorber`,
+because :func:`absorber_pitches` answers it by running this same construction
+over the structure's own extent.
 
 Each axis is meshed independently:
 
 1. **Fixed positions.** Some coordinates must be grid lines (*anchors*) and some
-   would like to be (*preferences*); :func:`_fixed_positions` decides which is
-   which and why.
+   are only preferred there (*preferences*); :func:`_fixed_positions` gathers
+   them, :func:`_asked_by` is what one region asks of an axis, and
+   :func:`_thirds_lines` settles which conductor edges are given a pair.
 2. **A sizing field.** ``h(x)`` is the cell size wanted at ``x``, built as the
    lower envelope of every demand ramping away at slope ``g = ln(max_ratio)``.
-   Because ``h`` cannot change faster than ``g`` per unit length, cells sized by
-   it cannot break the growth ratio - smoothness is unexpressible rather than
-   repaired afterwards. Local refinement plugs in here and nowhere else, as one
-   more demand over one more span, pinning no line of its own.
+   :func:`_constraints` is what raises the demands, and everything after that is
+   :mod:`~.sizing_field`. Local refinement plugs in as one more demand over one more
+   span, pinning no line of its own.
 3. **Placement by arclength.** Each gap between fixed positions gets
    ``ceil(integral of 1/h)`` cells, placed by inverting the cumulative integral.
-   Rounding up scales the whole gap by one factor, so ratios inside it follow
-   the field exactly.
 4. **Seam settling.** A gap holds a whole number of cells, so its realised size
    is ``length / n`` and neighbouring gaps can disagree at a shared line. Each
-   publishes its realised *edge* size back into the field and the neighbour
-   grades down to meet it.
+   publishes its realised edge size back into the field and the neighbour grades
+   down to meet it.
 
-Two properties no amount of grading provides, and both are enforced rather than
-graded toward:
+Grading provides neither of the properties below, so both are enforced
+instead:
 
-* **A floor under the cell size**, because the FDTD timestep is set by the
-  *smallest* cell in the whole domain - so a sliver from a CAD boolean does not
-  give a slightly finer mesh, it gives a simulation that never finishes.
+* **A floor under the cell size.** The FDTD timestep is set by the smallest cell
+  in the whole domain, so a sliver from a CAD boolean gives a simulation that
+  never finishes rather than a slightly finer mesh.
 * **Symmetry**, judged on the sizing field rather than on the pinned positions,
-  and made exact by a fold about the centre. Upstream folds too, but judges the
+  and made exact by a fold about the centre. Upstream folds too, judging the
   positions alone - ``CheckSymmetry``,
   ``CSXCAD/python/CSXCAD/SmoothMeshLines.py:168``.
 
-The working behind all of this - why the slope is a logarithm and not
-``max_ratio - 1``, why the rounding slack must not be absorbed by a bump that
-vanishes at the gap ends, how the quadrature is sampled, and the two traps in
-the fold - is in docs/internals/sizing-field.md.
+docs/internals/sizing-field.md works all of this out, and
+:mod:`~.sizing_field` is where the code it describes lives.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass, replace
-from enum import Enum
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
-from ...portbox import FLATNESS
+from .absorber import _add_absorber, _validate_absorber, absorber_walls
+from .grid import FixedLine, MeshLines, _validate_total_size
+from .metal import (
+    Conductor,
+    Grouped,
+    _edge_pair,
+    _face_depth,
+    _grouped_into_conductors,
+    _met_by_metal,
+    _one_pair_at_each_face,
+)
+from .regions import (
+    _DIM_NAMES,
+    DIMENSIONS,
+    MaterialClass,
+    MeshError,
+    MeshParams,
+    Region,
+    SizingRegion,
+)
 from .sizing import Feature
 from .sizing import demands as sizing_demands
+from .sizing_field import (
+    _Constraint,
+    _is_symmetric,
+    _place_lines,
+    _pruned,
+    _settle,
+    _SizingField,
+    _Sources,
+    _symmetrize,
+)
+from .spend import Spend
 
 __all__ = [
-    "Feature",
-    "FixedLine",
-    "MaterialClass",
-    "MeshError",
-    "MeshLines",
-    "MeshParams",
-    "Region",
-    "SizingRegion",
-    "BYTES_PER_CELL",
-    "CONDUCTOR_WIDTH_KEPT",
-    "LARGE_GRID_BYTES",
-    "MAX_GRID_BYTES",
-    "cells_across",
-    "conductor_extents",
+    "absorber_pitches",
     "generate_mesh_lines",
-    "width_axes",
-    "width_spanned",
+    "validate",
 ]
-
-DIMENSIONS = 3
-_DIM_NAMES = ("x", "y", "z")
-
-# A budget, not a measurement: past this a grid is a mistake rather than a large
-# model, and refusing beats swapping.
-_MAX_LINES_PER_AXIS = 200_000
-
-# What one grid cell costs openEMS before anything else. `Operator::ShowStat`
-# prints `12 * prod(numLines) * sizeof(FDTD_FLOAT)` of operator and `6 *` the
-# same of field (openEMS `FDTD/operator.cpp:517`), and FDTD_FLOAT is `float`
-# (openEMS `tools/constants.h:21`). See MeshLines.cell_count
-# for why the count is over lines rather than intervals.
-BYTES_PER_CELL = 18 * 4
-
-# The per-axis limit again, in the quantity the product actually spends. Fixed
-# rather than read off the machine: this mesher is a pure function, and a grid
-# that builds on one machine and refuses on another makes the gates
-# machine-dependent.
-MAX_GRID_BYTES = 8 * 1024**3
-
-# Where a grid stops being ordinary. Derived rather than declared so the two
-# cannot drift apart: the warning has to arrive before the refusal does.
-LARGE_GRID_BYTES = MAX_GRID_BYTES // 8
-
-# Seam agreement propagates one gap per pass, so the real budget scales with the
-# geometry; this is only the floor under it.
-_MIN_SETTLING_PASSES = 24
-
-# Relative change below which a published seam size is considered settled.
-_SETTLING_TOLERANCE = 1e-3
-
-# Build to slightly inside the requested ratio, so quadrature error cannot push
-# the finished grid outside it.
-_GRADING_HEADROOM = 0.995
-
-# How many drawn features a refusal names before it starts counting them.
-_NAMES_PER_MESSAGE = 3
-
-#: How much of a conductor's drawn width the grid keeps, as a fraction.
-#:
-#: openEMS reads a cell's material at one sample point, so a conductor conducts
-#: over the grid lines that fall inside it and arrives *inscribed* in what was
-#: drawn. The thirds rule puts the outermost of those a third of a cell inside
-#: each face, so a conductor loses ``2/3`` of a cell across every width it has,
-#: whatever the policy asked for - and on a narrow trace that is a large part of
-#: the metal. This is what the mesher holds it to instead.
-#:
-#: Placed by measurement, on a microstrip read as the propagation constant
-#: between two lengths of one line, and set just under the least share measured
-#: to answer acceptably rather than in the middle of the range: see
-#: ``docs/internals/conductor-width.md``, which carries the figures and the
-#: method.
-CONDUCTOR_WIDTH_KEPT = 0.95
-
-
-class MeshError(Exception):
-    """The requested mesh is invalid, or cannot be built to specification."""
-
-
-class MaterialClass(Enum):
-    """How a region constrains the grid.
-
-    Only the distinction that changes meshing is modelled. Permittivity, loss
-    and conductivity matter to the solver but not to where lines go, except
-    through the resolutions the caller puts in :class:`MeshParams`.
-    """
-
-    METAL = "metal"
-    DIELECTRIC = "dielectric"
-
-
-@dataclass(frozen=True)
-class Region:
-    """An axis-aligned box of one material class.
-
-    :param lower: Minimum corner, ``(x, y, z)``.
-    :param upper: Maximum corner. Equal to ``lower`` in a dimension means a
-        zero-thickness sheet, which pins a grid line exactly there.
-    :param material: What the box is made of, as far as meshing cares.
-    :param label: Free text carried into error messages, so a rejected mesh
-        names the object the user drew.
-    """
-
-    lower: tuple[float, float, float]
-    upper: tuple[float, float, float]
-    material: MaterialClass
-    label: str = ""
-    #: Which material, not merely which class. Two regions sharing this name are
-    #: one object to the engine - ``driver`` puts every solid of one material
-    #: into a single CSXCAD property - so a face where they meet is not a
-    #: boundary and needs no line at all. Two *different* metals meeting is a
-    #: property boundary that must fall on a line or it moves by up to a cell.
-    #: Empty means unknown, which is read as "different" wherever it matters.
-    material_name: str = ""
-    #: Bulk cell size wanted inside this region, or ``None`` for the global one.
-    #: Per-region so that a wave slowed by a dielectric is resolved there and
-    #: nowhere else; one lambda taken from the slowest material in the model
-    #: over-meshes the air around it by that material's index. Conductors ignore
-    #: it: their edges resolve a field singularity, not a wavelength, and are
-    #: sized by ``metal_res``.
-    size: float | None = None
-    #: Axes along which this region's two faces are **not** conductor edges -
-    #: the metal carries on past them and something else accounts for it.
-    #:
-    #: A transmission-line port is the case this exists for. ``MSLPort`` lays a
-    #: strip over the port box whose ends along the propagation axis are where
-    #: the wave enters and where the port hands over to the drawn trace, never a
-    #: physical termination. Refining them applies a field-singularity treatment
-    #: at a discontinuity that is not there, and ``MSLPort`` reads its probes off
-    #: the global grid rather than the port box, so the cost is not confined to
-    #: the port.
-    #:
-    #: A real edge at the same place is still resolved, because the region that
-    #: owns it asks separately.
-    continuous: frozenset[int] = frozenset()
-    #: Extents of the box **before** it was clipped to the domain, or ``None``
-    #: where nothing clipped it. Read only by ``min_lines``, and so only on a
-    #: dielectric, where it is required: that rule stops a thin *layer* being
-    #: spanned by one cell, and whatever part of a large board survived the
-    #: domain is not a thickness. Sizing from the clipped extent would let a
-    #: small domain demand fine cells, thinning the absorber and shrinking the
-    #: domain again.
-    drawn: tuple[float, float, float] | None = None
-    #: The finest cell this region's own demands may ask for, or ``None`` to ask
-    #: at the policy's own sizes. It floors what the region asks; it does not
-    #: raise the field, so a neighbour asking for something finer still wins.
-    #:
-    #: Attached to the region rather than expressed as a box, and that is the
-    #: whole of why it is here. The grid is separable, so a box spends itself on
-    #: a slab through the model on each axis: for a refinement that overshoots
-    #: harmlessly, and for the opposite it would take resolution off geometry
-    #: level with the box and nowhere near it. Naming the object cannot spill.
-    relaxed_to: float | None = None
-    #: Corners of the whole piece of metal this region is one of, or ``None``
-    #: where nobody has worked it out and the region stands for itself.
-    #:
-    #: Filled in by :func:`generate_mesh_lines`, once, because working it out is
-    #: a question about every other region and the answer is wanted on all three
-    #: axes by two callers. Read only where a conductor's **width** is the
-    #: subject: what a face is a face of, and how much of the metal the grid
-    #: leaves conducting, are questions about the piece of metal rather than
-    #: about the rectangle the translation happened to cut.
-    conductor: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
-
-    def thickness(self, dim: int) -> float:
-        """The feature's own extent on an axis, ignoring any clipping."""
-        if self.drawn is None:
-            return self.extent(dim)
-        return self.drawn[dim]
-
-    def asking(self, size: float) -> float:
-        """``size``, or the relaxed size where that is coarser."""
-        return size if self.relaxed_to is None else max(size, self.relaxed_to)
-
-    def __post_init__(self) -> None:
-        if len(self.lower) != DIMENSIONS or len(self.upper) != DIMENSIONS:
-            raise MeshError(f"region {self.label!r}: corners must be 3-vectors")
-        if self.size is not None and self.size <= 0:
-            raise MeshError(f"region {self.label!r}: size must be > 0")
-        if self.relaxed_to is not None and not self.relaxed_to > 0:
-            raise MeshError(f"region {self.label!r}: relaxed_to must be > 0")
-        for dim in range(DIMENSIONS):
-            if self.upper[dim] < self.lower[dim]:
-                raise MeshError(
-                    f"region {self.label!r}: upper corner is below lower corner "
-                    f"in {_DIM_NAMES[dim]} ({self.upper[dim]} < {self.lower[dim]})"
-                )
-
-    def extent(self, dim: int) -> float:
-        return self.upper[dim] - self.lower[dim]
-
-    def is_sheet(self, dim: int) -> bool:
-        """True where the region has no thickness along ``dim``."""
-        return self.extent(dim) == 0.0
-
-    @property
-    def name(self) -> str:
-        return self.label or self.material.value
-
-
-@dataclass(frozen=True)
-class SizingRegion:
-    """A box asking for finer cells, in absolute length.
-
-    Not geometry. A sizing region contributes *constraints only* - never a
-    fixed position, never the thirds rule - so a box drawn around a coupled gap
-    does not snap the mesh to the box instead of to the gap.
-
-    It is absolute where :class:`MeshParams` is per-wavelength: global sizing
-    resolves the *wave*, whose scale is lambda, and a refinement region
-    resolves a *feature*, whose scale is millimetres. Upstream openEMS does the
-    same - every local override in the tutorials is a length or a divisor of
-    the bulk.
-
-    **It refines only.** A region coarser than the global cap is refused by
-    name: coarsening past the bulk target is numerical dispersion, which shows
-    up as a wrong answer rather than as a bad grid. The real need behind "this
-    region should be coarser" is per-material wavelength, not this.
-
-    **Each axis is refined as a slab.** The grid is rectilinear and separable,
-    so a box refines ``[lower[dim], upper[dim]]`` along every axis
-    independently - three orthogonal slabs, not a cube, and cells outside the
-    box but level with it in one axis are refined too.
-
-    :param lower: Minimum corner, ``(x, y, z)``.
-    :param upper: Maximum corner.
-    :param size: Target cell size inside the box.
-    :param min_lines: Fewest cells across the box, or 0 to use the global
-        ``min_lines``. Per region because one global integer cannot give a
-        50 um bond layer and a 1.6 mm core different counts, nor give a
-        conductor one at all - the global count is dielectrics only.
-    :param label: Free text carried into error messages, naming the object the
-        user drew.
-    """
-
-    lower: tuple[float, float, float]
-    upper: tuple[float, float, float]
-    size: float
-    min_lines: int = 0
-    label: str = ""
-
-    def __post_init__(self) -> None:
-        if len(self.lower) != DIMENSIONS or len(self.upper) != DIMENSIONS:
-            raise MeshError(f"refinement region {self.name!r}: corners must be 3-vectors")
-        for dim in range(DIMENSIONS):
-            if self.upper[dim] < self.lower[dim]:
-                raise MeshError(
-                    f"refinement region {self.name!r}: upper corner is below lower "
-                    f"corner in {_DIM_NAMES[dim]} "
-                    f"({self.upper[dim]} < {self.lower[dim]})"
-                )
-        if self.size <= 0:
-            raise MeshError(f"refinement region {self.name!r}: size must be > 0")
-        if self.min_lines < 0:
-            raise MeshError(f"refinement region {self.name!r}: min_lines must be >= 0")
-
-    @property
-    def name(self) -> str:
-        return self.label or "refinement region"
-
-
-@dataclass(frozen=True)
-class MeshParams:
-    """Grid policy. All lengths in the caller's units, consistently.
-
-    :param metal_res: Target cell size at conductor edges.
-    :param dielectric_res: Target cell size elsewhere, and the global cap.
-    :param max_ratio: Largest permitted size ratio between adjacent cells, per
-        dimension. Values near 1 give smooth, expensive grids.
-    :param min_lines: Fewest cells across any **dielectric** region with
-        nonzero extent, so a thin substrate is not spanned by one cell.
-        Conductors are exempt: their thickness is a loss term, not a wave to
-        sample, and a refinement region is where a conductor gets its own count
-        if one is genuinely wanted.
-    :param pml_cells: Uniform absorber cells added *outside* the domain at each
-        end of an axis. Zero disables the absorber on that axis. One value for
-        all three axes, or one per axis - a rectangular waveguide is PEC on its
-        four side walls and absorbing only at the two ends, so its mesh must
-        not grow sideways or the walls move and the cutoff shifts.
-    :param cap: The coarsest cell anywhere - the sizing field's ceiling.
-        Defaults to ``dielectric_res``. It is the bulk size in *vacuum*, and
-        ``dielectric_res`` is the bulk size in the slowest material, so
-        ``cap >= dielectric_res`` always.
-
-        It is also the only length the *domain* is measured in, both the air
-        padding and ``THROUGH``: the domain is fixed before anything is meshed,
-        so it is sized by the one cell the mesher cannot exceed. See
-        :func:`~.write.domain`.
-    :param min_cell: Hard floor on cell size. Constraints closer together than
-        this are snapped together. Defaults to ``metal_res / 1000``, which is
-        far below anything meshing wants because its job is to catch coincident
-        anchors rather than to shape the grid - a floor tight enough to
-        influence cell sizes would merge geometry the user drew apart. It
-        protects the timestep, not the grid; see the module docstring.
-    """
-
-    metal_res: float
-    dielectric_res: float
-    max_ratio: tuple[float, float, float] = (1.3, 1.3, 1.3)
-    min_lines: int = 4
-    pml_cells: int | tuple[int, int, int] = 8
-    min_cell: float | None = None
-    cap: float | None = None
-
-    def __post_init__(self) -> None:
-        if self.metal_res <= 0 or self.dielectric_res <= 0:
-            raise MeshError("resolutions must be > 0")
-        if self.metal_res > self.dielectric_res:
-            raise MeshError(
-                f"metal_res ({self.metal_res}) must not exceed dielectric_res "
-                f"({self.dielectric_res}); metal edges need the finer grid"
-            )
-        if len(self.max_ratio) != DIMENSIONS:
-            raise MeshError("max_ratio must have one entry per dimension")
-        if any(ratio <= 1.0 for ratio in self.max_ratio):
-            raise MeshError("max_ratio must be > 1; a ratio of 1 forbids grading")
-        if self.min_lines < 1:
-            raise MeshError("min_lines must be >= 1")
-
-        cells = self.pml_cells
-        if isinstance(cells, int):
-            cells = (cells,) * DIMENSIONS
-        else:
-            cells = tuple(int(value) for value in cells)
-            if len(cells) != DIMENSIONS:
-                raise MeshError("pml_cells must be one value or one per dimension")
-        if any(value < 0 for value in cells):
-            raise MeshError("pml_cells must be >= 0")
-        object.__setattr__(self, "pml_cells", cells)
-        if self.cap is not None and self.cap < self.dielectric_res:
-            raise MeshError(
-                f"cap ({self.cap}) is finer than dielectric_res "
-                f"({self.dielectric_res}); the ceiling cannot be below the bulk "
-                "size it is a ceiling for"
-            )
-
-        if self.min_cell is None:
-            object.__setattr__(self, "min_cell", self.metal_res / 1000.0)
-        elif self.min_cell <= 0:
-            raise MeshError("min_cell must be > 0")
-        elif self.min_cell > self.metal_res:
-            raise MeshError(
-                f"min_cell ({self.min_cell}) exceeds metal_res ({self.metal_res}); "
-                "the floor would override the resolution it is meant to protect"
-            )
-
-    @property
-    def ceiling(self) -> float:
-        """The coarsest cell anywhere. ``cap`` when given, else the bulk size.
-
-        ``cap`` stays ``None`` rather than being filled in, because "unset" and
-        "set to the same number" have to differ: per-material sizing is derived
-        from ``cap``, and deriving it from a ``dielectric_res`` that was never
-        meant to be a vacuum wavelength would refine every dielectric by
-        sqrt(epsilon) for a caller who asked for nothing of the sort.
-        """
-        return self.dielectric_res if self.cap is None else self.cap
-
-    def resolution(self, material: MaterialClass) -> float:
-        return self.metal_res if material is MaterialClass.METAL else self.dielectric_res
-
-
-@dataclass(frozen=True)
-class FixedLine:
-    """A position the grid had to contain, and what put it there.
-
-    ``_fixed_positions`` already builds strings like ``"conducting sheet
-    'Trace'"`` and ``"'GND' edge at 0, inside"`` for its own error messages.
-    Carrying them out lets a mesh report say *why* the smallest cell in the
-    model is where it is. Recovering that from positions alone is guesswork: a
-    line at the top of a substrate and a line two thirds of a cell outside a
-    trace edge are the same float.
-
-    :param required: True for an anchor, which is never moved and whose loss is
-        an error; False for a preference that survived. An anchor at an awkward
-        position is geometry that must be respected, a preference there is one
-        that may still be dropped.
-    """
-
-    position: float
-    source: str
-    required: bool
-
-
-@dataclass(frozen=True)
-class MeshLines:
-    """Grid line positions per axis, absorber included.
-
-    :param fixed: Per axis, the positions the mesher pinned and why. Defaulted
-        so a grid can still be built by hand in a test without inventing
-        provenance for it.
-    """
-
-    x: np.ndarray
-    y: np.ndarray
-    z: np.ndarray
-    fixed: tuple[tuple[FixedLine, ...], ...] = ((), (), ())
-
-    def __getitem__(self, dim: int) -> np.ndarray:
-        return (self.x, self.y, self.z)[dim]
-
-    @property
-    def shape(self) -> tuple[int, int, int]:
-        """Number of lines per axis."""
-        return (len(self.x), len(self.y), len(self.z))
-
-    @property
-    def cell_count(self) -> int:
-        """What openEMS calls cells - the number that decides what a solve costs.
-
-        The product of the **line** counts, not of the intervals between them.
-        ``prod(n - 1)`` Yee cells is a defensible geometric answer and is not the
-        one this property is for.
-
-        openEMS updates and allocates per *line*, the outermost included:
-        ``Operator::GetNumberCells`` returns ``prod(numLines)``
-        (``FDTD/operator.cpp:510``), the operator is ``12 * prod(numLines)``
-        floats and the field data ``6 * prod(numLines)``, and ``MCells/s``
-        divides the iteration time by that same product. Time and memory both
-        scale with lines, so the criterion in the summary line above picks
-        openEMS' count.
-
-        Never print it without the shape beside it - a bare count sits a few
-        lines from openEMS' own with nothing to say the two describe one grid.
-        :func:`report.summary` is the format.
-
-        (``mesh._cell_count`` is a different quantity and stays as it is: it
-        counts the intervals a span is divided into, which really are cells.)
-        """
-        return int(np.prod(self.shape))
-
-    def smallest_cell(self) -> float:
-        """The cell that sets the FDTD timestep."""
-        return float(min(np.min(np.diff(self[d])) for d in range(DIMENSIONS)))
-
-
-def cells_across(lines: np.ndarray, low: float, high: float) -> int:
-    """How many cells of one axis span ``low`` to ``high``.
-
-    Lines strictly inside cut the span into one more piece than there are of
-    them, and a span sitting wholly within a single cell is spanned by that one
-    rather than by none.
-
-    Here rather than beside either caller because two of them read a finished
-    grid to say how well it resolves an object - the mesh report and pre-flight
-    - and they have to agree on what "cells across" counts. The grid is passed
-    as a bare array so both :class:`MeshLines` and the envelope's own grid can
-    be asked.
-    """
-    inside = int(np.searchsorted(lines, high, side="left")) - int(
-        np.searchsorted(lines, low, side="right")
-    )
-    return max(inside + 1, 1)
-
-
-def width_spanned(lines: np.ndarray, low: float, high: float) -> float:
-    """The share of ``low`` to ``high`` the conductor drawn there still conducts.
-
-    openEMS reads a cell's material at one sample point, so a conductor conducts
-    over the grid lines the drawing contains and arrives *inscribed* in it. This
-    is how much of the drawn span survives that, as a fraction: 0.0 says the span
-    holds fewer than two lines and has no width left at all.
-
-    A line **on** the boundary counts, and that is what separates the two shapes
-    a conductor arrives in. Where the thirds rule was applied there is no line on
-    the face - it puts one a third of a cell inside and one two thirds outside -
-    so the span comes back short at both ends. Where the faces were pinned
-    instead, the metal reaches its own boundary and 1.0 is the honest answer
-    rather than an unreachable one.
-    """
-    inside = lines[(lines >= low) & (lines <= high)]
-    if inside.size < 2:
-        return 0.0
-    return float(inside[-1] - inside[0]) / (high - low)
-
-
-Box = tuple[Sequence[float], Sequence[float]]
-
-
-def conductor_extents(lower: Sequence[float], upper: Sequence[float], others: Iterable[Box]) -> Box:
-    """The corners of the whole piece of metal the box ``lower`` to ``upper`` is in.
-
-    Two conductors butted face to face are one piece of metal: the field
-    penetrates neither, so the seam between them is not a boundary of anything.
-    A piece of a strip is therefore not a narrower strip, and this is what says
-    how wide the strip actually is. It matters because the translation cuts a
-    drawn outline into rectangles by itself, so most conductors reach the grid
-    in pieces nobody drew - and a width read off one of those is a width of
-    nothing.
-
-    ``others`` are the surrounding boxes of the same metal, this one included or
-    not as the caller finds convenient. Both the mesher, which sizes cells from a
-    width, and pre-flight, which measures what the grid left of one, work it out
-    with this, so a demand and a complaint cannot be about different pieces of
-    metal.
-
-    Each axis is grown on its own, and only across metal covering the box's
-    **own** cross-section on the other two - the same reading of "butted" that
-    :func:`_met_by_metal` takes. Growing on two axes at once would change that
-    cross-section as it went, and an L would then reach different metal depending
-    on which arm was followed first.
-    """
-    boxes = list(others)
-    grown_lower, grown_upper = list(lower), list(upper)
-    for dim in range(DIMENSIONS):
-        covering = [
-            box
-            for box in boxes
-            if all(
-                box[0][axis] <= lower[axis] + FLATNESS and box[1][axis] >= upper[axis] - FLATNESS
-                for axis in range(DIMENSIONS)
-                if axis != dim
-            )
-        ]
-        # Swept in order of where each box starts, so one pass reaches the end of
-        # the run: a box that extends it can only be met after every box that
-        # reaches it. Repeated passes over an unsorted list find the same answer
-        # and turn meshing a long chain of rectangles into an interactive wait.
-        low, high = lower[dim], upper[dim]
-        for box in sorted(covering, key=lambda box: box[0][dim]):
-            if box[0][dim] > high + FLATNESS:
-                break
-            if box[1][dim] > high:
-                high = box[1][dim]
-        for box in sorted(covering, key=lambda box: box[1][dim], reverse=True):
-            if box[1][dim] < low - FLATNESS:
-                break
-            if box[0][dim] < low:
-                low = box[0][dim]
-        grown_lower[dim], grown_upper[dim] = low, high
-    return tuple(grown_lower), tuple(grown_upper)
-
-
-def width_axes(lower: Sequence[float], upper: Sequence[float], cell: float) -> tuple[int, ...]:
-    """The axes across which a conductor has a width the grid resolves.
-
-    Every axis it spans more than one ``cell`` of, where ``cell`` is the size the
-    policy asks for at metal.
-
-    An axis it spans less than that is a *thickness*, and is excluded because
-    nothing there is at stake. The mesher does not apply the thirds rule across
-    one - it pins both faces plainly instead - and a conductor whose faces are on
-    lines arrives exactly as drawn, so there is no share of it to hold. That is
-    what a foil deliberately gets: a single cell through it, and its own
-    thickness handed to openEMS as a material property.
-
-    Anisotropy would be the alternative to reading it off the cell, and it is
-    worse. A rule picking the *shortest* axis excludes one of a cube's three
-    arbitrarily, and the grid then holds two of its faces to a share and the
-    third to nothing, for a shape with no thin direction at all.
-
-    A shape with extent on fewer than two axes has no width at all, whatever its
-    one span is: it is a line, it encloses nothing, and a share of it describes
-    nothing.
-
-    Here rather than beside either caller so the mesher and pre-flight cannot
-    disagree about which axes a demand was spent on and which one a complaint is
-    about.
-    """
-    live = tuple(dim for dim in range(DIMENSIONS) if upper[dim] - lower[dim] > 0.0)
-    if len(live) < 2:
-        return ()
-    return tuple(dim for dim in live if upper[dim] - lower[dim] > cell)
-
-
-class _Sources:
-    """The pinned lines on one axis, for naming geometry when meshing fails.
-
-    Below :func:`_snap` the arithmetic works in bare coordinates and has no use
-    for a name. A refusal does: a coordinate identifies a feature only to a
-    reader who already knows where it is. So provenance travels alongside the
-    positions and every refusal spends it.
-
-    Positions are sorted and there are always at least two, both guaranteed by
-    :func:`_snap`.
-    """
-
-    def __init__(self, fixed: Sequence[FixedLine], dim: int) -> None:
-        self.lines = tuple(fixed)
-        self.positions = [line.position for line in self.lines]
-        self.dim = dim
-        self.axis = _DIM_NAMES[dim]
-
-    def at(self, position: float) -> str:
-        """Name the pinned line nearest ``position``, and locate it."""
-        line = min(self.lines, key=lambda entry: abs(entry.position - position))
-        return f"{line.source} ({line.position:g})"
-
-    def spanning(self, position: float) -> str:
-        """Name the pinned lines that bracket ``position``.
-
-        A cell lies between grid lines, and most grid lines are placed rather
-        than pinned, so what locates one is the pair of drawn features it sits
-        between rather than the nearest in isolation.
-        """
-        below = [line for line in self.lines if line.position <= position]
-        above = [line for line in self.lines if line.position >= position]
-        if not below or not above or below[-1] is above[0]:
-            return f"at {self.at(position)}"
-        return (
-            f"between {below[-1].source} ({below[-1].position:g}) "
-            f"and {above[0].source} ({above[0].position:g})"
-        )
-
-    def describe_all(self, positions: Sequence[float]) -> str:
-        """Name every pinned line in ``positions``, abbreviating a long list.
-
-        A failure here can implicate most of a crowded axis, and a message
-        longer than the report view holds goes unread. The remainder is counted
-        rather than dropped, so the scale of the problem still arrives.
-        """
-        unique = sorted(set(positions))
-        named = [self.at(position) for position in unique[:_NAMES_PER_MESSAGE]]
-        rest = len(unique) - len(named)
-        return ", ".join(named) + (f", and {rest} more" if rest else "")
-
-
-@dataclass(frozen=True)
-class _Constraint:
-    """A demand that cells be no larger than ``size`` over ``[lower, upper]``.
-
-    A point constraint has ``lower == upper``. Away from its span the demand
-    relaxes at the grading slope, which is what makes the field Lipschitz.
-
-    ``source`` names what asked. Constraints do not pin lines, so unlike
-    :class:`FixedLine` there is no position to recover a name from afterwards:
-    what a constraint leaves behind is a cell size that several of them could
-    equally have set.
-    """
-
-    lower: float
-    upper: float
-    size: float
-    source: str = ""
-
-
-class _SizingField:
-    """``h(x)``: the cell size wanted at each point along one axis."""
-
-    def __init__(
-        self,
-        constraints: Sequence[_Constraint],
-        cap: float,
-        slope: float,
-        floor: float,
-    ) -> None:
-        self._cap = cap
-        self._slope = slope
-        self._floor = floor
-        self._sources = tuple(c.source for c in constraints)
-        if constraints:
-            self._lower = np.array([c.lower for c in constraints])
-            self._upper = np.array([c.upper for c in constraints])
-            self._size = np.array([c.size for c in constraints])
-        else:
-            self._lower = self._upper = self._size = None
-
-    def winner(self, x: float) -> str:
-        """What set the field at ``x``, or ``""`` where the cap did.
-
-        The argument of the same ``min`` that :meth:`__call__` takes the value
-        of. Asked once per axis by the report rather than during placement, so
-        it recomputes rather than having placement carry it around.
-        """
-        if self._size is None:
-            return ""
-        distance = np.maximum(0.0, np.maximum(self._lower - x, x - self._upper))
-        ramped = self._size + self._slope * distance
-        best = int(np.argmin(ramped))
-        return self._sources[best] if ramped[best] < self._cap else ""
-
-    def breakpoints(self) -> list[float]:
-        """Positions where the field can change slope.
-
-        Each constraint bends at its own bounds, and again where its ramp meets
-        the cap and stops rising. That second set is what separates a fine
-        feature from the flat expanse beyond it; without it the two share one
-        integration piece and a sample budget sized for the whole span steps
-        straight over the fine part.
-        """
-        if self._lower is None:
-            return []
-        edges = [float(v) for v in np.concatenate([self._lower, self._upper])]
-        if self._slope > 0:
-            reach = np.maximum(self._cap - self._size, 0.0) / self._slope
-            edges += [float(v) for v in np.concatenate([self._lower - reach, self._upper + reach])]
-        return edges
-
-    def __call__(self, x: np.ndarray) -> np.ndarray:
-        values = np.full(np.shape(x), self._cap, dtype=float)
-        if self._size is not None:
-            column = np.asarray(x, dtype=float)[..., np.newaxis]
-            distance = np.maximum(0.0, np.maximum(self._lower - column, column - self._upper))
-            values = np.minimum(values, np.min(self._size + self._slope * distance, axis=-1))
-        return np.maximum(values, self._floor)
 
 
 def generate_mesh_lines(
@@ -766,6 +115,10 @@ def generate_mesh_lines(
     forced: Sequence[Sequence[float]] | None = None,
     sizing: Sequence[SizingRegion] = (),
     features: Sequence[Feature] = (),
+    pitches: Sequence[tuple[float | None, float | None]] | None = None,
+    walls: Sequence[Sequence[tuple[float, float]]] | None = None,
+    judge: bool = True,
+    spend: Spend | None = None,
 ) -> MeshLines:
     """Build the grid.
 
@@ -773,24 +126,37 @@ def generate_mesh_lines(
         grid determined by ``domain`` and ``params`` alone.
     :param forced: Per axis, positions that must be grid lines even though no
         region asks for them. Ports need this: openEMS' waveguide port places
-        its excitation as a zero-thickness box at a plane it is *told*, and
+        its excitation as a zero-thickness box at a plane it is told, and
         unlike the microstrip port it does not snap to whatever line is nearest.
-        Miss the plane and the excitation is silently not discretised at all -
-        the run completes, having excited nothing. Treated exactly like a
-        conducting sheet: an anchor, never moved, and refused if it collides
-        with another anchor.
-    :param domain: ``(lower, upper)`` corners of the *physical* region - the
-        structure plus whatever air the caller wants around it. Absorber cells
-        are added outside this box, so the final grid is larger than ``domain``.
+        Miss the plane and the excitation is silently not discretised at all,
+        and the run completes having excited nothing. Such a position is treated
+        exactly like a conducting sheet: an anchor, never moved, and refused if
+        it collides with another anchor.
+    :param domain: ``(lower, upper)`` corners of what is meshed - the structure
+        plus whatever air the caller wants around it, less any absorber block
+        that comes out of the structure rather than being added beyond it.
     :param params: Grid policy.
     :param sizing: Local refinement. See :class:`SizingRegion`: constraints
         only, absolute lengths, and refining only.
     :param features: Lengths measured off geometry that is not axis-aligned - a
         gap with a diagonal normal, a conductor's own cross-section - each
         spent across the three axes by :mod:`~.sizing`. Like ``sizing`` these
-        are constraints only and pin nothing: a boundary that is not parallel
-        to a grid plane has no coordinate to pin, which is exactly why it needs
-        the criterion instead.
+        are constraints only and pin nothing. A boundary that is not parallel to
+        a grid plane has no coordinate to pin, so it needs the criterion
+        instead.
+    :param pitches: Per axis, one absorber cell at each face, from
+        :func:`absorber_pitches`; ``None`` for a face whose absorber is added
+        beyond the domain at the interior's own edge pitch.
+    :param walls: Per axis, where the structure is declared to run out through
+        the absorber and which way is inward from there. Read by nothing but
+        :func:`_measured_features`, and a no-op wherever the absorber comes out
+        of the domain: the interior then stops one block short of the wall, and
+        a demand measured there is outside it already. It is not a no-op on an
+        axis absorbing in no cells of its own, where the interior reaches the
+        declared wall and nothing else excuses the cut end standing on it.
+    :param judge: Whether to hold the result to :func:`validate`. False for a
+        pass whose absorber pitch is still being reconciled - see
+        :func:`~.absorber.laid_pitches`.
     :raises MeshError: If the request is inconsistent, or if the resulting grid
         would violate the smoothness or absorber rules.
     """
@@ -799,10 +165,10 @@ def generate_mesh_lines(
         raise MeshError("domain corners must be 3-vectors")
     for region in regions:
         _check_region_inside_domain(region, lower, upper)
-    for region in sizing:
-        _check_sizing_region(region, params, lower, upper)
+    for refinement in sizing:
+        _check_sizing_region(refinement, params, lower, upper)
     features = _features_inside(features, lower, upper)
-    regions = _grouped_into_conductors(regions)
+    grouped = _grouped_into_conductors(regions)
 
     axes = []
     for dim in range(DIMENSIONS):
@@ -813,7 +179,7 @@ def generate_mesh_lines(
             )
         axes.append(
             _mesh_axis(
-                regions,
+                grouped,
                 dim,
                 lower[dim],
                 upper[dim],
@@ -821,6 +187,9 @@ def generate_mesh_lines(
                 () if forced is None else forced[dim],
                 sizing,
                 features,
+                () if walls is None else tuple(walls[dim]),
+                (None, None) if pitches is None else (pitches[dim][0], pitches[dim][1]),
+                spend,
             )
         )
 
@@ -831,35 +200,26 @@ def generate_mesh_lines(
         fixed=(axes[0][1], axes[1][1], axes[2][1]),
     )
     _validate_total_size(lines)
+    if judge:
+        validate(lines, params)
     return lines
 
 
-def _validate_total_size(lines: MeshLines) -> None:
-    """Refuse a grid no machine will hold.
+def validate(lines: MeshLines, params: MeshParams) -> None:
+    """Judge a finished grid, one axis at a time.
 
-    ``_MAX_LINES_PER_AXIS`` bounds one axis, and the quantity that decides what
-    a solve costs is the *product* - so three axes each comfortably inside the
-    per-axis limit multiply to a grid nothing can allocate, and every route that
-    has reached one did so from a mistyped property rather than from a large
-    model. It is checked here because this is where the finished grid exists:
-    the absorber has been appended, which the per-axis limit never sees.
+    Separate from building it because an absorber taken out of the structure is
+    reconciled with the interior over one pass or several, and only a pass whose
+    seams are inside the grading budget is a finished grid. The passes before it
+    hold a block the interior did not grade into, which is what is being
+    iterated rather than a fault to refuse.
     """
-    cells = lines.cell_count
-    if cells * BYTES_PER_CELL <= MAX_GRID_BYTES:
-        return
-    shape = " x ".join(str(n) for n in lines.shape)
-    raise MeshError(
-        f"the grid is {cells:,} cells ({shape} lines), which openEMS counts as "
-        f"{cells * BYTES_PER_CELL / 1024**3:,.1f} GiB of operator and field, "
-        f"against a ceiling of {MAX_GRID_BYTES / 1024**3:g} GiB. No single axis "
-        "is out of bounds - it is the product that ran away, and pml_cells "
-        "reaches it fastest because it is applied to every axis after "
-        "everything else"
-    )
+    for dim in range(DIMENSIONS):
+        _validate(lines[dim], _Sources(lines.fixed[dim], dim), params)
 
 
 def _mesh_axis(
-    regions: Sequence[Region],
+    grouped: Grouped,
     dim: int,
     domain_lower: float,
     domain_upper: float,
@@ -867,36 +227,202 @@ def _mesh_axis(
     forced: Sequence[float] = (),
     sizing: Sequence[SizingRegion] = (),
     features: Sequence[Feature] = (),
+    walls: Sequence[tuple[float, float]] = (),
+    pitches: tuple[float | None, float | None] = (None, None),
+    spend: Spend | None = None,
 ) -> tuple[np.ndarray, tuple[FixedLine, ...]]:
     """Everything for one axis, from geometry to validated line positions.
 
     Returns the lines and the pinned positions they were built around. The
-    provenance travels with them as a :class:`_Sources`: the arithmetic below
+    provenance travels with them as a :class:`_Sources`. The arithmetic below
     ignores it, and every refusal uses it to name the geometry the user drew
     rather than the coordinate the mesher happened to be looking at.
+
+    ``domain_lower`` and ``domain_upper`` are what gets meshed. Where the
+    absorber comes out of the structure rather than being added beyond it, they
+    are already inside the structure by one block, and ``pitches`` says how deep
+    a block cell is so :func:`_add_absorber` can lay it back.
+
+    ``walls`` is where the structure is declared to end, which is a different
+    question and is only asked by :func:`_measured_features`. Where the absorber
+    comes out of the domain it decides nothing here, because the interior has
+    already stopped one block short of the wall; :func:`absorber_pitches`, whose
+    field spans the structure, asks there instead. Where an axis carries no
+    absorber cells of its own, the interior does reach the declared wall, and
+    this is the only place the question gets asked at all.
     """
-    ratio = params.max_ratio[dim]
-    # ln(ratio), not ratio - 1; docs/internals/sizing-field.md works out why the
-    # difference is enough to fail every smoothness check. The headroom factor
-    # keeps quadrature error from pushing the finished grid back over the line.
-    slope = math.log(ratio) * _GRADING_HEADROOM
-    floor = float(params.min_cell)
-
     mandatory, preferred = _fixed_positions(
-        regions, dim, domain_lower, domain_upper, params, forced
+        grouped, dim, domain_lower, domain_upper, params, forced
     )
-    fixed = _snap(mandatory, preferred, floor, dim)
+    fixed = _snap(mandatory, preferred, params.floor, dim)
     sources = _Sources(fixed, dim)
-    constraints = _constraints(regions, dim, params, domain_lower, domain_upper, sizing, features)
-
-    field = _settle(sources, constraints, params.ceiling, slope, floor)
-    interior = _place_lines(sources, field, floor, params.ceiling)
+    # The interior cell meeting the block has to grade into it. Asked for at the
+    # seam, so the mesher grades to it the way it grades to anything else,
+    # rather than the two meeting by coincidence. Which of the two comes out
+    # coarser depends on what wins the field over that first cell's span, and
+    # absorber.rough_seams is what judges the pair.
+    seams = [
+        _Constraint(bound, bound, pitch, f"{_DIM_NAMES[dim]} absorber seam")
+        for bound, pitch in ((domain_lower, pitches[0]), (domain_upper, pitches[1]))
+        if pitch is not None
+    ]
+    field = _axis_field(
+        grouped,
+        sources,
+        params,
+        domain_lower,
+        domain_upper,
+        sizing,
+        features,
+        walls,
+        seams,
+        spend,
+    )
+    interior = _place_lines(sources, field, params.floor, params.ceiling)
     if _is_symmetric(sources.positions, field, domain_lower, domain_upper):
         interior = _symmetrize(interior, sources.positions)
 
-    lines = _add_absorber(interior, params.pml_cells[dim])
-    _validate(lines, sources, params)
+    lines = _add_absorber(interior, params.absorber[dim], pitches)
     return np.asarray(lines, dtype=float), tuple(fixed)
+
+
+def _axis_field(
+    grouped: Grouped,
+    sources: _Sources,
+    params: MeshParams,
+    lower: float,
+    upper: float,
+    sizing: Sequence[SizingRegion],
+    features: Sequence[Feature],
+    walls: Sequence[tuple[float, float]],
+    extra: Sequence[_Constraint] = (),
+    spend: Spend | None = None,
+) -> _SizingField:
+    """``h(x)`` over one axis: what the drawing asks of it, settled.
+
+    The grid and the absorber block are sized by this one construction, so the
+    interval and the pinning are the whole of what can make their two fields
+    differ. :func:`absorber_pitches` runs it over the structure's own extent,
+    and :func:`_mesh_axis` over the interior, which is that extent with a block
+    taken off each face the structure runs out through.
+
+    ``walls`` is where the structure is declared to run out. Both callers pass
+    the same value. What differs is whether it falls on the interval, and
+    :func:`_measured_features` is the only thing that reads it.
+
+    ``extra`` are demands the caller makes of its own bounds, on top of what the
+    geometry asks for. :func:`_mesh_axis` asks for the absorber seam there.
+
+    It pins nothing and lays no lines. The positions arrive pinned, in
+    ``sources``, because how they are arrived at is where the two callers
+    genuinely differ.
+    """
+    constraints = _constraints(
+        grouped, sources.dim, params, lower, upper, sizing, features, walls, spend
+    )
+    constraints.extend(extra)
+    return _settle(
+        sources, constraints, params.ceiling, params.slope(sources.dim), params.floor, spend
+    )
+
+
+def absorber_pitches(
+    regions: Sequence[Region],
+    domain: tuple[tuple[float, float, float], tuple[float, float, float]],
+    params: MeshParams,
+    forced: Sequence[Sequence[float]] | None = None,
+    sizing: Sequence[SizingRegion] = (),
+    features: Sequence[Feature] = (),
+    absorbed: Sequence[tuple[bool, bool]] | None = None,
+    spend: Spend | None = None,
+) -> tuple[tuple[float | None, float | None], ...]:
+    """How deep one absorber cell is on each face the structure runs out through.
+
+    Asked before the grid is built, because the answer says where the interior
+    ends, and everything handed to the mesher has to be clipped to what it
+    meshes. ``None`` is a face whose absorber goes outside the domain instead.
+    There the interior's own edge pitch is the answer, and there is nothing to
+    decide in advance.
+
+    This is one settling pass per absorbing axis over the structure's own extent.
+    The reservation it replaces could only guess at the answer: the pitch a mesh
+    lays at a wall is a property of the finished sizing field, and no arithmetic
+    over the material list can anticipate the grading that produced it.
+    """
+    if absorbed is None:
+        return ((None, None),) * DIMENSIONS
+
+    lower, upper = domain
+    # The same filter :func:`generate_mesh_lines` applies before meshing, and
+    # for the same reason. The grid is separable, so a demand that misses this
+    # volume on one axis would still refine slabs on the other two where the
+    # geometry it was measured from is not. This field decides the block, so it
+    # has to be asked of the same demands the mesh is.
+    features = _features_inside(features, lower, upper)
+    # Grouped here too, rather than by the caller. This entry point takes the
+    # drawing, and where a conductor ends is read off the answer, so it asks the
+    # question itself exactly as generate_mesh_lines does.
+    grouped = _grouped_into_conductors(regions)
+    out: list[tuple[float | None, float | None]] = []
+    for dim in range(DIMENSIONS):
+        cells = params.absorber[dim]
+        faces = (absorbed[dim][0], absorbed[dim][1])
+        if not cells or not any(faces):
+            out.append((None, None))
+            continue
+        mandatory, preferred = _fixed_positions(
+            grouped, dim, lower[dim], upper[dim], params, () if forced is None else forced[dim]
+        )
+        # Snapped onto the bounds, which is what a caller asking how fine the
+        # mesh wants to be near a boundary may do and a caller building a grid
+        # to solve on may not. _snap says why.
+        pinned = _snap(mandatory, preferred, params.floor, dim, (lower[dim], upper[dim]))
+        walls = absorber_walls(lower[dim], upper[dim], faces)
+        field = _axis_field(
+            grouped,
+            _Sources(pinned, dim),
+            params,
+            lower[dim],
+            upper[dim],
+            sizing,
+            features,
+            walls,
+            spend=spend,
+        )
+        out.append(
+            (
+                _absorber_cell(field, lower[dim], 1.0, cells, params.floor) if faces[0] else None,
+                _absorber_cell(field, upper[dim], -1.0, cells, params.floor) if faces[1] else None,
+            )
+        )
+    return tuple(out)
+
+
+def _absorber_cell(
+    field: _SizingField, wall: float, inward: float, cells: int, floor: float
+) -> float:
+    """What one cell of the absorber measures on a face the structure runs through.
+
+    The block is ``cells`` cells of a single size, because a graded block
+    reflects. That size must be no coarser than anything the field asks for
+    inside the block. Otherwise the interior cell meeting the block is the finer
+    of the two, and the seam breaks the smoothness rule.
+
+    Read in one step. Start from the size the field wants at the wall, take the
+    minimum over the block that size implies, and stop. The minimum over a band
+    only falls as the band grows, so the narrower band the answer implies cannot
+    lower it again, and the answer is safe for the block it describes.
+
+    The answer is safe rather than stable. How far in the band reaches is
+    proportional to the size at the wall, so a coarser policy widens it, and a
+    feature the wider band swallows collapses the block instead of deepening it.
+    Nothing downstream therefore computes the absorber's depth from the policy,
+    and the checks that care about it read the finished grid.
+    """
+    wanted = float(field(np.asarray([wall], dtype=float))[0])
+    edge = wall + inward * cells * wanted
+    _, sizes = field.polyline(min(wall, edge), max(wall, edge))
+    return max(float(np.min(sizes)), floor)
 
 
 def _features_inside(
@@ -906,16 +432,16 @@ def _features_inside(
 ) -> list[Feature]:
     """Only the features whose geometry is in the volume being meshed.
 
-    The grid is separable, so a demand is projected onto each axis on its own -
-    and a feature that misses the domain in a *single* axis would still refine
+    The grid is separable, so a demand is projected onto each axis on its own,
+    and a feature that misses the domain in a single axis would still refine
     slabs on the other two, somewhere the geometry it was measured from is not.
     A feature outside the domain in any axis is therefore outside it altogether
     and asks for nothing.
 
-    Dropped rather than refused, unlike a :class:`SizingRegion`: a refinement
-    region is a typed request, where a silent no-op would hand back a grid that
-    was not asked for, while a feature is measured off geometry that is simply
-    not in this simulation.
+    Dropped rather than refused, unlike a :class:`SizingRegion`. A refinement
+    region is a typed request, and a silent no-op would hand back a grid that was
+    not asked for. A feature is measured off geometry that is not in this
+    simulation at all.
     """
     return [
         feature
@@ -951,19 +477,19 @@ def _check_sizing_region(
 ) -> None:
     """Refuse a refinement that would coarsen, cannot be honoured, or misses.
 
-    The first two are about the same thing: a sizing region is an explicit
-    request, so silently clamping it leaves the user with a grid that is not
-    the one they asked for and no way to tell. Material regions clamp against
-    the floor instead, because their sizes are derived rather than requested.
+    The first two are one thing. A sizing region is an explicit request, so
+    silently clamping it leaves the user with a grid that is not the one they
+    asked for and no way to tell. Material regions clamp against the floor
+    instead, because their sizes are derived rather than requested.
 
     The third is the trap the separable grid sets. A box refines its span on
-    each axis independently, so one that misses the domain in a *single* axis
-    still refines slabs on the other two - and those slabs are somewhere the
+    each axis independently, so one that misses the domain in a single axis
+    still refines slabs on the other two, and those slabs are somewhere the
     author was not looking. Missing in one axis is enough to refuse, because
     the volumes no longer intersect at all.
 
-    Overhanging the wall is a different thing and is allowed: refining right up
-    to a THROUGH boundary is ordinary, and there the spans do overlap.
+    Overhanging the wall is allowed. Refining right up to a THROUGH boundary is
+    ordinary, and there the spans do overlap.
     """
     missing = [
         _DIM_NAMES[dim]
@@ -995,175 +521,18 @@ def _check_sizing_region(
             "names the object instead; to coarsen the whole model, lower "
             "ElementsPerWavelength"
         )
-    if region.size < float(params.min_cell):
+    if region.size < params.floor:
         raise MeshError(
             f"refinement region {region.name!r} asks for cells of "
             f"{region.size:g}, below the cell floor of "
-            f"{float(params.min_cell):g}. The floor sets the timestep for the "
+            f"{params.floor:g}. The floor sets the timestep for the "
             "whole simulation. Ask for less refinement, or lower "
             "MinElementSize deliberately"
         )
 
 
-def _met_by_metal(
-    region: Region, regions: Sequence[Region], dim: int, at_high: bool
-) -> Region | None:
-    """The conductor continuing this region's face along ``dim``, if any.
-
-    Two conductors butted in plane are one piece of metal. The field penetrates
-    neither, so the seam carries no edge singularity, and the thirds rule - a
-    treatment for an *isolated* edge - has nothing to resolve there. Both sides
-    otherwise claim the seam as an edge and lay a pair of lines each, which is
-    four lines across continuous metal.
-
-    The face has to be **covered**, not merely touched, and that is what
-    separates a seam from a T-junction: a stem meeting the side of a bar ends
-    where the bar begins, but the bar's own face at that plane runs past the
-    stem and is still exposed for most of its length.
-
-    Class and not name, because the singularity is what is being ruled out and
-    the metal either side of a copper-against-PEC seam is still metal. Whether
-    the seam needs a *line* is a different question, and the caller asks it of
-    the region returned here.
-    """
-    if region.material is not MaterialClass.METAL:
-        return None
-    plane = region.upper[dim] if at_high else region.lower[dim]
-    for other in regions:
-        if other is region or other.material is not MaterialClass.METAL:
-            continue
-        # Reaches past the plane: a region merely ending at it lies on this
-        # side and covers nothing, whatever it does further back.
-        if at_high:
-            beyond = other.lower[dim] <= plane + FLATNESS and other.upper[dim] > plane + FLATNESS
-        else:
-            beyond = other.upper[dim] >= plane - FLATNESS and other.lower[dim] < plane - FLATNESS
-        if beyond and all(
-            other.lower[t] <= region.lower[t] + FLATNESS
-            and other.upper[t] >= region.upper[t] - FLATNESS
-            for t in range(DIMENSIONS)
-            if t != dim
-        ):
-            return other
-    return None
-
-
-def _edge_to_resolve(
-    region: Region,
-    regions: Sequence[Region],
-    dim: int,
-    at_high: bool,
-    outside: float,
-    domain_lower: float,
-    domain_upper: float,
-) -> bool:
-    """Whether this conductor face is an isolated edge, with a singularity on it.
-
-    It is not, wherever the metal carries on past the face: the region declares
-    the axis continuous, another conductor covers the face, or the face sits at
-    the domain wall and the conductor runs on into the absorber. Each is the
-    same absence in different words, and gets the same answer.
-
-    Both the thirds rule and the refinement constraints ask, and where both ask
-    they have to agree about a plane. Disagreeing, one treats as an edge what
-    the other declines to, and the cells there come out several times finer than
-    anything asked for - a pitch the absorber then copies. That is why
-    ``outside`` is built from the policy's own resolution at both call sites and
-    never from a region's relaxed size: the two must put the same question.
-
-    A relaxed region is the one case where the thirds rule does not ask at all,
-    having declined the treatment; the constraint still does, at the relaxed
-    size. Agreement is not at stake there, because only one of them is asking.
-
-    ``outside`` is where the outer thirds line would fall, which is what decides
-    whether the edge has room to be resolved inside the domain at all.
-    """
-    if dim in region.continuous:
-        return False
-    if _met_by_metal(region, regions, dim, at_high) is not None:
-        return False
-    return domain_lower < outside < domain_upper
-
-
-def _grouped_into_conductors(regions: Sequence[Region]) -> list[Region]:
-    """``regions``, each conductor carrying the whole piece of metal it is in.
-
-    Once, here, rather than wherever a width is wanted: it is a question about
-    every other region, both callers of it want all three axes, and asking it
-    again per axis per caller made meshing a decomposed outline quadratic in the
-    rectangles it was cut into.
-
-    Class and not material name, matching :func:`_met_by_metal`: the metal either
-    side of a copper-against-PEC seam is still metal, and a width is a question
-    about where the metal ends.
-    """
-    metal = [
-        (region.lower, region.upper) for region in regions if region.material is MaterialClass.METAL
-    ]
-    if len(metal) < 2:
-        return list(regions)
-    return [
-        (
-            replace(region, conductor=conductor_extents(region.lower, region.upper, metal))
-            if region.material is MaterialClass.METAL
-            else region
-        )
-        for region in regions
-    ]
-
-
-def _edge_size(region: Region, dim: int, params: MeshParams) -> float:
-    """The cell the grid is built from at ``region``'s two faces on ``dim``.
-
-    The policy's own size for the material, except across a conductor's width,
-    where it is instead the coarsest cell that still leaves
-    :data:`CONDUCTOR_WIDTH_KEPT` of that width conducting.
-
-    That second case is the only control the grid has over how much of a
-    conductor survives. openEMS conducts over the lines inside the metal, the
-    thirds rule puts the outermost of those a third of a cell inside each face,
-    and both of those are true whatever the policy asked for - so a width is held
-    by sizing the cell *from the width*, and by nothing else. The policy's size
-    resolves the field singularity at an edge, which is a different quantity and
-    is why the two are combined by taking the finer rather than one replacing the
-    other.
-
-    The width is the whole conductor's and never this region's own, because the
-    translation cuts a drawn outline into rectangles by itself. See
-    :attr:`Region.conductor`.
-
-    The thickness is left at the policy's size, because a single cell through a
-    foil is what the mesher deliberately lays. See :func:`width_axes`.
-
-    Both the thirds rule and the edge constraint are built from this, and must
-    be: they place lines around one edge between them, and a disagreement about
-    the size puts them at cross purposes. Neither passes ``relaxed_to`` in - that
-    coarsens what a region *asks* for, and where the outer line falls is a
-    question about the drawing. See :func:`_edge_to_resolve`.
-    """
-    res = params.resolution(region.material)
-    if region.material is not MaterialClass.METAL:
-        return res
-    lower, upper = region.conductor or (region.lower, region.upper)
-    if dim not in width_axes(lower, upper, res):
-        return res
-    # The rule above, inverted: a width `w` keeps `1 - (2/3) * cell / w`, so the
-    # coarsest cell holding a share K is `1.5 * (1 - K) * w`.
-    holding = 1.5 * (1.0 - CONDUCTOR_WIDTH_KEPT) * (upper[dim] - lower[dim])
-    # A demand the floor would dominate is not a demand. Held to within one
-    # graded step of `min_cell`, the field around the face is the floor rather
-    # than the size asked for, while the thirds rule still pins a pair that close
-    # together - and between them they make a grid that cannot be built, on
-    # geometry the user is entitled to mesh. So it is dropped rather than
-    # clamped: the conductor is meshed at the size the policy asked for, and
-    # pre-flight says what that left of it.
-    if holding <= float(params.min_cell) * params.max_ratio[dim]:
-        return res
-    return min(res, holding)
-
-
 def _fixed_positions(
-    regions: Sequence[Region],
+    grouped: Grouped,
     dim: int,
     domain_lower: float,
     domain_upper: float,
@@ -1172,30 +541,35 @@ def _fixed_positions(
 ) -> tuple[list[tuple[float, str]], list[tuple[float, str]]]:
     """Coordinates that must appear in the final grid, and ones preferred.
 
-    Conductor geometry is mandatory. openEMS applies PEC by sampling material at
-    E-field locations (``Operator::CalcPEC_Range``), and for a sheet in the z
-    plane the tangential ``E_x``/``E_y`` components sit on a *main-grid* z line
-    (``Operator::GetYeeCoords``). Off a line the sheet is not modelled at all,
-    and the run completes having conducted nothing there.
-
     A dielectric interface is only a preference, and it is dropped where it
-    would land inside a thirds-rule span: a substrate edge routinely sits at the
+    would land inside a thirds-rule span. A substrate edge routinely sits at the
     same coordinate as the ground plane edge above it, and pinning both would
-    cut the conductor's cell in a 2:1 ratio - guaranteeing a smoothness failure
+    cut the conductor's cell in a 2:1 ratio. That guarantees a smoothness failure
     at the one place in the model where resolution matters most. openEMS
     defaults to quarter-cell material averaging (``Operator::Init`` calls
     ``SetMaterialAvgMethod(QuarterCell)``), so a cut cell is handled gracefully
     and the dielectric loses nothing by giving way.
+
+    Where the metal ends is read off what :func:`_grouped_into_conductors`
+    filled in, which is why this takes a :class:`Grouped` rather than a list of
+    regions. Asked of boxes nobody grouped it would give a run no longer than
+    each box and pin every seam of a decomposed conductor as an isolated edge.
+
+    Both lists come back in the order they were built. :func:`_snap` sorts by
+    position and keeps the first of a run, so this order settles which of two
+    anchors at exactly one coordinate names the line in a report and in a
+    refusal; where two differ in their last bits the lower is kept whatever
+    order they were built in.
     """
-    # The domain walls are structure, not objects: they are always pinned and
-    # are never in conflict with anything, so they bypass the checks below.
+    # The domain walls are structure rather than objects. They are always pinned
+    # and are never in conflict with anything, so they bypass the checks below.
     walls: list[tuple[float, str]] = [
         (domain_lower, "domain lower bound"),
         (domain_upper, "domain upper bound"),
     ]
     # Refused rather than filtered. A requested line exists because something
     # cannot be discretised without it, so dropping one quietly reproduces the
-    # exact failure the request was there to prevent: openEMS finds no line at
+    # exact failure the request was there to prevent. openEMS finds no line at
     # the plane, discretises nothing, and returns a full run of 0/0.
     for position in forced:
         if not domain_lower <= position <= domain_upper:
@@ -1212,114 +586,19 @@ def _fixed_positions(
         if domain_lower < position < domain_upper
     ]
     preferred: list[tuple[float, str]] = []
-    thirds_spans: list[tuple[float, float]] = []
+    candidates: list[tuple[float, float, float, Conductor]] = []
 
-    candidates: list[tuple[float, float, float, str]] = []
+    for region in grouped.regions:
+        asked = _asked_by(region, grouped, dim, params, domain_lower, domain_upper)
+        mandatory.extend(asked.anchors)
+        preferred.extend(asked.preferences)
+        candidates.extend(asked.pairs)
 
-    for region in regions:
-        res = _edge_size(region, dim, params)
-        low, high = region.lower[dim], region.upper[dim]
-
-        if region.is_sheet(dim) and region.material is MaterialClass.METAL:
-            mandatory.append((low, f"conducting sheet {region.name!r}"))
-        elif region.is_sheet(dim):
-            # A dielectric sheet has no PEC condition to align to, so it is a
-            # preference like any other dielectric interface.
-            preferred.append((low, f"dielectric sheet {region.name!r}"))
-        elif dim in region.continuous and region.material is MaterialClass.METAL:
-            # The metal carries on past both faces, so neither is an edge. The
-            # faces are still pinned - openEMS builds the strip between them
-            # and a face falling between two lines would move it - but with
-            # a plain line rather than the thirds rule. See Region.continuous.
-            mandatory.append((low, f"{region.name!r} lower face, continuous"))
-            mandatory.append((high, f"{region.name!r} upper face, continuous"))
-        elif (
-            region.material is MaterialClass.METAL
-            and region.asking(res) <= res
-            and region.extent(dim) > res
-        ):
-            # One third of a cell inside the conductor, two thirds outside, and
-            # no line on the edge itself. openEMS samples material at E-field
-            # locations, so this is choosing where those samples fall relative
-            # to the field singularity at the edge. Conductors only - a
-            # dielectric interface has no singularity to resolve.
-            for at_high, (edge, inside, outside) in enumerate(
-                (
-                    (low, low + res / 3.0, low - 2.0 * res / 3.0),
-                    (high, high - res / 3.0, high + 2.0 * res / 3.0),
-                )
-            ):
-                if _edge_to_resolve(
-                    region, regions, dim, bool(at_high), outside, domain_lower, domain_upper
-                ):
-                    candidates.append((edge, inside, outside, region.name))
-                    continue
-
-                # No singularity, so no thirds rule. Whether the face still
-                # wants a plain line is decided by what is on the far side.
-                met = _met_by_metal(region, regions, dim, bool(at_high))
-                if met is None:
-                    # The conductor runs on into the absorber - a feed line into
-                    # the PML is the ordinary case. Placing the outside line
-                    # anyway would silently grow the grid past the box the
-                    # caller asked for.
-                    mandatory.append((edge, f"{region.name!r} face at the domain wall"))
-                elif not (met.material_name and met.material_name == region.material_name):
-                    # Two different metals. The property boundary still has to
-                    # fall on a line, or it moves by up to a cell. Same material
-                    # is one object drawn in pieces and asks for nothing: a
-                    # decomposed shape must mesh as the shape it came from.
-                    mandatory.append((edge, f"{region.name!r} face, metal on both sides"))
-        elif region.material is MaterialClass.METAL:
-            # Past the thirds rule, either because the conductor is thinner than
-            # a cell of its own or because it has been relaxed past the edge
-            # size - and the thirds rule *is* the resolution a relaxed conductor
-            # declined, so keeping it would pin a fine pair of lines around
-            # every edge the grid was told to let go. Either way the faces are
-            # still held: where the metal is is geometry, and only how closely
-            # it is followed was given up. A seam is still a seam, though: a cut
-            # can leave a piece narrower than `metal_res`, and pinning both its
-            # faces would charge the model for an undrawn plane.
-            for at_high, face in enumerate((low, high)):
-                met = _met_by_metal(region, regions, dim, bool(at_high))
-                if (
-                    met is not None
-                    and met.material_name
-                    and met.material_name == region.material_name
-                ):
-                    continue
-                mandatory.append((face, f"{region.name!r} {'upper' if at_high else 'lower'} face"))
-        else:
-            preferred.extend(
-                [
-                    (low, f"{region.name!r} lower face"),
-                    (high, f"{region.name!r} upper face"),
-                ]
-            )
-
-    # A thirds span owns its interval. Anything else landing inside it would
-    # cut the conductor's edge cell, which is the one cell in the model whose
-    # size was chosen deliberately. Mandatory positions are checked too - a
-    # via sitting flush on a ground plane puts a sheet exactly on the metal
-    # face, which silently reinstates the line the thirds rule exists to avoid.
-    # Thirds lines are decided last, because whether an edge may have them
-    # depends on what else is already pinned nearby. This also covers two
-    # conductors meeting at a face - a via landing on a ground plane. The
-    # metal is continuous there, so there is no edge singularity to resolve,
-    # and the plane's own line is what the face gets. Another conductor's line is
-    # an absolute requirement; the thirds rule is the best available treatment
-    # of an isolated edge. So where they collide the thirds rule yields, the
-    # edge is pinned plainly, and the model still meshes - refusing legal
-    # geometry because two conductors are close would be the worse answer.
+    # Read before a single pair is laid, so a pair yields to what the axis pins
+    # and never to another pair.
     hard = [position for position, _ in walls + mandatory]
-    for edge, inside, outside, name in candidates:
-        span = (min(inside, outside), max(inside, outside))
-        if any(span[0] < position < span[1] for position in hard):
-            mandatory.append((edge, f"{name!r} edge at {edge:g}, crowded"))
-            continue
-        mandatory.append((inside, f"{name!r} edge at {edge:g}, inside"))
-        mandatory.append((outside, f"{name!r} edge at {edge:g}, outside"))
-        thirds_spans.append(span)
+    pinned, thirds_spans = _thirds_lines(candidates, hard)
+    mandatory.extend(pinned)
 
     kept_preferred = [
         (position, source)
@@ -1329,30 +608,231 @@ def _fixed_positions(
     return walls + mandatory, kept_preferred
 
 
+@dataclass(frozen=True)
+class _Asked:
+    """What one region asks of one axis.
+
+    Separate fields because different regions ask for different kinds of thing,
+    and one region asks for two kinds at once: a conductor met by metal at one
+    face and standing free at the other pins a line there and offers a pair
+    here. A caller collects each field into its own list.
+
+    What is decided is decided about this region. Whether a face is an edge at
+    all is read off the metal around it, so the other regions are in reach - but
+    no line another region asked for is, and nothing here is judged against one.
+    """
+
+    #: Positions that must be grid lines, each with what asked for it.
+    anchors: tuple[tuple[float, str], ...] = ()
+    #: Positions wanted there, given up where something else needs the room.
+    preferences: tuple[tuple[float, str], ...] = ()
+    #: Thirds pairs offered at a face, as :func:`~.metal._one_pair_at_each_face`
+    #: takes them - the face, the line inside the metal, the line outside it,
+    #: and the conductor that asked.
+    pairs: tuple[tuple[float, float, float, Conductor], ...] = ()
+
+
+def _asked_by(
+    region: Region,
+    grouped: Grouped,
+    dim: int,
+    params: MeshParams,
+    domain_lower: float,
+    domain_upper: float,
+) -> _Asked:
+    """What ``region`` pins on ``dim``, what it prefers there, and what it offers.
+
+    Conductor geometry is mandatory. openEMS applies PEC by sampling material at
+    E-field locations (``Operator::CalcPEC_Range``), and for a sheet in the z
+    plane the tangential ``E_x``/``E_y`` components sit on a main-grid z line
+    (``Operator::GetYeeCoords``). Off a line the sheet is not modelled at all,
+    and the run completes having conducted nothing there.
+
+    Whether a pair offered here is laid is not answered here. That depends on
+    what else the axis already pins, which is a question about the axis rather
+    than about this region, and :func:`_thirds_lines` puts it.
+    """
+    low, high = region.lower[dim], region.upper[dim]
+
+    # Grouping made every metal region a Conductor, so the type is the material
+    # test here and it narrows what the metal branches below may read.
+    if isinstance(region, Conductor) and region.is_sheet(dim):
+        return _Asked(anchors=((low, f"conducting sheet {region.name!r}"),))
+    if region.is_sheet(dim):
+        # A dielectric sheet has no PEC condition to align to, so it is a
+        # preference like any other dielectric interface.
+        return _Asked(preferences=((low, f"dielectric sheet {region.name!r}"),))
+    if not isinstance(region, Conductor):
+        return _Asked(
+            preferences=(
+                (low, f"{region.name!r} lower face"),
+                (high, f"{region.name!r} upper face"),
+            )
+        )
+    if dim in region.continuous:
+        # The metal carries on past both faces, so neither is an edge. The
+        # faces are still pinned - openEMS builds the strip between them and
+        # a face falling between two lines would move it - but with a plain
+        # line rather than the thirds rule. See Region.continuous.
+        return _Asked(
+            anchors=(
+                (low, f"{region.name!r} lower face, continuous"),
+                (high, f"{region.name!r} upper face, continuous"),
+            )
+        )
+
+    # Each face is sized from the metal behind that face alone, so the two
+    # need not agree. A piece flush against a plane at one end and running
+    # on at the other asks a different cell at each. Both are settled before
+    # either is placed, since each pair's inner line sits a share of its own
+    # cell inside the metal and the two meet when the region is thinner than
+    # those shares together. One face laying a pair on its own has nothing
+    # to cross, because its inner line runs into more of the same metal.
+    faces = [
+        _edge_pair(region, grouped, dim, side, params, domain_lower, domain_upper)
+        for side in (False, True)
+    ]
+    wants = [
+        face.resolve
+        and _face_depth(region, dim, side, params) is not None
+        and region.asking(face.cell) <= face.cell
+        for side, face in zip((False, True), faces)
+    ]
+    room = not all(wants) or region.extent(dim) >= params.edge_line_inside * sum(
+        face.cell for face in faces
+    )
+    anchors: list[tuple[float, str]] = []
+    pairs: list[tuple[float, float, float, Conductor]] = []
+    for at_high, face in zip((False, True), faces):
+        edge, inside, outside = face.position, face.inside, face.outside
+        # A pair straddling the edge, with no line on the edge itself.
+        # openEMS samples material at E-field locations, so this is choosing
+        # where those samples fall relative to the field singularity at the
+        # edge. Conductors only - a dielectric interface has no singularity
+        # to resolve.
+        #
+        # `room` is the whole of what the region's own extent decides here.
+        # Whether a face is an edge is a question about the metal. A cut
+        # leaving a thin piece against a real edge would otherwise put a line
+        # on the conductor face, which is the one placement the thirds rule
+        # exists to avoid.
+        if wants[at_high] and room:
+            pairs.append((edge, inside, outside, region))
+            continue
+
+        # No pair here - the metal carries on past the face, or the
+        # treatment was declined, or it will not fit. Whether the face still
+        # wants a plain line is decided by what is on the far side.
+        met = _met_by_metal(region, grouped, dim, at_high)
+        if met is not None and met.material_name and met.material_name == region.material_name:
+            # One object drawn in pieces, and it asks for nothing. A
+            # decomposed shape must mesh as the shape it came from.
+            continue
+        if met is not None:
+            # Two different metals. The property boundary still has to fall
+            # on a line, or it moves by up to a cell.
+            anchors.append((edge, f"{region.name!r} face, metal on both sides"))
+        elif not domain_lower < outside < domain_upper:
+            # The conductor runs on into the absorber. A feed line into the
+            # PML is the ordinary case. Placing the outside line anyway would
+            # silently grow the grid past the box the caller asked for.
+            anchors.append((edge, f"{region.name!r} face at the domain wall"))
+        else:
+            # Past the thirds rule. The metal's position is still geometry,
+            # and only how closely it is followed was given up.
+            anchors.append((edge, f"{region.name!r} {'upper' if at_high else 'lower'} face"))
+    return _Asked(anchors=tuple(anchors), pairs=tuple(pairs))
+
+
+def _thirds_lines(
+    candidates: Sequence[tuple[float, float, float, Conductor]],
+    hard: Sequence[float],
+) -> tuple[list[tuple[float, str]], list[tuple[float, float]]]:
+    """The lines the thirds rule lays on an axis, and the spans they own.
+
+    A face is collapsed to one pair first. A solid arrives as the boxes it was
+    cut into and every box against a plane asks about it, so
+    :func:`~.metal._one_pair_at_each_face` says which of them is answered.
+
+    A thirds span owns its interval. Anything else landing inside it would cut
+    the conductor's edge cell, which is the one cell in the model whose size was
+    chosen deliberately. ``hard`` has to be every position the axis pins before
+    any pair is judged. A via sitting flush on a ground plane puts a sheet
+    exactly on the metal face, which silently reinstates the line the thirds
+    rule exists to avoid; and a pair judged against a pair would yield to
+    whichever conductor was drawn first. This also covers two conductors meeting
+    at a face, such as a via landing on a ground plane. The metal is continuous
+    there, so there is no edge singularity to resolve, and the face gets the
+    plane's own line. Another conductor's line is an absolute requirement, while
+    the thirds rule is the best available treatment of an isolated edge. Where
+    the two collide the thirds rule yields, the edge is pinned plainly, and the
+    model still meshes. Refusing legal geometry because two conductors are close
+    would be the worse answer.
+
+    A pair that yields still pins its face, so a collision decides whether the
+    face gets the pair or a line of its own, and only a pair that was laid owns
+    a span.
+    """
+    lines: list[tuple[float, str]] = []
+    spans: list[tuple[float, float]] = []
+    for edge, inside, outside, region in _one_pair_at_each_face(candidates):
+        name = region.name
+        span = (min(inside, outside), max(inside, outside))
+        if any(span[0] < position < span[1] for position in hard):
+            lines.append((edge, f"{name!r} edge at {edge:g}, crowded"))
+            continue
+        lines.append((inside, f"{name!r} edge at {edge:g}, inside"))
+        lines.append((outside, f"{name!r} edge at {edge:g}, outside"))
+        spans.append(span)
+    return lines, spans
+
+
 def _snap(
     mandatory: Sequence[tuple[float, str]],
     preferred: Sequence[tuple[float, str]],
     min_cell: float,
     dim: int,
+    walls: Sequence[float] = (),
 ) -> list[FixedLine]:
     """Combine pinned positions, dropping preferences that crowd the floor.
 
     A mandatory position is an anchor and is never moved. Averaging one away
-    is not a rounding - it relocates a conducting sheet or a domain wall, and
-    nothing downstream can detect it, because validation checks the positions
-    this function returns rather than the ones the caller asked for. Two
-    anchors closer together than the cell floor is unmeshable geometry, and
-    saying so is the only honest answer.
+    relocates a conducting sheet or a domain wall, and nothing downstream can
+    detect it, because validation checks the positions this function returns
+    rather than the ones the caller asked for. Two anchors closer together than
+    the cell floor is unmeshable geometry, and saying so is the only honest
+    answer.
 
-    Preferred positions carry no such obligation, so a dielectric interface
-    that would crowd an anchor is simply dropped: openEMS averages material
-    inside a cut cell, and a slightly less accurate interface is a far better
-    outcome than a cell that halves the timestep for the whole simulation.
+    Preferred positions carry no such obligation, so a dielectric interface that
+    would crowd an anchor is dropped. openEMS averages material inside a cut
+    cell, and a slightly less accurate interface is a far better outcome than a
+    cell that halves the timestep for the whole simulation.
     """
-    # Coincident anchors are one position, not a conflict: a ground plane drawn
-    # flush with the domain wall, or two objects sharing a face, is ordinary.
+    # ``walls`` is given only where the caller is asking what size cells the
+    # mesh wants near a boundary, rather than building a grid to solve on. There
+    # a face drawn flush with the boundary is the boundary. The structure was
+    # measured from those same faces, so one of them arriving a few ulps off
+    # comes from the kernel rather than from the drawing, and refusing the pair
+    # would refuse a model the grid itself can hold. Nothing that reaches openEMS
+    # is snapped this way. Moving a conducting sheet onto a wall is what the
+    # refusal below exists to prevent.
+    snapped = [
+        (min(walls, key=lambda wall: abs(wall - position), default=position), source)
+        if any(abs(wall - position) < min_cell for wall in walls)
+        else (position, source)
+        for position, source in mandatory
+    ]
+
+    # Coincident anchors are one position rather than a conflict. A ground plane
+    # drawn flush with the domain wall, or two objects sharing a face, is
+    # ordinary. The one kept is the lowest of the group, and where two are at
+    # exactly one coordinate the sort is stable and the one built first stays.
+    # The rest go with their provenance: every refusal about that line
+    # afterwards names the survivor and can no longer say anything else was
+    # there. So a coordinate the mesher was handed - a requested line, a domain
+    # bound - can outlive the name of the conductor drawn at it.
     anchors: list[tuple[float, str]] = []
-    for position, source in sorted(mandatory, key=lambda entry: entry[0]):
+    for position, source in sorted(snapped, key=lambda entry: entry[0]):
         if anchors and math.isclose(position, anchors[-1][0], rel_tol=1e-12, abs_tol=1e-12):
             continue
         anchors.append((position, source))
@@ -1382,45 +862,48 @@ def _snap(
 
 
 def _constraints(
-    regions: Sequence[Region],
+    grouped: Grouped,
     dim: int,
     params: MeshParams,
     domain_lower: float,
     domain_upper: float,
     sizing: Sequence[SizingRegion] = (),
     features: Sequence[Feature] = (),
+    walls: Sequence[tuple[float, float]] = (),
+    spend: Spend | None = None,
 ) -> list[_Constraint]:
     """Where the grid should be fine, and how fine.
 
     A :class:`Region` is an axis-aligned box, so what it asks of an axis is read
     straight off its faces. A :class:`~.sizing.Feature` is a length with a
-    *direction*, and what it asks of each axis is decided by the criterion in
-    :mod:`~.sizing` - which is the only way a boundary that is not parallel to a
+    direction, and what it asks of each axis is decided by the criterion in
+    :mod:`~.sizing`. That criterion is the only way a boundary not parallel to a
     grid plane can be sized at all.
 
     A demand built from geometry is dropped at or above the cap rather than
     carried. It could never win the field's ``min`` against the cap, so ``h(x)``
-    is the same either way - but a constraint also contributes breakpoints, and
-    :func:`_sample_grid` partitions its quadrature on those, so carrying one
-    moves the samples the trapezoid rule sees. A :class:`SizingRegion` is not
-    filtered that way: one coarser than the cap is refused by name in
+    is the same either way. A constraint also contributes bends, though, and
+    the integral of the field is summed piece by piece over those, so carrying
+    one moves every line in its last digits. A :class:`SizingRegion` is not
+    filtered that way. One coarser than the cap is refused by name in
     :func:`_check_sizing_region`, and one exactly at it is an explicit request to
     mesh at the bulk size, which is honoured rather than dropped.
     """
     constraints: list[_Constraint] = []
-    for region in regions:
-        constraints.extend(
-            _conductor_edges(region, regions, dim, params, domain_lower, domain_upper)
-        )
+    for region in grouped.regions:
+        if isinstance(region, Conductor):
+            constraints.extend(
+                _conductor_edges(region, grouped, dim, params, domain_lower, domain_upper)
+            )
         constraints.extend(_dielectric_spans(region, dim, params))
     constraints.extend(_refinements(sizing, dim, params))
-    constraints.extend(_measured_features(features, dim, params))
+    constraints.extend(_measured_features(features, dim, params, walls, spend))
     return constraints
 
 
 def _conductor_edges(
-    region: Region,
-    regions: Sequence[Region],
+    region: Conductor,
+    grouped: Grouped,
     dim: int,
     params: MeshParams,
     domain_lower: float,
@@ -1428,76 +911,69 @@ def _conductor_edges(
 ) -> Iterator[_Constraint]:
     """A conductor's isolated edges, as point demands at the edge size.
 
-    Conductor edges drive resolution and the interior of a ground plane does
-    not, so these are points rather than a span, and a face with no edge on it
-    is not refined at all - :func:`_edge_to_resolve` decides, and
+    Conductor edges drive resolution and the interior of a ground plane does not,
+    so these are points rather than a span, and a face with no edge on it is not
+    refined at all. :func:`~.metal._edge_to_resolve` decides, and
     :func:`_fixed_positions` asks it about the same plane. A sheet is the one
-    shape where the two act differently, and must: it has no thickness to be an
-    edge of, and its plane is where the metal is, so it is pinned there whatever
-    covers it.
+    shape where the two act differently, and they have to. A sheet has no
+    thickness to be an edge of, and its plane is where the metal is, so it is
+    pinned there whatever covers it.
 
-    A **relaxed** region is the second place they differ, and only in what they
-    do with the answer: this still asks, and asks at a size the region chose,
-    while :func:`_fixed_positions` declines the thirds rule outright. Without
-    the demand a relaxed conductor would ask for nothing at all and rise to the
-    cap, which would leave the size the user typed meaning nothing.
+    A relaxed region is the second place they differ, and only in what they do
+    with the answer. This function still asks, at a size the region chose, while
+    :func:`_fixed_positions` declines the thirds rule outright. Without the
+    demand a relaxed conductor would ask for nothing at all and rise to the cap,
+    which would leave the size the user typed meaning nothing.
 
-    Where the probe is asked from is *not* relaxed. Whether a face has metal
-    beyond it is a question about the drawing, and an answer that moved with how
-    coarsely the user asked for the object to be meshed would make an edge
-    appear and disappear on a setting that says nothing about geometry - out at
-    a relaxed offset it can also fall outside the domain, or land inside a
-    different object.
+    Where the probe is asked from is not relaxed. Whether a face has metal beyond
+    it is a question about the drawing. An answer that moved with how coarsely
+    the user asked for the object to be meshed would make an edge appear and
+    disappear on a setting that says nothing about geometry. Out at a relaxed
+    offset the probe can also fall outside the domain, or land inside a different
+    object.
     """
-    if region.material is not MaterialClass.METAL:
-        return
-    reach = _edge_size(region, dim, params)
-    res = region.asking(reach)
-    low, high = region.lower[dim], region.upper[dim]
-    for at_high, (edge, outside) in enumerate(
-        (
-            (low, low - 2.0 * reach / 3.0),
-            (high, high + 2.0 * reach / 3.0),
-        )
-    ):
-        if _edge_to_resolve(
-            region, regions, dim, bool(at_high), outside, domain_lower, domain_upper
-        ):
-            yield _Constraint(edge, edge, res, f"{region.name!r} edge at {edge:g}")
+    for at_high in (False, True):
+        face = _edge_pair(region, grouped, dim, at_high, params, domain_lower, domain_upper)
+        if face.resolve:
+            yield _Constraint(
+                face.position,
+                face.position,
+                region.asking(face.cell),
+                f"{region.name!r} edge at {face.position:g}",
+            )
 
 
 def _dielectric_spans(region: Region, dim: int, params: MeshParams) -> Iterator[_Constraint]:
     """A dielectric's bulk size, and the count across a thin one.
 
     Dielectrics only, on every axis, because each of these is an argument about
-    a wave. A conductor has no wave inside it to sample - what its thickness
-    does to the answer is loss, whose scale is the skin depth, orders below a
-    foil, and a conducting sheet hands openEMS a conductivity and a thickness
-    instead. Laterally the same holds: under a strip the transverse field is
-    flat and all the structure is at the two edges, which ``metal_res`` and the
-    thirds rule resolve. Spanning metal here sets the smallest cell in the
-    model, and through the Courant limit every other cell pays for it.
+    a wave. A conductor has no wave inside it to sample. Its thickness
+    contributes loss to the answer, and loss has the scale of the skin depth,
+    orders below a foil. A conducting sheet hands openEMS a conductivity and a
+    thickness instead.
+    The same holds laterally: under a strip the transverse field is flat, and all
+    the structure is at the two edges, which ``metal_res`` and the thirds rule
+    resolve. Spanning metal here sets the smallest cell in the model, and through
+    the Courant limit every other cell pays for it.
     """
     if region.material is not MaterialClass.DIELECTRIC or region.extent(dim) <= 0:
         return
     low, high = region.lower[dim], region.upper[dim]
 
     # The wave slows by sqrt(epsilon) inside this region, so it wants finer cells
-    # *here* and not everywhere. A span, because the whole interior carries the
-    # wave - unlike a conductor, where only the edge singularity does.
+    # here rather than everywhere. A span, because the whole interior carries the
+    # wave. In a conductor only the edge singularity does.
     bulk = region.asking(params.dielectric_res if region.size is None else region.size)
     if bulk < params.ceiling:
         yield _Constraint(low, high, bulk, f"{region.name!r} bulk")
 
     if params.min_lines >= 2:
         # Floored, because an unsatisfiable demand is a refusal of geometry the
-        # user is entitled to mesh. Sized from what was *drawn* rather than from
-        # what survived clipping - see Region.drawn: a board reduced to a narrow
+        # user is entitled to mesh. Sized from what was drawn rather than from
+        # what survived clipping - see Region.drawn. A board reduced to a narrow
         # window by a THROUGH face is not a narrow feature, and counting cells
         # across the window drags the boundary pitch down with it.
-        wanted = region.asking(
-            max(region.thickness(dim) / params.min_lines, float(params.min_cell))
-        )
+        wanted = region.asking(max(region.thickness(dim) / params.min_lines, params.floor))
         if wanted < params.ceiling:
             yield _Constraint(low, high, wanted, f"{region.name!r} across its thickness")
 
@@ -1511,352 +987,73 @@ def _refinements(
         wanted = region.size
         across = region.min_lines or params.min_lines
         if across >= 2 and high > low:
-            # The same rule material regions get, with the region's own count: a
+            # The same rule material regions get, with the region's own count. A
             # box narrower than `size * across` is spanned by `across` cells
             # instead. Floored, because an unsatisfiable demand is a refusal of
             # geometry rather than a finer mesh.
-            wanted = min(wanted, max((high - low) / across, float(params.min_cell)))
+            wanted = min(wanted, max((high - low) / across, params.floor))
         yield _Constraint(low, high, wanted, region.name)
 
 
 def _measured_features(
-    features: Sequence[Feature], dim: int, params: MeshParams
+    features: Sequence[Feature],
+    dim: int,
+    params: MeshParams,
+    walls: Sequence[tuple[float, float]] = (),
+    spend: Spend | None = None,
 ) -> Iterator[_Constraint]:
     """A length measured off geometry, once the criterion has spent it here.
 
-    Passed through at its own size rather than clamped: the sizing field floors
+    Passed through at its own size rather than clamped. The sizing field floors
     every constraint alike, and a second floor here would decide the same thing
-    twice. These sizes are measured off a drawing rather than typed,
-    so one below the floor is imperfect input to be met as closely as policy
-    allows - unlike a :class:`SizingRegion`, which is an explicit request and is
-    refused by name.
+    twice. These sizes are measured off a drawing rather than typed, so one below
+    the floor is imperfect input to be met as closely as policy allows. A
+    :class:`SizingRegion` is an explicit request instead, and is refused by name.
+
+    ``walls`` are the faces the structure is declared to run out through, and a
+    demand that reaches no further in than one of them is dropped. Such a demand
+    measures the drawing's own cut end - the ring where a shell was sliced, the
+    sharp edge where a solid stops - and the declaration says that end is not
+    there. Resolving it puts the model's finest cells inside the absorber, where
+    there is no field left to resolve. A boxed solid already gets this treatment:
+    :func:`~.metal._edge_to_resolve` declines a face at the domain wall because the metal
+    runs on past it. A triangulated solid carries no region and reaches the field
+    only through here, and this closes that asymmetry.
+
+    The test is how far the demand reaches in, and it has to be, because a body's
+    own demand crosses the wall too. A triangulated solid gets its material's
+    bulk cell size only from :func:`~.plan.features`, over the solid's whole
+    extent. A rule that dropped whatever crossed a wall would therefore take the
+    bulk resolution of every solid running out through one, and mesh a substrate
+    at the vacuum cell. A cut end has no extent inside the model, and a body is
+    nothing but extent inside the model.
+
+    The pruning is last, and this is the only place it can be. Dropping a demand
+    another one covers rests on that other demand reaching the field, and two
+    rules take a demand away after it was measured: the wall above, and
+    :func:`_features_inside`, which keeps only what lies in the volume being
+    meshed. Both act per axis or per box rather than on the drawing, so the scan
+    has to run here, where what the axis was left with is known. The ceiling
+    forces nothing: a dominator is strictly finer than what it drops, so a
+    demand that survives the ceiling has none that the ceiling took. See
+    :func:`_pruned`.
     """
+    kept = []
     for demand in sizing_demands(features)[dim]:
-        if demand.size < params.ceiling:
-            yield _Constraint(demand.lower, demand.upper, demand.size, demand.source)
-
-
-def _settle(
-    sources: _Sources,
-    constraints: Sequence[_Constraint],
-    cap: float,
-    slope: float,
-    floor: float,
-) -> _SizingField:
-    """Iterate the field until the cells meeting at each fixed line agree.
-
-    A gap holds a whole number of cells, so its real cell size is
-    ``length / n``, not what the field asked for. A gap one cell long is the
-    awkward case: the smallest perturbation tips it from one cell to two,
-    halving its cells against a neighbour that has not moved.
-
-    The fix is to publish each gap's realized *edge* cell size back as a point
-    constraint at that fixed line, so the neighbour grades down to meet it. It
-    has to be the edge size and not one size for the whole gap: a uniform
-    constraint would flatten the neighbour's interior too, forcing it to be
-    fine everywhere instead of only near the seam.
-
-    Published sizes only ever shrink and are floored, so this settles. It does
-    not settle *quickly*: a constraint travels one gap per pass, so the budget
-    has to scale with the number of pinned positions rather than being a fixed
-    small number. Too small a budget gives up quietly, and the symptom surfaces
-    a step later as ``_validate`` blaming the user's geometry for a smoothness
-    violation the mesher itself caused.
-
-    The stopping test is a relative tolerance, not exact equality. Chasing the
-    last 0.1% of a monotonically shrinking sequence costs many passes and
-    changes no measurable grid line.
-
-    Whichever seams were still moving on the final pass are the ones that did
-    not reconcile, so a failure names those rather than the axis as a whole.
-    """
-    fixed = sources.positions
-    seams: dict[float, float] = {}
-    budget = max(_MIN_SETTLING_PASSES, 2 * len(fixed))
-
-    moved: list[float] = []
-    for _ in range(budget):
-        # Named, like every other constraint. A published seam usually *wins*
-        # the field near its own pinned line - it is the realized edge cell, and
-        # so the finest thing there - and an anonymous winner would leave the
-        # report attributing an axis' finest plane to nothing at all.
-        extra = [
-            _Constraint(p, p, size, f"cells meeting at {sources.at(p)}")
-            for p, size in seams.items()
-        ]
-        field = _SizingField(list(constraints) + extra, cap, slope, floor)
-
-        moved = []
-        for lower, upper in zip(fixed[:-1], fixed[1:]):
-            lines = _segment_lines(lower, upper, field, sources, floor, cap)
-            for position, size in (
-                (lower, lines[1] - lines[0]),
-                (upper, lines[-1] - lines[-2]),
-            ):
-                size = max(size, floor)
-                if size < seams.get(position, math.inf) * (1.0 - _SETTLING_TOLERANCE):
-                    seams[position] = size
-                    moved.append(position)
-
-        if not moved:
-            return field
-
-    raise MeshError(
-        f"cell sizes either side of {sources.describe_all(moved)} did not agree "
-        f"after {budget} passes on the {sources.axis} axis. This is a mesher "
-        "limitation, not a fault in the geometry; widening max_ratio or reducing "
-        "the number of pinned features usually clears it."
-    )
-
-
-def _place_lines(sources: _Sources, field: _SizingField, floor: float, cap: float) -> list[float]:
-    """Fill every gap between fixed positions, by arclength in the field."""
-    fixed = sources.positions
-    lines = [fixed[0]]
-    for lower, upper in zip(fixed[:-1], fixed[1:]):
-        lines.extend(_segment_lines(lower, upper, field, sources, floor, cap)[1:])
-        if len(lines) > _MAX_LINES_PER_AXIS:
-            raise MeshError(
-                f"grid would need more than {_MAX_LINES_PER_AXIS} lines on one "
-                "axis; the resolutions or the domain size are unrealistic"
-            )
-    return lines
-
-
-def _segment_lines(
-    lower: float,
-    upper: float,
-    field: _SizingField,
-    sources: _Sources,
-    floor: float = 0.0,
-    cap: float = math.inf,
-) -> list[float]:
-    """Place lines across one gap so cell sizes track the sizing field."""
-    x = _sample_grid(lower, upper, field)
-    h = field(x)
-
-    arclength = _cumulative_trapezoid(1.0 / h, x)
-    total = float(arclength[-1])
-    count = _cell_count(
-        total, float(np.min(h)), float(np.max(h)), floor, cap, lower, upper, sources
-    )
-    if count == 1:
-        return [lower, upper]
-
-    # Equal arclength per cell scales the whole segment by the same factor
-    # (count / total), so cell-to-cell ratios inside it follow the field exactly
-    # and stay within budget. Do not be tempted to absorb the rounding slack
-    # with a correction that vanishes at the ends, to keep the seam cells at
-    # h(a) and h(b): such a bump has its own gradient and it adds to the
-    # field's, which docs/internals/sizing-field.md works out. Seam agreement is
-    # _settle's job, and it does it by grading the neighbour rather than by
-    # deforming this segment.
-    # The ends come back exactly, without being put back: _sample_grid lays its
-    # pieces with linspace, so x runs from lower to upper exactly; the first and
-    # last targets are then the first and last arclengths themselves; and
-    # interpolating at a knot returns that knot's value.
-    targets = np.linspace(0.0, total, count + 1)
-    return [float(p) for p in np.interp(targets, arclength, x)]
-
-
-def _cell_count(
-    total: float,
-    finest: float,
-    coarsest: float,
-    floor: float,
-    cap: float,
-    lower: float,
-    upper: float,
-    sources: _Sources,
-) -> int:
-    """How many cells this gap gets, honouring both the cap and the floor.
-
-    Cells all carry the same arclength, so choosing ``n`` scales every cell in
-    the gap by ``total / n``. Rounding *up* keeps cells at or below what the
-    field asked for, which is what respects the cap - but it also makes every
-    cell smaller than the field wanted, and where the field is already sitting
-    on the floor that pushes the realized cells under it.
-
-    That is not a rounding detail. ``min_lines`` drives the sizing field down
-    to the floor inside a thin enough layer, and rounding up there lands the
-    realized cells *below* it - so a layer the policy is willing to mesh
-    becomes one the mesher refuses. The floor has to constrain the choice here,
-    not be asserted afterwards on an output the scheme cannot produce. So round
-    down instead when rounding up would breach it, and if neither direction
-    satisfies both bounds, say so plainly.
-    """
-    if total > _MAX_LINES_PER_AXIS:
-        # Refuse before allocating. `total` is the cell count this gap wants and
-        # it is known here, before any array exists; checking afterwards spends
-        # the memory on its way to rejecting the request, and inside FreeCAD
-        # that is an OOM kill and a lost document.
-        raise MeshError(
-            f"the {sources.axis} axis span from {sources.at(lower)} to "
-            f"{sources.at(upper)} needs about {total:.3g} cells on its own, past "
-            f"the {_MAX_LINES_PER_AXIS} per-axis limit. The resolutions are far "
-            "finer than the model, or the domain is far larger than intended."
+        if demand.size >= params.ceiling:
+            continue
+        inside = (
+            demand.upper - wall if inward > 0 else wall - demand.lower for wall, inward in walls
         )
-
-    up = max(int(math.ceil(total - 1e-9)), 1)
-    if finest * total / up >= floor * (1.0 - 1e-9):
-        return up
-
-    down = max(up - 1, 1)
-    if coarsest * total / down <= cap * (1.0 + 1e-9):
-        return down
-
-    raise MeshError(
-        f"the {sources.axis} axis span from {sources.at(lower)} to "
-        f"{sources.at(upper)} cannot be filled: {up} cells fall below the "
-        f"{floor:g} cell floor and {down} exceed the {cap:g} cap. Raise "
-        "dielectric_res, lower min_cell, or coarsen min_lines for the feature here."
-    )
-
-
-def _sample_grid(lower: float, upper: float, field: _SizingField) -> np.ndarray:
-    """Integration samples for one gap, concentrated where the field varies.
-
-    Uniform sampling fails at large dynamic range. With a fine feature in a
-    long span, a uniform grid capped at some sample budget steps straight over
-    the fine region; the trapezoid rule then draws a chord across a strongly
-    convex ``1/h`` and the integral - and every line position derived from it
-    - is wrong. Raising the budget only moves the span at which it breaks.
-
-    Instead the gap is split at the field's own breakpoints, and each piece is
-    sampled against *its* finest cell. Fine regions get dense samples, flat
-    regions get few, and the total stays bounded regardless of the ratio
-    between them.
-    """
-    edges = _field_breakpoints(lower, upper, field)
-    pieces = []
-    for start, stop in zip(edges[:-1], edges[1:]):
-        finest = float(np.min(field(np.linspace(start, stop, 9))))
-        count = int(np.clip(8.0 * (stop - start) / finest, 8, 8192))
-        pieces.append(np.linspace(start, stop, count + 1))
-    return np.unique(np.concatenate(pieces))
-
-
-def _field_breakpoints(lower: float, upper: float, field: _SizingField) -> list[float]:
-    """Positions where the sizing field changes slope, plus the gap ends.
-
-    The field is a lower envelope of linear ramps, so it bends only at the
-    constraints' own bounds. Sampling each smooth piece separately is what
-    keeps a fine feature from being stepped over.
-    """
-    inside = sorted(
-        {
-            float(np.clip(position, lower, upper))
-            for position in field.breakpoints()
-            if lower < position < upper
-        }
-    )
-    return [lower, *inside, upper]
-
-
-def _cumulative_trapezoid(values: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """Cumulative integral of ``values`` over ``x``, starting at zero."""
-    steps = np.diff(x) * (values[:-1] + values[1:]) / 2.0
-    return np.concatenate([[0.0], np.cumsum(steps)])
-
-
-def _is_symmetric(fixed: Sequence[float], field: _SizingField, lower: float, upper: float) -> bool:
-    """True when both the pinned positions and the sizing field mirror.
-
-    Testing positions alone is not enough, and gets it backwards in the most
-    ordinary case: the two ends of the domain always mirror each other, so a
-    structure sitting at one end only - with nothing pinned in between -
-    would be declared symmetric and folded, destroying its grading.
-    """
-    centre = (lower + upper) / 2.0
-    span = upper - lower
-
-    mirrored = sorted(2.0 * centre - position for position in fixed)
-    if not np.allclose(mirrored, fixed, rtol=0.0, atol=span * 1e-9):
-        return False
-
-    sizes = field(np.linspace(lower, upper, 257))
-    return bool(np.allclose(sizes, sizes[::-1], rtol=1e-9, atol=0.0))
-
-
-def _symmetrize(lines: Sequence[float], anchors: Sequence[float] = ()) -> list[float]:
-    """Fold the grid onto its mirror image, keeping ``anchors`` bit-exact.
-
-    An asymmetric grid under a symmetric structure excites modes that are not
-    in the model, and the asymmetry needed to do that is far smaller than the
-    error visible by eye.
-
-    The fold is exact only for a domain centred on zero, where negation is
-    exact; elsewhere ``(u+v)/2`` rounds and a few parts in 1e15 survive. On a
-    cell boundary that is beneath notice. On an anchor it is fatal, and silently
-    so: a zero-thickness sheet occupies a zero-width interval, so a solver finds
-    it only where a grid line equals its position *exactly*. One ulp and the
-    conductor is not discretised at all, and the run still completes, saying so
-    only as ``Unused primitive`` - which has a benign form that reads exactly
-    like this fatal one. So the anchors go back verbatim after the fold.
-    """
-    array = np.asarray(lines, dtype=float)
-    centre = (array[0] + array[-1]) / 2.0
-    folded = (array + (2.0 * centre - array[::-1])) / 2.0
-
-    # The fold pairs line i with line n-1-i and averages them. That is only
-    # meaningful if those two really are mirror images - which requires the
-    # two halves to hold the *same number of cells*. They can fail to: mirrored
-    # gaps integrate the same sizing field over mirrored sample points, so a
-    # one-ulp difference in the arclength total can tip `ceil` and give one side
-    # an extra cell. The field and the anchors still mirror, so _is_symmetric
-    # approves, and the fold then averages a dense region against a sparse one.
-    #
-    # The result is not obviously broken - that is the danger. It comes out
-    # strictly increasing and perfectly uniform, having averaged the grading
-    # away entirely, and passes every check in _validate. So the guard has to be
-    # here.
-    #
-    # Measured against the *smallest cell*, not against the span. What a count
-    # mismatch does is move lines by a fraction of a cell, so that is the scale
-    # the question is asked on; a span-relative limit is a different quantity,
-    # and it drifts away from this one as soon as an axis has a long
-    # uninterrupted gap - placement walks a gap from one end, so rounding
-    # accumulates along it in proportion to the gap rather than to the cell.
-    # A thousandth of the finest cell sits between the two regimes;
-    # `test_the_limit_is_a_fraction_of_a_cell_not_of_the_span` brackets it.
-    smallest = float(np.min(np.diff(array))) if array.size > 1 else 0.0
-    drift = float(np.max(np.abs(folded - array))) if array.size else 0.0
-    if smallest > 0.0 and drift > smallest * 1e-3:
-        raise MeshError(
-            f"cannot fold this axis onto its mirror image: doing so would move "
-            f"a grid line by {drift:.6g}, far more than the rounding a genuine "
-            f"fold corrects. The two halves hold different numbers of cells, so "
-            f"folding would average the grading away and leave a uniform grid "
-            f"that looks valid"
-        )
-
-    for anchor in anchors:
-        folded[int(np.argmin(np.abs(folded - anchor)))] = anchor
-
-    return [float(value) for value in folded]
-
-
-def _add_absorber(interior: Sequence[float], pml_cells: int) -> list[float]:
-    """Extend the axis with uniformly spaced absorber cells at both ends.
-
-    Uniform by construction: a graded absorber reflects, and a reflection off
-    the absorber is indistinguishable from the one being measured.
-    """
-    if pml_cells == 0:
-        return list(interior)
-    if len(interior) < 2:
-        raise MeshError("cannot add an absorber to an axis with fewer than two lines")
-
-    lines = list(interior)
-    low_pitch = lines[1] - lines[0]
-    high_pitch = lines[-1] - lines[-2]
-    below = [lines[0] - low_pitch * i for i in range(pml_cells, 0, -1)]
-    above = [lines[-1] + high_pitch * i for i in range(1, pml_cells + 1)]
-    return below + lines + above
+        if any(reach <= 0.0 for reach in inside):
+            continue
+        kept.append(demand)
+    for demand in _pruned(kept, params.slope(dim), spend):
+        yield _Constraint(demand.lower, demand.upper, demand.size, demand.source)
 
 
 def _validate(
-    lines: Sequence[float],
+    lines: Sequence[float] | np.ndarray,
     sources: _Sources,
     params: MeshParams,
 ) -> None:
@@ -1874,15 +1071,16 @@ def _validate(
         raise MeshError(f"{name} axis has non-increasing grid lines")
 
     smallest = float(np.min(spacings))
-    if smallest < float(params.min_cell) * (1.0 - 1e-9):
+    if smallest < params.floor * (1.0 - 1e-9):
         # The cell's midpoint, which is never itself a grid line and so never a
-        # pinned one: asking about either end instead answers "at" whichever
-        # feature owns that end, and says nothing about what the cell is between.
+        # pinned one. Asking about either end instead answers "at" whichever
+        # feature owns that end, and reports nothing about what the cell lies
+        # between.
         offending = int(np.argmin(spacings))
         where = float(array[offending] + spacings[offending] / 2.0)
         raise MeshError(
             f"{name} axis has a cell of {smallest:.6g} {sources.spanning(where)}, "
-            f"below the floor of {params.min_cell:.6g}; this would dictate the "
+            f"below the floor of {params.floor:.6g}; this would dictate the "
             "timestep for the whole simulation"
         )
 
@@ -1897,27 +1095,26 @@ def _validate(
             f"{np.max(ratios):.3f}, limit is {params.max_ratio[dim]}"
         )
 
-    _validate_absorber(array, spacings, name, params.pml_cells[dim])
+    _validate_absorber(array, spacings, name, params.absorber[dim])
 
+    # Exactly, because that is the question the geometry asks. A zero-thickness
+    # conductor occupies no interval and openEMS discretises it only where a
+    # grid line equals its position. Every position _snap returned is written
+    # back literally from here on: sizing_field._segment_lines assigns each gap
+    # its two ends, _symmetrize restores the anchors after the fold, and
+    # _add_absorber only extends the axis at its ends. A guard looser
+    # than that accepts a line beside the object, and an object that takes no
+    # cell is silent - the run completes and returns a clean wrong matrix.
+    #
+    # What _snap dropped is not asked about at all. A near-coincident anchor
+    # leaves with its provenance, and the line the grid carries can then be a
+    # few last bits from where that one was drawn.
     for line in sources.lines:
-        if not np.any(np.isclose(array, line.position, rtol=0.0, atol=1e-9)):
+        if not np.any(array == line.position):
+            nearest = float(array[int(np.argmin(np.abs(array - line.position)))])
             raise MeshError(
-                f"{name} axis lost a required grid line at {line.position:.6g} "
-                f"({line.source}); the object there would not be modelled"
+                f"{name} axis lost a required grid line at {float(line.position)!r} "
+                f"({line.source}); the nearest line is at {nearest!r}. The object "
+                "there would not be modelled: a plane is discretised only where a "
+                "line equals its position exactly"
             )
-
-
-def _validate_absorber(array: np.ndarray, spacings: np.ndarray, name: str, pml_cells: int) -> None:
-    if pml_cells == 0:
-        return
-    if array.size < 2 * pml_cells + 2:
-        raise MeshError(
-            f"{name} axis has {array.size} lines, too few for {pml_cells} "
-            "absorber cells at each end plus an interior"
-        )
-    for label, block in (
-        ("lower", spacings[:pml_cells]),
-        ("upper", spacings[-pml_cells:]),
-    ):
-        if not np.allclose(block, block[0], rtol=1e-9, atol=0.0):
-            raise MeshError(f"{name} axis {label} absorber is not uniformly spaced: {block}")

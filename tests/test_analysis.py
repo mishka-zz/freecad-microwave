@@ -349,14 +349,13 @@ class TestWhatARefinementMayBeAimedAt:
 
 
 class TestWhatTheWorkbenchRecognisesAsItsOwn:
-    """Three places ask "is this object ours?", and they must agree.
+    """Every place that asks "is this object ours?" must give the same answer.
 
-    Asking by testing the proxy class name for a prefix
-    which was wrong twice: it read as *openEMS*, and renaming the classes would
-    have silently changed which objects the workbench recognised - an
-    unrecognised object gets no view provider and can be referenced by a
-    refinement region. Deriving the set from the classes is the one form that
-    cannot fall out of step with them.
+    Testing the proxy class name for a prefix couples recognition to naming:
+    rename the classes and the workbench silently stops recognising its own
+    objects, which costs them a view provider and lets a refinement region
+    reference something nothing will draw. Deriving the set from the classes is
+    the one form that cannot fall out of step with them.
     """
 
     def test_it_names_every_document_object(self):
@@ -379,8 +378,8 @@ class TestWhatTheWorkbenchRecognisesAsItsOwn:
         assert kinds() == expected
 
     def test_it_does_not_name_the_mixin_every_object_inherits(self):
-        """``ViewProviderRestored`` is imported into all six modules, so a
-        naive scan of module contents collects it six times over."""
+        """``ViewProviderRestored`` is imported into every object module, so a
+        naive scan of module contents collects it once per module."""
         from Microwave.Objects.kinds import kinds
 
         assert "ViewProviderRestored" not in kinds()

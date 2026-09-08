@@ -3,29 +3,39 @@
 
 """Startup for every mode.
 
-FreeCAD execs this whether or not there is a GUI, and ``InitGui.py`` only when
-there is, so the version check lives here: it reaches a headless run, and it is
-printed once. Registering the workbench is ``InitGui.py``'s job, and it makes
-the same check before doing any of it.
+FreeCAD execs this file whether or not there is a GUI, and ``InitGui.py`` only
+when there is. The host check is here, so that it reaches a headless run and is
+printed once. ``InitGui.py`` registers the workbench, and makes the same check
+before it registers anything.
 
 Nothing else belongs here. The document objects register themselves when the
 modules that define them are imported.
 """
 
 
-def _report_an_unsupported_freecad():
+def _report_an_unsupported_host():
     try:
+        import sys
+
         import FreeCAD
 
-        from Microwave import freecad_version
+        from Microwave import host_versions
 
-        refusal = freecad_version.refusal(FreeCAD.Version())
+        # Asked on its own. A `Version()` that raises is a FreeCAD this was
+        # not written against, and it must not carry off the Python answer.
+        try:
+            release = FreeCAD.Version()
+        except Exception:
+            release = ()
+
+        refusal = host_versions.refusal(release, sys.version_info)
         if refusal:
             FreeCAD.Console.PrintError(refusal + "\n")
     except Exception:
-        # An install broken enough to fail here cannot report itself through
-        # the module that is broken, and it will say so at the first command.
+        # An install broken enough to fail here cannot report the failure
+        # through the module that is broken. It reports it at the first command
+        # instead.
         pass
 
 
-_report_an_unsupported_freecad()
+_report_an_unsupported_host()

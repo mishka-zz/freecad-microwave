@@ -339,8 +339,8 @@ class TestCreatingAnObjectIsOneUndoStep:
         assert capsys.readouterr().out == ""
 
     def test_a_second_copy_is_made_and_said_out_loud(self, doc, monkeypatch, capsys):
-        """The refusal this replaced was right about the accident and wrong
-        about a stackup, so the copy appears and the user is told."""
+        """Refusing would be right about the mis-click and wrong about a
+        stackup, so the copy appears and the user is told."""
         from Microwave import Commands
         from Microwave.Gui import material_picker
 
@@ -785,12 +785,25 @@ class TestAMaterialRepaintsItsOwnDocument:
 
 
 class _Restorable:
-    """Just enough of a document object: a name, a proxy, and a view object."""
+    """Just enough of a document object: a name, a proxy, and a view object.
+
+    It answers ``addProperty`` and ``setEditorMode`` because every real document
+    object does, and a restore hook that fills in a property added since the
+    file was written calls them. Guarding against their absence in the code
+    would be guarding against a document object that does not exist.
+    """
 
     def __init__(self, name, proxy, view_object):
         self.Name = self.Label = name
         self.Proxy = proxy
         self.ViewObject = view_object
+
+    def addProperty(self, kind, name, group="", doc=""):
+        setattr(self, name, [])
+        return self
+
+    def setEditorMode(self, name, mode):
+        pass
 
     def isDerivedFrom(self, kind):
         # An App::FeaturePython. Every real document object answers this, so the
@@ -1092,21 +1105,127 @@ class TestTheMeshPreviewObject:
         set_segments(preview, ())
         assert preview.Shape.edges == ()
 
-    def test_it_records_what_it_was_built_from(self, doc, fake_part):
-        from Microwave.Objects.preview import createEMMeshPreview, set_segments
+    def test_the_display_properties_and_only_those_are_marked(self, doc):
+        """A display property moves no cell, so a recompute fired by one would
+        mark the drawing stale for a change of view.
+
+        The stub records the status and does not act on it: whether it
+        suppresses FreeCAD's touch is FreeCAD's decision, counted under a real
+        one by ``tests/test_preview_recompute.py``. What this pins is the list.
+        Every name in the set is a property the object actually carries, so the
+        loop never skips one silently, and nothing else on the preview is
+        marked - ``Digest`` and the grid are written by the code that draws,
+        and a write that made no recompute follow would leave the badge
+        reporting the drawing before it."""
+        from Microwave.Objects.preview import DISPLAY_PROPERTIES, createEMMeshPreview
 
         preview = createEMMeshPreview()
-        set_segments(preview, (((0, 0, 0), (1, 0, 0)),), digest="abc123", cells=814000)
+        marked = {name for name, status in preview._property_status.items() if "Output" in status}
+        assert marked == set(DISPLAY_PROPERTIES) | {"Status"}
+
+    def test_it_records_what_it_was_built_from(self, doc, fake_part):
+        from Microwave.Objects.preview import (
+            createEMMeshPreview,
+            set_provenance,
+            set_segments,
+        )
+
+        preview = createEMMeshPreview()
+        set_segments(preview, (((0, 0, 0), (1, 0, 0)),))
+        set_provenance(preview, digest="abc123", cells=814000)
         assert preview.Digest == "abc123"
         assert preview.Cells == 814000
+
+
+class TestAPreviewRestoredWithoutItsGridProperties:
+    """FreeCAD restores the properties an object had, and does not reconcile a
+    restored object against the class it belongs to. A preview whose file was
+    written without the grid properties therefore comes back without them, and
+    the write in ``refresh`` would raise straight through Update Mesh."""
+
+    def _restored(self):
+        from Microwave.Objects import preview as preview_objects
+
+        obj = preview_objects.createEMMeshPreview()
+        for name in preview_objects.GRID_PROPERTIES:
+            obj.PropertiesList.remove(name)
+            obj._props.pop(name)
+        return obj, preview_objects
+
+    def test_the_properties_come_back(self, doc):
+        obj, preview_objects = self._restored()
+        obj.Proxy.onDocumentRestored(obj)
+        assert all(hasattr(obj, name) for name in preview_objects.GRID_PROPERTIES)
+
+    def test_and_the_grid_can_then_be_written(self, doc):
+        """The failure this prevents is not a preview that will not redraw. It
+        is Update Mesh raising on the write, on every document that already
+        carries a preview."""
+        obj, preview_objects = self._restored()
+        obj.Proxy.onDocumentRestored(obj)
+        preview_objects.set_grid(obj, ((0.0, 1.0),) * 3, ((), (), ()), (0, 0, 0))
+        assert preview_objects.stored_grid(obj) is not None
+
+    def test_it_draws_nothing_until_it_is_meshed_again(self, doc):
+        """The properties come back empty, and an empty grid is one nothing can
+        be drawn from."""
+        obj, preview_objects = self._restored()
+        obj.Proxy.onDocumentRestored(obj)
+        assert preview_objects.stored_grid(obj) is None
+
+
+class TestAPreviewRestoredWithoutTheStatusOnItsDisplayProperties:
+    """A file may hold a preview whose display properties carry no status, for
+    the same reason one may hold a preview with no grid properties: FreeCAD
+    restores what the file carried."""
+
+    def _restored(self):
+        from Microwave.Objects import preview as preview_objects
+
+        obj = preview_objects.createEMMeshPreview()
+        obj._property_status.clear()
+        return obj, preview_objects
+
+    def test_the_status_is_put_back(self, doc):
+        obj, preview_objects = self._restored()
+        obj.Proxy.onDocumentRestored(obj)
+        assert {
+            name
+            for name in preview_objects.DISPLAY_PROPERTIES
+            if "Output" in obj._property_status.get(name, [])
+        } == set(preview_objects.DISPLAY_PROPERTIES)
+        assert "Output" in obj._property_status.get("Status", [])
+
+    def test_a_display_property_the_file_never_carried_takes_nothing_with_it(self, doc):
+        """FreeCAD refuses the status on a property that is not there, and the
+        grid properties are repaired by the same hook. Unguarded, the oldest
+        files would lose the repair they need most."""
+        obj, preview_objects = self._restored()
+        gone = "SliceY"
+        obj.PropertiesList.remove(gone)
+        obj._props.pop(gone)
+        for name in preview_objects.GRID_PROPERTIES:
+            obj.PropertiesList.remove(name)
+            obj._props.pop(name)
+
+        obj.Proxy.onDocumentRestored(obj)
+
+        assert all(hasattr(obj, name) for name in preview_objects.GRID_PROPERTIES)
+        assert gone not in obj._property_status
+        # Skipped, rather than abandoned at the first refusal. The names are
+        # taken in order, so a loop that gave up would leave everything after
+        # this one unmarked.
+        assert set(obj._property_status) == (
+            set(preview_objects.DISPLAY_PROPERTIES) | {"Status"}
+        ) - {gone}
 
 
 class TestADisplayPropertyRedrawsWithoutAButton:
     """``onChanged`` is what makes the display properties live.
 
-    ``Gui/mesh_preview.redraw`` has four tests of its own, and ``onChanged`` is
-    its only caller - so the function was covered and the call site was not,
-    and the whole method could return immediately with the suite green. The
+    ``Gui/mesh_preview.redraw`` is tested on its own and ``onChanged`` is its
+    only caller - so the function was covered and the call site was not, and the
+    whole method could return immediately with the suite green. The
     design claim it carries ("a display property that needs a button press is
     not how FreeCAD behaves anywhere else") would simply stop being true:
     changing ``Display`` or dragging a slice does nothing, the picture is of the
@@ -1125,7 +1244,9 @@ class TestADisplayPropertyRedrawsWithoutAButton:
         drawn = []
         monkeypatch.setattr(_vp_hook, "PREVIEW_REDRAW", drawn.append)
         obj = preview_objects.createEMMeshPreview()
-        obj.Digest = "abc123"
+        # A grid to draw is what the guard reads. A preview with none has
+        # nothing to show a different view of.
+        preview_objects.set_grid(obj, ((0.0, 1.0),) * 3, ((), (), ()), (0, 0, 0))
         return obj, drawn
 
     def test_a_display_property_redraws(self, doc, monkeypatch):
@@ -1140,10 +1261,11 @@ class TestADisplayPropertyRedrawsWithoutAButton:
         assert drawn == []
 
     def test_a_preview_that_never_drew_does_not_redraw(self, doc, monkeypatch):
-        """An empty ``Digest`` is only ever set by a completed refresh, which
-        is what makes it the test for "half-built or restoring"."""
+        """A stored grid is only ever written by a completed refresh, which is
+        what makes it the test for "half-built or restoring" - and it is also
+        what the redraw reads, so a preview without one has nothing to draw."""
         preview, drawn = self._preview(monkeypatch)
-        preview.Digest = ""
+        preview.LinesX = []
         preview.Proxy.onChanged(preview, "ShowSliceX")
         assert drawn == []
 
@@ -1266,10 +1388,11 @@ class TestAnInjectedProviderIsAttached:
         inject_vp(obj, kind)
         return obj
 
-    #: The port view providers are missing here because ``ports.py`` imports
-    #: ``pivy.coin`` at module scope, which does not exist outside FreeCAD. They
-    #: go through the same one call site, so the coverage gap is in the fake and
-    #: not in the fix.
+    #: The port view providers are missing here because there is nothing for the
+    #: injection to fix in one. ``EMPortViewProvider`` defines no ``attach``, no
+    #: scene graph and no ``updateData``, and reads ``self.Object`` nowhere -
+    #: FreeCAD's own Part view provider draws the shape. A provider that never
+    #: asks for the object cannot be caught out by not having been given it.
     CONSTRUCTIBLE = [name for name, module in DOCUMENT_CLASSES if not module.endswith(".ports")]
 
     @pytest.mark.parametrize("name", CONSTRUCTIBLE)
@@ -1529,6 +1652,32 @@ class TestTheIconSet:
         assert not missing, f"no icon on disk, so FreeCAD draws a generic one: {missing}"
         assert len(set(paths.values())) == len(paths), f"two kinds share a picture: {paths}"
 
+    def test_the_stale_badge_follows_the_value_the_document_writes(self):
+        """The provider reads the status the document layer declares, not a copy.
+
+        ``Objects/preview.py`` declares what ``Status`` may hold and is the only
+        place that writes it. A provider comparing against its own literal keeps
+        passing while the tree stops going amber: the picture is still on disk
+        and still named, so every other test in this class is satisfied. That is
+        this class's drift one level in, at the condition rather than at the
+        filename.
+        """
+        from Microwave.Objects.preview import CURRENT, OUT_OF_DATE
+        from Microwave.ViewProviders.preview import EMMeshPreviewViewProvider
+
+        def drawn(status):
+            provider = types.SimpleNamespace(Object=types.SimpleNamespace(Status=status))
+            return EMMeshPreviewViewProvider.getIcon(provider)
+
+        assert drawn(OUT_OF_DATE).endswith("MeshPreviewStale.svg"), (
+            "a preview the document called out of date draws the plain grid, so "
+            "the badge the mesher sets is invisible in the tree"
+        )
+        assert drawn(CURRENT).endswith("MeshPreview.svg"), (
+            "a preview that matches its drawing draws the badge, so the tree "
+            "asks for a remesh that is not needed"
+        )
+
     def test_they_are_well_formed_svg(self):
         import xml.etree.ElementTree as ElementTree
 
@@ -1572,43 +1721,12 @@ class TestEveryObjectMayBeShown:
         ("results", "EMSParametersViewProvider"),
     ]
 
-    @pytest.fixture
-    def fake_pivy(self, monkeypatch):
-        """``pivy.coin`` exists only inside FreeCAD.
-
-        Stubbed rather than skipped, because the thing under test is whether
-        ``attach`` *asks* for a display mode - and ``ports.py`` imports pivy at
-        module scope, so without this it is the one provider the suite can never
-        look at.
-        """
-        import sys
-        import types
-
-        pivy = types.ModuleType("pivy")
-        coin = types.ModuleType("pivy.coin")
-
-        # A node that accepts any attribute and any child, which is all the
-        # providers do with one before it reaches a renderer.
-        class _Node:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def addChild(self, child):
-                pass
-
-            def __setattr__(self, key, value):
-                object.__setattr__(self, key, value)
-
-        coin.__getattr__ = lambda name: _Node
-        pivy.coin = coin
-        monkeypatch.setitem(sys.modules, "pivy", pivy)
-        monkeypatch.setitem(sys.modules, "pivy.coin", coin)
-        yield
-        # Do not leave a module imported against a stub for the rest of the run.
-        sys.modules.pop("Microwave.ViewProviders.ports", None)
+    # ``add_display_mode`` imports ``pivy`` at call time and ``conftest`` stubs
+    # it for the whole run, so ``attach`` registers its mode here. No view
+    # provider imports pivy at module scope, and a test enforces that.
 
     @pytest.mark.parametrize("module, name", PROVIDERS)
-    def test_it_offers_a_display_mode(self, fake_pivy, module, name):
+    def test_it_offers_a_display_mode(self, module, name):
         import importlib
 
         provider = getattr(importlib.import_module(f"Microwave.ViewProviders.{module}"), name)
@@ -1618,7 +1736,7 @@ class TestEveryObjectMayBeShown:
         assert instance.getDefaultDisplayMode() in modes
 
     @pytest.mark.parametrize("module, name", PROVIDERS)
-    def test_attaching_asks_for_that_mode(self, fake_pivy, module, name):
+    def test_attaching_asks_for_that_mode(self, module, name):
         """The methods alone are not enough - the mode has to be *added*.
 
         ``getDisplayModes`` naming a mode that ``attach`` never registered is
@@ -2350,3 +2468,53 @@ class TestTheResultCommandsActOnTheStudyInHand:
         _, title, text = shown(boxes)
         assert title == "Plot impedance"
         assert "nothing doing at port 4" in text
+
+
+class TestTheBadgeAfterAMeshIsDrawn:
+    """What *Update Mesh* leaves on the status line, as a value.
+
+    A grid can be under-resolved in two ways that the report keeps apart because
+    they are found differently - a region the grid barely spans, and a layer
+    measured along its own chord, which contributes no region at all. They are
+    one thing to a person reading a badge.
+    """
+
+    def verdict(self, unresolved=0, undercounted=0, oversized=None):
+        from types import SimpleNamespace
+
+        from Microwave.Gui.task_panel import mesh_verdict
+
+        return mesh_verdict(
+            SimpleNamespace(
+                unresolved=("region",) * unresolved,
+                undercounted=("chord",) * undercounted,
+                oversized=oversized,
+            )
+        )
+
+    def test_a_grid_with_nothing_to_say_is_green(self):
+        assert self.verdict() == ("Mesh drawn", "green")
+
+    def test_a_barely_resolved_region_is_amber(self):
+        text, colour = self.verdict(unresolved=2)
+        assert colour == "orange"
+        assert "2 reading(s)" in text
+
+    def test_a_layer_the_grid_undercounted_is_the_same_verdict(self):
+        """Read off a chord rather than off a region, and a badge that ignored
+        it would say a mesh is fine on the drawings the count exists for - a
+        substrate bent, rolled or folded, which has no box to be judged by.
+
+        Counted as a reading and not as an object: a region is one object, a
+        chord is one face of one, and a bent board carries several."""
+        text, colour = self.verdict(undercounted=1)
+        assert colour == "orange"
+        assert "1 reading(s)" in text
+
+    def test_and_the_two_are_counted_together(self):
+        assert self.verdict(unresolved=2, undercounted=3)[0].startswith("5 reading(s)")
+
+    def test_a_grid_nobody_meant_is_amber_and_says_which_thing_it_is(self):
+        text, colour = self.verdict(oversized="this grid is 9.9 GiB")
+        assert colour == "orange"
+        assert "very large" in text

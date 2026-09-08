@@ -26,8 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import FreeCAD  # noqa: E402
 import Part  # noqa: E402
 
-from Microwave.Solvers.openems import geometry, lfs, write  # noqa: E402
-from Microwave.Solvers.openems.mesh import MeshParams  # noqa: E402
+from Microwave.Solvers.openems import document, geometry, lfs, plan  # noqa: E402
 from Microwave.Solvers.openems.model import (  # noqa: E402
     Frequency,
     Material,
@@ -36,12 +35,14 @@ from Microwave.Solvers.openems.model import (  # noqa: E402
     Solid,
     Termination,
 )
+from Microwave.Solvers.openems.regions import MeshParams
 from tests.cavity import (  # noqa: E402
     BAND,
-    DIVISORS,
+    CASES,
     EPS_R,
     KAPPA,
     LOSS_MEASURED_AT,
+    MODE_AXIS,
     POINTS,
     POLE_AXES,
     PORT_IMPEDANCE,
@@ -49,9 +50,15 @@ from tests.cavity import (  # noqa: E402
     PROBE_WIDTH,
     RADIUS,
     SHELL_WALL,
+    axes,
     cell_size,
     timesteps,
+    wall_cell,
+    wall_phase,
 )
+
+#: Axes a grid has, and so offsets a slide needs.
+DIMENSIONS = 3
 
 #: Above the priority a port gets, so the shell wins wherever they meet and the
 #: cavity is bounded by metal rather than by whichever was added last.
@@ -104,7 +111,7 @@ def _geometry(doc, pole):
             solids.append(solid)
             # Asked the way the translation asks it, so this cannot come to
             # disagree with what gets emitted.
-            bodies.append(lfs.Body(piece.label, piece.shape, metal, solid.is_mesh, solid.is_sheet))
+            bodies.append(document.measured_body(piece, metal))
         doc.removeObject(obj.Name)
     return tuple(solids), tuple(bodies)
 
@@ -120,12 +127,18 @@ def _port():
     coordinate drives nothing and says so only as ``Unused primitive``. A lumped
     port asks for a grid line on every axis it is flat across, and inside a
     sphere there is no surface for the mesher to pin one against.
+
+    **Centred on all three axes**, which is what puts it where the paragraph
+    above says it is. It is also what lets one handle hold the wall on all three:
+    the element's faces are pinned, so a box standing off centre carries the grid
+    on that axis off with it, and that axis then registers against the wall
+    somewhere the other two do not.
     """
     return Port(
         number=1,
         kind="lumped",
-        start=(-PROBE_WIDTH / 2, 0.0, -PROBE_LENGTH / 2),
-        stop=(PROBE_WIDTH / 2, PROBE_WIDTH, PROBE_LENGTH / 2),
+        start=(-PROBE_WIDTH / 2, -PROBE_WIDTH / 2, -PROBE_LENGTH / 2),
+        stop=(PROBE_WIDTH / 2, PROBE_WIDTH / 2, PROBE_LENGTH / 2),
         # A lumped port is a circuit element and has no propagation axis of its
         # own - the adapter wants one only to check the port is clear of the
         # absorber - but it must have extent along whichever axis is named.
@@ -138,9 +151,8 @@ def _port():
     )
 
 
-def _problem(doc, divisor, pole, name) -> Problem:
-    solids, bodies = _geometry(doc, pole)
-    materials = (
+def _materials():
+    return (
         Material(name="Copper", kind="pec"),
         Material(
             name="Vacuum",
@@ -150,9 +162,11 @@ def _problem(doc, divisor, pole, name) -> Problem:
             measured_at=LOSS_MEASURED_AT,
         ),
     )
-    ports = (_port(),)
+
+
+def _params(divisor):
     resolution = cell_size(divisor)
-    params = MeshParams(
+    return MeshParams(
         metal_res=resolution,
         dielectric_res=resolution,
         max_ratio=(1.3, 1.3, 1.3),
@@ -162,7 +176,36 @@ def _problem(doc, divisor, pole, name) -> Problem:
         pml_cells=0,
         cap=resolution,
     )
-    grid = write.plan_grid(
+
+
+def _slid(grid, ports, offset):
+    """The mesh moved by ``offset`` mm, and the probe carried along with it.
+
+    Every spacing in a grid is a difference, so translating it leaves the mesh
+    exactly the mesh it was and changes only whereabouts in a cell the surface
+    falls. That is the free variable a single solve per resolution never records:
+    two grids of the same cell staircase a sphere differently and answer
+    differently.
+
+    The probe travels with the mesh so that an offset changes where the lines
+    fall against the *wall* rather than what the probe is. openEMS builds a lumped
+    element from its box snapped to the grid, so a probe left standing while the
+    lines move is rebuilt at whatever size they leave it, and the case would be
+    measuring that too.
+
+    It does move the probe off the cavity's centre, by up to a cell. What that is
+    worth is measured rather than argued: the same mesh slid by a *whole* cell
+    registers the wall exactly where it was and stands the probe a cell further
+    out, and ``test_a_probe_carried_off_centre_is_not_what_these_cases_measure``
+    holds the two apart.
+    """
+    return grid.moved(offset), tuple(port.moved(offset) for port in ports)
+
+
+def _problem(doc, case, name) -> Problem:
+    solids, bodies = _geometry(doc, POLE_AXES[case.pole])
+    materials, ports, params = _materials(), (_port(),), _params(case.divisor)
+    grid = plan.plan_grid(
         solids,
         ports,
         materials,
@@ -170,6 +213,10 @@ def _problem(doc, divisor, pole, name) -> Problem:
         padding=((2, 2), (2, 2), (2, 2)),
         measured=lfs.features(bodies, params.cap, params.metal_res, min_lines=params.min_lines),
     )
+    if case.phase:
+        offset = [0.0] * DIMENSIONS
+        offset[MODE_AXIS] = case.phase * wall_cell(axes(grid)[MODE_AXIS])
+        grid, ports = _slid(grid, ports, tuple(offset))
     return Problem(
         title=f"spherical cavity, {name}",
         frequency=Frequency(start=BAND[0], stop=BAND[1], points=POINTS),
@@ -178,35 +225,24 @@ def _problem(doc, divisor, pole, name) -> Problem:
         solids=solids,
         ports=ports,
         boundary=("PEC",) * 6,
-        termination=Termination(max_timesteps=timesteps(divisor), end_criteria=0.0),
+        termination=Termination(max_timesteps=timesteps(case.divisor), end_criteria=0.0),
+        grown_by=case.grown_by,
     )
-
-
-def cases():
-    """Every case the gate solves, as ``name -> (divisor, pole axis)``.
-
-    The sequence the extrapolation runs over is one orientation at each cell
-    size. The turned sphere is solved at the coarsest of them, where the
-    staircase is largest and so a triangulation the answer depended on would
-    show up most.
-    """
-    found = {f"upright-{divisor}": (divisor, POLE_AXES["upright"]) for divisor in DIVISORS}
-    found[f"turned-{min(DIVISORS)}"] = (min(DIVISORS), POLE_AXES["turned"])
-    return found
 
 
 def main(out):
     os.makedirs(out, exist_ok=True)
     written = []
-    for name, (divisor, pole) in sorted(cases().items()):
+    for name, case in sorted(CASES.items()):
         doc = FreeCAD.newDocument(f"cavity_{name}")
-        problem = _problem(doc, divisor, pole, name)
+        problem = _problem(doc, case, name)
         grid = problem.grid
         print(
             f"{name}: {sum(len(s.faces) for s in problem.solids)} triangles, "
             f"{grid.cell_count:,} cells, "
             f"lines {len(grid.x)} x {len(grid.y)} x {len(grid.z)}, "
-            f"{problem.termination.max_timesteps} timesteps"
+            f"{problem.termination.max_timesteps} timesteps, "
+            f"wall at {wall_phase(axes(grid)[MODE_AXIS]):.4f} of its cell"
         )
         os.makedirs(os.path.join(out, name), exist_ok=True)
         with open(os.path.join(out, name, "openems.json"), "w") as handle:

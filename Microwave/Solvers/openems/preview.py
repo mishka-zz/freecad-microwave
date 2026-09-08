@@ -3,45 +3,45 @@
 
 """Drawable geometry for a mesh preview: line segments, and nothing else.
 
-Pure numpy in, coordinate pairs out - no FreeCAD, no ``Part``, no view
-provider. Everything about *what the user sees* is decided here and is
-therefore testable headlessly; the FreeCAD side turns these tuples into edges.
+A drawn grid in, coordinate pairs out. There is no FreeCAD here, no ``Part``
+and no view provider. What the user sees is decided here and is therefore
+testable headlessly, and the FreeCAD side turns these tuples into edges.
 
 Why not simply draw the grid
 ----------------------------
 
 A full wireframe of an ``nx x ny x nz`` grid is ``ny*nz + nx*nz + nx*ny``
-segments - tens of thousands on any real model, and a solid grey block on
-screen. The useful views grow with the *sum* of the line counts:
+segments: tens of thousands on any real model, and a solid grey block on screen.
+The useful views grow with the sum of the line counts instead.
 
 ``Outline``
-    The domain and the absorber shell, as two wireframe boxes. Answers "is my
+    The domain and the absorber shell, as two wireframe boxes. It answers "is my
     model the size I think it is", which a board drawn in metres is not.
 
 ``Slices``
-    Three orthogonal planes *of the grid*, cut through the model. The only view
-    that shows grading.
+    Three orthogonal planes of the grid, cut through the model. It is the only
+    view that shows grading.
 
 ``Anchors``
-    The pinned planes, as rectangles. Answers "did my port plane get its line",
-    where the failure is silent: openEMS discretises nothing at a plane it was
-    told about but never given a line, and returns a run of zeroes.
+    The pinned planes, as rectangles. It answers "did my port plane get its
+    line", where the failure is silent: openEMS discretises nothing at a plane
+    it was told about but never given a line, and returns a run of zeroes.
 
-A slice position is **snapped to the nearest grid line**: a plane drawn between
-two lines shows a cross-section of nothing.
+A slice position is snapped to the nearest grid line. A plane drawn between two
+lines shows a cross-section of nothing.
 
-Every view is drawn against the *outer* extent, absorber included. The absorber
-is uniform by construction, and a preview that hides it cannot show when it is
-not.
+Every view is drawn against the outer extent, absorber included. The absorber is
+uniform by construction, and a preview that hides it cannot show when it is not.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
-from .mesh import DIMENSIONS, MeshLines, MeshParams
+from .regions import DIMENSIONS
 from .report import extents
 
 __all__ = [
@@ -49,6 +49,7 @@ __all__ = [
     "DISPLAY_MODES",
     "OUTLINE",
     "SLICES",
+    "DrawnGrid",
     "Segment",
     "preview_segments",
     "snap",
@@ -69,9 +70,44 @@ DISPLAY_MODES = (OUTLINE, SLICES, ANCHORS)
 _OTHER = ((1, 2), (0, 2), (0, 1))
 
 
+@dataclass(frozen=True)
+class DrawnGrid:
+    """A laid grid in the form a drawing of it needs: positions, and nothing else.
+
+    The mesher's own :class:`~.grid.MeshLines` carries why each pinned line is
+    there, and its :class:`~.regions.MeshParams` carries the policy the grid was
+    laid to. A drawing reads neither. It reads where the lines are, which of
+    them may not be moved, and how many cells at each end of an axis are
+    absorber - and that is what this holds.
+
+    The narrowing is what lets a preview carry the grid it drew and be redrawn
+    from it without meshing again. Reconstructing a ``MeshLines`` instead would
+    mean inventing the provenance string a ``FixedLine`` requires and no drawing
+    reads.
+
+    :param axes: Grid line positions per axis, absorber included, ascending.
+    :param anchors: Per axis, the positions the mesher pinned and may not move.
+        The preferences that survived are ordinary lines here: a preference is
+        dropped whenever it crowds anything, so drawing it would claim a
+        guarantee the mesher has not given.
+    :param absorber: Absorber cells at each end of each axis. Zero where the
+        axis has none.
+    """
+
+    axes: tuple[Sequence[float], Sequence[float], Sequence[float]]
+    anchors: tuple[Sequence[float], Sequence[float], Sequence[float]]
+    absorber: tuple[int, int, int]
+
+    def __post_init__(self) -> None:
+        for name in ("axes", "anchors", "absorber"):
+            if len(getattr(self, name)) != DIMENSIONS:
+                raise ValueError(f"{name} wants one entry per dimension")
+        if any(len(axis) < 2 for axis in self.axes):
+            raise ValueError("an axis of a drawn grid has fewer than two lines")
+
+
 def preview_segments(
-    lines: MeshLines,
-    params: MeshParams,
+    grid: DrawnGrid,
     display: str = SLICES,
     *,
     slices: Sequence[bool] = (True, True, True),
@@ -79,18 +115,19 @@ def preview_segments(
 ) -> tuple[Segment, ...]:
     """Every line segment one view of the mesh is made of.
 
-    The outline is included in *every* mode rather than being a mode of its own.
-    It costs twenty-four edges, and slices or anchors floating without a box
-    around them are much harder to read than they need to be.
+    The outline is included in every mode rather than being a mode of its own.
+    It costs the edges of one box, and of a second where an absorber makes the
+    two extents differ. Slices or anchors floating without a box around them are
+    much harder to read.
 
-    :param display: One of :data:`DISPLAY_MODES`. Anything else is a programming
-        error rather than user input - the document property is an enumeration
-        - so it raises.
+    :param display: One of :data:`DISPLAY_MODES`. Anything else is a
+        programming error rather than user input, the document property being an
+        enumeration, so it raises.
     """
     if display not in DISPLAY_MODES:
         raise ValueError(f"{display!r} is not a display mode; expected one of {DISPLAY_MODES}")
 
-    domain, outer = extents(lines, params)
+    domain, outer = extents(grid.axes, grid.absorber)
     segments: list[Segment] = list(_box_edges(domain.lower, domain.upper))
     if domain.size != outer.size:
         segments.extend(_box_edges(outer.lower, outer.upper))
@@ -98,23 +135,23 @@ def preview_segments(
     if display == SLICES:
         for dim in range(DIMENSIONS):
             if slices[dim]:
-                segments.extend(_slice(lines, dim, float(positions[dim])))
+                segments.extend(_slice(grid, dim, float(positions[dim])))
     elif display == ANCHORS:
         for dim in range(DIMENSIONS):
-            segments.extend(_anchors(lines, dim))
+            segments.extend(_anchors(grid, dim))
 
     return tuple(segments)
 
 
-def snap(lines: MeshLines, dim: int, position: float) -> float:
-    """The grid line nearest ``position`` on ``dim``.
+def snap(axis: Sequence[float], position: float) -> float:
+    """The line of ``axis`` nearest ``position``.
 
     A slice plane must coincide with a line of the grid. Between two lines it
     would show a cross-section of no cell in particular, and its spacing would
     be an artefact of where the user happened to drag a slider.
     """
-    axis = lines[dim]
-    return float(axis[int(np.argmin(np.abs(axis - position)))])
+    values = np.asarray(axis, dtype=float)
+    return float(values[int(np.argmin(np.abs(values - position)))])
 
 
 def _box_edges(lower: Point, upper: Point) -> list[Segment]:
@@ -135,22 +172,22 @@ def _box_edges(lower: Point, upper: Point) -> list[Segment]:
     return edges
 
 
-def _slice(lines: MeshLines, dim: int, position: float) -> list[Segment]:
+def _slice(grid: DrawnGrid, dim: int, position: float) -> list[Segment]:
     """One plane of the grid, drawn as the lines that lie in it."""
-    plane = snap(lines, dim, position)
+    plane = snap(grid.axes[dim], position)
     first, second = _OTHER[dim]
-    low = (float(lines[first][0]), float(lines[second][0]))
-    high = (float(lines[first][-1]), float(lines[second][-1]))
+    low = (float(grid.axes[first][0]), float(grid.axes[second][0]))
+    high = (float(grid.axes[first][-1]), float(grid.axes[second][-1]))
 
     segments: list[Segment] = []
-    for value in lines[first]:
+    for value in grid.axes[first]:
         segments.append(
             (
                 _point(dim, plane, first, float(value), second, low[1]),
                 _point(dim, plane, first, float(value), second, high[1]),
             )
         )
-    for value in lines[second]:
+    for value in grid.axes[second]:
         segments.append(
             (
                 _point(dim, plane, second, float(value), first, low[0]),
@@ -160,51 +197,51 @@ def _slice(lines: MeshLines, dim: int, position: float) -> list[Segment]:
     return segments
 
 
-def _anchors(lines: MeshLines, dim: int) -> list[Segment]:
+def _anchors(grid: DrawnGrid, dim: int) -> list[Segment]:
     """Every pinned plane on one axis, as a rectangle.
 
-    Only the *anchors* - lines the mesher is not permitted to move. A
-    preference that survived is an ordinary grid line with a nice explanation,
-    and drawing it here would say the mesher had promised something it has not:
-    preferences are dropped whenever they crowd anything.
+    Every anchor the grid carries gets one, the caller having passed the anchors
+    alone - see :attr:`DrawnGrid.anchors`, which says why a preference that
+    survived is not among them.
 
     The two domain walls are anchors on every axis, and they are also the six
-    faces of the box ``Outline`` already draws - six rectangles of pure
-    duplication on every model there is, crowding out the ones with something to
-    say. They are skipped here, and nothing is hidden by it, because the outline
-    draws that exact box in every mode. What is left is the question the view
-    exists for: did the geometry I drew get its lines?
+    faces of the box ``Outline`` already draws. Drawing them here would repeat
+    six rectangles on every model and crowd out the ones with something to say,
+    so they are skipped. Nothing is hidden by that, because the outline draws
+    that box in every mode. What is left answers the question the view exists
+    for: whether the geometry the user drew got its lines.
     """
     first, second = _OTHER[dim]
-    low = (float(lines[first][0]), float(lines[second][0]))
-    high = (float(lines[first][-1]), float(lines[second][-1]))
-    walls = _walls(lines, dim)
+    low = (float(grid.axes[first][0]), float(grid.axes[second][0]))
+    high = (float(grid.axes[first][-1]), float(grid.axes[second][-1]))
+    walls = _walls(grid, dim)
 
     segments: list[Segment] = []
-    for pin in lines.fixed[dim]:
-        if not pin.required or pin.position in walls:
+    for anchor in grid.anchors[dim]:
+        if anchor in walls:
             continue
         corners = [
-            _point(dim, pin.position, first, low[0], second, low[1]),
-            _point(dim, pin.position, first, high[0], second, low[1]),
-            _point(dim, pin.position, first, high[0], second, high[1]),
-            _point(dim, pin.position, first, low[0], second, high[1]),
+            _point(dim, anchor, first, low[0], second, low[1]),
+            _point(dim, anchor, first, high[0], second, low[1]),
+            _point(dim, anchor, first, high[0], second, high[1]),
+            _point(dim, anchor, first, low[0], second, high[1]),
         ]
         segments.extend((corners[index], corners[(index + 1) % 4]) for index in range(4))
     return segments
 
 
-def _walls(lines: MeshLines, dim: int) -> frozenset[float]:
-    """The two pinned positions that are the domain walls, by value.
+def _walls(grid: DrawnGrid, dim: int) -> frozenset[float]:
+    """The outermost anchors, which are the domain walls, by value.
 
-    Compared by value rather than by source string: the string is written for a
-    person to read, and a drawing rule that breaks when an error message is
-    reworded is a trap for whoever rewords it.
-    The outermost anchors *are* the walls, by construction - ``_fixed_positions``
-    pins both bounds and nothing is placed outside them.
+    The outermost anchors are the walls by construction:
+    ``mesh._fixed_positions`` pins both bounds, and nothing is placed outside
+    them. A :class:`DrawnGrid` carries no reason for any of them, so a value is
+    the only thing there is to compare - which is also the only thing worth
+    comparing, a drawing rule that breaks when an error message is reworded
+    being a trap for whoever rewords it.
     """
-    anchors = [pin.position for pin in lines.fixed[dim] if pin.required]
-    if not anchors:
+    anchors = grid.anchors[dim]
+    if len(anchors) == 0:
         return frozenset()
     return frozenset({min(anchors), max(anchors)})
 

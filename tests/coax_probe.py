@@ -17,14 +17,14 @@ the gate - the impedance of a coaxial line depends on the two radii through
 wrong impedance, and the closed form says by how much.
 
 The same line is written at several cell sizes across the annulus, at two
-triangulation finenesses, and at one of those cell sizes at several alignments
-against its own grid. Refining the cell says how the discretisation approaches
-the drawing, which one answer at one mesh cannot; refining the triangulation
-says the drawing is the shape rather than the polygon - chords across a circle
-are inscribed, so a coarse triangulation is a *smaller* inner conductor and a
-*larger* outer one, both of which push the impedance the same way. Moving the
-grid says how much of a difference between two cell sizes is the cell size,
-the rest of it being where the cells happened to fall.
+triangulation finenesses, and at each end of those cell sizes at several
+alignments against its own grid. Refining the cell says how the discretisation
+approaches the drawing, which one answer at one mesh cannot; refining the
+triangulation says the drawing is the shape rather than the polygon - chords
+across a circle are inscribed, so a coarse triangulation is a *smaller* inner
+conductor and a *larger* outer one, both of which push the impedance the same
+way. Moving the grid says how much of a difference between two cell sizes is the
+cell size, the rest of it being where the cells happened to fall.
 
 Only the mesh moves across the sequence. The line as drawn, the ports as drawn
 and the record's length in seconds are the same in every case, because a device
@@ -48,8 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import FreeCAD  # noqa: E402
 import Part  # noqa: E402
 
-from Microwave.Solvers.openems import geometry, lfs, write  # noqa: E402
-from Microwave.Solvers.openems.mesh import MeshParams  # noqa: E402
+from Microwave.Solvers.openems import document, geometry, lfs, plan  # noqa: E402
 from Microwave.Solvers.openems.model import (  # noqa: E402
     THROUGH,
     Frequency,
@@ -59,26 +58,25 @@ from Microwave.Solvers.openems.model import (  # noqa: E402
     Solid,
     Termination,
 )
+from Microwave.Solvers.openems.regions import MeshParams
 from tests.coax import (  # noqa: E402
     BAND_TOP,
     CAP,
-    CONDUCTOR_STEPS,
     DIELECTRIC_RES,
     EPS_R,
     FEED_SHIFT,
-    FINENESSES,
+    INNER,
     INNER_RADIUS,
-    LATTICE_PHASES,
     LENGTH,
     MEASUREMENT_SHIFT,
     OUTER_RADIUS,
     POINTS,
-    REPLICATED_AT,
+    SHIELD,
     SHIELD_WALL,
     SURFACE_FIDELITY,
     annulus_cell,
+    cases,
     conductor_res,
-    phase_case,
     timesteps,
 )
 
@@ -107,9 +105,9 @@ def _shapes():
         )
 
     return (
-        ("Inner", "Copper", Part.makeCylinder(INNER_RADIUS, LENGTH, origin, axis)),
+        (INNER, "Copper", Part.makeCylinder(INNER_RADIUS, LENGTH, origin, axis)),
         ("Insulator", "PTFE", tube(INNER_RADIUS, OUTER_RADIUS)),
-        ("Shield", "Copper", tube(OUTER_RADIUS, OUTER_RADIUS + SHIELD_WALL)),
+        (SHIELD, "Copper", tube(OUTER_RADIUS, OUTER_RADIUS + SHIELD_WALL)),
     )
 
 
@@ -130,6 +128,11 @@ def _geometry(doc, fineness):
     """
     geometry.DEFLECTION_OF_EXTENT = fineness
 
+    # How far each conductor's emitted surface stands from the drawing, in mm,
+    # keyed by the name the envelope carries. Written out beside the envelope so
+    # a gate can score what the translation reports against what the solve did
+    # with it.
+    departures = {}
     solids, bodies = [], []
     for label, material, shape in _shapes():
         obj = _drawn(doc, label, shape)
@@ -149,9 +152,11 @@ def _geometry(doc, fineness):
             solids.append(solid)
             # The solid is asked what form it is in, the way the translation
             # asks it, so this cannot come to disagree with what gets emitted.
-            bodies.append(lfs.Body(piece.label, piece.shape, metal, solid.is_mesh, solid.is_sheet))
+            bodies.append(document.measured_body(piece, metal))
+            if piece.departure is not None and piece.departure.displaced:
+                departures[solid.name] = piece.departure.displaced
         doc.removeObject(obj.Name)
-    return tuple(solids), tuple(bodies)
+    return tuple(solids), tuple(bodies), departures
 
 
 def _ports():
@@ -208,8 +213,10 @@ def _aligned(grid, offset):
     return grid.moved((offset[0] * annulus_cell(grid.x), offset[1] * annulus_cell(grid.y), 0.0))
 
 
-def _problem(doc, fineness, steps, offset) -> Problem:
-    solids, bodies = _geometry(doc, fineness)
+def _problem(doc, fineness, steps, offset) -> tuple[Problem, dict]:
+    """The envelope for one case, and how far its conductors' surfaces stand
+    from the shapes they were drawn as."""
+    solids, bodies, departures = _geometry(doc, fineness)
     materials = (
         Material(name="Copper", kind="pec"),
         Material(name="PTFE", kind="dielectric", epsilon=EPS_R),
@@ -237,7 +244,7 @@ def _problem(doc, fineness, steps, offset) -> Problem:
         fidelity=SURFACE_FIDELITY,
         min_lines=params.min_lines,
     )
-    grid = write.plan_grid(
+    grid = plan.plan_grid(
         solids,
         ports,
         materials,
@@ -246,7 +253,7 @@ def _problem(doc, fineness, steps, offset) -> Problem:
         measured=measured,
     )
     grid = _aligned(grid, offset)
-    return Problem(
+    problem = Problem(
         title=(
             f"coaxial line, conductor cell one {steps}th of the annulus, "
             f"triangulated at {fineness:g} of its extent, lattice at "
@@ -260,38 +267,7 @@ def _problem(doc, fineness, steps, offset) -> Problem:
         boundary=("PML_8",) * 6,
         termination=Termination(max_timesteps=timesteps(grid), end_criteria=0.0),
     )
-
-
-def cases():
-    """Every case, as ``name -> (fineness, conductor steps, lattice offset)``.
-
-    The sequence a rate is read from is one triangulation at each conductor
-    resolution, and it is the *fine* one: a triangulation is a fixed error in
-    millimetres however small the cell gets, so a sequence run on the coarse one
-    would flatten onto the polygon rather than onto the drawing.
-
-    The coarse triangulation is solved at the finest cell of the sequence, which
-    is where the two can differ most - the grid contributes least there, so
-    whatever separates them is the polygonisation and nothing else.
-
-    The rest are one resolution of that sequence solved again at other
-    alignments against its own lattice. A resolution says what size the cells
-    are and nothing about where they fall, so a sequence of one solve apiece
-    varies both at once and reads the difference as the trend. These say how
-    much of it is the alignment.
-    """
-    found = {f"fine-{steps}": (FINENESSES["fine"], steps, (0.0, 0.0)) for steps in CONDUCTOR_STEPS}
-    found[f"coarse-{max(CONDUCTOR_STEPS)}"] = (
-        FINENESSES["coarse"],
-        max(CONDUCTOR_STEPS),
-        (0.0, 0.0),
-    )
-    for offset in LATTICE_PHASES:
-        found[phase_case(offset)] = (FINENESSES["fine"], REPLICATED_AT, offset)
-    # A case is its directory, so two names that collide are one solve reported
-    # twice - and the name rounds the offset it is built from.
-    assert len(found) == len(CONDUCTOR_STEPS) + 1 + len(LATTICE_PHASES), sorted(found)
-    return found
+    return problem, departures
 
 
 def main(out):
@@ -299,7 +275,7 @@ def main(out):
     written = []
     for name, (fineness, steps, offset) in sorted(cases().items()):
         doc = FreeCAD.newDocument(f"coax_{name}")
-        problem = _problem(doc, fineness, steps, offset)
+        problem, departures = _problem(doc, fineness, steps, offset)
         grid = problem.grid
         triangles = sum(len(solid.faces) for solid in problem.solids)
         print(
@@ -312,6 +288,8 @@ def main(out):
         os.makedirs(os.path.join(out, name), exist_ok=True)
         with open(os.path.join(out, name, "openems.json"), "w") as handle:
             json.dump(problem.to_dict(), handle)
+        with open(os.path.join(out, name, "departures.json"), "w") as handle:
+            json.dump(departures, handle)
         written.append(name)
         FreeCAD.closeDocument(doc.Name)
 

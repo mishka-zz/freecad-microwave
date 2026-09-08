@@ -4,33 +4,44 @@
 """Cutting a Manhattan outline into axis-aligned rectangles.
 
 A layout arriving from DXF or drawn in the Sketcher is one outline, and a
-rectilinear grid can hold it perfectly - just not in one piece. This turns the
-outline into the pieces, **exactly**: no fitting, no approximation, and nothing
-that a finer grid would change. A shape that cannot be cut this way is refused
-here rather than approximated, because a best fit is the silent staircase the
-whole check exists to prevent.
+rectilinear grid holds it perfectly once it is cut into pieces. This module
+makes that cut exactly: no fitting, no approximation, and nothing a finer grid
+would change. A shape that cannot be cut this way is refused here rather than
+approximated. A best fit would be the silent staircase this check exists to
+prevent.
 
-Plain coordinates in, rectangles out. No FreeCAD, no numpy, no solver: the
-subject is a sweep over sorted numbers, and keeping it that way is what lets it
-be tested on tuples.
+Plain coordinates in, rectangles out. The module imports no FreeCAD, no numpy
+and no solver. The subject is a sweep over sorted numbers, so the module can be
+tested on tuples.
 
-**The method.** Every vertex coordinate becomes a band boundary, so a segment
-spans a band wholly or not at all and there is no partial case to reason about.
-Within one band the outline's crossings are the u values of the segments running
-through it; sorted and paired even-odd, they *are* the inside intervals - which
-is why there is no point-in-polygon test anywhere here, and why a hole or a
-second disjoint island needs no special case, being simply more crossings.
-Bands that repeat an interval extend one rectangle rather than starting another.
+The method is a sweep in bands. Every vertex coordinate becomes a band boundary,
+so a segment spans a band wholly or not at all and there is no partial case to
+handle. Within one band the outline's crossings are the u values of the segments
+running through it. Sorted and paired even-odd, those crossings are the inside
+intervals, so there is no point-in-polygon test anywhere here, and a hole or a
+second disjoint island is more crossings rather than a special case. Bands that
+repeat an interval extend one rectangle rather than starting another.
 
-**Both ways round.** The sweep runs banded in v and again banded in u, and the
-cheaper answer wins. That is not tidiness: a comb cut across its fingers gives
-one rectangle per finger and one for the spine, cut along them just one per
-finger - and every extra rectangle is a seam, and every seam is grid the user
-pays for on every timestep of every run.
+A crossing walked an even number of times is dropped before the pairing. It
+toggles as often as it is walked, so it never moved a boundary, and pairing it
+would start an interval at a coordinate the metal runs straight through. A
+solid's cross-section is the even-odd of every plane's outline walked so far, so
+a boundary one plane draws is drawn again by every plane standing on it.
+Dropping such a crossing does not always give fewer rectangles: a doubled wall
+can hold two bands' runs into one rectangle that dropping it then splits. What
+it does give is a band whose crossings report where the boundary lies rather
+than how often one was drawn.
+
+The sweep runs both ways round, banded in v and again banded in u, and the
+cheaper answer wins. A comb cut across its fingers gives one rectangle per
+finger and one for the spine; cut along them it gives one per finger. Every
+extra rectangle is a seam, and every seam is grid the user pays for on every
+timestep of every run.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 
 #: A corner, ``(u, v)``.
@@ -48,9 +59,9 @@ class RectilinearError(ValueError):
 def _levels(values: Sequence[float], tolerance: float) -> list[float]:
     """Distinct coordinates, near-equal ones merged, each cluster's smallest.
 
-    The smallest and not the mean: a mean is a coordinate that appears in no
-    edge, and then an edge's span no longer matches a band boundary exactly,
-    which is the one property the whole sweep rests on.
+    The smallest rather than the mean. A mean is a coordinate that appears in no
+    edge, so an edge's span would no longer match a band boundary exactly, and
+    the sweep rests on that match.
     """
     out: list[float] = []
     for value in sorted(values):
@@ -71,15 +82,15 @@ def _sweep(segments: Sequence[Segment], tolerance: float) -> list[Rect]:
     verticals: list[tuple[float, float, float]] = []
     for (u0, v0), (u1, v1) in segments:
         if abs(u0 - u1) <= tolerance:
-            # min and not the midpoint, for the reason `_levels` gives: a mean is
-            # a coordinate that appears in no edge of the drawing.
+            # min rather than the midpoint, for the reason `_levels` gives: a
+            # mean is a coordinate that appears in no edge of the drawing.
             verticals.append((min(u0, u1), min(v0, v1), max(v0, v1)))
 
     if not verticals:
         return []
 
-    # Snapping both axes to their own levels is what makes an interval a
-    # dictionary key: a run repeated in the next band has to compare equal, and
+    # Snapping both axes to their own levels lets an interval serve as a
+    # dictionary key. A run repeated in the next band has to compare equal, and
     # two segments a nanometre apart are one edge of one drawing.
     u_levels = _levels([u for u, _, _ in verticals], tolerance)
     bands = _levels([v for _, low, high in verticals for v in (low, high)], tolerance)
@@ -91,11 +102,16 @@ def _sweep(segments: Sequence[Segment], tolerance: float) -> list[Rect]:
     out: list[Rect] = []
     open_rects: dict[tuple[float, float], float] = {}
     for lower, upper in zip(bands, bands[1:]):
-        crossings = sorted(u for u, low, high in verticals if low <= lower and high >= upper)
+        walked = Counter(u for u, low, high in verticals if low <= lower and high >= upper)
+        crossings = sorted(u for u, times in walked.items() if times % 2)
         if len(crossings) % 2:
+            # Counted on the drawing rather than on what survived the dropping.
+            # A count of what survived is a number nobody can find in their
+            # model. Dropping a coordinate drops an even number of walls, so the
+            # parity is the same on either count.
             raise RectilinearError(
                 f"the outline crosses the band {lower:.6g} to {upper:.6g} an odd "
-                f"number of times ({len(crossings)}), so it is not closed there"
+                f"number of times ({sum(walked.values())}), so it is not closed there"
             )
         runs = {
             (crossings[i], crossings[i + 1]): None
@@ -110,15 +126,15 @@ def _sweep(segments: Sequence[Segment], tolerance: float) -> list[Rect]:
 
     for span, start in open_rects.items():
         out.append((span[0], start, span[1], bands[-1]))
-    return [rect for rect in out if rect[2] - rect[0] > tolerance and rect[3] - rect[1] > tolerance]
+    return out
 
 
 def rectangles(edges: Sequence[Segment], *, tolerance: float) -> list[Rect]:
     """The outline ``edges`` bound, as the fewest axis-aligned rectangles found.
 
     ``edges`` is every edge of every ring - outer wires and inner ones alike,
-    in any order, wound either way. Even-odd pairing does not care, which is
-    the reason for taking them loose rather than as ordered rings.
+    in any order, wound either way. Even-odd pairing ignores both order and
+    winding, so the edges are taken loose rather than as ordered rings.
 
     Raises :class:`RectilinearError` if an edge is not axis-aligned, or if the
     rings do not close.
@@ -144,13 +160,12 @@ def rectangles(edges: Sequence[Segment], *, tolerance: float) -> list[Rect]:
 def _cost(cut: Sequence[Rect]) -> tuple[int, float]:
     """How much grid a cut will cost: pieces first, then the thinnest piece.
 
-    Pieces because each new seam is a plane the mesher has to put a line on.
-    The tie-break is not decoration: two cuts of the same shape into the same
+    Pieces count because each new seam is a plane the mesher has to put a line
+    on. The tie-break matters too. Two cuts of the same shape into the same
     number of rectangles can differ in whether one of them is a sliver, and a
-    piece thinner than ``metal_res`` is treated by the mesher as a feature
-    rather than as an edge - so an arbitrary choice here decides whether a real
-    conductor edge gets its thirds treatment. Widest-thinnest-piece wins, and
-    negated so that ``min`` reads both terms the same way.
+    sliver is two of those lines a sliver apart - one cell that small divides
+    the timestep for the whole domain. The cut with the widest thinnest piece
+    wins, and that term is negated so ``min`` reads both terms the same way.
     """
     if not cut:
         return (0, 0.0)

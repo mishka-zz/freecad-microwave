@@ -34,3 +34,16 @@ htmlcov/
 # What the corpus probe writes when no destination is given. It is rewritten
 # from the CAD kernel on every run, and is megabytes of triangles.
 tests/_corpus/
+
+# An environment or a build put inside the checkout. These carry other people's
+# Python and other people's prose, held to none of the conventions here, and the
+# tests that police the tree read the working tree rather than the index - so
+# what is in the directory and is not ours has to be named somewhere, and this
+# is where. `.git/info/exclude` is the same door for a file that is only yours.
+.venv/
+venv/
+.direnv/
+build/
+dist/
+.eggs/
+*.egg-info/

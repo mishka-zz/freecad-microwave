@@ -4,10 +4,16 @@
 """Properties of a finished grid that hold without any reference to compare to.
 
 Every other mesh test asks whether one grid is right. These ask whether the
-mesher is the same mesher whichever way the model is turned, which is a
+mesher is the same mesher whichever way the model is presented, which is a
 question a single grid cannot answer and which no closed form is needed for:
 draw the structure again on other axes, mirrored, or somewhere else in space,
 and the grid must come back turned the same way.
+
+A rigid motion is not the only presentation. A solid arrives as the boxes it was
+cut into, and the same metal cut another way must mesh the same. That
+dependence is harder to see: the cut leaves every coordinate where it was and
+shows up only as a grid nobody can compare against anything.
+:class:`TestOneSolidCutTwoWays` holds the mesher to it.
 
 That catches a class of defect the per-case tests cannot see. A rule that reads
 one axis where it meant another, a constant that only suits the sizes the
@@ -35,22 +41,40 @@ Nothing here imports openEMS, CSXCAD or FreeCAD.
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass, replace
+from dataclasses import MISSING, dataclass, fields, replace
 
 import numpy as np
 import pytest
 
 import Microwave.Solvers.openems.mesh as mesh
-from Microwave.Solvers.openems.mesh import (
+from Microwave.portbox import FLATNESS
+from Microwave.Solvers.openems.grid import MeshLines
+from Microwave.Solvers.openems.mesh import generate_mesh_lines
+from Microwave.Solvers.openems.metal import (
+    Conductor,
+    _bands,
+    _edge_pair,
+    _edge_size,
+    _face_depth,
+    _grouped_into_conductors,
+    _met_by_metal,
+    _one_pair_at_each_face,
+    conductor_faces,
+    conductor_pieces,
+    conductor_run,
+    edge_lines,
+    width_axes,
+)
+from Microwave.Solvers.openems.regions import (
     DIMENSIONS,
+    EDGE_LINE_INSIDE,
     MaterialClass,
-    MeshLines,
     MeshParams,
     Region,
     SizingRegion,
-    generate_mesh_lines,
 )
 from Microwave.Solvers.openems.sizing import Feature
+from Microwave.Solvers.openems.sizing_field import _symmetrize
 from tests.mesh_fixtures import assert_graded_within
 
 #: How far a *translated* grid's cells may sit from the original's, relative to
@@ -555,7 +579,7 @@ class TestTheModelCanBeTurnedAndMeshedAgain:
         tolerance, and a tolerance that stops scaling stops finding anything.
         """
         folded = []
-        original = mesh._symmetrize
+        original = _symmetrize
         monkeypatch.setattr(
             mesh,
             "_symmetrize",
@@ -717,3 +741,938 @@ class TestTheCatalogueItself:
     def test_the_capped_scene_has_a_ceiling_above_its_bulk(self):
         params = CATALOGUE["capped"]().params
         assert params.ceiling > params.dielectric_res
+
+
+#: Outer span of the hollow box the tilings below partition, per axis, in mm.
+SHELL = (10.0, 10.0, 4.0)
+#: How thick its wall is drawn, in mm. Every tiling's boxes are built from these
+#: two, so a tiling that stopped holding the same metal is a fault in the tiling.
+WALL = 0.5
+
+
+def _metal(lower, upper, label: str) -> Region:
+    return Region(
+        lower=lower, upper=upper, material=MaterialClass.METAL, label=label, material_name="Copper"
+    )
+
+
+def _standing_on_the_floor() -> list[Region]:
+    """A floor spanning the footprint, with four walls standing on it."""
+    x, y, z = SHELL
+    return [
+        _metal((0.0, 0.0, 0.0), (x, y, WALL), "floor"),
+        _metal((0.0, 0.0, WALL), (WALL, y, z), "x low wall"),
+        _metal((x - WALL, 0.0, WALL), (x, y, z), "x high wall"),
+        _metal((WALL, 0.0, WALL), (x - WALL, WALL, z), "y low wall"),
+        _metal((WALL, y - WALL, WALL), (x - WALL, y, z), "y high wall"),
+    ]
+
+
+def _between_two_slabs() -> list[Region]:
+    """The same metal, cut on x first: two full-height slabs with the rest
+    between them."""
+    x, y, z = SHELL
+    return [
+        _metal((0.0, 0.0, 0.0), (WALL, y, z), "x low slab"),
+        _metal((x - WALL, 0.0, 0.0), (x, y, z), "x high slab"),
+        _metal((WALL, 0.0, 0.0), (x - WALL, y, WALL), "floor"),
+        _metal((WALL, 0.0, WALL), (x - WALL, WALL, z), "y low wall"),
+        _metal((WALL, y - WALL, WALL), (x - WALL, y, z), "y high wall"),
+    ]
+
+
+TILINGS = {"standing on the floor": _standing_on_the_floor, "between two slabs": _between_two_slabs}
+
+#: Domain and policy the tilings are meshed in. Clear of the shell on every side
+#: so that no face is excused the edge treatment for sitting at a wall.
+CUT_DOMAIN = ((-5.0, -5.0, -5.0), (15.0, 15.0, 9.0))
+CUT_PARAMS = MeshParams(metal_res=0.4, dielectric_res=2.0)
+
+
+def _occupies(regions, point) -> bool:
+    return any(
+        all(region.lower[d] <= point[d] <= region.upper[d] for d in range(DIMENSIONS))
+        for region in regions
+    )
+
+
+class TestOneSolidCutTwoWays:
+    """Two partitions of one hollow box, which must mesh the same.
+
+    A solid bounded by planes square to the grid reaches the mesher as the boxes
+    it was cut into, and the mesher reads each box on its own - so the cut is a
+    second thing the answer must not depend on, and unlike a rigid motion it
+    leaves the coordinates alone and is invisible in the result.
+
+    A hollow box is the specimen because each of its four side planes has metal
+    of two depths against it: the wall standing on that plane, and the floor
+    running the whole footprint away from it. Which of the two a box against the
+    plane reports is decided by where the sweep cut, and both are true of the
+    metal.
+
+    What a face is worth is read off the piece of metal's own table of faces -
+    :func:`conductor_faces` - rather than off the run of whichever box
+    happened to lie against the plane, so the answer belongs to the metal and
+    the cut reaches it nowhere.
+    """
+
+    def test_the_two_tilings_hold_the_same_metal(self):
+        """A sanity check on the specimen, not a proof of equal regions: the
+        boxes are disjoint, the volumes agree, and a lattice finer than the wall
+        finds the same metal. Without it a tiling drifting off the shell would
+        leave every comparison below green and about two structures."""
+        tilings = [builder() for builder in TILINGS.values()]
+        assert len({tuple(sorted((r.lower, r.upper) for r in one)) for one in tilings}) == len(
+            tilings
+        )
+        for regions in tilings:
+            for one, other in itertools.combinations(regions, 2):
+                assert any(
+                    one.lower[d] >= other.upper[d] - FLATNESS
+                    or other.lower[d] >= one.upper[d] - FLATNESS
+                    for d in range(DIMENSIONS)
+                ), f"{one.label} and {other.label} overlap, so the volumes below prove nothing"
+        volume = [
+            sum(np.prod([region.extent(d) for d in range(DIMENSIONS)]) for region in regions)
+            for regions in tilings
+        ]
+        assert volume[0] == pytest.approx(volume[1], rel=1e-12)
+        # Half the wall, so no lattice line can straddle a wall and miss it.
+        step = WALL / 2.0
+        lattice = [np.arange(-step, SHELL[dim] + 2 * step, step) for dim in range(DIMENSIONS)]
+        for point in itertools.product(*lattice):
+            assert _occupies(tilings[0], point) == _occupies(tilings[1], point), point
+
+    @pytest.mark.parametrize("dim", range(DIMENSIONS))
+    def test_the_two_tilings_pin_the_same_lines(self, dim: int):
+        """The anchors, which is where the cut reaches the grid: a face of the
+        metal is pinned or it is not, and no grading covers the difference."""
+        anchored = []
+        for builder in TILINGS.values():
+            mandatory, _ = mesh._fixed_positions(
+                _grouped_into_conductors(builder()),
+                dim,
+                CUT_DOMAIN[0][dim],
+                CUT_DOMAIN[1][dim],
+                CUT_PARAMS,
+            )
+            anchored.append(sorted({round(position, 9) for position, _ in mandatory}))
+        assert anchored[0] == anchored[1]
+
+    @pytest.mark.parametrize("dim", range(DIMENSIONS))
+    def test_the_two_tilings_give_the_same_grid(self, dim: int):
+        """Cells rather than positions, and to :data:`PLACEMENT` rather than to
+        rounding: the two cuts hand the sizing field different bends, so the
+        integral between two anchors is summed over different pieces and the
+        lines in a gap move. That is the same budget a translation is held to
+        and for the same reason - a gap's count tipping by one. The count is
+        what a solve costs and is asserted exactly."""
+        grids = [
+            generate_mesh_lines(builder(), CUT_DOMAIN, CUT_PARAMS)[dim]
+            for builder in TILINGS.values()
+        ]
+        assert len(grids[0]) == len(grids[1])
+        want = np.diff(grids[0])
+        assert np.max(np.abs(np.diff(grids[1]) - want) / want) <= PLACEMENT
+
+    def test_a_face_of_the_metal_is_resolved_at_the_finest_depth_against_it(self):
+        """The plane at x = 0 has metal of two depths behind it - the wall
+        standing on it, and the floor running the whole footprint away from it -
+        and the wall is what has to be held. Resolving the floor's depth there
+        would put the pair a wall's whole width apart.
+
+        Both regions ask about that plane, and both ask the same thing: the
+        depths belong to the piece of metal, so which box is asked decides
+        nothing."""
+        regions = _standing_on_the_floor()
+        lines = generate_mesh_lines(regions, CUT_DOMAIN, CUT_PARAMS)
+        grouped = _grouped_into_conductors(regions)
+        wall, floor = (
+            next(region for region in grouped.regions if region.label == label)
+            for label in ("x low wall", "floor")
+        )
+        assert _face_depth(wall, 0, False, CUT_PARAMS) == pytest.approx(WALL, abs=0.0)
+        fine = _edge_size(wall, 0, False, CUT_PARAMS)
+        assert _edge_size(floor, 0, False, CUT_PARAMS) == fine
+        # What the floor would ask for on its own run away from that plane,
+        # which is what a face read off the box against it comes to. The same
+        # box grouped by itself, so nothing else is there for it to be part of.
+        alone = _grouped_into_conductors(
+            [region for region in regions if region.label == "floor"]
+        ).regions[0]
+        coarse = _edge_size(alone, 0, False, CUT_PARAMS)
+        assert fine < coarse
+        for cell, present in ((fine, True), (coarse, False)):
+            pair = edge_lines(0.0, -1.0, cell, CUT_PARAMS.edge_line_inside)
+            for position in pair:
+                assert (
+                    bool(np.any(np.isclose(lines.x, position, rtol=0.0, atol=1e-9))) is present
+                ), (position, cell)
+
+    def test_two_blocks_sharing_a_plane_keep_an_edge_each(self):
+        """A face is a plane and a side. Two separate blocks - one ending at the
+        plane from below, one starting from it a few millimetres along - have an
+        edge at that coordinate looking opposite ways, and the void one of them
+        faces is the side the other's metal is on. Two edges, and each is asked
+        for at its own depth."""
+        below = _metal((0.0, 0.0, -2.0), (4.0, 4.0, 0.0), "below")
+        above = _metal((5.0, 0.0, 0.0), (9.0, 4.0, 0.6), "above")
+        domain = ((-6.0, -6.0, -6.0), (15.0, 10.0, 6.0))
+        lines = generate_mesh_lines([below, above], domain, CUT_PARAMS)
+        grouped = _grouped_into_conductors([below, above])
+        sizes = set()
+        for region, outward, at_high in zip(grouped.regions, (1.0, -1.0), (True, False)):
+            cell = _edge_size(region, 2, at_high, CUT_PARAMS)
+            sizes.add(cell)
+            for position in edge_lines(0.0, outward, cell, CUT_PARAMS.edge_line_inside):
+                assert np.any(np.isclose(lines.z, position, rtol=0.0, atol=1e-9)), (
+                    f"{region.label} lost its edge at z = 0"
+                )
+        assert len(sizes) == 2, "both edges ask the same cell, so neither can be dropped"
+
+    @pytest.mark.parametrize("dim", range(DIMENSIONS))
+    def test_every_box_against_one_plane_asks_the_same_cell(self, dim: int):
+        """What lets one pair stand for a whole face: a depth is read off the
+        piece's table, so two boxes of one piece against one plane cannot
+        disagree about what that plane is worth."""
+        for builder in TILINGS.values():
+            asked: dict[tuple[float, bool], set[float]] = {}
+            for region in _grouped_into_conductors(builder()).regions:
+                for at_high in (False, True):
+                    if _face_depth(region, dim, at_high, CUT_PARAMS) is None:
+                        continue
+                    plane = region.upper[dim] if at_high else region.lower[dim]
+                    asked.setdefault((round(plane, 9), at_high), set()).add(
+                        _edge_size(region, dim, at_high, CUT_PARAMS)
+                    )
+            assert asked, "no face asked for anything, so this proves nothing"
+            for face, cells in asked.items():
+                assert len(cells) == 1, (face, cells)
+
+    @pytest.mark.parametrize("sliver", (0.05, 0.1, 0.2))
+    def test_a_thin_piece_against_an_edge_does_not_cost_it_the_treatment(self, sliver: float):
+        """Whether a face gets the thirds rule at all is decided on the extent
+        of the metal, never on the box's own. A cut leaving a piece thinner than
+        the cell against a real edge would otherwise pin a plain line there -
+        which is a line *on* the conductor face, the one placement the rule
+        exists to avoid - while the same strip drawn whole is resolved."""
+        strip = ((0.0, 0.0, 0.0), (4.0, 1.0, 0.05))
+        domain = ((-5.0, -5.0, -5.0), (9.0, 6.0, 5.0))
+        whole = [_metal(*strip, "strip")]
+        cut = [
+            _metal(strip[0], (sliver, strip[1][1], strip[1][2]), "end"),
+            _metal((sliver, 0.0, 0.0), strip[1], "rest"),
+        ]
+        assert sliver < _edge_size(
+            _grouped_into_conductors(cut).regions[0], 0, False, CUT_PARAMS
+        ), "the piece is not thinner than the cell, so nothing here is at stake"
+        anchored = []
+        for regions in (whole, cut):
+            mandatory, _ = mesh._fixed_positions(
+                _grouped_into_conductors(regions), 0, domain[0][0], domain[1][0], CUT_PARAMS
+            )
+            anchored.append(sorted({round(position, 9) for position, _ in mandatory}))
+        assert anchored[0] == anchored[1]
+        # And the pair is really there, so the two do not agree by both losing it.
+        cell = _edge_size(_grouped_into_conductors(whole).regions[0], 0, False, CUT_PARAMS)
+        for position in edge_lines(0.0, -1.0, cell, CUT_PARAMS.edge_line_inside):
+            assert round(position, 9) in anchored[0]
+
+    def test_a_conductor_thinner_than_a_cell_still_gets_plain_faces(self):
+        """The other side of the rule above, and what the extent is read for: a
+        piece of metal that really is thinner than the cell has its two pairs
+        crossing, so both faces are pinned plainly instead. Reading the metal
+        rather than the box does not weaken that - a conductor drawn whole is
+        its own metal."""
+        foil = [_metal((0.0, 0.0, 0.0), (0.2, 4.0, 4.0), "foil")]
+        domain = ((-5.0, -5.0, -5.0), (9.0, 9.0, 9.0))
+        mandatory, _ = mesh._fixed_positions(
+            _grouped_into_conductors(foil), 0, domain[0][0], domain[1][0], CUT_PARAMS
+        )
+        assert sorted({round(position, 9) for position, _ in mandatory}) == [
+            domain[0][0],
+            0.0,
+            0.2,
+            domain[1][0],
+        ]
+
+
+class TestWhatGroupingHandsOn:
+    """:func:`_grouped_into_conductors` produces the one value the grid is
+    built from, so what it carries forward is the whole of what the drawing
+    said about a box plus what it worked out about the metal."""
+
+    def test_a_conductor_carries_the_region_it_was_made_from_whole(self):
+        """Grouping copies a region field by field, so a field added to
+        :class:`regions.Region` with a default and not copied is lost without a
+        word: the box meshes at that default instead of at what was drawn. A
+        field with no default raises instead, and the checker names it. Asked of
+        the fields rather than of a list written here, so the day the first
+        happens this fails rather than the grid moving."""
+        drawn = Region(
+            lower=(0.0, 0.0, 0.0),
+            upper=(4.0, 2.0, 0.5),
+            material=MaterialClass.METAL,
+            label="drawn",
+            material_name="Copper",
+            size=0.3,
+            continuous=frozenset({1}),
+            drawn=(9.0, 2.0, 0.5),
+            relaxed_to=0.7,
+        )
+        settled = [
+            (
+                field.name,
+                field.default if field.default_factory is MISSING else field.default_factory(),
+            )
+            for field in fields(Region)
+            if not (field.default is MISSING and field.default_factory is MISSING)
+        ]
+        assert all(getattr(drawn, name) != default for name, default in settled), (
+            "a field left at its default reads the same carried or dropped"
+        )
+        carried = _grouped_into_conductors([drawn]).regions[0]
+        for field in fields(Region):
+            assert getattr(carried, field.name) == getattr(drawn, field.name), field.name
+
+    def test_a_region_that_is_not_metal_is_handed_on_as_it_arrived(self):
+        """Only metal has a piece to belong to, so a dielectric comes back the
+        object that went in rather than a copy of it.
+
+        Drawn with metal beside it, because a list holding no metal at all is
+        handed straight back and would prove this of a route nothing takes."""
+        board = Region(
+            lower=(-8.0, -8.0, 0.0),
+            upper=(8.0, 8.0, 1.6),
+            material=MaterialClass.DIELECTRIC,
+            label="Substrate",
+        )
+        ground = _metal((-8.0, -8.0, 0.0), (8.0, 8.0, 0.0), "GroundPlane")
+        handed = _grouped_into_conductors([board, ground]).regions
+        assert handed[0] is board
+        assert isinstance(handed[1], Conductor)
+
+
+class TestWhichPairsSurviveAtOneFace:
+    """:func:`_one_pair_at_each_face` on its own, which is where the rule
+    that collapses a face's pairs is stated.
+
+    A pure function of a list, so the awkward arrangements - two sides at one
+    coordinate, two conductors at one coordinate, coordinates a hair apart - are
+    written down rather than searched for in a structure that produces them.
+
+    Every pair here asks the same cell, because that is what the mesher hands
+    it: a depth is read off the piece of metal, so which box asked cannot
+    change the answer. What survives is therefore never decided by a size, and
+    a specimen that varied one would be testing a distinction the caller cannot
+    make.
+    """
+
+    @staticmethod
+    def _pair(edge: float, cell: float, region: Conductor, outward: float = -1.0):
+        inside, outside = edge_lines(edge, outward, cell, CUT_PARAMS.edge_line_inside)
+        return (edge, inside, outside, region)
+
+    @staticmethod
+    def _piece(lower, upper, label: str, piece: int = 0) -> Conductor:
+        """One box of a conductor, as ``_grouped_into_conductors`` hands it on.
+
+        Grouped on its own, so its run, its faces and its extent are the box's
+        own and nothing is written here that the grouping would not produce.
+        The piece is then set, because whether two boxes are one conductor is
+        what these specimens vary and drawing them touching would settle it
+        somewhere else."""
+        alone = _grouped_into_conductors([_metal(lower, upper, label)]).regions[0]
+        return replace(alone, piece=piece)
+
+    def test_the_pairs_come_back_in_the_order_they_arrived(self):
+        """The anchors are built in this order and :func:`mesh._snap` keeps the
+        first at a coincident position, so the order decides which box a face is
+        named after in a refusal and in the report."""
+        one = self._piece((0.0, 0.0, 0.0), (4.0, 4.0, 1.0), "one", piece=0)
+        two = self._piece((9.0, 0.0, 0.0), (13.0, 4.0, 1.0), "two", piece=1)
+        given = [self._pair(9.0, 0.2, two), self._pair(0.0, 0.2, one)]
+        assert [candidate[3].label for candidate in _one_pair_at_each_face(given)] == [
+            "two",
+            "one",
+        ]
+
+    def test_two_sides_of_one_plane_survive_whatever_order_they_arrive_in(self):
+        """Interleaved, so a rule that only looks at the pair it kept last sees a
+        face of the other side between two of this one and starts again."""
+        piece = self._piece((0.0, 0.0, -2.0), (4.0, 4.0, 2.0), "step")
+        given = [
+            self._pair(0.0, 0.2, piece, outward=-1.0),
+            self._pair(0.0, 0.2, piece, outward=1.0),
+            self._pair(0.0, 0.2, piece, outward=-1.0),
+        ]
+        kept = _one_pair_at_each_face(given)
+        assert sorted(outside > inside for _, inside, outside, _ in kept) == [False, True]
+
+    def test_a_conductor_the_metal_does_not_reach_keeps_its_own_pair(self):
+        """A face is answered by lines the same metal asked for. Otherwise the
+        cell at one conductor is decided by an unrelated object elsewhere in the
+        model, and moves when that object is drawn a nanometre further off."""
+        near = self._piece((0.0, 0.0, 0.0), (20.0, 10.0, 2.0), "ground", piece=0)
+        far = self._piece((26.0, 0.0, 0.0), (28.0, 2.0, 0.6), "pad", piece=1)
+        given = [self._pair(0.0, 0.15, near), self._pair(0.0, 0.15, far)]
+        assert len(_one_pair_at_each_face(given)) == 2
+
+    def test_faces_the_kernel_can_tell_apart_stay_two_faces(self):
+        """The merge is for one plane read off two boxes, which agree to the
+        kernel's own tolerance and no worse. Two features a fiftieth of a
+        millimetre apart are two features and each keeps its edge."""
+        piece = self._piece((0.0, 0.0, 0.0), (4.0, 4.0, 1.0), "piece")
+        given = [self._pair(0.0, 0.2, piece), self._pair(0.02, 0.2, piece)]
+        assert len(_one_pair_at_each_face(given)) == 2
+
+    def test_one_plane_read_off_two_boxes_is_one_face(self):
+        """The other side of it: a coordinate that differs only in the last bits
+        of the kernel's arithmetic is not two faces."""
+        piece = self._piece((0.0, 0.0, 0.0), (4.0, 4.0, 1.0), "piece")
+        given = [self._pair(0.0, 0.2, piece), self._pair(1e-9, 0.2, piece)]
+        assert len(_one_pair_at_each_face(given)) == 1
+
+    def test_a_run_the_piece_reaches_only_through_another_is_still_one_face(self):
+        """A piece of metal arrives as several runs and two of them need not meet
+        each other; a third meeting both is what makes them one. Being one piece
+        is walked rather than tested, so all three are one face here however far
+        apart the arms sit."""
+        low = self._piece((0.0, 0.0, 0.0), (4.0, 4.0, 4.0), "low arm")
+        middle = self._piece((0.0, 0.0, 0.0), (12.0, 4.0, 1.0), "spine")
+        high = self._piece((8.0, 0.0, 0.0), (12.0, 4.0, 4.0), "high arm")
+        given = [
+            self._pair(0.0, 0.2, low),
+            self._pair(0.0, 0.2, high),
+            self._pair(0.0, 0.2, middle),
+        ]
+        assert len(_one_pair_at_each_face(given)) == 1
+
+    @pytest.mark.parametrize("dim", range(DIMENSIONS))
+    def test_a_block_drawn_in_pieces_meshes_as_the_block(self, dim: int):
+        """The case a single neighbour cannot answer: the plate's continuation
+        upward is two pads and neither covers it, so a run read off one box
+        reports a third of the metal that is there. Drawn whole, drawn as a plate
+        with two pads on it, and drawn as two half plates under one top."""
+        block = [_metal((0.0, 0.0, 0.0), (10.0, 10.0, 3.0), "whole")]
+        plate_and_pads = [
+            _metal((0.0, 0.0, 0.0), (10.0, 10.0, 1.0), "plate"),
+            _metal((0.0, 0.0, 1.0), (5.0, 10.0, 3.0), "pad a"),
+            _metal((5.0, 0.0, 1.0), (10.0, 10.0, 3.0), "pad b"),
+        ]
+        halves_and_top = [
+            _metal((0.0, 0.0, 0.0), (5.0, 10.0, 1.0), "half a"),
+            _metal((5.0, 0.0, 0.0), (10.0, 10.0, 1.0), "half b"),
+            _metal((0.0, 0.0, 1.0), (10.0, 10.0, 3.0), "top"),
+        ]
+        grids = [
+            generate_mesh_lines(drawing, CUT_DOMAIN, CUT_PARAMS)[dim]
+            for drawing in (block, plate_and_pads, halves_and_top)
+        ]
+        for other in grids[1:]:
+            assert len(other) == len(grids[0])
+            assert np.max(np.abs(np.diff(other) - np.diff(grids[0])) / np.diff(grids[0])) <= (
+                PLACEMENT
+            )
+
+    def test_and_no_single_neighbour_covers_that_plate(self):
+        """Without this the case above is three drawings of a block that any rule
+        would agree about."""
+        boxes = [
+            ((0.0, 0.0, 0.0), (10.0, 10.0, 1.0)),
+            ((0.0, 0.0, 1.0), (5.0, 10.0, 3.0)),
+            ((5.0, 0.0, 1.0), (10.0, 10.0, 3.0)),
+        ]
+        covering = [
+            box
+            for box in boxes[1:]
+            if all(box[0][a] <= FLATNESS and box[1][a] >= 10.0 - FLATNESS for a in (0, 1))
+        ]
+        assert not covering
+        assert conductor_run(boxes[0][0], boxes[0][1], boxes, 2) == (0.0, 3.0)
+
+
+class TestWhatARunIsMeasuredOver:
+    """:func:`conductor_run` on its own: the cross-section it divides, and
+    the two ways dividing it wrongly hides a conductor rather than failing."""
+
+    def test_a_conductor_with_no_thickness_still_has_a_run(self):
+        """A sheet's cross-section is a plane, so it has no bands unless a span
+        of no width counts as one. Without that the minimum is taken over
+        nothing, every sheet reports itself unbounded, and every one of them
+        quietly loses the edge treatment while the run completes."""
+        sheet = ((0.0, 0.0, 0.0), (4.0, 6.0, 0.0))
+        assert conductor_run(sheet[0], sheet[1], [sheet], 0) == (0.0, 4.0)
+        assert conductor_run(sheet[0], sheet[1], [sheet], 2) == (0.0, 0.0)
+
+    def test_two_sheets_butted_in_their_own_plane_are_one_run(self):
+        near = ((0.0, 0.0, 0.0), (4.0, 6.0, 0.0))
+        far = ((4.0, 0.0, 0.0), (9.0, 6.0, 0.0))
+        assert conductor_run(near[0], near[1], [near, far], 0) == (0.0, 9.0)
+
+    def test_metal_merely_alongside_does_not_carry_a_run_on(self):
+        """What carries a run on is covering a band's middle, not touching the
+        cross-section. A neighbour lying against this box's side is beside it,
+        and a rule that counted it would grow a run along a face two conductors
+        happen to share."""
+        strip = ((0.0, 0.0, 0.0), (4.0, 2.0, 1.0))
+        alongside = ((0.0, 2.0, 0.0), (9.0, 4.0, 1.0))
+        assert conductor_run(strip[0], strip[1], [strip, alongside], 0) == (0.0, 4.0)
+
+    def test_a_neighbour_a_hair_out_of_line_still_carries_the_run(self):
+        """Two faces the kernel cannot separate are one face. They do divide the
+        cross-section into a band narrower than that, and what keeps the run
+        whole across it is that covering a middle is asked to within FLATNESS -
+        so both neighbours cover the sliver between them. Without that, every
+        run would stop at its own box: finer everywhere, and looking like the
+        fault this rule removes rather than like a bug."""
+        plate = ((0.0, 0.0, 0.0), (4.0, 4.0, 1.0))
+        near = ((0.0, 0.0, 1.0), (2.0, 4.0, 3.0))
+        far = ((2.0 + FLATNESS / 2.0, 0.0, 1.0), (4.0, 4.0, 3.0))
+        assert conductor_run(plate[0], plate[1], [plate, near, far], 2) == (0.0, 3.0)
+
+    def test_a_face_met_by_two_metals_is_pinned_for_the_one_that_differs(self):
+        """Once the metal past a face may be several regions, which of them is
+        named stops being arbitrary: the caller pins a plain line where the
+        material differs and nothing where it does not, and a property boundary
+        with no line on it moves by up to a cell. So the odd one out is the one
+        to name, whichever order the regions arrive in."""
+        plate = _metal((0.0, 0.0, 0.0), (4.0, 4.0, 1.0), "plate")
+        same = replace(_metal((0.0, 0.0, 1.0), (2.0, 4.0, 3.0), "same metal"))
+        other = replace(
+            _metal((2.0, 0.0, 1.0), (4.0, 4.0, 3.0), "other metal"), material_name="PEC"
+        )
+        for order in ([plate, same, other], [plate, other, same]):
+            grouped = _grouped_into_conductors(order)
+            met = _met_by_metal(grouped.regions[0], grouped, 2, True)
+            assert met is not None and met.material_name == "PEC"
+
+    def test_and_a_face_met_by_one_metal_throughout_names_that_one(self):
+        plate = _metal((0.0, 0.0, 0.0), (4.0, 4.0, 1.0), "plate")
+        halves = [
+            _metal((0.0, 0.0, 1.0), (2.0, 4.0, 3.0), "half a"),
+            _metal((2.0, 0.0, 1.0), (4.0, 4.0, 3.0), "half b"),
+        ]
+        grouped = _grouped_into_conductors([plate, *halves])
+        met = _met_by_metal(grouped.regions[0], grouped, 2, True)
+        assert met is not None and met.material_name == plate.material_name
+
+    def test_a_face_outside_the_cross_section_is_not_a_band_boundary(self):
+        """A neighbour may reach into the cross-section and go on well past it,
+        and where it ends outside says nothing about what covers the inside. A
+        band boundary there puts a middle outside the cross-section, and the run
+        is then read off metal this box has no face against."""
+        assert _bands(0.0, 4.0, [-3.0, 2.0, 9.0]) == [(0.0, 2.0), (2.0, 4.0)]
+        assert _bands(0.0, 4.0, [-3.0, 9.0]) == [(0.0, 4.0)]
+
+    def test_a_band_boundary_sits_at_both_faces_of_a_neighbour(self):
+        """A run is read at one point per band, so a band must not straddle a
+        place where coverage changes. Taking boundaries from a neighbour's near
+        face alone leaves the far one inside a band: here a single pad covers
+        half the plate, and a band spanning both halves reads the covered half
+        and reports the plate three times as deep as it is."""
+        plate = ((0.0, 0.0, 0.0), (4.0, 4.0, 1.0))
+        pad = ((0.0, 0.0, 1.0), (2.0, 4.0, 3.0))
+        assert conductor_run(plate[0], plate[1], [plate, pad], 2) == (0.0, 1.0)
+
+    def test_metal_ending_at_a_face_is_not_past_it(self):
+        """A region flush with the face lies on this side and covers nothing
+        beyond, so it cannot be what the metal past the face is made of - and
+        naming it would pin a line on a seam that is copper on both sides."""
+        plate = _metal((0.0, 0.0, 0.0), (4.0, 4.0, 1.0), "plate")
+        above = _metal((0.0, 0.0, 1.0), (4.0, 4.0, 3.0), "above")
+        under = replace(_metal((0.0, 0.0, -1.0), (2.0, 4.0, 1.0), "under"), material_name="PEC")
+        grouped = _grouped_into_conductors([plate, above, under])
+        met = _met_by_metal(grouped.regions[0], grouped, 2, True)
+        assert met is not None and met.material_name == plate.material_name
+
+    def test_metal_alongside_is_not_metal_past_the_face(self):
+        """A conductor sharing only a plane with this one lies over none of its
+        face, so what it is made of says nothing about that face. Otherwise a
+        copper seam gets a line pinned on it because somebody drew a PEC block
+        beside it, and the grid moves with a distant object."""
+        lower = _metal((0.0, 0.0, 0.0), (4.0, 4.0, 1.0), "lower half")
+        upper = _metal((0.0, 0.0, 1.0), (4.0, 4.0, 2.0), "upper half")
+        beside = replace(_metal((4.0, 0.0, 0.0), (8.0, 4.0, 2.0), "beside"), material_name="PEC")
+        for regions in ([lower, upper], [lower, upper, beside]):
+            grouped = _grouped_into_conductors(regions)
+            met = _met_by_metal(grouped.regions[0], grouped, 2, True)
+            assert met is not None and met.material_name == lower.material_name
+
+    def test_a_chain_that_closes_through_a_joined_pair_is_one_piece(self):
+        """Connectedness is not pairwise, so it is walked rather than tested:
+        two boxes that touch nothing of each other are one piece once a third
+        touches both, and joining anything but the two chains' own
+        representatives splits what was already joined."""
+        boxes = [
+            ((2.0, 2.0, 3.0), (3.0, 3.0, 4.0)),
+            ((2.0, 2.0, 2.0), (4.0, 4.0, 4.0)),
+            ((3.0, 3.0, 1.0), (4.0, 4.0, 2.0)),
+            ((3.0, 1.0, 3.0), (4.0, 2.0, 4.0)),
+        ]
+        assert len(set(conductor_pieces(boxes))) == 1
+
+    def test_a_conductor_touching_nothing_is_its_own_piece(self):
+        boxes = [((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)), ((9.0, 9.0, 9.0), (10.0, 10.0, 10.0))]
+        assert len(set(conductor_pieces(boxes))) == 2
+
+    def test_a_decomposed_conductor_pins_no_seam(self):
+        """One strip cut into three boxes, and no line at either cut.
+
+        Where the metal ends is read off what grouping filled in, so the run
+        spans the whole strip and neither cut is a face of anything. The
+        absorber's own pass asks the same question of the same regions and gets
+        the same answer, which is what makes a decomposed conductor mesh as the
+        shape it was cut from."""
+        strip = [
+            _metal((0.0, 0.0, 0.0), (3.0, 1.0, 0.2), "a"),
+            _metal((3.0, 0.0, 0.0), (6.0, 1.0, 0.2), "b"),
+            _metal((6.0, 0.0, 0.0), (9.0, 1.0, 0.2), "c"),
+        ]
+        grouped = _grouped_into_conductors(strip)
+        pinned, _ = mesh._fixed_positions(grouped, 0, -5.0, 14.0, CUT_PARAMS)
+        assert not [
+            source for _, source in pinned if "edge at 3" in source or "edge at 6" in source
+        ]
+
+
+class TestWhatFacesAPieceOfMetalHas:
+    """:func:`conductor_faces` on its own: which planes a piece of metal
+    ends at along an axis, and how deep it is behind each.
+
+    A run says how far the metal reaches everywhere across a box, which is a
+    width; a face is open over only part of that cross-section, and how deep the
+    metal is behind the open part is a different number and the one a thirds
+    pair is sized from. Asking it of the piece is what makes it independent of
+    the cut.
+    """
+
+    @staticmethod
+    def _faces(boxes, dim):
+        return {
+            (face.plane, face.at_high): face.depths for face in conductor_faces(boxes, boxes, dim)
+        }
+
+    def test_one_box_has_its_own_two_faces(self):
+        box = ((0.0, 0.0, 0.0), (4.0, 6.0, 1.0))
+        assert self._faces([box], 0) == {(0.0, False): (4.0,), (4.0, True): (4.0,)}
+
+    def test_a_plane_two_boxes_are_cut_at_is_not_a_band_of_its_own(self):
+        """A decomposed solid puts several boxes' faces at one coordinate, so the
+        cuts a cross-section is divided at arrive repeated. Divided at one twice,
+        the band left between the two is the plane itself - and a band stands for
+        the coverage at its middle, so the metal on *both* sides answers there
+        and the run comes back deeper than any column the metal has.
+
+        :func:`conductor_run` never saw it, taking the shallowest band and
+        never the deepest; reading each band's ends is what makes it visible."""
+        low = ((0.0, 0.0, 0.0), (1.0, 1.0, 2.0))
+        near = ((1.0, 0.0, 0.0), (2.0, 1.0, 1.0))
+        far = ((2.0, 0.0, 1.0), (3.0, 1.0, 2.0))
+        boxes = [low, near, far]
+        assert _bands(0.0, 2.0, [end[2] for box in boxes for end in box]) == [
+            (0.0, 1.0),
+            (1.0, 2.0),
+        ]
+        # Below z = 1 the metal runs x 0..2; above it, 0..1 and 2..3. Nothing is
+        # three deep, and the plane at z = 1 is where a run of three came from.
+        assert self._faces(boxes, 0)[(0.0, False)] == (1.0, 2.0)
+        assert self._faces(boxes, 0)[(3.0, True)] == (1.0,)
+
+    def test_a_seam_is_not_a_face(self):
+        """Two conductors butted face to face are one piece of metal, so the
+        plane where they meet is a boundary of nothing and the run behind either
+        end is the whole of it."""
+        near = ((0.0, 0.0, 0.0), (2.0, 1.0, 1.0))
+        far = ((2.0, 0.0, 0.0), (5.0, 1.0, 1.0))
+        assert self._faces([near, far], 0) == {(0.0, False): (5.0,), (5.0, True): (5.0,)}
+
+    def test_a_plane_a_face_of_the_metal_in_several_places_carries_each_depth(self):
+        """A comb's teeth all end on their own planes and all start on one. The
+        plane they start on is a face nowhere - the spine is behind it - but the
+        depths behind each tooth's own end differ, and a single number for the
+        plane would be one tooth's answer given to the others."""
+        spine = ((0.0, 0.0, 0.0), (6.0, 1.0, 1.0))
+        teeth = [((2.0 * k, 1.0, 0.0), (2.0 * k + 1.0, 2.0 + k, 1.0)) for k in range(3)]
+        assert self._faces([spine, *teeth], 1) == {
+            # The spine alone between two teeth, and each tooth over it.
+            (0.0, False): (1.0, 2.0, 3.0, 4.0),
+            # The spine's own top, where no tooth stands on it.
+            (1.0, True): (1.0,),
+            **{(2.0 + k, True): (2.0 + k,) for k in range(3)},
+        }
+
+    def test_the_depth_behind_a_face_is_not_the_run_across_the_box(self):
+        """The two numbers side by side, on the shape that separates them. The
+        plate's continuation upward is two pads and neither covers its whole
+        cross-section, so the run stops at the plate - while the metal behind
+        the plane at the bottom is the block's full height."""
+        plate = ((0.0, 0.0, 0.0), (10.0, 10.0, 1.0))
+        pads = [((0.0, 0.0, 1.0), (5.0, 10.0, 3.0)), ((5.0, 0.0, 1.0), (10.0, 10.0, 3.0))]
+        boxes = [plate, *pads]
+        assert self._faces(boxes, 2)[(0.0, False)] == (3.0,)
+        assert conductor_run(plate[0], plate[1], boxes, 2) == (0.0, 3.0)
+
+    def test_a_depth_no_width_can_be_read_off_does_not_decide_a_plane(self):
+        """One piece of metal can end on one plane in two places, and one of them
+        be a fin thinner than a cell. The fin is getting plain lines of its own -
+        there is no share of it to hold - so letting its depth decide the plane
+        would size the arm's pair from metal that is not asking for one, and the
+        cell would come out a fraction of anything the policy named."""
+        arm = _metal((0.0, 0.0, 0.0), (10.0, 2.0, 1.0), "arm")
+        fin = _metal((0.0, 0.0, 1.0), (0.05, 2.0, 5.0), "fin")
+        assert self._faces([(arm.lower, arm.upper), (fin.lower, fin.upper)], 0)[(0.0, False)] == (
+            0.05,
+            10.0,
+        )
+        # Both boxes have a face on that plane and both are answered by the arm's
+        # depth, which is what makes one pair able to stand for the plane: a box
+        # with nothing to hold asks for what the plane asks for rather than for
+        # something of its own.
+        for region in _grouped_into_conductors([arm, fin]).regions:
+            assert _face_depth(region, 0, False, CUT_PARAMS) == 10.0
+            assert _edge_size(region, 0, False, CUT_PARAMS) == CUT_PARAMS.metal_res
+
+    def test_a_face_is_answered_by_its_own_piece_of_metal(self):
+        """Two conductors ending on one plane far apart. A table built over both
+        would hand the pad's depth to the ground plane, and the cell at a ground
+        plane would then move when an unrelated object was drawn a little
+        shorter."""
+        plane = _metal((0.0, 0.0, 0.0), (20.0, 10.0, 1.0), "ground")
+        pad = _metal((0.0, 20.0, 0.0), (2.0, 22.0, 1.0), "pad")
+        ground, pad_only = _grouped_into_conductors([plane, pad]).regions
+        assert ground.piece != pad_only.piece
+        assert _face_depth(ground, 0, False, CUT_PARAMS) == 20.0
+        assert _face_depth(pad_only, 0, False, CUT_PARAMS) == 2.0
+
+    def test_a_seam_band_cannot_talk_a_face_out_of_its_treatment(self):
+        """Whether an axis is a width is a question about the piece of metal, and
+        the box's *run* is not that: a run is the intersection over the box's
+        cross-section, so a box whose face is part seam reports a run narrower
+        than every column of the metal - and narrower than a cell, on which the
+        face is declined and pinned plainly. Which is a line on a conductor face
+        with a width of metal behind it, and the cut decides whether it happens.
+
+        A Z of three steps, cut two ways, every step just under a cell - which
+        is the regime the question lives in."""
+        step = 0.35
+        shape = {
+            "on the middle": [
+                ((0.0, 1 * step, 0.0), (step, 2 * step, 2 * step)),
+                ((0.0, 2 * step, 1 * step), (step, 3 * step, 2 * step)),
+                ((0.0, 0.0, 0.0), (step, 1 * step, 1 * step)),
+            ],
+            "on the slab": [
+                ((0.0, 0.0, 0.0), (step, 2 * step, 1 * step)),
+                ((0.0, 1 * step, 1 * step), (step, 2 * step, 2 * step)),
+                ((0.0, 2 * step, 1 * step), (step, 3 * step, 2 * step)),
+            ],
+        }
+        anchored = []
+        for name, boxes in shape.items():
+            regions = [
+                _metal(lower, upper, f"{name} {n}") for n, (lower, upper) in enumerate(boxes)
+            ]
+            grouped = _grouped_into_conductors(regions)
+            assert any(
+                width_axes(region.run[0], region.run[1], CUT_PARAMS.metal_res)
+                != width_axes(region.piece_box[0], region.piece_box[1], CUT_PARAMS.metal_res)
+                for region in grouped.regions
+            ), f"{name}: no box's run disagrees with the piece, so nothing here is at stake"
+            mandatory, _ = mesh._fixed_positions(grouped, 1, -5.0, 5.0, CUT_PARAMS)
+            anchored.append(sorted(round(position, 9) for position, _ in mandatory))
+        assert anchored[0] == anchored[1]
+        # And both resolve the two faces rather than agreeing by pinning them.
+        assert 2 * step not in anchored[0] and step not in anchored[0]
+
+    @pytest.mark.parametrize("dim", range(DIMENSIONS))
+    def test_the_two_tilings_have_the_same_faces(self, dim: int):
+        """The property the whole of it is for, asserted on the table rather than
+        on the grid it ends up in."""
+        tables = [
+            self._faces([(region.lower, region.upper) for region in builder()], dim)
+            for builder in TILINGS.values()
+        ]
+        assert tables[0] == tables[1]
+
+
+class TestTheTwoInnerLinesCannotCross:
+    """The one thing a region's *own* extent still decides.
+
+    Each thirds pair puts its inner line a share of a cell inside the metal, so
+    two of them meet when the region is thinner than those two shares together.
+    Where the share is small the arithmetic cannot reach it - a face is only an
+    edge on an axis the conductor is wider than a cell of, and the share is a
+    fraction of that cell - so the guard is reachable only where the share is
+    most of the cell, which is what makes it a policy rather than a constant.
+    """
+
+    BLOCK = [_metal((0.0, 0.0, 0.0), (0.5, 4.0, 4.0), "block")]
+    DOMAIN = (-5.0, 6.0)
+
+    def _anchors(self, inside: float):
+        params = replace(CUT_PARAMS, edge_line_inside=inside)
+        mandatory, _ = mesh._fixed_positions(
+            _grouped_into_conductors(self.BLOCK), 0, *self.DOMAIN, params
+        )
+        return sorted(round(position, 6) for position, _ in mandatory)
+
+    def test_at_the_default_share_both_faces_are_resolved(self):
+        assert self._anchors(EDGE_LINE_INSIDE) == [-5.0, -0.025, 0.0125, 0.4875, 0.525, 6.0]
+
+    def test_at_a_share_that_would_cross_both_faces_are_pinned_plainly(self):
+        """Nothing is refused and no pair is placed on top of another: the faces
+        are held where they are, which is what a grid can still say about them."""
+        assert self._anchors(0.96) == [-5.0, 0.0, 0.5, 6.0]
+
+
+class TestWhatOneFaceIsAsked:
+    """:func:`metal._edge_pair` is the one question the pinning and the edge
+    demand both put about a conductor face, so what it may be asked about is
+    wider than what either caller goes on to use."""
+
+    #: A plate thinner than the cell the policy asks for at metal, so z is not a
+    #: width the grid resolves and the thirds rule does not apply across it.
+    FOIL = ((-4.0, -4.0, 0.0), (4.0, 4.0, 0.1))
+
+    def _pair(self, dim: int, at_high: bool):
+        grouped = _grouped_into_conductors([_metal(*self.FOIL, "Foil")])
+        region = grouped.regions[0]
+        return region, _edge_pair(region, grouped, dim, at_high, CUT_PARAMS, -50.0, 50.0)
+
+    def test_a_face_on_an_axis_that_is_not_a_width_is_still_given_a_verdict(self):
+        """The verdict is the metal\'s own and is reached without a depth. The
+        pinning asks for it first and drops the face afterwards on the depth, so
+        a helper that answered only where there was a width would leave the
+        thirds rule deciding on a value nobody computed."""
+        region, face = self._pair(2, False)
+        assert _face_depth(region, 2, False, CUT_PARAMS) is None, (
+            "the foil is thicker than a cell here, so z is a width and this is "
+            "not the case the test is about"
+        )
+        assert face.resolve is True
+
+    def test_the_inner_line_of_the_pair_is_the_one_in_the_metal(self):
+        """Both callers read the two by name, and swapping them would put the
+        conductor face a whole cell from where it was drawn."""
+        for dim in range(DIMENSIONS):
+            for at_high in (False, True):
+                region, face = self._pair(dim, at_high)
+                assert min(face.inside, face.outside) < face.position, (dim, at_high)
+                assert face.position < max(face.inside, face.outside), (dim, at_high)
+                assert (face.inside < face.position) is at_high, (dim, at_high)
+
+
+class TestWhatAnAxisAnchorsOn:
+    """:func:`mesh._fixed_positions` on the two things its answer turns on that
+    no grid can show: what the thirds rule was judged against, and which of two
+    coincident anchors names the line."""
+
+    def test_one_pair_is_not_crowded_by_another(self):
+        """The pairs are judged against what the axis pinned before any of them
+        was laid. Judged against a running list instead, a face keeps its pair
+        or gives it up according to the order the regions arrived in, and the
+        conductor drawn second is meshed worse than the one drawn first.
+
+        The gap is narrower than the cell at these faces, so each conductor's
+        outer line stands inside the other's pair."""
+        pair = [
+            _metal((-3.1, -2.0, -2.0), (-0.1, 2.0, 2.0), "left"),
+            _metal((0.1, -2.0, -2.0), (3.1, 2.0, 2.0), "right"),
+        ]
+        mandatory, _ = mesh._fixed_positions(
+            _grouped_into_conductors(pair), 0, -8.0, 8.0, CUT_PARAMS
+        )
+        placed = {source: position for position, source in mandatory}
+        assert (
+            placed["'right' edge at 0.1, outside"]
+            < placed["'left' edge at -0.1, outside"]
+            < placed["'right' edge at 0.1, inside"]
+        ) and (
+            placed["'left' edge at -0.1, inside"]
+            < placed["'right' edge at 0.1, outside"]
+            < placed["'left' edge at -0.1, outside"]
+        ), "the two pairs do not reach each other, so nothing here is at stake"
+        assert sorted(source for source in placed if "edge at -0.1" in source) == [
+            "'left' edge at -0.1, inside",
+            "'left' edge at -0.1, outside",
+        ]
+        assert sorted(source for source in placed if "edge at 0.1" in source) == [
+            "'right' edge at 0.1, inside",
+            "'right' edge at 0.1, outside",
+        ]
+
+    def test_a_face_drawn_on_the_domain_wall_is_named_for_the_wall(self):
+        """Two anchors at one coordinate are one line, and :func:`mesh._snap`
+        keeps the first the axis offered. The walls are offered first, so a
+        refusal and a report name the wall rather than whatever was drawn
+        against it."""
+        pad = [_metal((0.0, -2.0, -2.0), (0.1, 2.0, 2.0), "pad")]
+        mandatory, preferred = mesh._fixed_positions(
+            _grouped_into_conductors(pad), 0, -5.0, 0.1, CUT_PARAMS
+        )
+        assert (0.1, "'pad' face at the domain wall") in mandatory, (
+            "the pad's face is not pinned on the wall, so no two anchors coincide"
+        )
+        named = {
+            line.position: line.source
+            for line in mesh._snap(mandatory, preferred, CUT_PARAMS.floor, 0)
+        }
+        assert named[0.1] == "domain upper bound"
+
+    def test_a_plane_read_off_two_boxes_is_answered_once(self):
+        """The pairs are collapsed to one at each face on the way through. Left
+        uncollapsed, a solid cut into boxes asks at the same plane once per box,
+        and two boxes whose faces differ inside the kernel's own tolerance ask
+        for two pairs a nanometre apart."""
+        cut = [
+            _metal((0.0, -2.0, -2.0), (3.0, 0.0, 2.0), "a"),
+            _metal((1e-9, 0.0, -2.0), (3.0, 2.0, 2.0), "b"),
+        ]
+        mandatory, _ = mesh._fixed_positions(
+            _grouped_into_conductors(cut), 0, -8.0, 8.0, CUT_PARAMS
+        )
+        assert sorted(source for _, source in mandatory if "edge at" in source) == [
+            "'a' edge at 0, inside",
+            "'a' edge at 0, outside",
+            "'a' edge at 3, inside",
+            "'a' edge at 3, outside",
+        ]
+
+    def test_a_pair_that_yielded_owns_no_span(self):
+        """A span exists to keep everything else out of the edge cell, and a
+        pair that gave way laid no edge cell to keep anything out of. Held
+        anyway, the interface below is dropped for crowding a pair that is not
+        there."""
+        regions = [
+            _metal((0.0, -2.0, -2.0), (3.0, 2.0, 2.0), "strip"),
+            Region(
+                lower=(-0.08, -2.0, -2.0),
+                upper=(3.0, 2.0, 2.0),
+                material=MaterialClass.DIELECTRIC,
+                label="slab",
+            ),
+        ]
+        mandatory, preferred = mesh._fixed_positions(
+            _grouped_into_conductors(regions), 0, -8.0, 8.0, CUT_PARAMS, forced=(-0.05,)
+        )
+        assert (0.0, "'strip' edge at 0, crowded") in mandatory, (
+            "the strip's edge kept its pair, so no span is at stake"
+        )
+        assert (-0.08, "'slab' lower face") in preferred
+
+    def test_a_face_the_metal_carries_on_past_is_an_anchor(self):
+        """A continuous face gets no thirds pair and is still where the metal
+        ends. Offered as a preference instead, it is dropped wherever it crowds
+        anything, and openEMS then builds the strip between two lines that are
+        not the ones it was drawn between."""
+        feed = [_metal((0.0, -2.0, -2.0), (3.0, 2.0, 2.0), "feed")]
+        feed[0] = replace(feed[0], continuous=frozenset({0}))
+        mandatory, preferred = mesh._fixed_positions(
+            _grouped_into_conductors(feed), 0, -8.0, 8.0, CUT_PARAMS
+        )
+        assert [source for _, source in mandatory if "feed" in source] == [
+            "'feed' lower face, continuous",
+            "'feed' upper face, continuous",
+        ]
+        assert preferred == []

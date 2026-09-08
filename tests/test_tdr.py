@@ -793,6 +793,28 @@ class TestWhatTheStructureStoresIsNotDistance:
             V, rel=5e-2
         )
 
+    def test_and_over_too_little_band_it_reads_what_the_structure_stores(self):
+        """The other half of the sentence above, and a claim the chart makes to
+        a user.
+
+        Nothing about the structure moves, only how much band it is looked at
+        over: the answer walks either side of the truth on the way in, because
+        where the top of the band falls decides how much of a resonance is
+        inside the average. So a reader told to sweep wider and stop when the
+        axis stops moving would stop on one of the crossings, and the bound and
+        the walk are asserted together rather than as two tests - one narrow
+        reading being wrong says nothing a wrong estimator would not also say.
+        """
+        walked = [
+            tdr.velocity(stepped(self.FILTER, fmax=FMAX / divisor), 2, 1, self.separation()) / V
+            for divisor in (20, 15, 10, 8, 6, 5, 4, 2, 1)
+        ]
+        assert min(walked) < 0.8 and max(walked) > 1.1, (
+            f"the fixture has to cross the truth for this to test anything: {walked}"
+        )
+        closing = [abs(reading - 1.0) for reading in walked]
+        assert closing != sorted(closing, reverse=True)
+
     #: Three open stubs of different lengths on one line, so the band holds
     #: three transmission zeros and the phase runs backwards at each. Written
     #: down rather than swept because it is a regression fixture: it is the

@@ -1,231 +1,231 @@
 # Drawing the device
 
-Draw with anything - primitives, the Sketcher, a boolean, an imported DXF
-outline. What matters is the shape that comes out, not the feature that made it.
+FreeCAD geometry can be created using primitives, the Sketcher, boolean
+operations, or imported DXF profiles. The workbench extracts the resulting
+shape for simulation.
 
-> **openEMS.** Everything on this page is a consequence of the Yee grid being
-> rectilinear. A moment-method or finite-element adapter accepts curves and
-> rotations, and will have its own page. Nothing here is refused by the document
-> - it is refused when translating for openEMS, so a model drawn for a different
-> solver keeps its geometry.
+> This page describes geometry handling for the openEMS FDTD solver.
+> OpenEMS uses a rectilinear Yee grid. While curved and rotated geometry is
+> supported, the discretization follows rectilinear grid constraints.
+> Solvers based on the Method of Moments (NEC2) or FEM (Palace) use their
+> own mesh representations and do not share these constraints.
 
-## Where to draw it
+## Placement and orientation
 
-Nothing requires a particular orientation - a device drawn on any axis solves,
-and the waveguide acceptance test solves one guide drawn two ways to prove it.
+The workbench supports arbitrary model orientation and position. Devices
+oriented along any coordinate axis simulate correctly.
 
-But the defaults assume the ordinary board: **substrate lying in XY with its
-thickness in Z, ground underneath, trace on top.** A new microstrip port starts
-with its excitation axis at `-Z`, which is the field pointing from the trace
-down to the ground. Draw it that way and the axes read themselves off the
-geometry; draw it another way and they still do, but every default that came
-with the port is then the wrong one.
+Default conventions assume a standard planar PCB layout:
+- Substrate placed in the XY plane with thickness along the Z axis.
+- Ground plane on the bottom surface (-Z).
+- Signal trace on the top surface (+Z).
+- Microstrip ports default to an excitation axis of `-Z` (pointing from
+  trace to ground).
 
-Origin and absolute position are free. The domain is built around whatever was
-drawn, so a board centred on the origin and one 300 mm away mesh identically.
+If a model uses a different orientation, adjust the port excitation axes
+accordingly.
 
-### What draws what
+Absolute coordinates and origin position are arbitrary. The mesher
+constructs the simulation domain around the bounding box of the assigned
+geometry.
 
-| To model | Draw |
+### Recommended geometry types
+
+| Component | Recommended FreeCAD object |
 |---|---|
-| A substrate, a plated trace, a metal wall, an enclosure | `Part::Box` |
-| A ground plane, a zero-thickness trace | `Part::Plane` |
-| A layout - traces, stubs, pads, clearances - as one shape | A Sketcher profile padded to a face, or an imported outline |
+| Substrate, plated trace, enclosure, metal wall | `Part::Box` |
+| Ground plane, zero-thickness trace | `Part::Plane` |
+| Ground plane on existing substrate | Bind material directly to the bottom face of the substrate |
+| Complex planar layout (traces, stubs, pads) | Closed sketch converted to a face via `Part > Shape Builder`, or imported 2D profile |
 
-A sheet lying exactly on a solid's face is the normal case, not an overlap: a
-trace at the top of the substrate and a ground plane at the bottom of it are
-both coincident with a face of the board and neither is reported. What *is*
-reported is two things with volume in the same place.
+Coincident planar faces (such as a trace on the top surface of a substrate
+or a ground plane on the bottom surface) are supported and are not flagged as
+interfering overlaps.
 
-### Conductors that meet
+Material bindings can be assigned to individual faces of a solid. In this
+case, only the selected face forms the active electromagnetic boundary; the
+underlying solid volume remains unaffected.
 
-Two conductors that join should **butt**, not overlap. Where a stub meets a
-through line, put the stub's edge against the line's edge rather than running it
-into the line.
+### Joining conductors
 
-They are one conductor to the solver either way, so this is a rule about the
-drawing rather than about the physics: overlapping sheets are two solids in the
-same place, which is what gets reported - and where they carry different
-materials it cannot be told from a mistake.
+When connecting conductors (such as a stub attached to a transmission
+line), place them edge-to-edge rather than overlapping them.
 
-## The rule
+OpenEMS models overlapping metal solids as a single continuous conductor.
+However, overlapping planar sketches can produce area discrepancies during
+decomposition into rectilinear boxes, causing translation errors.
 
-**A solid must fill its own bounding box.** A shape is measured against its
-box - volume for a solid, area for a flat one - and accepted when they agree.
+## Geometry representation in openEMS
 
-This is a test on the measurement, not on the feature type. A boolean result or
-an extruded rectangle that happens to be a box passes; a `Part::Box` rotated 30
-degrees does not, and takes the surface route below instead.
+The openEMS adapter evaluates each shape and selects the most efficient
+solver representation:
 
-A shape that does *not* fill its box is sent as its own surface instead, and
-openEMS holds that exactly - it answers "is this point inside?" against the
-triangles themselves. So a rotation, a curve, a taper, a fillet or a boolean cut
-is modelled rather than turned away, and what approximates the shape is the
-*grid*, which stays rectilinear.
+1. **Boxes and axis-aligned solids**: The adapter compares the shape with
+   its bounding box. If volume and dimensions match, the object is exported
+   directly as a box primitive.
+2. **Decomposed orthogonal solids**: Solids with steps or bends bounded by
+   axis-aligned planes are partitioned into rectangular boxes.
+3. **Triangulated surfaces**: Curved, rotated, or irregular shapes that
+   cannot be represented by rectangular boxes are triangulated and exported
+   as polyhedral surfaces. OpenEMS determines point containment by testing
+   against these surface triangles.
 
-**A flat shape is held as the area it encloses.** Flat in exactly one axis, it is
-cut into rectangles where every edge is axis-aligned - exactly, and the cut is
-proved by area - and sent as coplanar polygons where they are not. A round pad, a
-curved taper and a letter with a counter in it all pass, holes included. The
-rectangles are tried first because they cost the grid the fewest planes.
+Triangulated surfaces consist of planar facets forming chords across curved
+boundaries. Consequently, the discretised boundary deviates slightly from
+the ideal CAD curve (inward on convex surfaces, outward on concave bores).
+The Check command and the Run panel report the mean surface deviation in
+millimetres. See [CurveTolerance](meshing.md#curvetolerance) for options to
+control surface triangulation fidelity.
 
-**A layout drawn in one operation is judged island by island.** Each separate
-region of it - a pad, a stub, a glyph - is held in whichever of those two forms
-suits it, so one curve somewhere on the sheet no longer decides the treatment of
-everything beside it. The clearances *between* the islands are measured off the
-drawing and the mesh is sized to hold them open, which is what a coupling gap
-and a gap-coupled resonator need and what nothing else in the model would ask
-for.
+Planar shapes lying in a coordinate plane are decomposed into axis-aligned
+rectangles. If non-orthogonal edges or curves are present, the shape is
+exported as planar triangular facets.
 
-So the shapes to draw are:
+For complex 2D layouts, the adapter decomposes the geometry into isolated
+islands (pads, stubs, lines). Clearances between adjacent features are
+measured automatically to ensure the grid resolves critical coupling gaps.
 
-| | |
-|---|---|
-| **A box** | Anything with thickness, and the cheapest thing to mesh |
-| **A solid** | Any shape at all. A taper, a horn, a rod, a filleted block |
-| **A flat sheet** | Any outline at all. A layout, a ground plane, a round pad |
-| **A metal shell** | A conductor drawn as an open surface. A reflector, a horn, a pipe wall |
+Summary of supported geometry:
+
+| Shape type | Application | Meshing cost |
+|---|---|---|
+| Box | Dielectric substrates, straight traces, enclosures | Lowest |
+| General solid | Curved/tapered structures, horns, rods, housings | Moderate |
+| Flat sheet | Planar layouts, ground planes, thin patches | Low |
+| Metal shell | Zero-thickness conductor surfaces (reflectors, horns) | Moderate |
 
 ## A conductor drawn as a surface is given a thickness
 
-Metal is the one material that can be handed a thickness nobody drew, because
-the field inside a conductor is zero: a skin and the slab behind it do the same
-thing to the problem. So a reflector or a horn drawn as a shell is offset into a
-solid and meshed as one, and the surface you drew stays exactly where it is, as
-one wall of the metal.
+When a conductor is modeled as an open surface or zero-thickness shell (such
+as a horn antenna or reflector), the adapter automatically offsets the
+surface into a solid volume. This applies exclusively to conductors, since
+the electric field inside a conductor is zero.
 
-The thickness is not a number anybody chose. It is the smallest one the grid
-will still resolve at the size the metal is already being meshed at, so it never
-becomes the finest thing in the model - which also means it moves when the band
-or the mesh policy moves, and it is nowhere in your document. Check therefore
-reports it, per object and in millimetres, and a headless run prints the same
-line.
+The offset thickness is derived from the mesh policy and the top of the band:
+it is sized from the coarsest cell the grid will use anywhere, computed in
+vacuum, so it never becomes the finest feature limiting the FDTD timestep.
+The applied thickness is reported by the Check command and during simulation
+startup.
 
-Read that line. A drawing that *meant* a solid and failed to close arrives here
-looking exactly like a shell somebody meant, and no measurement can separate the
-two. If the object named was meant to be solid, close it and give it the
-thickness you intended.
+If a body was intended to be a closed solid but contains unknitted or
+missing faces, it will be treated as an open shell and assigned this
+artificial thickness. Inspect geometry warnings to ensure closed solids are
+properly closed in CAD.
 
-Where the thickness has outgrown the drawing - wide against the surface, or
-tight against the radius it curves through - it is refused instead, and the
-message says which of the two it was.
+## Rejected geometry configurations
 
-## What is refused, and why by name
+The adapter validates geometry prior to simulation and explicitly rejects
+shapes that cannot be represented in openEMS:
 
-What is left is geometry that is not a shape openEMS can hold. Each refusal
-names the object and says what to do about it.
-
-| Refused | What it is | What to do |
+| Rejected condition | Description | Corrective action |
 |---|---|---|
-| **Flat in two axes** | A line or a point. It has no area to model | Give it the extent it is meant to have |
-| **Part volume and part surface** | One object holding solids *and* faces that belong to none of them. Which of the two a loose face was meant to be cannot be read from the drawing | Split it, or knit the faces into the solid |
-| **Wound inside out** | A solid whose faces point inward. It describes everything *except* the space it appears to occupy, so it is not bounded. `Part > Check geometry` will not report this - the shape is valid, it is simply the complement | Reverse it |
-| **Two lumps meeting at a single point** | A surface that pinches to nothing. openEMS cannot decide what is inside it | Separate the lumps, or overlap them properly |
-| **A tilted or curved *dielectric* surface** | An area is laid at one elevation on one axis, and a surface tilted across all three has no elevation to take | Give it thickness. A dielectric's thickness is most of what the layer does, so nothing may supply one for you |
-| **A triangulation that lost the drawing** | The shape's own surface came back open, or came back enclosing measurably less than was drawn, and refining the triangulation did not close the gap | Check the shape for a self-intersection or a face the kernel could not triangulate |
+| Flat in two axes | A 1D line or 0D point enclosing no area | Assign width/thickness |
+| Mixed volume and surface | A single object containing both solid volumes and loose faces | Separate into distinct objects or knit into a closed solid |
+| Inverted normal (inside out) | A solid whose surface normals point inward | Reverse face normals |
+| Self-pinching surface | Two lobes of a single volume touching at a single vertex | Merge lobes or split into separate solids |
+| Tilted or curved dielectric sheet | A zero-thickness dielectric that is not flat on one of the three axes | Model dielectric as a solid with explicit thickness |
+| Surface that will not close | A solid whose surface is open, wound against itself, or pinched, so no polyhedron can be built from it | Run `Part > Check geometry` and repair faces |
+| Degenerate triangulation | Triangulated volume deviates excessively from CAD solid | Repair self-intersections or simplify CAD faces |
 
-A **flat** dielectric sheet is not on that list. It is modelled as the area it
-encloses, at the elevation it lies on, exactly as a flat conductor is. Only a
-dielectric surface with no elevation to take is refused.
+Dielectric sheets must be planar or modeled as solids with explicit
+thickness. Unlike conductors, dielectrics cannot be assigned an artificial
+thickness automatically.
 
-A **conductor** drawn as an open surface is not on it either. It is given a
-thickness instead, as above - the field inside metal is zero, so a skin and the
-slab behind it do the same thing to the problem.
+The adapter automatically translates the whole problem - geometry, ports and
+grid together - so that the simulation domain's minimum corner sits at the
+coordinate origin `(0,0,0)`, satisfying openEMS ray-casting requirements for
+triangulated polyhedra.
 
-Where a shape is drawn is not on that list and never will be. It is a real
-constraint of the engine - openEMS decides what is inside a solid held as its
-own surface by casting a ray from the point in question toward one it builds by
-scaling that solid's maximum corner away from the origin, which reaches outside
-the solid only while some part of it is above the origin - but it is one the
-adapter absorbs: every structure is handed to the engine translated until its
-minimum corner is at the origin, so a device drawn anywhere solves the same.
+These checks prevent openEMS from running simulations on corrupted geometry
+that would otherwise produce plausible-looking but invalid results.
 
-The refusal is the point. openEMS would otherwise take the shape and solve
-*something*, and a wrong shape is not a crash but a plausible number. A
-conductor that vanished comes back with an S-matrix, and nothing anywhere says
-it is the S-matrix of a different device.
+## Where a curved conductor ends up
 
-What the grid costs you is reported rather than refused. A curve on a
-rectilinear grid is a staircase however the shape was described, so the mesh is
-sized against the drawing's own features and the mesh report says what that came
-to.
+OpenEMS determines electrical conductivity at grid edges by point-sampling
+material at discrete sample points (`Operator::CalcPEC_Range`). On curved
+conductor boundaries, point-sampling results in an effective electrical
+boundary that sits inside the drawn CAD surface by approximately half a
+cell on average.
 
-One part of that cost is taken off for you. openEMS decides whether a metal edge
-conducts by sampling a single point on it, so only the grid lines *inside* a
-conductor conduct and the surface it builds lands at the last one still within
-the drawing - the metal loses, half a cell on average, and proportional to the
-cell, which means refining the mesh buys back only what it costs. A curved
-conductor is therefore handed over grown by half the cell it will be sampled on,
-and the last line still inside it is the one you drew. You see nothing of it: the
-geometry, the preview and every message stay as drawn.
+To compensate for this systematic discretization offset, the adapter expands
+curved conductor surfaces outward by half a Yee cell (`0.5 * cell_size`)
+prior to passing them to openEMS.
 
-Two limits on that, both deliberate. It applies to **conductors**, because a
-dielectric boundary is averaged over the cell rather than point-sampled and
-carries no such rounding. And it applies to **solids**: a flat sheet has a grid
-line pinned at the plane it lies in, so nothing rounds it across its thickness,
-but a *curved outline* - a round pad, a spiral, a curved taper - is
-point-sampled and is not corrected.
+This compensation applies to:
+- Curved conductor solids.
+- Oblique planar conductor faces not aligned with grid axes.
 
-How much a curved outline gives up has not been measured, and the reason is
-worth knowing before you go looking for it. A flat conductor keeps its charge at
-its rim, where the field is singular, and a grid resolves that to a share of a
-cell however the rim is drawn - so a plate whose every edge lands on a grid line,
-with nothing sampled and nothing rounded, still reads as a conductor of a
-different size. That reading and a receded rim are the same size and point the
-same way. Nothing that measures a capacitance can separate them, so the workbench
-states neither a size nor a direction for this one.
+It does not apply to:
+- Dielectric interfaces (which openEMS volume-averages across the cell).
+- Axis-aligned rectangular conductor faces. These receive a grid line of their
+  own, and are displaced only by the small clearance that keeps that line
+  inside the metal.
+- The perimeter edges of planar conductor sheets, which are point-sampled
+  without boundary expansion.
+
+The 0.5-cell offset corrects the effective boundary location for resonant
+modes. Remaining discretization scatter diminishes with mesh refinement.
+
+During solver driver execution, the rasterized grid is evaluated per
+conductor body to verify that grid discretization has not severed the body
+into disconnected pieces.
+
+Adjacent pairs of conductor bodies are evaluated similarly to verify that gaps
+between them remain resolved on the Yee grid after applying boundary compensation.
+A gap this grid does not resolve is excluded from this check: at that width the
+drawn surfaces and the compensated ones rasterize alike, and neither
+distinguishes a gap the grid lost from two bodies drawn in contact.
 
 ## Zero-thickness copper
 
-Copper on a board is thin against every other length in the model, and meshing
-its thickness costs cells on an axis where nothing happens. Draw it as a flat
-sheet and bind it to a **conducting sheet** material, which carries its
-thickness as a *property* rather than as geometry. See [Materials](materials.md).
+Copper foil on standard circuit boards is thin relative to the substrate.
+Resolving copper thickness with volumetric grid cells requires small cells
+along the Z axis, reducing the FDTD timestep.
 
-Both routes work. A trace drawn with real thickness is an ordinary solid, and
-where it matters - a thick trace on a thin substrate - it is the more honest
-model.
+To avoid this computational overhead:
+1. Model traces and ground planes as zero-thickness planar sheets
+   (`Part::Plane` or face bindings).
+2. Assign a `ConductingSheet` material, specifying electrical conductivity
+   and copper foil thickness as material properties.
 
-The choice changes what a port is selected on: the end of a solid trace is a
-**face**, and the end of a sheet trace is an **edge**. Ports take either.
+For thick conductors where vertical sidewall capacitance is critical,
+model the conductor as a 3D solid (`Part::Box`) and assign `PEC` material.
+OpenEMS applies surface impedance loss only to 2D planar elements; solid
+conductor volumes are treated as lossless PEC.
+
+Port attachment depends on the chosen model:
+- Solid trace: Select the end cross-section face.
+- Planar sheet trace: Select the end edge.
 
 ## What reaches the solver
 
-**Only geometry a binding points at.** A solid nobody bound to a material is not
-in the simulation - not as air, not as anything: it is simply absent, and the
-run does not mention it.
+Only geometry bound to an `EMMaterial` via an `EMMaterialBinding` is exported
+to the solver. Unbound objects in the FreeCAD document are ignored during
+simulation.
 
-That is what makes a document with a housing, a jig and three revisions of a
-board in it perfectly simulable - the binding names the one that is meant. It is
-also the first thing to check when a result looks like a different device: a
-substrate left unbound solves as a trace in mid-air, and it solves cleanly.
-
-A **port** on unbound geometry is different, and is refused: the port has to
-know what its conductor is made of, and says so by name.
+Ports referencing unbound geometry are rejected during pre-flight checks.
 
 ## How much to draw
 
-**Around the structure** - how much substrate and ground plane past the last
-feature - is a modelling choice with no formula, and the honest way to settle it
-is to widen it and solve again. If the answer does not move, it was wide enough.
-A resonance close to the board edge is the case to watch: the open end of a
-stub is a voltage antinode, and a board that stops too soon makes the resonance
-partly a property of the board.
+Substrate and ground plane boundaries should extend past active RF features
+to prevent artificial fringing effects. To verify that ground and substrate
+extensions are sufficient, increase their dimensions and re-run the
+simulation; if S-parameters do not change, the margins are adequate.
 
-**Beyond the structure** - air between the model and the absorber - is not drawn
-at all. It is the mesh policy's job, per face. See [Meshing](meshing.md).
+Air buffers between the physical device and absorbing boundaries are added
+automatically by the mesh policy. Do not model air volumes explicitly.
 
 ## Overlaps
 
-Two solids in the same place are reported. Whichever the solver builds second
-wins in the region they share, and that is a modelling accident far more often
-than it is a stackup - so it is said out loud, whether the two carry one
-material or two.
+Pre-flight checks verify that coincident solids do not assign conflicting
+materials to the same space:
+- Two coincident solids with the same material generate a warning.
+- Two coincident solids with different materials generate an error, as
+  openEMS cannot resolve conflicting material properties in the same grid
+  cell.
 
 ## Sanity
 
-The workbench models what was drawn, including the parts of it nobody meant.
-A sliver left by a boolean is a real feature to the mesher, and a 1 µm sliver
-sets the timestep for the entire simulation - see the element-size floor in
-[Meshing](meshing.md). Cleaning geometry before simulating is cheaper than
-diagnosing it afterwards.
+Small slivers or micro-edges generated by CAD boolean operations can force
+the mesher to generate extremely small Yee cells, severely reducing the FDTD
+timestep. Clean CAD geometry and remove micro-features before meshing.

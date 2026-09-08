@@ -19,32 +19,28 @@ behaves as a shunt capacitor on the same condition. Both stop being true as the
 band goes up, and they stop being true in a way the prototype cannot express at
 all:
 
-- the **corner** lands a little below where it was placed;
-- the **stopband is shallow** compared with what the prototype promises, because
-  each section's reactance stops rising with frequency the way a lumped element's
-  does;
-- and the whole response **comes back** where the sections reach a half
-  wavelength, which the prototype - having no length in it - says nothing about.
+- the corner lands a little below where it was placed;
+- the stopband is shallow compared with what the prototype promises, because
+  each section's reactance stops rising with frequency the way a lumped
+  element's does;
+- and the whole response comes back where the sections reach a half wavelength,
+  which the prototype - having no length in it - says nothing about.
 
-That last one is the point of the file. The lumped prototype claims tens of dB
-of rejection at the re-entrant passband, and the structure passes nearly
-everything. Nobody finds that by evaluating the design equations again, because
-the design equations are what got it wrong; it is found by solving the board, in
-one broadband run, which is what FDTD is for.
+The re-entrant band is why this file ships. The lumped prototype claims tens of
+dB of rejection there, and the structure passes nearly everything. Evaluating
+the design equations again does not find it, because the design equations are
+what got it wrong; one broadband FDTD run does.
 
-There is a fourth, and it is the one no circuit model of any depth reaches: at
-that same re-entrant band the board **radiates**, and a third of the incident
-power leaves it. Read the power balance rather than the response - the substrate
-here is declared lossless and the copper is worth a tenth of a decibel, so
-whatever ``1 - |S11|^2 - |S21|^2`` comes to has gone out through the boundary.
-The wide sections are what does it: a strip 8 mm across on 1.6 mm of laminate is
-a patch, and a filter section that is half a wavelength long is a patch being
-driven at resonance. It is a stopband on paper and an antenna on the bench.
+One more effect reaches no circuit model at all: at that same re-entrant band
+the board radiates. Read the power balance rather than the response - the
+substrate here is declared lossless and the copper's loss is small, so whatever
+``1 - |S11|^2 - |S21|^2`` comes to has gone out through the boundary. The wide
+sections do it: a strip 8 mm across on 1.6 mm of laminate is a patch, and a
+filter section that is half a wavelength long is a patch driven at resonance.
 
 ``stub_notch.FCStd`` makes a version of the same argument about a single
 resonance. This one makes it about a design a person would actually be
-fabricating, and the gap it exposes is the difference between a part that works
-and a part that does not.
+fabricating, and the gap it exposes would reach a fabricated board.
 
 What the board is
 -----------------
@@ -70,8 +66,10 @@ so each feature in the response has one cause. It starts at its own step,
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
-    /Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd \\
-        examples/stepped_lowpass_synthesised.py
+    freecadcmd examples/stepped_lowpass_synthesised.py
+
+``freecadcmd`` ships inside the FreeCAD installation. On macOS it is
+``FreeCAD.app/Contents/Resources/bin/freecadcmd``.
 
 It writes beside itself. Set ``OUT`` to put the document somewhere else.
 """
@@ -162,8 +160,9 @@ def geometry(doc):
     """What the user draws: a board, a ground plane and the line above it.
 
     Both conductors are faces rather than solids, as in the other examples, and
-    each section is its own sheet butted against its neighbour - translation
-    proves every shape fills its bounding box, which a stepped trace does not.
+    each section is its own sheet butted against its neighbour. Translation cuts
+    a stepped outline into rectangles by itself, so this says the sections in
+    the file rather than leaving them to be read back out of one.
     """
     board = doc.addObject("Part::Box", "Substrate")
     board.Length, board.Width, board.Height = LENGTH, BOARD, HEIGHT

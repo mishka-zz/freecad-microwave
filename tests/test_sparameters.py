@@ -792,7 +792,8 @@ class TestWhatItCarries:
             result.parameter(1, 1)
 
     def test_measured_impedance_is_kept_separate_from_the_reference(self):
-        """QA F2 wants Z0 shown; it is not the 50 ohm the matrix is normalised to."""
+        """What a port measured is shown, and it is not the 50 ohm the matrix
+        is normalised to."""
         result = SParameters.from_runs(series_resistor(30.0, 75.0, 20.0), reference=50.0)
         assert result.impedance(1).real == pytest.approx(30.0, rel=1e-12, abs=0.0)
         assert result.impedance(2).real == pytest.approx(75.0, rel=1e-12, abs=0.0)
@@ -1123,11 +1124,10 @@ class TestTouchstone:
     def test_a_reference_the_format_cannot_hold_is_refused_here(self, tmp_path):
         """One real number for every port at every frequency, or no file.
 
-        Three ways to miss that, and all three used to arrive as scikit-rf's own
-        sentence out of a vendored library, after the save dialog, naming
-        nothing about the model: ports at different impedances, which is the
-        ordinary 30/75 study; a reference that varies with frequency; and a
-        complex one.
+        Unguarded, each way of missing it arrives as scikit-rf's own sentence
+        out of a vendored library, after the save dialog, naming nothing about
+        the model: ports at different impedances, which is the ordinary 30/75
+        study; a reference that varies with frequency; and a complex one.
         """
         runs = series_resistor(30.0, 75.0, 20.0)
         for reference in (None, [30.0, 75.0], [50.0, None]):
@@ -1374,8 +1374,8 @@ class TestOneBadPointDoesNotKillTheSweep:
         Z-parameters for *every* frequency, so one differing point moves all of
         them by ~6e-8 - the same residue :func:`_normalisation` records.
 
-        It still discriminates, because the failure this guards against is not
-        subtle: a band-wide mean impedance, which is what this replaced, moves
+        It still discriminates, because the failure it guards against is not
+        subtle: normalising against a band-wide mean impedance instead moves
         these points by a third.
         """
         spoiled = SParameters.from_runs(one_bad_point(index=1)).usable()

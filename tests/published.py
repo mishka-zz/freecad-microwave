@@ -44,6 +44,12 @@ class SteppedLowPass(NamedTuple):
     system: float
     #: The stated -3 dB corner, in Hz.
     corner: float
+    #: How many significant figures :attr:`corner` is printed to, which is a
+    #: transcription of the page and not a judgement about the instrument. It is
+    #: what says how well the reference locates itself: a figure printed to two
+    #: places stands for every value that rounds to it, whatever the network
+    #: analyser underneath it could resolve.
+    corner_figures: int
     #: The stated stopband floor in dB, and the frequency above which the
     #: authors claim it, in Hz.
     stopband: float
@@ -75,6 +81,7 @@ CHEN_2025 = SteppedLowPass(
     kinds=("C", "L", "C", "L", "C"),
     system=50.0,
     corner=2.5e9,
+    corner_figures=2,
     stopband=-20.0,
     stopband_from=5e9,
 )

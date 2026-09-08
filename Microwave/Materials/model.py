@@ -3,15 +3,15 @@
 
 """What a materials catalog holds, as plain data.
 
-Standard library only - no FreeCAD, no numpy, no Qt. A catalog is something a
-third party writes and sends, so reading one has to be possible, and
-testable, without any of that. It is also why a catalog is *data* and not a
-Python module: a format executed on load means opening a stranger's materials
-file runs their code.
+Standard library only - no FreeCAD, no numpy, no Qt. A third party writes a
+catalog and sends it, so reading one has to be possible, and testable, without
+any of those. For the same reason a catalog is data rather than a Python
+module: a format executed on load means opening a stranger's materials file runs
+their code.
 
-Units are millimetres, hertz and S/m, matching the document layer, because a
-catalog that used its own would be one conversion away from a silent factor of
-a thousand.
+Units are millimetres, hertz and S/m, matching the document layer. A catalog
+with units of its own would be one conversion away from a silent factor of a
+thousand.
 """
 
 from __future__ import annotations
@@ -21,22 +21,23 @@ import re
 from dataclasses import dataclass
 
 #: The catalog format this workbench understands. A file declaring a higher
-#: number is refused rather than read optimistically: the whole point of the
-#: field is that a future version may mean something different by a key that
-#: already exists, and guessing would be worse than saying no.
+#: number is refused rather than read. The field exists because a future version
+#: may mean something different by a key that already exists, and refusing is
+#: safer than guessing.
 SCHEMA = 1
 
-#: Exactly the kinds ``Solvers/openems/materials.py`` can translate. There is
-#: deliberately no dispersive kind: the openEMS adapter refuses one, no other
-#: adapter builds one, so offering it in a catalog would be a silent no-op.
-#: Dispersion is *data about* a dielectric, below, not a kind.
+#: Exactly the kinds ``Solvers/openems/materials.py`` can translate. There is no
+#: dispersive kind: the openEMS adapter refuses one and no other adapter builds
+#: one, so offering it in a catalog would be a silent no-op. Dispersion is data
+#: about a dielectric, held in :class:`DispersionPoint` below.
 KINDS = ("dielectric", "pec", "conducting_sheet")
 
-#: Lower case, digits, and separators. A slug rather than free text because it
-#: is an identity that ends up inside a saved document: ``rogers:ro4350b`` has
-#: to survive a rename of the file it came from and mean the same thing.
-#: ``\\Z`` and not ``$``: ``$`` also matches before a trailing newline, which
-#: would let ``"fr4\\n"`` pass as an id that documents then refer to for ever.
+#: Lower case, digits, and separators. A slug rather than free text, because the
+#: id ends up inside a saved document: ``rogers:ro4350b`` has to survive a
+#: rename of the file it came from and still mean the same thing. The pattern
+#: ends in ``\\Z`` rather than ``$``, because ``$`` also matches before a
+#: trailing newline and would let ``"fr4\\n"`` pass as an id that documents then
+#: refer to for ever.
 SLUG = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
 COLOR = re.compile(r"#[0-9A-Fa-f]{6}\Z")
 
@@ -44,16 +45,17 @@ REFERENCE_SEPARATOR = ":"
 
 
 class MaterialError(ValueError):
-    """A catalog says something that cannot be true, and the message says what."""
+    """The catalog holds a value that cannot be true. The message names it."""
 
 
 @dataclass(frozen=True, order=True)
 class MaterialRef:
     """Which material, in which catalog. ``generic:fr4``.
 
-    Qualified because several catalogs are live at once and two of them defining
-    FR4 is the normal case, not a clash - a board house's FR-4 and a generic
-    nominal one are different materials that happen to share a name.
+    The reference is qualified because several catalogs are live at once, and
+    two of them defining FR4 is the normal case rather than a clash. A board
+    house's FR-4 and a generic nominal one are different materials that share a
+    name.
     """
 
     catalog: str
@@ -96,33 +98,32 @@ class MaterialEntry:
     conductivity: float = 0.0
     thickness: float = 0.0
     #: Hz. The frequency ``epsilon_r`` and ``loss_tangent`` are quoted at. A
-    #: loss tangent without one is not a physical quantity - it is a number
-    #: was written down - so the parser requires it wherever loss is
-    #: nonzero.
+    #: loss tangent quoted at no frequency is not a physical quantity, so the
+    #: parser requires this wherever loss is nonzero.
     measured_at: float = 0.0
     dispersion: tuple[DispersionPoint, ...] = ()
     color: str = "#888888"
     description: str = ""
     datasheet: str = ""
 
-    # Every field is hashable, and that is load-bearing rather than incidental:
-    # a frozen dataclass generates __hash__ over all of them, so one dict field
-    # makes both this and Catalog unhashable. The picker groups rows with
-    # ``by_catalog.setdefault(catalog, [])`` from its constructor, so the dialog
-    # then raises TypeError the moment it opens - and the suite cannot see it,
-    # Qt being a MagicMock there.
+    # Every field has to stay hashable. A frozen dataclass generates __hash__
+    # over all of them, so one dict field makes both this and Catalog
+    # unhashable. ``Gui/material_picker.group_by_catalog`` keys its dict by
+    # ``catalog.id`` for that reason, and anything else putting one of these in
+    # a set or a dict key needs the same care. The suite cannot see such a
+    # failure, because Qt is a MagicMock there.
 
     def at(self, frequency: float) -> MaterialEntry:
         """This entry with the dispersion row nearest ``frequency`` applied.
 
-        Never interpolates. A row is something a laboratory measured; a point
-        between two rows is invented, and an invented permittivity
-        that looks measured is exactly what this whole layer exists to avoid.
-        Returns ``self`` when there is no table to choose from.
+        Never interpolates. A row is a laboratory measurement, and a point
+        between two rows is invented. This layer exists to keep an invented
+        permittivity from looking measured. Returns ``self`` when there is no
+        table to choose from.
 
-        A frequency exactly between two rows takes the **lower** one, because
-        ``min`` keeps the first of equal keys and rows are sorted ascending.
-        Arbitrary, but fixed and written down rather than discovered.
+        A frequency exactly between two rows takes the lower one, because
+        ``min`` keeps the first of equal keys and rows are sorted ascending. The
+        choice is arbitrary, and it is fixed and written down here.
         """
         if not self.dispersion or frequency <= 0:
             return self
@@ -137,19 +138,18 @@ class MaterialEntry:
         )
 
     def rgb(self) -> tuple[float, float, float]:
-        """``color`` as FreeCAD wants it."""
+        """``color`` in the form FreeCAD takes."""
         text = self.color.lstrip("#")
         red, green, blue = (int(text[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
         return (red, green, blue)
 
     def digest(self) -> str:
-        """A fingerprint of the physics, and of nothing else.
+        """A fingerprint of the kind and the physical values, and of nothing else.
 
-        Provenance only. It answers "has this material been edited since it came
-        out of the catalog?", so it must not move when a description is reworded
-        or a colour adjusted - otherwise every catalog release would report
-        every material in every document as edited, and the answer would stop
-        being worth reading.
+        Stored on a material at import, as a record of what the catalog stated.
+        A description, a datasheet reference and every other presentation field
+        are left out, so rewording one in a later catalog release does not move
+        the fingerprint.
         """
         payload = "|".join(
             f"{value:.12g}"

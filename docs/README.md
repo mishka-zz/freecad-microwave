@@ -2,72 +2,86 @@
 
 A FreeCAD workbench for electromagnetic design.
 
-This is written for an engineer who already knows RF and already knows FreeCAD,
-and who has not used this workbench before. It assumes familiarity with ports,
-reference impedances and meshes, and none at all with how this workbench
-spells them.
+This reference describes the Microwave workbench in FreeCAD. It is written
+for engineers familiar with RF design, microwave theory, and FreeCAD,
+explaining how ports, materials, mesh policies, and solver adapters are
+configured.
 
 | Page | What it covers |
 |---|---|
 | [The document model](model.md) | The objects a study is made of, and which of them belong to a solver |
 | [Drawing the device](geometry.md) | What geometry can be simulated, and what is refused |
-| [Materials](materials.md) | Material types, catalogs, and binding them to solids |
+| [Materials](materials.md) | Material types, catalogs, and binding them to geometry |
 | [Ports](ports.md) | Microstrip, lumped and waveguide ports: what to select, and what each property does |
 | [Meshing](meshing.md) | Sizing policy, local refinement, the domain, and the grid openEMS gets |
 | [Running a study](running.md) | The solver object, boundaries, the run panel, and the headless route |
 | [Results](results.md) | S-parameters, reference impedance, Touchstone, impedance against distance |
+| [How well this is known](metrology.md) | How to run the acceptance gates, and how to read what one of them says |
+
+## Standard simulation workflow
+
+1. Draw the device. See [Drawing the device](geometry.md).
+2. Create an EM Analysis. The ports, mesh policy, refinements and results all
+   go inside it, so make it first. Materials stay at the document root.
+3. Set the frequency band on the analysis.
+4. Bind materials to the geometry. See [Materials](materials.md).
+5. Add the ports, selecting the faces or edges each one needs. See
+   [Ports](ports.md).
+6. Set the mesh policy and press Update Mesh to see the grid. See
+   [Meshing](meshing.md).
+7. Press Check, and act on what it reports.
+8. Press Run.
+9. Read the S-parameters, and export Touchstone if you want to keep them. See
+   [Results](results.md).
+
+The documents in `examples/` are complete studies built this way. Open one and
+read it beside this reference.
 
 ## One workbench, several solvers
 
-The workbench separates **what the problem is** from **how a solver answers
-it**, and that split runs through the whole tool. Learning where the line falls
-is most of learning the workbench.
+Settings are divided between problem definition (solver-neutral) and
+solver configuration (backend-specific):
 
-**The document is the model.** Geometry, materials, ports, the frequency band
-and the mesh *intent* are statements about the device. They are held in document
-objects that name no solver, and they do not change when the solver does.
+- **Problem definition**: Geometry, materials, ports, frequency bands, and
+  mesh sizing goals describe the physical device. They reside in
+  solver-neutral document objects and remain unchanged when switching
+  solvers.
+- **Solver configuration**: Each solver uses a dedicated adapter that
+  validates the model against its capabilities, generates native input
+  files, executes the solver subprocess, and imports results. openEMS
+  (FDTD) is the primary solver; Palace (FEM) is planned next, and
+  NEC2 (Method of Moments) is considered.
 
-**An adapter owns its solver.** Each backend declares what it can express,
-checks the model against that before anything runs, writes that solver's own
-native input, runs it, and reads its output back. openEMS (FDTD) is the first
-adapter. NEC2 (method of moments) is next and Palace (finite element) later.
+Consequently, problem parameters (such as frequency sweep range) are set
+on the `EMAnalysis` container, while solver-specific parameters (such as
+PML absorbing boundary depth) are set on the solver object.
 
-So a property is on the study when it describes the problem, and on the solver
-when it describes the run. The frequency band is on the study - every solver
-answering the question needs the same band. The PML depth is on the solver -
-"eight cells of perfectly matched layer" is not a thing a moment-method code
-has an opinion about.
+Key operational rules:
 
-Consequences worth knowing up front:
-
-- **Some operations are solver-specific and are labelled here as such.** The
-  mesh *policy* is neutral, and the *grid* is not: a Yee grid is FDTD's, wire
-  segments are the moment method's, and tetrahedra are the finite-element
-  method's. Where a page describes something only openEMS does, it says so.
-
-- **An unsupported model is refused by name, never approximated quietly.**
-  Pre-flight names the object and what is wrong with it before any solving
-  starts. A dispersive material, a rotated solid or a port on the wrong face
-  each produce a sentence to act on rather than a plausible wrong number.
+- **Solver-specific terminology**: Mesh policy settings use generic
+  *elements*. Adapter-specific documentation uses solver terms (Yee *cells*
+  for FDTD, wire *segments* for MoM, *tetrahedra* for FEM).
+- **Explicit validation**: Unsupported geometry or material configurations
+  are rejected with explicit error messages before simulation begins. The
+  workbench does not silently approximate unsupported features.
 
 ## Conventions
 
-**Units.** Draw in whichever units FreeCAD is set to; lengths reach the
-solver in millimetres. Frequencies are entered with their unit - `5 GHz`,
-`2.4e9 Hz` - through FreeCAD's own frequency property.
+**Units.** Geometry uses the active FreeCAD display unit. Dimensions are
+converted to millimetres for the solver. Frequencies should be entered
+with standard units (e.g. `5 GHz`, `2.4e9 Hz`).
 
-**Element, not cell.** Objects shared by every solver say *element*, because a
-cell is FDTD's word, a segment is the moment method's and a tetrahedron is the
-finite-element method's. Inside the openEMS adapter the FDTD words are the
-correct ones and are used.
+**Element vs Cell.** Neutral workbench objects use *element*.
+Solver-specific components use native terms (*cell* for openEMS/FDTD). The
+`EMMeshPolicy` padding properties, `AirCells<axis><side>`, are the exception:
+they count Yee cells and are named for them.
 
-**Ohms.** Impedances are plain numbers in ohms.
+**Impedance.** All impedance values are in ohms (Ω).
 
-**Version.** The build is at the foot of the simulation panel, on the first
-line of a run's log, and in the header of any Touchstone file. Quote it in a
-bug report.
+**Version.** The build version is displayed at the bottom of the
+simulation panel, in the run log header, and in exported Touchstone file
+headers.
 
-**Figures.** Every picture here is drawn by `images/build.py` under a real
-FreeCAD, from the workbench's own view providers - a port box in a figure is a
-port box, and a grid is the grid. There are few of them on purpose: a picture
-is here where the thing has to be *seen* to be understood, and nowhere else.
+**Figures.** The mesh and port figures on these pages are generated by
+`images/build.py` directly from FreeCAD view providers, displaying actual
+mesh lines and port boundaries.

@@ -3,21 +3,29 @@
 
 """The document's own materials.
 
-An ``EMMaterial`` holds *values*, and the solve reads those values and nothing
+An ``EMMaterial`` holds values, and the solve reads those values and nothing
 else. Where they came from is recorded beside them, in the Provenance group, and
-is never consulted at translation time - which is what makes a ``.FCStd``
-solve unchanged on a machine with no catalogs installed at all.
+is never consulted at translation time, so a ``.FCStd`` solves unchanged on a
+machine with no catalogs installed at all.
 
-That is the whole relationship between this module and ``Microwave.Materials``:
-a catalog is a **starting point**, not a live link. Values are copied in once.
-An engineer who measures their own laminate and types 4.15 over the catalog's
-4.3 keeps that number for ever; the provenance then says the material has been
-edited since it was imported, which is information rather than a fault.
+A catalog is a starting point rather than a live link. Values are copied in
+once. An engineer who measures their own laminate and types 4.15 over the
+catalog's 4.3 keeps that number. ``SourceDigest`` still records what the catalog
+stated, so the two can be compared by hand. Nothing in the workbench compares
+them.
 """
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 import FreeCAD
 
 from ._vp_hook import ViewProviderRestored
+
+if TYPE_CHECKING:
+    from ..Materials.model import Catalog, MaterialEntry
 
 
 class EMMaterial(ViewProviderRestored):
@@ -38,9 +46,9 @@ class EMMaterial(ViewProviderRestored):
         obj.Color = (0.8, 0.8, 0.8)
 
         # The frequency Permittivity and LossTangent are quoted at. Editable,
-        # because typing a measured permittivity of one's own means saying where it
-        # measured it. Zero means unstated, which is what a hand-made material
-        # starts as.
+        # because an engineer typing a measured permittivity of their own has to
+        # state where it was measured. Zero means unstated, which is what a
+        # hand-made material starts as.
         obj.addProperty(
             "App::PropertyFrequency",
             "MeasuredAt",
@@ -49,10 +57,10 @@ class EMMaterial(ViewProviderRestored):
         )
         obj.MeasuredAt = 0.0
 
-        # Provenance. Read-only in the editor because it is a record of what
-        # happened, not a setting: editing Source would not fetch anything, and
-        # a property that looks like it does something and does not is a
-        # silent no-op.
+        # Provenance. Read-only in the editor, because these record what
+        # happened rather than set anything. Editing Source would not fetch
+        # anything, and a property that looks like it does something and does
+        # not is a silent no-op.
         for name, description in (
             ("Source", "Catalog and material this came from, as catalog:material"),
             ("SourceCatalog", "Name and version of that catalog when it was picked"),
@@ -90,11 +98,11 @@ class EMMaterialBinding(ViewProviderRestored):
         return None
 
 
-def createEMMaterial(name="EMMaterial", doc=None):
+def createEMMaterial(name: str = "EMMaterial", doc: Any = None) -> Any:
     doc = doc or FreeCAD.ActiveDocument
-    # The internal Name has to be an identifier; a catalog's name does not
+    # The internal Name has to be an identifier, and a catalog's name is not one
     # ("FR-4 TG155", "Copper, 1 oz"). FreeCAD would silently mangle or reject
-    # it, so the readable form goes on the Label where it belongs.
+    # such a name, so the readable form goes on the Label.
     obj = doc.addObject("App::FeaturePython", _identifier(name))
     obj.Label = name
     EMMaterial(obj)
@@ -104,12 +112,12 @@ def createEMMaterial(name="EMMaterial", doc=None):
     return obj
 
 
-def _identifier(name):
+def _identifier(name: str) -> str:
     cleaned = "".join(character if character.isalnum() else "_" for character in name)
     return cleaned.strip("_") or "EMMaterial"
 
 
-def createEMMaterialBinding(name="EMMaterialBinding"):
+def createEMMaterialBinding(name: str = "EMMaterialBinding") -> Any:
     obj = FreeCAD.ActiveDocument.addObject("App::FeaturePython", name)
     EMMaterialBinding(obj)
     from ._vp_hook import inject_view_provider
@@ -118,19 +126,19 @@ def createEMMaterialBinding(name="EMMaterialBinding"):
     return obj
 
 
-def fill_binding(binding, selection):
+def fill_binding(binding: Any, selection: Iterable[Any]) -> list[str]:
     """Set a binding's two links from what the user had picked. Returns the rest.
 
-    A pick tells its own halves apart: one of the objects is an ``EMMaterial``
-    and the others are geometry. Order says nothing and is not read - unlike a
-    port, where which of two copper faces is the trace is genuinely unknowable
-    from the shapes, so ``port_setup`` documents an order and honours it.
+    The two halves of a pick are distinguishable: one of the objects is an
+    ``EMMaterial`` and the others are geometry. Order says nothing here and is
+    not read. A port is different - which of two copper faces is the trace
+    cannot be read off the shapes - so ``port_setup`` documents an order and
+    honours it.
 
     The binding is made either way, as a port is. Translation refuses one that
     names no material and one that binds to nothing, both by name, so leaving a
-    link empty costs a message and never a wrong answer - and half a binding
-    with the other half to fill in is a better place to stand than no binding
-    and an error.
+    link empty costs a message and never a wrong answer. Half a binding with the
+    other half to fill in is more use than no binding and an error.
     """
     from .kinds import kind_of
     from .mesh import references_from
@@ -161,7 +169,7 @@ def fill_binding(binding, selection):
     return notes
 
 
-def apply_entry(obj, entry, catalog):
+def apply_entry(obj: Any, entry: MaterialEntry, catalog: Catalog) -> Any:
     """Copy one catalog entry's values onto an EMMaterial, with its provenance."""
     from ..Materials.model import MaterialRef
 
@@ -181,9 +189,9 @@ def apply_entry(obj, entry, catalog):
     return obj
 
 
-#: The catalog's vocabulary, which is the adapter's, mapped onto the document
-#: object's enumeration. Two spellings of one set exist because the enumeration
-#: is what a FreeCAD user sees in a dropdown and the other is what a file says.
+#: The catalog's vocabulary, which is also the adapter's, mapped onto the
+#: document object's enumeration. One set has two spellings: the enumeration is
+#: what a FreeCAD user sees in a dropdown, and the other is what a file holds.
 _MATERIAL_TYPES = {
     "dielectric": "Dielectric",
     "pec": "PEC",
@@ -191,42 +199,40 @@ _MATERIAL_TYPES = {
 }
 
 
-def sourced_from(doc, ref):
+def sourced_from(doc: Any, ref: object) -> list[Any]:
     """Every material in the document carrying ``ref``, in document order.
 
-    Plural, because more than one is legitimate: a stackup wants an FR-4 layer
-    on each side of a Rogers core with their own numbers, and the way an
-    uncatalogued laminate gets entered is to take the nearest catalog row and
-    edit it. The command that adds them names the ones already there; it does
-    not refuse.
+    More than one is legitimate. A stackup carries an FR-4 layer on each side of
+    a Rogers core with their own numbers, and an uncatalogued laminate is
+    entered by taking the nearest catalog row and editing it. The command that
+    adds them names the ones already there, and does not refuse.
 
-    This is the only thing that can answer "is this one of those?", because a
-    label cannot: :func:`label_for` numbers by what is free, not by what a
-    material came from.
+    A label cannot say whether a material came from a given reference, because
+    :func:`label_for` numbers by what is free rather than by what a material
+    came from. This function is the only thing that can.
     """
     wanted = str(ref)
     return [obj for obj in doc.Objects if getattr(obj, "Source", "") == wanted]
 
 
-def label_for(doc, entry, catalog):
+def label_for(doc: Any, entry: MaterialEntry, catalog: Catalog) -> str:
     """``Generic FR4 (1)`` - catalog, material, and which one of them.
 
-    All three parts unconditionally, which is the whole of the rule. Every
-    version of this that earned a part only when the document forced it had to
-    decide *what a collision was with* in order to pick between a catalog and a
-    number, and every such decision was wrong somewhere: a board solid named
-    after its laminate, or two catalogs sharing a display name, turned one
-    suffix into the other's meaning. Saying both always means neither has to
-    stand in for the other, and there is nothing left to get wrong.
+    Every part is written unconditionally. Adding a part only when the document
+    forces it would mean deciding what a collision is with, in order to choose
+    between a catalog and a number, and there is no right answer: a board solid
+    named after its laminate, or two catalogs sharing a display name, turn one
+    suffix into the other's meaning. Writing both always means neither has to
+    stand in for the other.
 
-    Numbering from ``(1)`` rather than leaving the first bare is the same
-    argument. A tree where the first is ``Generic FR4`` and the second
-    ``Generic FR4 (2)`` asks the reader to notice an absence; numbering both
-    puts the answer in the same place on every row.
+    Numbering from ``(1)`` rather than leaving the first bare follows the same
+    argument. In a tree where the first is ``Generic FR4`` and the second
+    ``Generic FR4 (2)``, the reader has to notice an absence. Numbering both puts
+    the answer in the same place on every row.
 
-    The number cannot come from FreeCAD. With duplicate labels disallowed -
-    the default - it resolves a collision by appending its own counter, and
-    on a name that already ends in a digit that reads as a different part:
+    The number cannot come from FreeCAD. With duplicate labels disallowed, which
+    is the default, FreeCAD resolves a collision by appending its own counter,
+    and on a name that already ends in a digit that reads as a different part:
     ``Generic FR4001``.
     """
     labelled = {obj.Label for obj in doc.Objects}
@@ -237,7 +243,7 @@ def label_for(doc, entry, catalog):
     return f"{stem} ({number})"
 
 
-def create_from_entry(doc, entry, catalog):
+def create_from_entry(doc: Any, entry: MaterialEntry, catalog: Catalog) -> Any:
     """A new EMMaterial at document root, carrying one catalog entry."""
     obj = createEMMaterial(label_for(doc, entry, catalog), doc=doc)
     return apply_entry(obj, entry, catalog)

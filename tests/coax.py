@@ -203,22 +203,92 @@ FINENESSES = {"coarse": 0.1, "fine": 0.001}
 #: out to half a cell along an axis and half a cell along the diagonal. Its
 #: corners are here - the zero one being the drawing's own - and a point on the
 #: side between the two extremes.
+#:
+#: Two axes and not three: the line is a cylinder, so it shows the grid the same
+#: cross-section at every height and there is nothing along it for a lattice to
+#: fall differently against. The two positions along it that would register - the
+#: source and the measurement plane - are asked for by :meth:`Port.wanted_lines`
+#: and get lines of their own rather than being rounded to whatever the grading
+#: left nearby.
 LATTICE_PHASES = ((0.5, 0.0), (0.25, 0.25), (0.5, 0.5))
 
-#: Which resolution the alignment is swept at: the coarsest in the sequence.
+#: Which resolutions the alignment is swept at: both ends of the sequence.
 #:
-#: How far sampling can displace a boundary is bounded by the cell it is sampled
-#: on, so what the alignment is worth shrinks with the cell - the coarsest is
-#: where it is largest, and a figure measured there bounds every finer point in
-#: the sequence rather than being extrapolated to them. It is also the cheapest
-#: to solve, and the one where the effect stands furthest above everything else
-#: that moves an answer.
-REPLICATED_AT = min(CONDUCTOR_STEPS)
+#: Both, because what an alignment is worth at one resolution says nothing
+#: certain about another. The mechanism bounds it - sampling can displace a
+#: boundary by at most the cell it is sampled on - and a bound is not a law. A
+#: cylinder shows the grid the same circle at every height, so nothing averages
+#: along the line and the span need not fall with the cell at all. So the end a
+#: rate is read *to* is measured rather than argued from the end it is read
+#: *from*, and the gate scores each end on its own span and carries neither
+#: anywhere.
+#:
+#: Both ends and not every resolution, because of what :data:`LATTICE_PHASES` is:
+#: the extremes of the region the lattice moves in rather than an even sample of
+#: it. Their range is the band and their mean is not the lattice's mean, so a
+#: sequence refitted through such means would be a second exponent of the same
+#: standing as the first rather than a check on it.
+REPLICATED_AT = (min(CONDUCTOR_STEPS), max(CONDUCTOR_STEPS))
 
 
-def phase_case(offset) -> str:
-    """The case name for a lattice offset, in hundredths of a cell."""
-    return "phase-{:.0f}-{:.0f}".format(*(100.0 * np.asarray(offset, dtype=float)))
+def phase_case(steps: int, offset) -> str:
+    """The case name for a lattice offset, in hundredths of a cell.
+
+    Named by its resolution as well, the alignment being swept at more than one.
+    """
+    return "phase-{:d}-{:.0f}-{:.0f}".format(steps, *(100.0 * np.asarray(offset, dtype=float)))
+
+
+#: The case a run that is not doing the study solves: the operating point.
+#:
+#: The coarsest of the sequence, and its own first point rather than a mesh of
+#: its own. A run's cost is the cells times the timesteps, and both rise with the
+#: resolution, so the coarsest point of a sequence is where a gate is cheapest to
+#: ask anything of at all.
+NOMINAL = f"fine-{min(CONDUCTOR_STEPS)}"
+
+
+def cases():
+    """Every case, as ``name -> (fineness, conductor steps, lattice offset)``.
+
+    The sequence a rate is read from is one triangulation at each conductor
+    resolution, and it is the *fine* one: a triangulation is a fixed error in
+    millimetres however small the cell gets, so a sequence run on the coarse one
+    would flatten onto the polygon rather than onto the drawing.
+
+    The coarse triangulation is solved at the finest cell of the sequence, which
+    is where the two can differ most - the grid contributes least there, so
+    whatever separates them is the polygonisation and nothing else.
+
+    The rest are the two ends of that sequence solved again at other alignments
+    against their own lattice. A resolution says what size the cells are and
+    nothing about where they fall, so a sequence of one solve apiece varies both
+    at once and reads the difference as the trend. These say how much of it is
+    the alignment - at both ends, because what it is worth at one of them is not
+    something the other can be argued from.
+    """
+    found = {f"fine-{steps}": (FINENESSES["fine"], steps, (0.0, 0.0)) for steps in CONDUCTOR_STEPS}
+    found[f"coarse-{max(CONDUCTOR_STEPS)}"] = (
+        FINENESSES["coarse"],
+        max(CONDUCTOR_STEPS),
+        (0.0, 0.0),
+    )
+    for steps in REPLICATED_AT:
+        for offset in LATTICE_PHASES:
+            found[phase_case(steps, offset)] = (FINENESSES["fine"], steps, offset)
+    # A case is its directory, so two names that collide are one solve reported
+    # twice - and the name rounds the offset it is built from.
+    wanted = len(CONDUCTOR_STEPS) + 1 + len(REPLICATED_AT) * len(LATTICE_PHASES)
+    assert len(found) == wanted, sorted(found)
+    return found
+
+
+#: What the two conductors are called. The probe draws them under these names
+#: and keys the departure it reports by them, so a gate reading those figures
+#: needs the names and draws nothing.
+INNER = "Inner"
+SHIELD = "Shield"
+CONDUCTORS = (INNER, SHIELD)
 
 
 def displacement_worth(distance: float) -> float:
@@ -231,9 +301,18 @@ def displacement_worth(distance: float) -> float:
     displacement over its own radius, over the logarithm the impedance is
     proportional to.
     """
-    return (
-        distance * (1.0 / INNER_RADIUS + 1.0 / OUTER_RADIUS) / math.log(OUTER_RADIUS / INNER_RADIUS)
-    )
+    return walls_worth(distance, distance)
+
+
+def walls_worth(inner: float, outer: float) -> float:
+    """The same, for two walls displaced by different distances.
+
+    ``displacement_worth`` is this with one figure standing for both, which is
+    what a grid does - it samples on one cell and eats into each by about the
+    same. A polygonisation does not: each conductor is triangulated against its
+    own radius, so the two move by different amounts.
+    """
+    return (inner / INNER_RADIUS + outer / OUTER_RADIUS) / math.log(OUTER_RADIUS / INNER_RADIUS)
 
 
 def conductor_res(steps: int) -> float:
@@ -252,8 +331,8 @@ def timesteps(grid, timestep_factor: float = 1.0) -> int:
     timestep, and a proxy that has stopped tracking is how a sequence quietly
     stops covering the same stretch of time.
 
-    ``timestep_bound`` assumes vacuum and a material only ever permits a longer
-    step, so this over-counts rather than under-counts - the safe direction.
+    ``timestep_bound`` estimates openEMS' step rather than bounding it, so what
+    this counts out is a record of about that length rather than at least it.
     """
     from Microwave.Solvers.openems.report import timestep_bound
 

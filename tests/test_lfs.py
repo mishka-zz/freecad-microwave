@@ -20,20 +20,31 @@ import pytest
 
 from Microwave.Solvers.openems import document
 from Microwave.Solvers.openems.lfs import (
+    BOUNDARY_FINENESS,
     CHORD_TOLERANCE,
-    MARCH_STEPS,
+    CURVATURE_SAMPLES,
+    MARCH_STEP,
     MAX_EDGE_SAMPLES,
+    MAX_HALVINGS,
     MAX_SAMPLES,
+    MOST_CROSSINGS,
     SEPARATION_REACH,
     SHARP_DEGREES,
     SURFACE_FIDELITY,
     TOUCHING,
-    WINDING_PROBE,
+    UNTRIMMED_SHORTFALL,
     Body,
+    Curvature,
+    _on_face,
+    bends_through,
+    curvature,
     features,
 )
-from Microwave.Solvers.openems.mesh import MeshParams
+from Microwave.Solvers.openems.regions import MeshParams
 from Microwave.Solvers.openems.sizing import Feature, separation
+from Microwave.Solvers.openems.spend import Spend
+from tests.conftest import GROWTH_WORTH_READING, LINEAR_ENOUGH
+from tests.directions import cross, scaled, widest_across
 
 
 class Point:
@@ -76,6 +87,50 @@ class Slab:
         )
 
 
+def box_surface(lower, upper):
+    """A box as the triangles a body of that shape reaches the engine as.
+
+    A chord is read off the triangulation rather than off the faces, so a
+    stand-in body has to carry one. Wound outward, which is what the
+    translation guarantees and what the sign of a crossing is read against.
+    """
+    (x0, y0, z0), (x1, y1, z1) = lower, upper
+    vertices = [
+        (x0, y0, z0),
+        (x1, y0, z0),
+        (x1, y1, z0),
+        (x0, y1, z0),
+        (x0, y0, z1),
+        (x1, y0, z1),
+        (x1, y1, z1),
+        (x0, y1, z1),
+    ]
+    faces = [
+        (0, 2, 1),
+        (0, 3, 2),
+        (4, 5, 6),
+        (4, 6, 7),
+        (0, 1, 5),
+        (0, 5, 4),
+        (1, 2, 6),
+        (1, 6, 5),
+        (2, 3, 7),
+        (2, 7, 6),
+        (3, 0, 4),
+        (3, 4, 7),
+    ]
+    return vertices, faces
+
+
+def joined(*surfaces):
+    """Two or more closed boxes as one triangulated boundary."""
+    vertices, faces = [], []
+    for points, triangles in surfaces:
+        faces += [tuple(i + len(vertices) for i in one) for one in triangles]
+        vertices += list(points)
+    return vertices, faces
+
+
 class BoundBox:
     def __init__(self, lower, upper):
         (self.XMin, self.YMin, self.ZMin) = lower
@@ -83,13 +138,28 @@ class BoundBox:
 
 
 class Surface:
-    """Answers where a point sits in a face's parameters. Only joins ask."""
+    """Answers where a point sits in a face's parameters. Only joins ask.
 
-    def __init__(self, face):
+    It answers whether it is planar only where the face was given an answer to
+    hand over. A surface without one carries no ``isPlanar`` at all, which is
+    the surface a reading cannot identify and therefore asks - and that is every
+    stand-in here that does not say otherwise.
+    """
+
+    def __init__(self, face, planar=None):
         self._face = face
+        if planar is not None:
+            self.isPlanar = lambda: planar
 
     def parameter(self, point):
         return (0.0, 0.0)
+
+
+class RefusingSurface(Surface):
+    """A surface the question cannot be put to at all."""
+
+    def isPlanar(self):
+        raise RuntimeError("this surface cannot say")
 
 
 class Face:
@@ -101,7 +171,16 @@ class Face:
     """
 
     def __init__(
-        self, curvature=(0.0, 0.0), normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, 0.0), size=1.0, edges=()
+        self,
+        curvature=(0.0, 0.0),
+        normal=(0.0, 0.0, 1.0),
+        at=(0.0, 0.0, 0.0),
+        size=1.0,
+        edges=(),
+        area=1.0,
+        orientation="Forward",
+        planar=None,
+        surface=Surface,
     ):
         self._curvature = curvature
         self._normal = normal
@@ -109,7 +188,11 @@ class Face:
         self.ParameterRange = (0.0, 1.0, 0.0, 1.0)
         self.BoundBox = BoundBox(at, tuple(a + size for a in at))
         self.Edges = list(edges)
-        self.Surface = Surface(self)
+        self.Surface = surface(self, planar)
+        self.Area = area
+        # The kernel's own word, and the reason a bore's curvature comes back
+        # with the face's sign rather than the metal's.
+        self.Orientation = orientation
 
     def curvatureAt(self, u, v):
         return self._curvature
@@ -159,9 +242,21 @@ class Edge:
 
 
 class Shape:
-    def __init__(self, lower, upper, faces=(), distance=None, witnesses=(), solids=()):
+    def __init__(
+        self,
+        lower,
+        upper,
+        faces=(),
+        distance=None,
+        witnesses=(),
+        solids=(),
+        edges=(),
+        area=0.0,
+    ):
         self.BoundBox = BoundBox(lower, upper)
+        self.Area = area
         self.Faces = list(faces)
+        self.Edges = list(edges)
         self.Solids = list(solids)
         self._distance = distance
         self._witnesses = witnesses
@@ -194,41 +289,39 @@ def tilted(about, angle):
     return tuple(math.cos(angle) * a + math.sin(angle) * b for a, b in zip(axis, sideways))
 
 
-def scaled(vector):
-    length = math.sqrt(sum(v * v for v in vector))
-    return tuple(v / length for v in vector)
-
-
-def cross(one, other):
-    return (
-        one[1] * other[2] - one[2] * other[1],
-        one[2] * other[0] - one[0] * other[2],
-        one[0] * other[1] - one[1] * other[0],
-    )
-
-
-def cell_across(measured):
-    """The cell the mesher lays on y, given a set of demands and a plain plate.
+def lines_on_y(measured, params):
+    """The grid the mesher lays on y, given a set of demands and a plain plate.
 
     On y because that is the way out of the wedge the join tests build, and a
     plain plate because a demand that only ever moved a line some other body had
     already moved would not have been read.
     """
-    import numpy as np
-
     from Microwave.Solvers.openems.model import Material, Solid
-    from Microwave.Solvers.openems.write import plan_mesh
+    from Microwave.Solvers.openems.plan import plan_mesh
 
     solids = [Solid(material="pec", lower=(0.0,) * 3, upper=(20.0, 20.0, 1.0), label="Plate")]
     lines, _, _ = plan_mesh(
-        solids,
-        [],
-        [Material(name="pec", kind="pec")],
-        MeshParams(metal_res=0.5, dielectric_res=2.0),
-        measured=measured,
+        solids, [], [Material(name="pec", kind="pec")], params, measured=measured
     )
-    index = int(np.searchsorted(lines[1], 0.0))
-    return float(lines[1][index + 1] - lines[1][index])
+    return lines[1]
+
+
+def cell_across(measured):
+    """The cell leading away from the origin, at the policy the join tests use."""
+    import numpy as np
+
+    lines = lines_on_y(measured, MeshParams(metal_res=0.5, dielectric_res=2.0))
+    index = int(np.searchsorted(lines, 0.0))
+    return float(lines[index + 1] - lines[index])
+
+
+def cell_over(measured, params, where):
+    """The cell the grid lays across ``where`` on y."""
+    import numpy as np
+
+    lines = lines_on_y(measured, params)
+    index = int(np.searchsorted(lines, where)) - 1
+    return float(lines[index + 1] - lines[index])
 
 
 def sphere_face(radius, at=(0.0, 0.0, 0.0)):
@@ -286,12 +379,12 @@ class TestWhatACurvedFaceAsksFor:
         assert features([flat], cap=100.0) == []
 
     def _apart(self, first, second):
-        """Two curved bodies far enough apart that neither covers the other.
+        """Two curved bodies, one at the origin and one a long way off.
 
-        Both demands have to survive to be compared, and the field is a minimum
-        of ramps: a finer demand nearby holds the field below a coarser one and
-        `_pruned` drops the coarser as redundant. The separation is what keeps
-        this a test of what each face asks rather than of which one won.
+        Placed apart so that each answers for its own face. Nothing here drops
+        either of them - what one measurement makes of another is settled in the
+        mesher - and the separation keeps the pair legible: a reader can tell
+        which demand came from which body by where it stands.
         """
         return [
             Body(
@@ -368,8 +461,8 @@ class TestWhichBoundHolds:
             min(v for v in feature.cells() if math.isfinite(v))
             for feature in features([corner], cap=1e4, edge_size=self.EDGE)
         ]
-        assert across == pytest.approx([self.EDGE] * len(across))
-        assert self.asked(0.5) == pytest.approx(self.EDGE)
+        assert across == pytest.approx([self.EDGE / math.sqrt(2.0)] * len(across))
+        assert self.asked(0.5) == pytest.approx(self.EDGE / math.sqrt(2.0))
 
     def test_and_a_body_thinner_than_an_edge_is_left_to_conduction(self):
         """A cell that does not fit inside the metal leaves it electrically
@@ -418,18 +511,74 @@ class TestACurvedFaceIsFollowedAcrossItself:
         """A rod metres long asks for no more constraints than a short one."""
         assert len(self.places(1e4, 0.5)) <= MAX_SAMPLES**2
 
+    @pytest.mark.parametrize(("size", "edge_size"), ((4.0, 0.5), (8.0, 0.5), (4.0, 2.0)))
+    def test_the_stations_are_no_further_apart_than_the_spacing_asked_for(self, size, edge_size):
+        """The comparisons above hold the counts against each other and leave
+        the scale open downward: a lattice ten times finer than the cell size
+        passes all three. This is what holds the stations to the spacing they
+        were asked for.
+
+        Asked for, and not what the demands settle at. A curvature held to a
+        fraction of its radius asks for less than the cell the stations are
+        spaced at, and the spacing follows the size a demand off a face will
+        usually settle on rather than the size this one did.
+        """
+        along = sorted({place[0] for place in self.places(size, edge_size)})
+        steps = [far - near for near, far in zip(along, along[1:])]
+        assert steps, "the face was sampled in one place"
+        assert max(steps) <= edge_size
+        # And not laid about twice as densely as it was asked for, which costs
+        # four times as much over a face and resolves nothing further.
+        assert min(steps) > edge_size / 2.0
+
+
+class _CountedFace(Face):
+    """A face that says how often its parameter range was read, which is once
+    for each lattice laid across it."""
+
+    def __init__(self, **built):
+        self._reads = 0
+        super().__init__(**built)
+
+    @property
+    def ParameterRange(self):
+        self._reads += 1
+        return self._range
+
+    @ParameterRange.setter
+    def ParameterRange(self, value):
+        self._range = value
+
+    @property
+    def lattices(self):
+        return self._reads
+
 
 class _SpreadFace(Face):
     """A face whose parameters map onto real distance, so the number of places
     it is sampled at can be counted. The shared stand-in answers one point for
-    every parameter pair, which collapses every sample onto one demand."""
+    every parameter pair, which collapses every sample onto one demand.
 
-    def __init__(self, curvature, size):
+    ``trimmed`` cuts the face out of its own parameter rectangle, which is what
+    a face is: a plane cut to a triangle, or a boolean's remnant, occupies only
+    part of the range its surface is stated over.
+    """
+
+    def __init__(self, curvature, size, trimmed=None):
         super().__init__(curvature=curvature, size=size)
         self._size = size
+        self._trimmed = trimmed
 
     def valueAt(self, u, v):
         return Point(self._size * u, self._size * v, 0.0)
+
+    def isPartOfDomain(self, u, v):
+        return True if self._trimmed is None else self._trimmed(u, v)
+
+
+def _refuses(u, v):
+    """A parameterisation with no answer for a point of its own - a pole, a seam."""
+    raise RuntimeError("this surface has no parameterisation here")
 
 
 class TestARelaxedBody:
@@ -575,6 +724,449 @@ class TestTheQueryIsBounded:
         assert bodies[0].shape.queried == 1
 
 
+class _Wall(Face):
+    """A flat wall spanned by two direction vectors, whose parameters map onto
+    real distance. The shared stand-in answers one point for every parameter
+    pair, which would collapse every sample onto one demand."""
+
+    def __init__(self, start, along, across, normal):
+        super().__init__(normal=normal)
+        self._start, self._along, self._across = start, along, across
+        corners = [
+            tuple(s + a * i + c * j for s, a, c in zip(start, along, across))
+            for i in (0.0, 1.0)
+            for j in (0.0, 1.0)
+        ]
+        self.BoundBox = BoundBox(
+            tuple(min(corner[d] for corner in corners) for d in range(3)),
+            tuple(max(corner[d] for corner in corners) for d in range(3)),
+        )
+
+    def valueAt(self, u, v):
+        return Point(
+            *(s + a * u + c * v for s, a, c in zip(self._start, self._along, self._across))
+        )
+
+
+class TestTheGapIsWalkedAlongTheRun:
+    """A witness pair is where two bodies are closest and nothing more, so a
+    pair running close along a length is also sampled along that run, with the
+    gap walked outward from each sample by stepping and then halving against
+    the kernel's own containment, pointed at the neighbour."""
+
+    GAP = 0.25
+    RUN = 10.0
+    CAP = 2.0
+
+    def wall(self, at=1.0, normal=(0.0, 1.0, 0.0)):
+        return _Wall((0.0, at, 0.0), (self.RUN, 0.0, 0.0), (0.0, 0.0, 1.0), normal)
+
+    def pair(self, faces=None, own=None, neighbour_solids=None, neighbour_faces=(), sheet=False):
+        near = Shape(
+            (0.0, 0.0, 0.0),
+            (self.RUN, 1.0, 1.0),
+            faces=[self.wall()] if faces is None else faces,
+            solids=[Slab((0.0, 0.0, 0.0), (self.RUN, 1.0, 1.0))] if own is None else own,
+            distance=self.GAP,
+            witnesses=[((0.0, 1.0, 0.5), (0.0, 1.0 + self.GAP, 0.5))],
+        )
+        # Taller than the sampled body, so the smaller-diagonal rule cannot
+        # turn around and sample the neighbour instead.
+        top = 2.0 + self.GAP + 1.0
+        far = Shape(
+            (0.0, 1.0 + self.GAP, 0.0),
+            (self.RUN, top, 1.0),
+            faces=neighbour_faces,
+            solids=(
+                [Slab((0.0, 1.0 + self.GAP, 0.0), (self.RUN, top, 1.0))]
+                if neighbour_solids is None
+                else neighbour_solids
+            ),
+        )
+        return [Body("Trace", near, sheet=sheet), Body("Keeper", far)]
+
+    def gaps(self, bodies):
+        return [f for f in features(bodies, cap=self.CAP) if f.normal is not None]
+
+    def walked(self, bodies):
+        """The demands the walk added: everything away from the witness at 0."""
+        return [f for f in self.gaps(bodies) if f.lower[0] > 0.0]
+
+    def test_the_gap_is_asked_along_the_run_not_only_at_its_witness(self):
+        stations = sorted({f.lower[0] for f in self.gaps(self.pair())})
+        spacing = max(self.GAP, self.RUN / MAX_SAMPLES)
+        assert stations[0] <= spacing
+        assert stations[-1] >= self.RUN - spacing
+        assert max(b - a for a, b in zip(stations, stations[1:])) <= spacing + 1e-9
+
+    def test_the_walked_width_is_the_gap(self):
+        walked = self.walked(self.pair())
+        assert walked, "nothing was walked"
+        for feature in walked:
+            assert feature.thickness == pytest.approx(self.GAP, rel=CHORD_TOLERANCE)
+
+    def test_both_walls_carry_each_asking(self):
+        """The gap is between them, the same statement the witness pair makes:
+        a demand at one wall only would leave the other to the grading."""
+        walls = {round(f.lower[1], 2) for f in self.walked(self.pair())}
+        assert walls == {1.0, 1.0 + self.GAP}
+
+    def test_the_source_names_both_objects(self):
+        assert {f.source for f in self.walked(self.pair())} == {
+            "the gap between 'Trace' and 'Keeper'"
+        }
+
+    def test_each_solid_of_the_neighbour_is_asked_separately(self):
+        """``isInside`` on a compound consults one member, so a point inside
+        another comes back outside and the walk crosses a wall that is there.
+
+        The neighbour here is drawn in two lumps with the near one set back, so
+        the wall the walk must strike belongs to the second. Asked as a compound
+        it would strike nothing and the gap would go unmeasured.
+        """
+        first = Slab((0.0, 6.0, 0.0), (self.RUN, 7.0, 1.0))
+        second = Slab((0.0, 1.0 + self.GAP, 0.0), (self.RUN, 2.0 + self.GAP, 1.0))
+        walked = self.walked(self.pair(neighbour_solids=[first, second]))
+        assert walked, "the second lump of the neighbour was never asked about"
+        for feature in walked:
+            assert feature.thickness == pytest.approx(self.GAP, rel=CHORD_TOLERANCE)
+        assert second.asked
+
+    def test_a_wall_facing_away_asks_nothing(self):
+        """The walk off the far side of the body leaves the reach without
+        striking the neighbour, and a sample that finds nothing asks nothing."""
+        both = self.pair(faces=[self.wall(), self.wall(at=0.0, normal=(0.0, -1.0, 0.0))])
+        assert min(f.lower[1] for f in self.gaps(both)) >= 1.0
+
+    def test_a_face_interior_to_the_body_asks_nothing(self):
+        """Both sides of it are material, so it is not a boundary and sees no
+        gap - the winding probe is what settles that."""
+        buried = self.pair(faces=[self.wall(at=0.5)])
+        assert self.walked(buried) == []
+
+    def test_a_body_with_no_inside_is_walked_both_ways(self):
+        """A sheet has no solids to settle a winding against, and its wall is
+        real from both sides - so a normal pointing away from the neighbour
+        still finds it."""
+        down = self.wall(normal=(0.0, -1.0, 0.0))
+        sheet = self.pair(faces=[down], own=[], sheet=True)
+        walked = self.walked(sheet)
+        assert walked, "the sheet asked nothing"
+        for feature in walked:
+            assert feature.thickness == pytest.approx(self.GAP, rel=CHORD_TOLERANCE)
+
+    def test_a_neighbour_with_no_inside_is_sampled_instead(self):
+        """Containment answers nothing for an area, so a sheet is only ever
+        reached by sampling it - the pair turns around and walks from the
+        sheet into the solid."""
+        wall = self.wall(at=1.0 + self.GAP, normal=(0.0, 1.0, 0.0))
+        turned = self.pair(neighbour_solids=[], neighbour_faces=[wall])
+        walls = {round(f.lower[1], 2) for f in self.walked(turned)}
+        assert walls == {1.0, 1.0 + self.GAP}
+
+    def test_a_pair_of_sheets_keeps_its_witness_and_nothing_more(self):
+        """Neither side can be walked into, and the extremal pair is all that
+        is measured for such a pair."""
+        down = self.wall(normal=(0.0, -1.0, 0.0))
+        sheets = self.pair(faces=[down], own=[], neighbour_solids=[], sheet=True)
+        assert self.walked(sheets) == []
+
+    def test_every_walked_asking_carries_the_spacing_it_was_sampled_at(self):
+        """The run wants more samples than the cap allows, so the lattice is
+        laid coarser than the gap - and what the demand records is the spacing
+        realised, not the one asked, because the realised one is what bounds
+        the field between stations."""
+        walked = self.walked(self.pair())
+        assert walked, "nothing was walked"
+        for feature in walked:
+            assert feature.sampled_at == pytest.approx(self.RUN / MAX_SAMPLES)
+
+    def test_the_witness_pair_carries_no_spacing(self):
+        """A witness stands alone - it is not part of a sampled family, and a
+        spacing on it would let the report promise a bound over a run nothing
+        sampled."""
+        witnesses = [f for f in self.gaps(self.pair()) if f.lower[0] == 0.0]
+        assert witnesses, "the extremal pair went missing"
+        for feature in witnesses:
+            assert feature.sampled_at is None
+
+    def test_a_short_run_is_sampled_at_the_gap_or_finer(self):
+        """Below the cap the lattice keeps its target, so a recorded spacing
+        above the gap can only mean the cap - which is what lets a reader of
+        the demands tell a capped run without seeing the face."""
+        short = _Wall((0.0, 1.0, 0.0), (2.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0))
+        walked = self.walked(self.pair(faces=[short]))
+        assert walked, "nothing was walked"
+        for feature in walked:
+            assert feature.sampled_at <= self.GAP
+
+    def test_a_gap_to_a_box_is_walked_from_the_measured_side(self):
+        """A box's flat walls are already pinned; it is the body carried as
+        geometry whose walls the grid has to find. The walk probes the
+        neighbour's solids, so which side was sampled is what the counters
+        say."""
+        box_solid = Slab((0.0, 0.0, 0.0), (self.RUN, 1.0, 1.0))
+        box = Shape(
+            (0.0, 0.0, 0.0),
+            (self.RUN, 1.0, 1.0),
+            faces=[self.wall()],
+            solids=[box_solid],
+            distance=self.GAP,
+            witnesses=[((0.0, 1.0, 0.5), (0.0, 1.0 + self.GAP, 0.5))],
+        )
+        drawn_solid = Slab((0.0, 1.0 + self.GAP, 0.0), (self.RUN, 2.0 + self.GAP, 1.0))
+        drawn = Shape(
+            (0.0, 1.0 + self.GAP, 0.0),
+            (self.RUN, 2.0 + self.GAP, 1.0),
+            faces=[self.wall(at=1.0 + self.GAP, normal=(0.0, -1.0, 0.0))],
+            solids=[drawn_solid],
+        )
+        pair = [Body("Ground", box, measured=False), Body("Trace", drawn)]
+        assert self.gaps(pair), "no gap was measured"
+        assert box_solid.asked > drawn_solid.asked
+
+    def test_and_from_the_smaller_of_two_drawn_bodies(self):
+        """The smaller body covers the shared stretch of the gap in fewer
+        samples, so where both are carried as geometry it is the one walked
+        from - read off the counters the same way."""
+        big_solid = Slab((0.0, 0.0, 0.0), (self.RUN, 1.0, 1.0))
+        big = Shape(
+            (0.0, 0.0, 0.0),
+            (self.RUN, 1.0, 1.0),
+            faces=[self.wall()],
+            solids=[big_solid],
+            distance=self.GAP,
+            witnesses=[((0.0, 1.0, 0.5), (0.0, 1.0 + self.GAP, 0.5))],
+        )
+        small_solid = Slab((0.0, 1.0 + self.GAP, 0.0), (2.0, 2.0 + self.GAP, 1.0))
+        small = Shape(
+            (0.0, 1.0 + self.GAP, 0.0),
+            (2.0, 2.0 + self.GAP, 1.0),
+            faces=[
+                _Wall(
+                    (0.0, 1.0 + self.GAP, 0.0),
+                    (2.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                    (0.0, -1.0, 0.0),
+                )
+            ],
+            solids=[small_solid],
+        )
+        pair = [Body("Board", big), Body("Chip", small)]
+        assert self.walked(pair), "no gap was walked"
+        assert big_solid.asked > small_solid.asked
+
+
+class _ObliqueSlab:
+    """A bar turned in the xy plane, answering containment in its own frame."""
+
+    def __init__(self, start, run, width, height, angle):
+        self._start = start
+        self._run, self._width, self._height = run, width, height
+        self._cos, self._sin = math.cos(angle), math.sin(angle)
+
+    def isInside(self, point, tolerance, check_face):
+        dx, dy = point.x - self._start[0], point.y - self._start[1]
+        along = dx * self._cos + dy * self._sin
+        across = -dx * self._sin + dy * self._cos
+        return (
+            -tolerance <= along <= self._run + tolerance
+            and -tolerance <= across <= self._width + tolerance
+            and -tolerance <= point.z <= self._height + tolerance
+        )
+
+
+class TestTheGridDeliversTheGapAlongTheRun:
+    """The criterion the walk exists for, asked of the finished grid.
+
+    An oblique run, because an axis-parallel one is delivered by the grid's own
+    tensor structure - the fine spacing one axis is asked for at the witness
+    spans the whole domain on the others - and the walk's absence would not
+    show. On an oblique run the gap's position moves across the axes, and
+    between point demands the field climbs at the grading slope.
+    """
+
+    GAP = 0.25
+    RUN = 10.0
+    ANGLE = math.radians(45.0)
+
+    def profile(self, measured, params):
+        """The cell the grid lays across the gap, at stations along the run."""
+        import numpy as np
+
+        from Microwave.Solvers.openems.model import Material, Solid
+        from Microwave.Solvers.openems.plan import plan_mesh
+
+        lines, _, _ = plan_mesh(
+            [Solid(material="air", lower=(-4.0, -1.0, 0.0), upper=(9.0, 10.0, 1.0))],
+            [],
+            [Material(name="air", kind="dielectric")],
+            params,
+            measured=measured,
+        )
+
+        def spacing(axis, value):
+            index = max(0, min(int(np.searchsorted(lines[axis], value)) - 1, len(lines[axis]) - 2))
+            return float(lines[axis][index + 1] - lines[axis][index])
+
+        u = (math.cos(self.ANGLE), math.sin(self.ANGLE))
+        normal = (-math.sin(self.ANGLE), math.cos(self.ANGLE))
+        middle = tuple(n * (1.0 + self.GAP / 2.0) for n in normal)
+        widths = []
+        for i in range(11):
+            t = self.RUN * i / 10.0
+            at = (middle[0] + u[0] * t, middle[1] + u[1] * t)
+            widths.append(abs(normal[0]) * spacing(0, at[0]) + abs(normal[1]) * spacing(1, at[1]))
+        return widths
+
+    def witness_places(self):
+        normal = (-math.sin(self.ANGLE), math.cos(self.ANGLE), 0.0)
+        return (
+            tuple(n * 1.0 for n in normal),
+            tuple(n * (1.0 + self.GAP) for n in normal),
+        )
+
+    def bodies(self):
+        u = (math.cos(self.ANGLE), math.sin(self.ANGLE), 0.0)
+        normal = (-math.sin(self.ANGLE), math.cos(self.ANGLE), 0.0)
+        along = tuple(v * self.RUN for v in u)
+        wall_start, witness = self.witness_places()
+        wall = _Wall(wall_start, along, (0.0, 0.0, 1.0), normal)
+        corners = [wall_start, tuple(s + a for s, a in zip(wall_start, along))]
+        low = tuple(min(c[d] for c in corners) - 2.0 for d in range(3))
+        high = tuple(max(c[d] for c in corners) + 2.0 for d in range(3))
+        near = Shape(
+            low,
+            high,
+            faces=[wall],
+            solids=[_ObliqueSlab((0.0, 0.0), self.RUN, 1.0, 1.0, self.ANGLE)],
+            distance=self.GAP,
+            witnesses=[(wall_start, witness)],
+        )
+        # Wider than the sampled bar, so the smaller-diagonal rule keeps
+        # sampling the bar that carries the wall.
+        far = Shape(
+            tuple(v - 1.0 for v in low),
+            tuple(v + 1.0 for v in high),
+            solids=[_ObliqueSlab((witness[0], witness[1]), self.RUN, 1.5, 1.0, self.ANGLE)],
+        )
+        return [Body("Trace", near), Body("Keeper", far)]
+
+    def test_the_grid_delivers_the_gap_along_the_whole_run(self):
+        """Between samples the field peaks half a grading step times the axis
+        weights above the gap, and a cell straddling a linearly climbing field
+        widens by at most 1/(1 - g/2) - both from the field's own slope, so the
+        bound is arithmetic over declared constants and not a figure from a
+        run."""
+        params = MeshParams(metal_res=0.5, dielectric_res=2.0)
+        grading = math.log(params.max_ratio[0])
+        bound = self.GAP * (1.0 + grading * math.sqrt(3.0) / 2.0) / (1.0 - grading / 2.0)
+        measured = features(self.bodies(), cap=params.dielectric_res)
+        widths = self.profile(measured, params)
+        assert max(widths) <= bound
+
+    def test_and_the_witness_alone_would_not_have(self):
+        """What holds the middle of the run down is the walk: the same grid
+        built from the witness pair alone climbs past the bound there, so the
+        test above cannot pass by the bulk being fine enough anyway."""
+        params = MeshParams(metal_res=0.5, dielectric_res=2.0)
+        grading = math.log(params.max_ratio[0])
+        bound = self.GAP * (1.0 + grading * math.sqrt(3.0) / 2.0) / (1.0 - grading / 2.0)
+        measured = features(self.bodies(), cap=params.dielectric_res)
+        ends = self.witness_places()
+        witness_only = [f for f in measured if f.lower in ends]
+        assert witness_only, "the extremal pair went missing"
+        widths = self.profile(witness_only, params)
+        assert max(widths) > bound
+
+    def test_the_report_carries_the_run_and_its_promise(self):
+        """The chain the report row exists for - emission, mesher, scoring -
+        on one oblique run. The run wants more samples than the cap allows,
+        so the row states the promise between stations; and the promise is
+        held to the grid itself: the delivered profile along the whole run
+        stays inside it."""
+        from Microwave.Solvers.openems.model import Material, Solid
+        from Microwave.Solvers.openems.plan import plan_mesh
+        from Microwave.Solvers.openems.report import mesh_report
+
+        params = MeshParams(metal_res=0.5, dielectric_res=2.0)
+        measured = features(self.bodies(), cap=params.dielectric_res)
+        lines, _, _ = plan_mesh(
+            [Solid(material="air", lower=(-4.0, -1.0, 0.0), upper=(9.0, 10.0, 1.0))],
+            [],
+            [Material(name="air", kind="dielectric")],
+            params,
+            measured=measured,
+        )
+        report = mesh_report(lines, [], params, measured=measured)
+        (row,) = [r for r in report.gapped if r.source == "the gap between 'Trace' and 'Keeper'"]
+        assert report.unheld == ()
+        assert row.capped
+        assert row.spaced == pytest.approx(self.RUN / MAX_SAMPLES)
+        assert max(self.profile(measured, params)) <= row.between
+
+
+class TestTheGridDeliversTheCountAtEveryTilt:
+    """The count allocation's guarantee, asked of the finished grid.
+
+    The algebra tests hold the guarantee against ideal lattices. The mesher
+    then grades, snaps and pins lines of its own, any of which can move a
+    delivered count in either direction - so the same claim is asked once of
+    the grid it actually builds. The symmetric normals are the ones whose
+    axis lattices the mesher lays identically, merging their crossings; they
+    are what the allocation is scaled for.
+    """
+
+    THICKNESS = 1.0
+    CENTER = (10.0, 10.0, 5.0)
+    TILTS = (
+        (0.0, 0.0, 1.0),
+        (1.0, 0.02, 0.0),
+        (3.0, 2.0, 1.0),
+        (2.0, 1.0, 1.0),
+        (1.0, 1.0, 0.0),
+        (1.0, 1.0 + 1e-6, 0.0),
+        (1.0, 1.0, 1.0),
+    )
+
+    def chord(self, normal):
+        length = math.sqrt(sum(value**2 for value in normal))
+        unit = tuple(value / length for value in normal)
+        start = tuple(c - 0.5 * self.THICKNESS * m for c, m in zip(self.CENTER, unit))
+        end = tuple(c + 0.5 * self.THICKNESS * m for c, m in zip(self.CENTER, unit))
+        return unit, start, end
+
+    def meshed(self, normal, count):
+        from Microwave.Solvers.openems.model import Material, Solid
+        from Microwave.Solvers.openems.plan import plan_mesh
+
+        unit, start, end = self.chord(normal)
+        layer = Feature(
+            thickness=self.THICKNESS,
+            normal=unit,
+            lower=tuple(min(a, b) for a, b in zip(start, end)),
+            upper=tuple(max(a, b) for a, b in zip(start, end)),
+            source="layer",
+            across=count,
+        )
+        lines, _, _ = plan_mesh(
+            [Solid(material="fr4", lower=(0.0, 0.0, 0.0), upper=(20.0, 20.0, 10.0))],
+            [],
+            [Material(name="fr4", kind="dielectric", epsilon=4.3)],
+            MeshParams(metal_res=0.5, dielectric_res=2.0),
+            measured=[layer],
+        )
+        return lines, layer, start, end
+
+    @pytest.mark.parametrize("count", [4, 8])
+    def test_every_tilt_is_spanned_by_the_cells_it_asked_for(self, count):
+        from Microwave.Solvers.openems.grid import cells_along
+
+        for normal in self.TILTS:
+            lines, _, start, end = self.meshed(normal, count)
+            assert cells_along(lines, start, end) >= count, normal
+
+
 class TestSharpJoins:
     """A conductor's edge carries a field singularity; a tangent join does not,
     however tightly it curves."""
@@ -596,28 +1188,33 @@ class TestSharpJoins:
         faces = [Face(normal=one, edges=[edge]), Face(normal=other, edges=[edge])]
         return Body("Pad", Shape((0.0,) * 3, (1.0,) * 3, faces=faces), metal=metal)
 
+    #: A handful of ways to turn one wedge, the first leaving its edge on an
+    #: axis and the rest leaving it on none.
+    ORIENTATIONS = [(0.0, 0.0, 1.0), (1.0, 2.0, 3.0), (0.3, -0.9, 0.1), (-2.0, 5.0, -1.0)]
+
     def joins(self, disagreement):
         return features([self.body(disagreement)], cap=100.0, edge_size=0.2)
 
-    def knife(self, disagreement):
-        return [f for f in self.joins(disagreement) if f.source == "'Pad' knife edge"]
-
-    def held(self, disagreement, source):
-        """The finest cell anything from ``source`` asks for on the way out."""
-        return min(f.cells()[1] for f in self.joins(disagreement) if f.source == source)
-
-    def knife_of(self, one, other):
+    def left(self, one, other):
+        """The finest cell each axis is left, over everything the join emits."""
         found = features([self.meeting(one, other)], cap=100.0, edge_size=0.2)
-        return next(f.normal for f in found if f.source == "'Pad' knife edge")
+        assert found
+        return [min(f.cells()[dim] for f in found) for dim in range(3)]
 
-    def test_a_corner_asks_for_the_edge_size_across_each_of_its_faces(self):
-        """Two demands, one per face, each along that face's own normal - which
-        is the direction the field varies in on that side of the edge."""
+    def test_a_corner_asks_across_the_whole_plane_of_its_edge(self):
+        """One demand per sample, carrying the edge's own line. Across an
+        axis-aligned edge each of the two axes gets the edge size over the
+        root of two - the largest square cell whose diagonal the plane
+        reaches - and the edge's own axis is left alone."""
         found = features([self.body(90.0)], cap=100.0, edge_size=0.2)
         assert {f.source for f in found} == {"'Pad' edge"}
+        places = [f.lower for f in found]
+        assert len(places) == len(set(places))
         for feature in found:
-            finite = [v for v in feature.cells() if math.isfinite(v)]
-            assert finite == [pytest.approx(0.2)]
+            assert feature.tangent is not None and feature.normal is None
+            sizes = feature.cells()
+            assert math.isinf(sizes[0])
+            assert sizes[1] == sizes[2] == pytest.approx(0.2 / math.sqrt(2.0))
 
     def test_a_tangent_join_asks_for_nothing(self):
         """Where a fillet meets the face it is tangent to. Refining it would put
@@ -638,109 +1235,80 @@ class TestSharpJoins:
     def test_nothing_is_asked_when_no_edge_size_was_given(self):
         assert features([self.body(90.0)], cap=100.0, edge_size=None) == []
 
-    def test_a_knife_edge_asks_once_more_along_the_way_out_of_its_tip(self):
-        """Where the two faces have closed onto each other, so that neither of
-        the demands they make is much use across the way out between them. Once
-        at each place along the edge, beside the two the faces make there - it
-        is a property of the join and follows the join wherever it runs."""
-        disagreement = 180.0 - SHARP_DEGREES + 1.0
-        found = self.knife(disagreement)
-        faces = [f for f in self.joins(disagreement) if f.source == "'Pad' edge"]
-        assert found and len(faces) == 2 * len(found)
-        assert [f.thickness for f in found] == [pytest.approx(0.2)] * len(found)
-        assert {f.lower for f in found} == {f.lower for f in faces}
+    @pytest.mark.parametrize("disagreement", [30.0, 90.0, 164.9, 165.1, 179.0])
+    def test_the_demand_is_the_same_however_the_part_is_turned(self, disagreement):
+        """The criterion of the rule: the widest the cell runs along any
+        direction across the edge spends the edge size exactly, at every
+        dihedral and every orientation. A demand per direction holds only the
+        directions it names, and what the rest gets turns on how the join lies
+        on the grid - two drawings of one wedge differing by a rotation would
+        be meshed apart, further apart the closer the faces have come. The
+        edge line here is the test's own cross product, and the sweep is the
+        suite's rather than the criterion's."""
+        apart = math.radians(disagreement) / 2.0
+        for about in self.ORIENTATIONS:
+            pair = [tilted(about, apart), tilted(about, -apart)]
+            sizes = self.left(*pair)
+            assert widest_across(sizes, cross(*pair)) == pytest.approx(0.2)
 
-    def test_and_that_direction_sits_at_the_same_angle_from_both_faces(self):
-        """Halfway between them, which is the way out of the wedge and not the
-        way out of either face."""
-        disagreement = 180.0 - SHARP_DEGREES + 1.0
-        normal = self.knife(disagreement)[0].normal
-        faces = [f.normal for f in self.joins(disagreement) if f.source == "'Pad' edge"]
-        assert [between(normal, face) for face in faces] == [
-            pytest.approx(math.radians(disagreement) / 2.0)
-        ] * len(faces)
+    def test_the_way_out_of_a_tip_is_never_left_coarser_than_the_edge_size(self):
+        """The direction between the two faces is in the plane, so it is held
+        with the rest - at a corner, at a near-knife, and with no step
+        anywhere in the dihedral. What a demand per face would leave there
+        opens with the dihedral and turns with the part."""
+        for disagreement in (30.0, 90.0, 150.0, 164.9, 165.1, 179.0):
+            apart = math.radians(disagreement) / 2.0
+            for about in self.ORIENTATIONS:
+                pair = [tilted(about, apart), tilted(about, -apart)]
+                sizes = self.left(*pair)
+                out = tuple(a + b for a, b in zip(*pair))
+                held = sum(abs(c) * s for c, s in zip(scaled(out), sizes) if math.isfinite(s))
+                assert held <= 0.2 * (1.0 + 1e-9)
 
-    @pytest.mark.parametrize("about", [(1.0, 2.0, 3.0), (0.3, -0.9, 0.1), (-2.0, 5.0, -1.0)])
-    def test_on_a_blade_lying_along_no_axis_as_well(self, about):
-        """Every component of the answer is arithmetic of its own, and a wedge
-        drawn square to the grid exercises one of the three. These do not."""
-        apart = math.radians(180.0 - SHARP_DEGREES + 1.0) / 2.0
-        pair = [tilted(about, apart), tilted(about, -apart)]
-        found = features([self.meeting(*pair)], cap=100.0, edge_size=0.2)
-        knife = [f for f in found if f.source == "'Pad' knife edge"]
-        assert knife and all(v for v in knife[0].normal)
-        assert [between(knife[0].normal, face) for face in pair] == [pytest.approx(apart)] * 2
-
-    def test_and_a_longer_normal_does_not_pull_it_over(self):
-        """Halfway between two directions, so what weighs on the answer is where
-        each of them points and not how long it arrived. A kernel hands over
-        unit normals, and a direction that has to be scaled to be read is a
-        thing to say in one place rather than to rely on in several."""
-        turn = math.radians(180.0 - SHARP_DEGREES + 1.0)
+    def test_a_longer_normal_does_not_pull_it_over(self):
+        """What weighs on the answer is where each face points and not how
+        long its normal arrived. A kernel hands over unit normals, and a
+        direction that has to be scaled to be read is a thing to say in one
+        place rather than to rely on in several."""
+        turn = math.radians(120.0)
         one, other = (0.0, 0.0, 1.0), (0.0, math.sin(turn), math.cos(turn))
-        stretched = self.knife_of(one, tuple(9.0 * v for v in other))
-        assert between(stretched, self.knife_of(one, other)) == pytest.approx(0.0, abs=1e-9)
+        plain = features([self.meeting(one, other)], cap=100.0, edge_size=0.2)
+        stretched = features(
+            [self.meeting(one, tuple(9.0 * v for v in other))], cap=100.0, edge_size=0.2
+        )
+        assert [f.cells() for f in stretched] == [pytest.approx(f.cells()) for f in plain]
 
-    def test_it_leaves_the_edges_own_axis_alone_as_the_two_faces_do(self):
+    def test_it_leaves_a_straight_edges_own_axis_alone(self):
         """A demand across an edge is a demand across it. Cells packed along a
-        straight edge resolve nothing, whichever of the three asks for them."""
-        assert math.isinf(self.knife(179.0)[0].cells()[0])
-
-    @pytest.mark.parametrize("about", [(1.0, 2.0, 3.0), (0.3, -0.9, 0.1), (-2.0, 5.0, -1.0)])
-    def test_which_is_square_to_the_edge_wherever_that_edge_runs(self, about):
-        """The reason it can be: each face contains the edge, so each normal is
-        square to it and the direction halfway between them is too. Asserted
-        against the line the two faces meet along, which is the one square to
-        both - the edge the samples are taken off carries no direction of its
-        own and cannot answer this."""
-        apart = math.radians(180.0 - SHARP_DEGREES + 1.0) / 2.0
-        pair = [tilted(about, apart), tilted(about, -apart)]
-        knife = self.knife_of(*pair)
-        along = scaled(cross(*pair))
-        assert sum(a * b for a, b in zip(scaled(knife), along)) == pytest.approx(0.0, abs=1e-12)
-
-    def test_an_ordinary_corner_asks_for_nothing_more(self):
-        """Not because its two faces cover the direction between them - what
-        that direction gets is only ever what the two leave it - but because at
-        a corner what they leave is near the edge size however the corner is
-        turned, and refining every corner in every model is not a trade worth
-        making for the rest."""
-        assert self.knife(90.0) == []
-
-    def test_the_same_tolerance_that_separates_a_fillet_separates_a_knife(self):
-        """One number, two questions. The low end asks whether the join is a
-        singularity; this end asks how much of the way out its two faces have
-        given up, which slides rather than switching, so where the line falls is
-        a judgement. What is pinned here is only that it is this number."""
-        assert self.knife(180.0 - SHARP_DEGREES + 1.0)
-        assert self.knife(180.0 - SHARP_DEGREES - 1.0) == []
-
-    def test_it_holds_the_direction_the_pair_lets_go_of(self):
-        """The pair's hold on the way out is what closing the edge gives up:
-        the sharper the wedge, the coarser the only cell either face asks for
-        there, and past the edge size it keeps going. The third demand does not
-        follow it down, and is finer than either throughout."""
-        assert self.held(170.0, "'Pad' edge") < self.held(179.0, "'Pad' edge")
-        for disagreement in (170.0, 179.0):
-            assert self.held(disagreement, "'Pad' knife edge") < 0.2
-            assert self.held(disagreement, "'Pad' edge") > 0.2
+        straight edge resolve nothing, and every direction the criterion holds
+        is square to the edge's own axis."""
+        assert all(math.isinf(f.cells()[0]) for f in self.joins(179.0))
 
     def test_and_the_grid_is_finer_there_for_it(self):
-        """End to end, because a demand that is measured and then dominated has
-        changed nothing. Meshed with the join's own demands and again with the
-        pair alone, so what is compared is the third demand and not the edge."""
+        """End to end, against the pair of per-face demands this rule
+        replaced, because a demand that is measured and then dominated has
+        changed nothing. On a near-closed wedge the pair's hold on the way
+        out opens with the dihedral; the plane demand does not follow it."""
+        turn = math.radians(179.0)
         found = self.joins(179.0)
-        pair = [f for f in found if f.source == "'Pad' edge"]
+        pair = [
+            Feature(thickness=0.2, normal=normal, lower=f.lower, upper=f.upper, source=f.source)
+            for f in found
+            for normal in ((0.0, 0.0, 1.0), (0.0, math.sin(turn), math.cos(turn)))
+        ]
         assert cell_across(found) < cell_across(pair)
 
-    def test_two_faces_exactly_back_to_back_have_no_way_out_between_them(self):
-        """A solid of no thickness at all. There is no direction halfway between
-        a pair that cancels, and guessing one would refine an arbitrary axis."""
+    def test_two_faces_exactly_back_to_back_have_no_line_of_meeting(self):
+        """A solid of no thickness meets itself everywhere: the cross product
+        cancels, and guessing an edge line would hold a plane picked by
+        rounding error. Each face is asked along its own normal instead - the
+        one direction still known."""
         edge = Edge(key=7)
         faces = [Face(normal=n, edges=[edge]) for n in ((0.0, 0.0, 1.0), (0.0, 0.0, -1.0))]
         body = Body("Blade", Shape((0.0,) * 3, (1.0,) * 3, faces=faces), metal=True)
         found = features([body], cap=100.0, edge_size=0.2)
         assert {f.source for f in found} == {"'Blade' edge"}
+        assert all(f.tangent is None and f.normal is not None for f in found)
 
     def test_an_edge_belonging_to_one_face_is_not_a_join(self):
         """The boundary of an open shell. There is no second surface to
@@ -759,10 +1327,9 @@ class TestTheMeasurementsReachTheGrid:
     spending each across the axes it touches.
     """
 
-    def mesh(self, measured=()):
-        from Microwave.Solvers.openems.mesh import MeshParams
+    def mesh(self, measured=(), params=None):
         from Microwave.Solvers.openems.model import Material, Port, Solid
-        from Microwave.Solvers.openems.write import plan_mesh
+        from Microwave.Solvers.openems.plan import plan_mesh
 
         materials = [Material(name="copper", kind="pec")]
         solids = [
@@ -783,7 +1350,7 @@ class TestTheMeasurementsReachTheGrid:
             solids,
             ports,
             materials,
-            MeshParams(metal_res=0.5, dielectric_res=2.0),
+            params or MeshParams(metal_res=0.5, dielectric_res=2.0),
             measured=measured,
         )
         return lines
@@ -811,6 +1378,78 @@ class TestTheMeasurementsReachTheGrid:
 
         for dim in range(3):
             assert np.array_equal(self.mesh()[dim], self.mesh(())[dim])
+
+    def layer(self, thickness, normal, across, relaxed_to=None):
+        """A count demand covering a chord of that thickness along that normal."""
+        length = math.sqrt(sum(value * value for value in normal))
+        step = tuple(value / length * thickness for value in normal)
+        at = (10.0, 10.0, 0.5)
+        return Feature(
+            thickness=thickness,
+            normal=step,
+            lower=tuple(min(a, a + s) for a, s in zip(at, step)),
+            upper=tuple(max(a, a + s) for a, s in zip(at, step)),
+            across=across,
+            source="'Board' across its thickness on face 0",
+            relaxed_to=relaxed_to,
+        )
+
+    def counted(self, layer):
+        """The report's verdict on a grid meshed from that one count demand."""
+        from Microwave.Solvers.openems.report import mesh_report
+
+        params = MeshParams(metal_res=0.5, dielectric_res=2.0)
+        return mesh_report(self.mesh([layer], params), [], params, measured=[layer])
+
+    @pytest.mark.parametrize(
+        "normal",
+        [
+            (0.0, 0.0, 1.0),
+            (2.0, 1.0, 0.5),
+            (3.0, 2.0, 1.0),
+            (1.0, 0.5, 0.25),
+            (1.0, 1.0, 0.0),
+            (1.0, 1.0, 1.0),
+        ],
+    )
+    def test_a_count_the_grid_delivered_is_scored_as_delivered(self, normal):
+        """The demand and its delivery are different claims, and only the
+        second is about the grid. The symmetric normals are the ones whose
+        axis lattices merge their crossings - the case the allocation is
+        scaled for, so a clean verdict on them is the scaling reaching the
+        grid and not the check going blind.
+        """
+        report = self.counted(self.layer(0.3, normal, across=4))
+        assert report.counted[0].asked == 4
+        assert report.undercounted == ()
+
+    @pytest.mark.parametrize("normal", [(1.0, 1.0, 0.0), (1.0, 1.0, 1.0)])
+    def test_a_grid_the_demand_never_reached_is_named_as_short(self, normal):
+        """What the check exists for: the grid scored is not promised to be the
+        grid the demand built - pinned lines, a hand grid, a regression. Scored
+        here against a mesh built without the layer's demand at all, which
+        leaves the bulk cell across it and must be said."""
+        layer = self.layer(0.3, normal, across=8)
+        params = MeshParams(metal_res=0.5, dielectric_res=2.0)
+        from Microwave.Solvers.openems.report import mesh_report
+
+        short = mesh_report(self.mesh([], params), [], params, measured=[layer]).undercounted
+        assert [c.asked for c in short] == [8]
+        assert short[0].across < 8
+
+    def test_a_body_the_user_relaxed_is_left_out_of_the_verdict(self):
+        """A relaxation says this body's own lengths may not ask for cells finer
+        than that; the count is one of those lengths, so the mesher obeying it is
+        the user getting what they asked for. Pre-flight's conductor check takes
+        the same position on the same field, and two checks disagreeing about one
+        consent is worse than either answer.
+
+        Checked against the same layer unrelaxed, so the case is a relaxation
+        being honoured rather than a grid that happened to deliver.
+        """
+        relaxed = self.layer(0.5, (2.0, 1.0, 0.5), across=8, relaxed_to=1.0)
+        assert self.counted(relaxed).counted == ()
+        assert self.counted(self.layer(0.5, (2.0, 1.0, 0.5), across=8)).counted
 
 
 class TestTheCullIsSafeInBothDirections:
@@ -864,53 +1503,6 @@ class TestTheCullIsSafeInBothDirections:
         assert [f.cells()[0] for f in found] == [pytest.approx(0.5)] * 2
 
 
-class TestRedundantMeasurementsAreDropped:
-    """The field is a minimum of ramps, so a demand another one already holds
-    down changes nothing and only costs a constraint. Sampling a curved face
-    produces those in quantity - one radius, measured once per sample."""
-
-    def test_one_place_asked_twice_is_asked_once(self):
-        """A face answering the same size at the same point however often it is
-        sampled. Two identical constraints are one constraint, and this is the
-        only way one demand of a given size covers another: the ramp between
-        them is zero, so anywhere else on the surface is a demand of its own."""
-        rod = Body(
-            "Rod",
-            Shape((0.0,) * 3, (100.0,) * 3, faces=[sphere_face(3.0, at=(0.0, 0.0, 0.0))]),
-            metal=True,
-        )
-        assert len(features([rod], cap=100.0)) == 1
-
-    def test_but_the_same_size_somewhere_else_is_a_demand_of_its_own(self):
-        """The failure this guards is a surface held down where it was first
-        sampled and left at bulk everywhere else, which is a shape followed at
-        one point."""
-        spread = _SpreadFace(curvature=(-1 / 3.0, -1 / 3.0), size=8.0)
-        rod = Body("Rod", Shape((0.0,) * 3, (8.0,) * 3, faces=[spread]), metal=True)
-        assert len(features([rod], cap=100.0, edge_size=0.5)) > 1
-
-    def test_a_finer_demand_nearby_covers_a_coarser_one(self):
-        near = Face(curvature=(-1.0, -1.0), at=(0.0, 0.0, 0.0))
-        coarse = Face(curvature=(-0.5, -0.5), at=(0.01, 0.0, 0.0))
-        body = Body("Rod", Shape((0.0,) * 3, (1.0,) * 3, faces=[near, coarse]), metal=True)
-        assert len(features([body], cap=100.0)) == 1
-
-    def test_but_one_far_enough_away_to_matter_survives(self):
-        near = Face(curvature=(-1.0, -1.0), at=(0.0, 0.0, 0.0))
-        far = Face(curvature=(-1.0, -1.0), at=(500.0, 0.0, 0.0))
-        body = Body("Rod", Shape((0.0,) * 3, (600.0,) * 3, faces=[near, far]), metal=True)
-        assert len(features([body], cap=100.0)) == 2
-
-    def test_a_directional_demand_is_never_pruned(self):
-        """Two gaps facing different ways are not comparable by size: each
-        spends itself across a different set of axes."""
-        one = Shape(
-            (0.0,) * 3, (1.0,) * 3, distance=0.5, witnesses=[((1.0, 0.5, 0.5), (1.5, 0.5, 0.5))]
-        )
-        other = Shape((1.5, 0.0, 0.0), (2.5, 1.0, 1.0))
-        assert len(features([Body("A", one), Body("B", other)], cap=10.0)) == 2
-
-
 class TestAnEdgeIsFollowedAlongItsLength:
     """An edge is a curve, and a demand made at one point on it holds near that
     point only. A circular rim is a *single* edge running right round a shape,
@@ -950,6 +1542,40 @@ class TestAnEdgeIsFollowedAlongItsLength:
         assert len(self.rim(length=1e6, edge_size=0.01)) <= 2 * MAX_EDGE_SAMPLES
 
 
+class TestACountIsNotDecidedByTheLastBitsOfALength:
+    """A station count is an integer read off a length in millimetres, so it is
+    a step function of a measurement - and a drawing sits on a step whenever a
+    face or an edge is a whole number of the cell it is sampled at, which is
+    most drawings. A kernel measures that length again whenever a file hands
+    the surface back, and its two readings differ in their last bits. Without
+    :data:`~Microwave.Solvers.openems.lfs.COUNT_SLACK` under the step, the same
+    shape is sampled in one set of places off the drawing and another off the
+    file, and every length read off it moves with them.
+    """
+
+    def face_stations(self, size):
+        face = _SpreadFace(curvature=(-1 / 3.0, -1 / 3.0), size=size)
+        body = Body("Rod", Shape((0.0,) * 3, (size,) * 3, faces=[face]), metal=True)
+        return len({f.lower for f in features([body], cap=100.0, edge_size=0.5)})
+
+    def edge_stations(self, length):
+        edge = Edge(key=1, length=length)
+        one = Face(normal=(0.0, 0.0, 1.0), edges=[edge])
+        other = Face(normal=(0.0, 1.0, 0.0), edges=[edge])
+        body = Body("Rim", Shape((0.0,) * 3, (length,) * 3, faces=[one, other]), metal=True)
+        return len(features([body], cap=100.0, edge_size=0.2))
+
+    def test_a_face_an_ulp_under_a_whole_cell_is_sampled_where_a_whole_one_is(self):
+        """Four millimetres sampled every half a millimetre is eight cells
+        exactly, so the face below is the one a drawing puts on the step."""
+        assert self.face_stations(math.nextafter(4.0, 0.0)) == self.face_stations(4.0)
+
+    def test_an_edge_an_ulp_under_a_whole_cell_is_sampled_where_a_whole_one_is(self):
+        """Ten millimetres sampled every fifth of one is fifty cells exactly.
+        The edge lattice is laid by its own function and needs its own case."""
+        assert self.edge_stations(math.nextafter(10.0, 0.0)) == self.edge_stations(10.0)
+
+
 class TestAnEdgeRefinesAcrossItselfAndNotAlong:
     """The field at a sharp edge varies with distance *from* the edge, and is
     the same everywhere along a straight one. Cells packed along its length
@@ -969,8 +1595,8 @@ class TestAnEdgeRefinesAcrossItselfAndNotAlong:
 
     def test_the_axes_across_the_edge_are_refined(self):
         found = self.slot_side()
-        assert min(f.cells()[1] for f in found) == pytest.approx(0.2)
-        assert min(f.cells()[2] for f in found) == pytest.approx(0.2)
+        assert min(f.cells()[1] for f in found) == pytest.approx(0.2 / math.sqrt(2.0))
+        assert min(f.cells()[2] for f in found) == pytest.approx(0.2 / math.sqrt(2.0))
 
     def test_and_the_axis_along_it_is_not(self):
         """The property this class exists for. An isotropic demand here refines
@@ -1013,15 +1639,26 @@ class TestASheetsOutlineIsAMetalEdge:
         assert found
         assert {f.source for f in found} == {"'Patch' outline"}
 
-    def test_it_is_resolved_across_the_boundary_and_in_the_sheets_plane(self):
-        """The edge runs along x and the sheet lies in the xy plane, so the
-        metal ends in y. Refining z would resolve nothing - the sheet has no
-        thickness - and refining x would be along the edge, not across it.
+    def test_it_is_the_demand_a_join_makes_and_not_one_in_the_sheets_plane(self):
+        """The edge runs along x, so x is the one axis packing cells into
+        resolves nothing, and both axes square to it are refined together - the
+        criterion a solid's join is stated with, reached here through the
+        feature's tangent.
+
+        The sheet's own plane does not come into it: the metal has no thickness
+        in z, but what is being resolved is the field, which wraps around the
+        edge. Asked along the in-plane normal instead, z comes back
+        unconstrained, and which axis that is depends on which way the sheet was
+        drawn facing.
+
+        The figures are the axis-aligned case of :func:`sizing.edge`, restated
+        rather than measured, and the invariance under turning the edge is held
+        there.
         """
         found = self.sheet()
-        assert min(f.cells()[1] for f in found) == pytest.approx(0.4)
         assert all(math.isinf(f.cells()[0]) for f in found)
-        assert all(math.isinf(f.cells()[2]) for f in found)
+        assert min(f.cells()[1] for f in found) == pytest.approx(0.4 / math.sqrt(2.0))
+        assert min(f.cells()[2] for f in found) == pytest.approx(0.4 / math.sqrt(2.0))
 
     def test_the_whole_outline_is_followed(self):
         places = sorted(f.lower[0] for f in self.sheet())
@@ -1052,7 +1689,7 @@ class TestACurvedOutlineIsFollowedLikeACurvedWall:
         """The demands a one-faced shape with that rim leaves the grid.
 
         With no edge size there is nothing else a sheet can ask for - its face
-        is flat, it has no thickness to march across, and a corner demand is
+        is flat, it has no thickness to measure across, and a corner demand is
         what the edge size buys - so what comes back is the rim alone.
         """
         edge = Edge(key=1, length=8.0, curvature=curvature)
@@ -1094,10 +1731,11 @@ class TestACurvedOutlineIsFollowedLikeACurvedWall:
         assert self.sheet(curvature=1e-6, cap=1.0) == []
 
     @pytest.mark.parametrize("radius", [2.0, 0.5, 0.2, 0.05, 0.005])
-    def test_a_rim_never_asks_for_finer_cells_than_a_corner(self, radius):
-        """A rim of vanishing radius is a corner, and a corner asks for the edge
-        size - so a share of that radius is floored by it, exactly as a fillet's
-        is.
+    def test_a_rim_is_floored_at_what_an_axis_aligned_corner_asks(self, radius):
+        """A rim of vanishing radius is a corner, and an axis-aligned corner asks
+        the edge size over the root of two across it - so a share of that radius
+        is floored by it, exactly as a fillet's is. It is a declared bound
+        rather than every corner's own demand - a turned tangent asks less.
 
         Swept right down through the floor and out the other side, because that
         is the whole of the claim: a clearance a boolean left rounded, or a via
@@ -1110,7 +1748,7 @@ class TestACurvedOutlineIsFollowedLikeACurvedWall:
         found = self.sheet(curvature=1.0 / radius, edge_size=edge_size)
         rims = [feature for feature in found if feature.source == "'Pad' rim curving"]
         assert rims
-        assert min(min(feature.cells()) for feature in rims) >= edge_size - 1e-12
+        assert min(min(feature.cells()) for feature in rims) >= edge_size / math.sqrt(2.0) - 1e-12
 
     def test_the_whole_rim_is_followed(self):
         """A curvature read at one point on a circle refines the grid on one
@@ -1147,19 +1785,66 @@ class TestHowThickTheMetalIs:
             faces=[face],
             solids=[Slab(lower, upper)] if solid else [],
         )
+        vertices, faces = box_surface(lower, upper) if solid else ((), ())
         return features(
-            [Body("Wall", shape, metal=metal, sheet=sheet)], cap=100.0, edge_size=self.EDGE
+            [Body("Wall", shape, metal=metal, sheet=sheet, vertices=vertices, faces=faces)],
+            cap=100.0,
+            edge_size=self.EDGE,
         )
 
     def thickness_demands(self, found):
         return [f for f in found if "thickness" in f.source]
+
+    def test_the_face_is_sampled_once_for_both_measurements(self):
+        """The curvature and the cross-section are read at the same stations on
+        the same faces, and laying a lattice costs a reading of the face's own
+        boundary - which is most of what either measurement spends.
+        """
+        lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, self.THICKNESS)
+        # Curved, so that the curvature has something to say at each station and
+        # the test can show it walked them rather than only that something did.
+        face = _CountedFace(curvature=(-1 / 3.0, -1 / 3.0), at=(0.0, 0.0, self.THICKNESS), size=8.0)
+        shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
+        vertices, faces = box_surface(lower, upper)
+        found = features(
+            [Body("Wall", shape, metal=True, vertices=vertices, faces=faces)],
+            cap=100.0,
+            edge_size=self.EDGE,
+        )
+        assert self.thickness_demands(found), "the cross-section never walked the face"
+        assert [f for f in found if "curving" in f.source], "the curvature never walked it"
+        assert face.lattices == 1
+
+    def test_each_demand_names_the_face_it_was_measured_on(self):
+        """A report points at the geometry through this name, so a body whose
+        faces are walked in one pass still has to tell them apart."""
+        lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, self.THICKNESS)
+        shape = Shape(
+            lower,
+            upper,
+            faces=[
+                Face(at=(0.0, 0.0, self.THICKNESS), size=8.0),
+                Face(at=(1.0, 1.0, self.THICKNESS), size=2.0),
+            ],
+            solids=[Slab(lower, upper)],
+        )
+        vertices, faces = box_surface(lower, upper)
+        found = features(
+            [Body("Wall", shape, metal=True, vertices=vertices, faces=faces)],
+            cap=100.0,
+            edge_size=self.EDGE,
+        )
+        assert {f.source for f in self.thickness_demands(found)} == {
+            "'Wall' thickness on face 0",
+            "'Wall' thickness on face 1",
+        }
 
     def test_a_flat_faced_body_is_measured_across_itself(self):
         """Curvature answers nothing here - the faces are planes - so without
         this the body asks for nothing at all and is meshed at the bulk size."""
         found = self.thickness_demands(self.slab())
         assert found
-        assert found[0].thickness == pytest.approx(self.THICKNESS, rel=1e-3)
+        assert found[0].thickness == pytest.approx(self.THICKNESS, rel=CHORD_TOLERANCE)
 
     def test_it_is_the_metals_own_cross_section_and_so_omnidirectional(self):
         """A conductor sampled too coarsely fails by coming apart into a
@@ -1167,7 +1852,9 @@ class TestHowThickTheMetalIs:
         """
         found = self.thickness_demands(self.slab())
         assert found[0].normal is None
-        assert found[0].cells() == pytest.approx((self.THICKNESS / math.sqrt(3),) * 3, rel=1e-3)
+        assert found[0].cells() == pytest.approx(
+            (self.THICKNESS / math.sqrt(3),) * 3, rel=CHORD_TOLERANCE
+        )
 
     def test_which_way_the_face_is_wound_does_not_change_the_answer(self):
         """A kernel points a face's normal out of the solid or into it according
@@ -1179,10 +1866,10 @@ class TestHowThickTheMetalIs:
         assert outward[0].thickness == pytest.approx(inward[0].thickness)
 
     def test_a_normal_that_is_not_a_unit_vector_measures_the_same_thickness(self):
-        """The march walks in multiples of the direction it is handed, so a
-        direction carrying a length of its own would scale the answer by it."""
+        """A distance along the line has to be a distance, so a direction
+        carrying a length of its own would scale the answer by it."""
         found = self.thickness_demands(self.slab(normal=(0.0, 0.0, 7.0)))
-        assert found[0].thickness == pytest.approx(self.THICKNESS, rel=1e-3)
+        assert found[0].thickness == pytest.approx(self.THICKNESS, rel=CHORD_TOLERANCE)
 
     def test_metal_thinner_than_an_edge_is_still_asked_for_across_itself(self):
         """A cross-section is not a refinement that can be traded for cells.
@@ -1202,19 +1889,55 @@ class TestHowThickTheMetalIs:
         """Above the coarsest cell the grid may use a demand cannot win the
         field's minimum, so measuring one would only cost a constraint."""
         shape = self.slab_shape(40.0)
-        assert features([Body("Block", shape, metal=True)], cap=1.0, edge_size=self.EDGE) == []
+        assert (
+            features(
+                [Body("Block", shape, metal=True, **self.blocked(40.0))],
+                cap=1.0,
+                edge_size=self.EDGE,
+            )
+            == []
+        )
 
-    def test_and_the_march_that_would_measure_it_stops_at_the_reach(self):
-        """The queries are the expensive part of this, and a body far thicker
-        than the grid cares about must not be walked to its far wall - which on
-        an imported solid can be a metre away from a cell of a tenth."""
-        cap, thickness = 1.0, 40.0
-        shape = self.slab_shape(thickness)
-        features([Body("Block", shape, metal=True)], cap=cap, edge_size=self.EDGE)
-        # Sampled on the top face, so how deep it went is how far below that
-        # face the kernel was ever asked about.
-        deepest = thickness - min(place[2] for place in shape.Solids[0].at)
-        assert deepest <= math.sqrt(3) * cap + WINDING_PROBE
+    def test_and_the_kernel_is_not_asked_about_a_chord_at_all(self):
+        """What made a thick body dear was the asking. Containment was put one
+        point at a time and cost the kernel a face intersector apiece, so a
+        drawing was priced by how finely it was drawn rather than by what it
+        carries. The crossings answer the same question in one cast, off
+        triangles the translation had already built.
+        """
+        shape = self.slab_shape(40.0)
+        features(
+            [Body("Block", shape, metal=True, **self.blocked(40.0))], cap=1.0, edge_size=self.EDGE
+        )
+        assert shape.Solids[0].asked == 0
+
+    def test_and_it_does_reach_the_reach(self):
+        """The other half of the bound, and the one that is easy to lose: a
+        reach applied one comparison too tightly would drop the body whose
+        chord is the longest that still binds. Read as the answer rather than
+        as the query, because a chord this long is the last one to measure.
+        """
+        cap = 1.0
+        edge = math.sqrt(3) * cap
+        assert self.thickness_demands(
+            features(
+                [
+                    Body(
+                        "Block",
+                        self.slab_shape(0.999 * edge),
+                        metal=True,
+                        **self.blocked(0.999 * edge),
+                    )
+                ],
+                cap=cap,
+                edge_size=self.EDGE,
+            )
+        )
+
+    def blocked(self, thickness):
+        """The triangulation the shape :meth:`slab_shape` builds arrives with."""
+        vertices, faces = box_surface((-40.0, -40.0, 0.0), (40.0, 40.0, thickness))
+        return {"vertices": vertices, "faces": faces}
 
     def slab_shape(self, thickness):
         lower, upper = (-40.0, -40.0, 0.0), (40.0, 40.0, thickness)
@@ -1233,12 +1956,15 @@ class TestHowThickTheMetalIs:
     def test_a_sheet_has_no_thickness_to_measure(self):
         """It reaches the engine as a zero-thickness primitive that conducts
         however it is sampled, so there is nothing to state the criterion
-        against - and asking a shell for containment answers nothing."""
+        against - and a surface enclosing nothing has no run for a line to
+        find."""
         assert self.thickness_demands(self.slab(sheet=True)) == []
 
-    def test_a_shape_carrying_no_solid_is_not_marched(self):
-        """A compound holds whatever it was given, including faces belonging to
-        none of its solids. Those have no inside for a chord to run through."""
+    def test_a_body_carrying_no_triangulation_is_not_measured(self):
+        """The chord is read off the triangles the body reaches the engine as,
+        so a body without them has nothing to read. Which bodies those are is
+        settled upstream - a shape a box describes exactly is sent as a box and
+        is not measured here - and this is the guard rather than the rule."""
         assert self.thickness_demands(self.slab(solid=False)) == []
 
     def test_the_demand_sits_where_it_was_measured(self):
@@ -1261,8 +1987,13 @@ class TestHowThickTheMetalIs:
         lower, upper = (0.0, 0.0, -self.THICKNESS), (8.0, 8.0, 0.0)
         face = _SpreadFace(curvature=(0.0, 0.0), size=8.0)
         shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
+        vertices, faces = box_surface(lower, upper)
         found = self.thickness_demands(
-            features([Body("Plate", shape, metal=True)], cap=100.0, edge_size=self.EDGE)
+            features(
+                [Body("Plate", shape, metal=True, vertices=vertices, faces=faces)],
+                cap=100.0,
+                edge_size=self.EDGE,
+            )
         )
         places = {feature.lower for feature in found}
         assert len(places) > 1
@@ -1270,25 +2001,57 @@ class TestHowThickTheMetalIs:
         assert min(place[0] for place in places) < 1.0
         assert max(place[0] for place in places) > 7.0
 
-    def test_each_solid_of_a_compound_is_asked_separately(self):
-        """``isInside`` on a compound consults one member, so a point inside
-        another comes back outside and the chord stops at nothing."""
-        near = (-4.0, -4.0, 0.0)
-        first = Slab(near, (4.0, 4.0, 0.2))
-        second = Slab((-4.0, -4.0, 0.2), (4.0, 4.0, self.THICKNESS))
-        shape = Shape(
-            near,
-            (4.0, 4.0, self.THICKNESS),
-            faces=[Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, self.THICKNESS), size=8.0)],
-            solids=[first, second],
-        )
+    def test_a_sample_beside_the_face_rather_than_on_it_measures_nothing(self):
+        """A face's parameter range is the rectangle its surface is trimmed out
+        of, and the trimming is what makes it the face. A lattice laid across
+        that rectangle puts a share of its points on the surface's own
+        extension - beside a plane cut to a triangle, or outside a boolean's
+        remnant - and a chord measured there is about no part of the drawing.
+
+        Read as places rather than as a count: what has to be true is that
+        nothing is asked for where the face is not.
+        """
+        lower, upper = (0.0, 0.0, -self.THICKNESS), (8.0, 8.0, 0.0)
+        half = _SpreadFace(curvature=(0.0, 0.0), size=8.0, trimmed=lambda u, v: u < 0.5)
+        shape = Shape(lower, upper, faces=[half], solids=[Slab(lower, upper)])
+        vertices, faces = box_surface(lower, upper)
         found = self.thickness_demands(
-            features([Body("Stack", shape, metal=True)], cap=100.0, edge_size=self.EDGE)
+            features(
+                [Body("Plate", shape, metal=True, vertices=vertices, faces=faces)],
+                cap=100.0,
+                edge_size=self.EDGE,
+            )
         )
-        assert found[0].thickness == pytest.approx(self.THICKNESS, rel=1e-3)
-        # The second is the load-bearing one: the first is asked for every point
-        # whatever the rule, and stopping there is exactly the fault.
-        assert second.asked
+        assert found
+        assert max(feature.lower[0] for feature in found) < 4.0
+
+    def test_a_sample_the_face_cannot_answer_for_is_kept(self):
+        """Where a face has no answer, the sample stands.
+
+        A parameterisation can fail at a point of its own - a pole, a seam - and
+        the failure says nothing about whether the face is there. Reading it as
+        "the face is not here" drops the sample, and a dropped sample is a
+        length nobody measured and a grid that coarsens with nothing said. The
+        other way costs a chord cast beside the face, which meets no material
+        and yields nothing.
+        """
+        lower, upper = (0.0, 0.0, -self.THICKNESS), (8.0, 8.0, 0.0)
+        mute = _SpreadFace(curvature=(0.0, 0.0), size=8.0, trimmed=_refuses)
+        shape = Shape(lower, upper, faces=[mute], solids=[Slab(lower, upper)])
+        vertices, faces = box_surface(lower, upper)
+        found = self.thickness_demands(
+            features(
+                [Body("Plate", shape, metal=True, vertices=vertices, faces=faces)],
+                cap=100.0,
+                edge_size=self.EDGE,
+            )
+        )
+        assert found
+        # Well into the far half, where the trimmed case above keeps only the
+        # near one. Past the middle rather than at it: a face filtered down to
+        # nothing falls back to its own middle station, which lands exactly
+        # there and would satisfy a strict inequality by a rounding.
+        assert max(feature.lower[0] for feature in found) > 6.0
 
     def two_slabs(self, gap, cap):
         """Metal, a gap, then metal again - all below the face being sampled.
@@ -1304,8 +2067,16 @@ class TestHowThickTheMetalIs:
             faces=[Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, self.THICKNESS), size=8.0)],
             solids=[near, far],
         )
+        vertices, faces = joined(
+            box_surface((-4.0, -4.0, 0.0), (4.0, 4.0, self.THICKNESS)),
+            box_surface((-4.0, -4.0, -gap - 6.0), (4.0, 4.0, -gap)),
+        )
         return self.thickness_demands(
-            features([Body("Pair", shape, metal=True)], cap=cap, edge_size=self.EDGE)
+            features(
+                [Body("Pair", shape, metal=True, vertices=vertices, faces=faces)],
+                cap=cap,
+                edge_size=self.EDGE,
+            )
         )
 
     def test_it_is_the_first_crossing_and_not_the_last(self):
@@ -1316,22 +2087,18 @@ class TestHowThickTheMetalIs:
         found = self.two_slabs(gap=3.0, cap=10.0)
         assert found[0].thickness == pytest.approx(self.THICKNESS, rel=2 * CHORD_TOLERANCE)
 
-    def test_a_gap_narrower_than_the_march_steps_over_is_read_through(self):
-        """The bracket is walked, so what it can see is bounded by its step.
+    @pytest.mark.parametrize("gap", [1e-6, 1e-3, 0.05])
+    def test_a_gap_of_any_width_ends_the_chord(self, gap):
+        """No width of air reads as metal, however narrow.
 
-        Pinned rather than tolerated: a gap this narrow reads the two bodies and
-        the air between them as one thickness, which is the *coarse* direction
-        and the one that leaves metal under-resolved. What bounds it is that the
-        step is a share of the coarsest cell in the model, so a gap has to be a
-        fraction of that cell to hide - and the finished grid is where a
-        conductor the sampling opened is caught.
+        A crossing is placed rather than tested for, so what ends the run is the
+        boundary itself and not whether anything happened to be looked at near
+        it. Read through, this pair would come back as one body with the air
+        between them counted as metal - the *coarse* direction, and the one that
+        leaves a conductor under-resolved.
         """
-        cap = 10.0
-        step = math.sqrt(3) * cap / MARCH_STEPS
-        # The wall and the gap together inside one step, so the first place
-        # looked at is already through both and into the far body.
-        found = self.two_slabs(gap=0.5 * (step - self.THICKNESS), cap=cap)
-        assert found[0].thickness > self.THICKNESS * 2
+        found = self.two_slabs(gap=gap, cap=10.0)
+        assert found[0].thickness == pytest.approx(self.THICKNESS, rel=CHORD_TOLERANCE)
 
 
 class TestHowManyCellsSpanADielectric:
@@ -1355,9 +2122,10 @@ class TestHowManyCellsSpanADielectric:
         lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, thickness)
         face = Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, thickness), size=8.0)
         shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
+        vertices, faces = box_surface(lower, upper)
         return self.counted(
             features(
-                [Body("Board", shape, metal=metal, sheet=sheet)],
+                [Body("Board", shape, metal=metal, sheet=sheet, vertices=vertices, faces=faces)],
                 cap=self.CAP if cap is None else cap,
                 min_lines=self.COUNT if count is None else count,
             )
@@ -1371,29 +2139,29 @@ class TestHowManyCellsSpanADielectric:
         and nothing at all says how many cells lie across it."""
         found = self.slab()
         assert found
-        assert found[0].thickness == pytest.approx(self.THICKNESS, rel=1e-3)
+        assert found[0].thickness == pytest.approx(self.THICKNESS, rel=CHORD_TOLERANCE)
         assert found[0].across == self.COUNT
 
     def test_it_asks_for_the_thickness_over_the_count(self):
         """On the axis the layer is thin along, and nothing on the other two -
         which is the rule the same layer would get from its own box."""
         sizes = self.slab()[0].cells()
-        assert sizes[2] == pytest.approx(self.THICKNESS / self.COUNT, rel=1e-3)
+        assert sizes[2] == pytest.approx(self.THICKNESS / self.COUNT, rel=CHORD_TOLERANCE)
         assert math.isinf(sizes[0]) and math.isinf(sizes[1])
 
     @pytest.mark.parametrize("count", [2, 3, 8])
     def test_the_count_asked_for_is_the_count_stated(self, count):
         found = self.slab(count=count)
         assert found[0].across == count
-        assert found[0].cells()[2] == pytest.approx(self.THICKNESS / count, rel=1e-3)
+        assert found[0].cells()[2] == pytest.approx(self.THICKNESS / count, rel=CHORD_TOLERANCE)
 
     def test_the_demand_covers_the_layer_rather_than_one_face_of_it(self):
         """A count is a statement about the whole of what it counts across. Held
         at the faces alone, the sizing field climbs through the middle and lands
         fewer cells there than were asked for."""
         found = self.slab()[0]
-        assert found.lower[2] == pytest.approx(0.0, abs=1e-3)
-        assert found.upper[2] == pytest.approx(self.THICKNESS, abs=1e-3)
+        assert found.lower[2] == pytest.approx(0.0, abs=CHORD_TOLERANCE * self.THICKNESS)
+        assert found.upper[2] == pytest.approx(self.THICKNESS, abs=CHORD_TOLERANCE * self.THICKNESS)
 
     def test_and_covers_nothing_the_layer_does_not(self):
         """On the axes the layer runs along it is a point, so a wall
@@ -1409,22 +2177,39 @@ class TestHowManyCellsSpanADielectric:
         lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, self.THICKNESS)
         face = Face(normal=(0.0, 0.0, -1.0), at=(0.0, 0.0, 0.0), size=8.0)
         shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
-        found = self.counted(features([Body("Board", shape)], cap=self.CAP, min_lines=self.COUNT))
-        assert found[0].lower[2] == pytest.approx(0.0, abs=1e-3)
-        assert found[0].upper[2] == pytest.approx(self.THICKNESS, abs=1e-3)
+        vertices, faces = box_surface(lower, upper)
+        found = self.counted(
+            features(
+                [Body("Board", shape, vertices=vertices, faces=faces)],
+                cap=self.CAP,
+                min_lines=self.COUNT,
+            )
+        )
+        assert found[0].lower[2] == pytest.approx(0.0, abs=CHORD_TOLERANCE * self.THICKNESS)
+        assert found[0].upper[2] == pytest.approx(
+            self.THICKNESS, abs=CHORD_TOLERANCE * self.THICKNESS
+        )
 
     def test_which_way_the_face_is_wound_does_not_change_the_span(self):
-        """A kernel points a face's normal out of the solid or into it according
-        to how it wound the face, so which side the material lies on is settled
-        by the walk and cannot be read off the normal."""
+        """Which side the material lies on is settled by the crossing rather
+        than by the normal, so a face handed over the other way round measures
+        the same layer and states the same span.
+        """
         lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, self.THICKNESS)
         spans = []
         for normal in ((0.0, 0.0, 1.0), (0.0, 0.0, -1.0)):
             face = Face(normal=normal, at=(0.0, 0.0, self.THICKNESS), size=8.0)
             shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
-            found = self.counted(features([Body("Board", shape)], cap=self.CAP, min_lines=4))
+            vertices, faces = box_surface(lower, upper)
+            found = self.counted(
+                features(
+                    [Body("Board", shape, vertices=vertices, faces=faces)],
+                    cap=self.CAP,
+                    min_lines=4,
+                )
+            )
             spans.append((found[0].lower[2], found[0].upper[2]))
-        assert spans[0] == pytest.approx(spans[1], abs=1e-3)
+        assert spans[0] == pytest.approx(spans[1], abs=CHORD_TOLERANCE * self.THICKNESS)
 
     def test_a_face_is_measured_all_over_rather_than_once(self):
         """A layer is thin somewhere, and that is where the count has to hold.
@@ -1439,7 +2224,14 @@ class TestHowManyCellsSpanADielectric:
         lower, upper = (0.0, 0.0, -self.THICKNESS), (size, size, 0.0)
         face = _SpreadFace(curvature=(0.0, 0.0), size=size)
         shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
-        found = self.counted(features([Body("Board", shape)], cap=self.CAP, min_lines=self.COUNT))
+        vertices, faces = box_surface(lower, upper)
+        found = self.counted(
+            features(
+                [Body("Board", shape, vertices=vertices, faces=faces)],
+                cap=self.CAP,
+                min_lines=self.COUNT,
+            )
+        )
         places = {feature.lower for feature in found}
         assert len(places) > self.COUNT
         assert min(place[0] for place in places) < self.CAP
@@ -1471,6 +2263,37 @@ class TestHowManyCellsSpanADielectric:
         assert self.slab(thickness=0.99 * self.COUNT * self.CAP)
         assert self.slab(thickness=1.01 * self.COUNT * self.CAP) == []
 
+    def test_the_span_is_laid_on_the_layer_and_not_on_the_sample(self):
+        """A sample does not stand where its own triangulation does.
+
+        A face is triangulated by chords, so a sample on a convex face stands
+        outside them and one on a concave face stands inside. The chord is the
+        run through the sample, so a span laid from the sample is the layer's
+        own span slid along the normal by however far the sample stood off -
+        and on a curved board that slides the demand off the board.
+
+        Drawn here by handing over a triangulation inset from the face the
+        samples are taken on, which is a convex face's own case with the offset
+        made large enough to read.
+        """
+        inset = 0.05
+        lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, self.THICKNESS)
+        face = Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, self.THICKNESS), size=8.0)
+        shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
+        vertices, faces = box_surface(lower, (4.0, 4.0, self.THICKNESS - inset))
+        found = self.counted(
+            features(
+                [Body("Board", shape, vertices=vertices, faces=faces)],
+                cap=self.CAP,
+                min_lines=self.COUNT,
+            )
+        )
+        assert found
+        assert found[0].thickness == pytest.approx(self.THICKNESS - inset, rel=CHORD_TOLERANCE)
+        # The layer the triangles describe, not that layer moved up by the inset.
+        assert found[0].upper[2] == pytest.approx(self.THICKNESS - inset, abs=1e-9)
+        assert found[0].lower[2] == pytest.approx(0.0, abs=1e-9)
+
     def test_and_it_is_wider_than_a_cross_section_is_walked_over(self):
         """Which is the whole of what the count buys: a layer this thick asks
         for less than the coarsest cell, while the reach a cross-section is
@@ -1493,14 +2316,21 @@ class TestHowManyCellsSpanADielectric:
         # underside and its length is set by the tilt rather than by the width.
         face = Face(normal=(1.0, 0.0, 1.0), at=(0.0, 0.0, thickness), size=8.0)
         shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
-        found = self.counted(features([Body("Board", shape)], cap=self.CAP, min_lines=self.COUNT))[
-            0
-        ]
+        vertices, faces = box_surface(lower, upper)
+        found = self.counted(
+            features(
+                [Body("Board", shape, vertices=vertices, faces=faces)],
+                cap=self.CAP,
+                min_lines=self.COUNT,
+            )
+        )[0]
 
         chord = thickness * math.sqrt(2.0)
         assert found.thickness == pytest.approx(chord, rel=1e-2)
         sizes = found.cells()
-        assert sizes[0] == pytest.approx(chord / (self.COUNT / math.sqrt(2.0)), rel=1e-2)
+        # Both axes carry half the normal, so the scaled rule asks each for
+        # the chord's own run on it over the count: chord/sqrt(2) cut n ways.
+        assert sizes[0] == pytest.approx(chord / (self.COUNT * math.sqrt(2.0)), rel=1e-2)
         assert sizes[2] == pytest.approx(sizes[0], rel=1e-2)
         assert math.isinf(sizes[1])
         # The shadow of the segment, which on x is how far the walk moved along
@@ -1509,56 +2339,84 @@ class TestHowManyCellsSpanADielectric:
         assert found.upper[0] == pytest.approx(0.0, abs=1e-2)
         assert found.lower[1] == found.upper[1]
 
-    def stack(self, depth):
-        """The layer, a void inside one march step, then material again.
-
-        Inside one step, so the first place looked at is already through both
-        and into the body beyond - which is what makes the walk read the layer
-        as running all the way down to ``depth`` below the far body's top.
-        """
-        void = 0.5 * (self.COUNT * self.CAP / MARCH_STEPS - self.THICKNESS)
-        near = Slab((-4.0, -4.0, 0.0), (4.0, 4.0, self.THICKNESS))
+    def stack(self, depth, void, metal=False, thickness=None):
+        """The layer, a void of the given width, then material again."""
+        thickness = self.THICKNESS if thickness is None else thickness
+        near = Slab((-4.0, -4.0, 0.0), (4.0, 4.0, thickness))
         far = Slab((-4.0, -4.0, -void - depth), (4.0, 4.0, -void))
-        face = Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, self.THICKNESS), size=8.0)
+        face = Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, thickness), size=8.0)
         shape = Shape(
             (-4.0, -4.0, -void - depth),
-            (4.0, 4.0, self.THICKNESS),
+            (4.0, 4.0, thickness),
             faces=[face],
             solids=[near, far],
         )
-        found = self.counted(features([Body("Stack", shape)], cap=self.CAP, min_lines=self.COUNT))
-        return found, void
-
-    def test_a_void_narrower_than_the_march_is_read_straight_through(self):
-        """The reach is walked in a fixed number of steps, so widening it for
-        the count coarsens the step by the same factor.
-
-        Pinned rather than tolerated: a void this narrow reads the layer, the
-        void and the body beyond as one thickness, which is the *coarse*
-        direction and the one that leaves the layer under-counted. What bounds
-        it is that the step is a share of the coarsest cell in the model.
-        """
-        depth = 6.0
-        found, void = self.stack(depth)
-        assert found[0].thickness == pytest.approx(
-            self.THICKNESS + void + depth, rel=2 * CHORD_TOLERANCE
+        vertices, faces = joined(
+            box_surface((-4.0, -4.0, 0.0), (4.0, 4.0, thickness)),
+            box_surface((-4.0, -4.0, -void - depth), (4.0, 4.0, -void)),
+        )
+        return features(
+            [Body("Stack", shape, metal=metal, vertices=vertices, faces=faces)],
+            cap=self.CAP,
+            edge_size=self.CAP,
+            min_lines=self.COUNT,
         )
 
-    def test_and_reading_through_far_enough_costs_the_demand_entirely(self):
-        """Which is worse than what the same fault does to a cross-section.
+    @pytest.mark.parametrize("thickness", [0.6, 0.8, 1.2])
+    @pytest.mark.parametrize("void", [1e-6, 0.01, 0.1, 1.0])
+    def test_a_void_of_any_width_is_the_end_of_the_layer(self, thickness, void):
+        """A fold or a hollow, measured as the layer it is.
 
-        There a layer read through comes back with a coarser demand; here it can
-        come back past the reach, and a layer past the reach asks for nothing at
-        all - the count is lost rather than loosened.
+        The crossing is placed rather than tested for, so how narrow the void is
+        and where it falls against anything decide nothing: the layer ends at
+        its own boundary. Read through, it would come back as thick as the body
+        beyond it and be counted at whatever that asked for, which is the coarse
+        direction and the one that leaves a layer under-counted.
+
+        The thicknesses and widths are swept together because a rule that looked
+        at places a fixed distance apart would answer them differently - a layer
+        a whole number of those apart puts the void's two ends on two of them -
+        and nothing here should be able to tell them apart.
         """
-        assert self.stack(2.0 * self.COUNT * self.CAP)[0] == []
+        found = self.counted(self.stack(depth=6.0, void=void, thickness=thickness))
+        assert found
+        assert found[0].thickness == pytest.approx(thickness, rel=2 * CHORD_TOLERANCE)
+        assert found[0].cells()[2] == pytest.approx(thickness / self.COUNT, rel=1e-2)
+
+    def test_and_a_void_reads_the_same_on_metal_that_does_not_reach_as_far(self):
+        """The count reaches over the count times the coarsest cell where a
+        cross-section reaches over the root of three times it, and the drawing
+        is the same drawing. Anything that read a line in steps of its own
+        reach would answer these two differently, on geometry neither chose.
+        """
+        void = 0.1 * self.CAP
+        counted = self.counted(self.stack(depth=6.0, void=void))
+        metal = [
+            feature
+            for feature in self.stack(depth=6.0, void=void, metal=True)
+            if "thickness" in feature.source
+        ]
+        assert metal
+        assert metal[0].thickness == pytest.approx(counted[0].thickness, rel=2 * CHORD_TOLERANCE)
+
+    def test_a_layer_thicker_than_the_reach_asks_for_nothing(self):
+        """Which is a harder failure than what the same reach does to a
+        cross-section. There a layer measured too coarsely comes back with a
+        coarser demand; here it comes back with none, so the count is lost
+        rather than loosened - and that is why the reach is the count times the
+        coarsest cell rather than anything narrower.
+        """
+        assert (
+            self.counted(self.stack(depth=6.0, void=1.0, thickness=2.0 * self.COUNT * self.CAP))
+            == []
+        )
 
 
 class TestTheMeshPolicyReachesTheMeasurement:
     """What the translation forwards, and what each value costs if it does not.
 
-    The three are read off one :class:`MeshParams` and spent on three different
-    measurements, so a dropped one is a whole class of demand going missing with
+    Each is read off one :class:`MeshParams` and spent on a different
+    measurement, so a dropped one is a whole class of demand going missing with
     every other demand still arriving. Asserted here rather than through a
     document, because none of it needs a kernel and the wiring is the subject.
     """
@@ -1574,7 +2432,8 @@ class TestTheMeshPolicyReachesTheMeasurement:
         lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, self.THICKNESS)
         face = Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, self.THICKNESS), size=8.0)
         shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
-        return Body("Board", shape, metal=metal)
+        vertices, faces = box_surface(lower, upper)
+        return Body("Board", shape, metal=metal, vertices=vertices, faces=faces)
 
     def test_the_element_count_arrives_at_the_count_the_settings_ask_for(self):
         params = self.params(min_lines=7)
@@ -1602,3 +2461,1334 @@ class TestTheMeshPolicyReachesTheMeasurement:
         coarse = document.measured([body], self.params(metal_res=0.05))
         fine = document.measured([body], self.params(metal_res=0.01))
         assert min(coarse[0].cells()) > min(fine[0].cells())
+
+
+class _Recording:
+    """A face that answers a curvature and remembers where it was asked.
+
+    Curvature by parameter rather than constant, unlike the :class:`Face` above:
+    what is under test here is where the samples land, so a face that answered
+    the same everywhere could not tell one lattice from another.
+
+    It carries an area, because the one walk that answers a radius answers how
+    much of the shape curves as well and reads the area of every face that does.
+    """
+
+    def __init__(self, curvature, span=(0.0, 1.0, 0.0, 1.0), area=1.0):
+        self.ParameterRange = span
+        self.Area = area
+        self._curvature = curvature
+        self.asked = []
+
+    def curvatureAt(self, u, v):
+        self.asked.append((u, v))
+        return (self._curvature(u, v) if callable(self._curvature) else self._curvature, 0.0)
+
+
+class _RecordingEdge:
+    """An edge that answers one bend everywhere and remembers where it was asked.
+
+    An edge is one parameter wide, so where the samples fell is legible from
+    what it was asked.
+    """
+
+    def __init__(self, bend, span=(0.0, 1.0)):
+        self.FirstParameter, self.LastParameter = span
+        self._bend = bend
+        self.asked = []
+
+    def curvatureAt(self, t):
+        self.asked.append(t)
+        return self._bend
+
+
+class TestWhatAnOutlineBendsThrough:
+    """The radii a flat sheet's request is bounded by.
+
+    :func:`curved_through` asked of edges instead of faces, and a separate
+    reading rather than the same call: a sheet's face does not curve at all, so
+    a rule taking its bound from the surfaces would leave every sheet unbounded.
+    """
+
+    def test_a_shape_with_no_edge_answers_nothing(self):
+        assert bends_through(Shape((0.0,) * 3, (1.0,) * 3)) is None
+
+    def test_and_neither_does_one_whose_edges_are_all_straight(self):
+        """A polygon's edges answer a curvature of zero, which is an edge saying
+        it does not bend rather than one that could not be asked."""
+        assert bends_through(Shape((0.0,) * 3, (1.0,) * 3, edges=[Edge(1), Edge(2)])) is None
+
+    def test_a_curvature_that_is_not_a_number_is_dropped_like_a_straight_edge(self):
+        """An edge answering NaN would otherwise pass every comparison it is put
+        through and settle the bound at NaN, which no later arithmetic recovers
+        from."""
+        nan = _RecordingEdge(float("nan"))
+        assert bends_through(Shape((0.0,) * 3, (1.0,) * 3, edges=[nan])) is None
+        assert nan.asked, "the edge was never asked, so this proves nothing"
+
+    def test_the_two_ends_come_from_the_edges_that_carry_them(self):
+        shape = Shape(
+            (0.0,) * 3,
+            (1.0,) * 3,
+            edges=[Edge(1, curvature=2.0), Edge(2), Edge(3, curvature=0.25)],
+        )
+        assert bends_through(shape) == pytest.approx((0.5, 4.0), abs=0.0)
+
+    def test_a_bend_is_a_magnitude_however_the_curve_is_wound(self):
+        """A hole and a boss are the same shape to a triangulation, and the
+        kernel answers an edge's curvature with the sign of its winding."""
+        assert bends_through(
+            Shape((0.0,) * 3, (1.0,) * 3, edges=[Edge(1, curvature=-2.0)])
+        ) == pytest.approx((0.5, 0.5), abs=0.0)
+
+    def test_the_edge_s_own_ends_are_sampled(self):
+        """Where :func:`curved_through` steps around a face's parameter
+        boundary. A conic trimmed at its own vertex carries its sharpest point
+        there, and a bound read too wide asks for a coarser triangulation than
+        the drawing needs."""
+        edge = _RecordingEdge(1.0, span=(0.0, 1.0))
+        bends_through(Shape((0.0,) * 3, (1.0,) * 3, edges=[edge]))
+        assert min(edge.asked) == 0.0
+        assert max(edge.asked) == 1.0
+
+    def test_the_places_span_the_edge_s_own_parameter_range(self):
+        """Rather than the unit interval, which is what an edge parameterised in
+        radians or millimetres would be sampled at one end of."""
+        edge = _RecordingEdge(1.0, span=(-2.0, 6.0))
+        bends_through(Shape((0.0,) * 3, (1.0,) * 3, edges=[edge]))
+        assert min(edge.asked) == -2.0
+        assert max(edge.asked) == 6.0
+
+    def test_asking_for_more_places_looks_at_more_of_them(self):
+        """The count is a bound on how sharp an answer can be found, so a caller
+        raising it is asking for a sharper one and has to get more places."""
+        few, many = _RecordingEdge(1.0), _RecordingEdge(1.0)
+        bends_through(Shape((0.0,) * 3, (1.0,) * 3, edges=[few]), count=3)
+        bends_through(Shape((0.0,) * 3, (1.0,) * 3, edges=[many]), count=9)
+        assert len(few.asked) == 3
+        assert len(many.asked) == 9
+
+    def test_a_single_place_is_the_middle_and_not_an_end(self):
+        """A count with no ends to space is answered by the one place on the
+        edge that is not an end, rather than by a division by zero."""
+        edge = _RecordingEdge(1.0, span=(2.0, 4.0))
+        bends_through(Shape((0.0,) * 3, (1.0,) * 3, edges=[edge]), count=1)
+        assert edge.asked == [3.0]
+
+    def test_a_place_the_curve_cannot_answer_for_is_not_the_edge(self):
+        """Why a curve declines is the kernel's business; what is fixed is the
+        answer when one does - the place is dropped and the edge is still read,
+        rather than the whole outline losing its bound to one refusal."""
+
+        class Awkward(_RecordingEdge):
+            def curvatureAt(self, t):
+                if t < 0.5:
+                    raise RuntimeError("no curvature here")
+                return super().curvatureAt(t)
+
+        edge = Awkward(0.5)
+        assert bends_through(Shape((0.0,) * 3, (1.0,) * 3, edges=[edge])) == pytest.approx(
+            (2.0, 2.0), abs=0.0
+        )
+
+
+class TestWhatAShapeCurvesThrough:
+    """The radii a triangulation's request is bounded by.
+
+    Both ends, because the two bound it from opposite sides: the sharpest says
+    how coarse a request may be before the kernel stops following the drawing,
+    and the widest says how fine it is worth being before the body is refined
+    for nothing.
+    """
+
+    def test_a_shape_with_no_face_answers_nothing(self):
+        assert curvature(Shape((0.0,) * 3, (1.0,) * 3)).through is None
+
+    def test_and_neither_does_one_whose_faces_are_all_flat(self):
+        """A plane answers a curvature of zero, which is a face saying it does
+        not curve rather than a face that could not be asked."""
+        assert curvature(Shape((0.0,) * 3, (1.0,) * 3, faces=[Face(), Face()])).through is None
+
+    def test_a_curvature_that_is_not_a_number_is_dropped_like_a_flat_one(self):
+        """A face answering NaN would otherwise pass every comparison it is put
+        through and settle the bound at NaN, which no later arithmetic recovers
+        from."""
+        nan = _Recording(float("nan"))
+        assert curvature(Shape((0.0,) * 3, (1.0,) * 3, faces=[nan])).through is None
+        assert nan.asked, "the face was never asked, so this proves nothing"
+
+    def test_the_two_ends_come_from_the_faces_that_carry_them(self):
+        shape = Shape(
+            (0.0,) * 3,
+            (1.0,) * 3,
+            faces=[Face(curvature=(0.25, 0.0)), Face(), Face(curvature=(0.0, 2.0))],
+        )
+        assert curvature(shape).through == pytest.approx((0.5, 4.0), abs=0.0)
+
+    def test_the_sharper_of_a_face_s_two_principal_curvatures_is_the_one_read(self):
+        """A saddle curves one way and the other, and what a triangulation has
+        to follow is whichever bends fastest."""
+        shape = Shape((0.0,) * 3, (1.0,) * 3, faces=[Face(curvature=(-4.0, 0.5))])
+        assert curvature(shape).through == pytest.approx((0.25, 0.25), abs=0.0)
+
+    def test_the_samples_are_cell_centred_so_a_face_s_own_boundary_is_stepped_around(self):
+        """Which is where a truncated cone's sharpest point sits, and is why the
+        answer may bound a request and may not be a target for one."""
+        face = _Recording(1.0, span=(0.0, 1.0, 0.0, 1.0))
+        curvature(Shape((0.0,) * 3, (1.0,) * 3, faces=[face]))
+        assert face.asked, "no sample was taken at all"
+        for u, v in face.asked:
+            assert 0.0 < u < 1.0 and 0.0 < v < 1.0
+
+    def test_the_lattice_spans_the_face_s_own_parameter_range(self):
+        """Rather than the unit square, which is what a face whose parameters
+        are angles or millimetres would be sampled at a corner of."""
+        face = _Recording(1.0, span=(-2.0, 6.0, 10.0, 11.0))
+        curvature(Shape((0.0,) * 3, (1.0,) * 3, faces=[face]))
+        us = [u for u, _ in face.asked]
+        vs = [v for _, v in face.asked]
+        assert min(us) > -2.0 and max(us) < 6.0
+        assert min(vs) > 10.0 and max(vs) < 11.0
+        assert max(us) - min(us) > 6.0, "the lattice does not reach across the range"
+
+    def test_asking_for_more_samples_takes_more_of_them(self):
+        """The count is a bound on how sharp an answer can be found, so a caller
+        raising it is asking for a sharper one and has to get more lattice."""
+        few, many = _Recording(1.0), _Recording(1.0)
+        curvature(Shape((0.0,) * 3, (1.0,) * 3, faces=[few]), count=3)
+        curvature(Shape((0.0,) * 3, (1.0,) * 3, faces=[many]), count=9)
+        assert len(few.asked) == 9
+        assert len(many.asked) == 81
+
+    def test_a_sample_the_surface_cannot_answer_for_is_not_the_face(self):
+        """A pole and a seam are points a parameterisation carries and cannot
+        evaluate, and a face is not disqualified by one of them."""
+
+        class Awkward(_Recording):
+            def curvatureAt(self, u, v):
+                if u < 0.5:
+                    raise RuntimeError("no curvature here")
+                return super().curvatureAt(u, v)
+
+        face = Awkward(0.5)
+        assert curvature(Shape((0.0,) * 3, (1.0,) * 3, faces=[face])).through == (
+            pytest.approx((2.0, 2.0), abs=0.0)
+        )
+
+
+class TestWhatACurvedSurfaceCovers:
+    """How much of a shape curves, and which ways it bends.
+
+    A departure divided by the whole area says how much of the shape is flat as
+    much as how far the curved part moved, and a departure summed over a surface
+    that bends both ways is a net of two opposite ones. Both are read here, off
+    the lattice a request is already bounded against.
+    """
+
+    def shape(self, *faces):
+        return Shape((0.0,) * 3, (1.0,) * 3, faces=list(faces))
+
+    def test_a_shape_with_no_face_covers_nothing(self):
+        assert curvature(Shape((0.0,) * 3, (1.0,) * 3)) == Curvature(
+            area=0.0, convex=False, concave=False, sharpest=None, widest=None
+        )
+
+    def test_a_flat_face_contributes_no_area(self):
+        """A plane answers a curvature of zero, and a plane is triangulated
+        exactly - so counting its area would divide a departure by the part of
+        the shape that did not depart."""
+        assert curvature(self.shape(Face(area=7.0))).area == 0.0
+
+    def test_only_the_faces_that_curve_are_counted(self):
+        found = curvature(self.shape(Face(area=7.0), Face(curvature=(-1 / 3.0, 0.0), area=5.0)))
+        assert found.area == pytest.approx(5.0)
+
+    def test_every_curved_face_is_counted_once_however_many_samples_it_takes(self):
+        """The area is the face's, not the lattice's: a face is sampled many
+        times over and counts its area once."""
+        assert curvature(self.shape(Face(curvature=(-1 / 3.0, 0.0), area=5.0))).area == 5.0
+
+    def test_a_surface_bending_one_way_does_not_read_as_bending_both(self):
+        found = curvature(
+            self.shape(
+                Face(curvature=(-1 / 3.0, 0.0), area=5.0),
+                Face(curvature=(-1 / 9.0, -1 / 4.0), area=2.0),
+            )
+        )
+        assert found.convex and not found.concave
+        assert found.both_ways is False
+
+    def test_a_direction_the_surface_does_not_turn_in_is_not_a_bend(self):
+        """A cone answers its straight direction as what is left of a zero
+        rather than as nothing, and a test against zero reads that as the
+        surface bending the other way.
+        """
+        cone = self.shape(Face(curvature=(-1 / 3.0, 9.66e-34), area=5.0))
+        assert curvature(cone).both_ways is False
+        assert curvature(cone).convex
+
+    def test_but_a_shallow_bend_that_is_a_number_still_counts(self):
+        """The bound is against the sharpest curvature at the same sample and
+        not against a length, so a genuine gentle curve is not rounded away by
+        a sharp one elsewhere on the shape."""
+        saddle = self.shape(Face(curvature=(-1 / 3.0, 1e-4), area=5.0))
+        assert curvature(saddle).both_ways
+
+    def test_and_one_bending_both_ways_does(self):
+        """A saddle at a single point is enough - what the caller is asking is
+        whether a figure summed over the whole boundary has opposite
+        contributions in it, and one region of either sign makes it so."""
+        assert curvature(self.shape(Face(curvature=(1 / 3.0, -1 / 4.0), area=5.0))).both_ways
+
+    def test_a_face_wound_inward_has_its_sign_turned_back(self):
+        """A shell's bore is wound against the metal behind it, so the kernel
+        answers the opposite of how that metal bends. Left alone, a hollow
+        sphere reads as bending one way."""
+        hollow = self.shape(
+            Face(curvature=(-1 / 5.0, -1 / 5.0), area=5.0),
+            Face(curvature=(-1 / 4.0, -1 / 4.0), area=4.0, orientation="Reversed"),
+        )
+        assert hollow.Faces[1].curvatureAt(0.0, 0.0)[0] < 0.0, "both faces read the same unturned"
+        assert curvature(hollow).both_ways
+
+    def test_a_curvature_that_is_not_a_number_neither_curves_nor_bends(self):
+        """A pole and a seam are places the parameterisation fails, not places
+        the shape is flat - and asking whether a value is above zero drops one
+        where asking whether it is at most zero would keep it."""
+        assert curvature(self.shape(Face(curvature=(float("nan"), float("nan")), area=5.0))) == (
+            curvature(self.shape(Face(area=5.0)))
+        )
+
+
+class TestAFaceThatCannotCurveIsNotAsked:
+    """A planar surface turns in no direction anywhere it is defined.
+
+    The question is put to the surface rather than to the class it arrived as,
+    so a spline lying in a plane is skipped and a shape that came through a file
+    carrying no type is read like any other.
+
+    A face carrying a curvature is used to say so, because the skip has to be
+    visible in the answer and not only in the cost: what the kernel returns on
+    such a face is the residue of its own arithmetic, and the guards inside the
+    reading cannot tell that residue from a bend. So the tests here state that
+    the face is not asked and that nothing of it reaches the answer, which is
+    the claim the code makes.
+
+    Both readings are exercised: the lattice a triangulation is bounded against,
+    and the station lattice the demands are measured on. What a real kernel
+    answers on a planar face is the corpus gate's, since a stand-in agrees with
+    this by construction.
+    """
+
+    def shape(self, *faces):
+        return Shape((0.0,) * 3, (1.0,) * 3, faces=list(faces))
+
+    def test_a_face_whose_surface_is_planar_is_never_asked(self):
+        face = _Recording(-1 / 3.0)
+        face.Surface = Surface(face, planar=True)
+        curvature(self.shape(face))
+        assert face.asked == []
+
+    def test_and_it_puts_nothing_into_the_reading(self):
+        """Not the area, not the flags, and not either radius. Anything the
+        reading keeps from a face it declined to sample is a figure taken off a
+        surface nobody looked at.
+        """
+        face = _Recording(-1 / 3.0, area=7.0)
+        face.Surface = Surface(face, planar=True)
+        assert curvature(self.shape(face)) == Curvature(
+            area=0.0, convex=False, concave=False, sharpest=None, widest=None
+        )
+
+    def test_a_face_whose_surface_is_not_planar_is_asked_at_every_station(self):
+        face = _Recording(-1 / 3.0)
+        face.Surface = Surface(face, planar=False)
+        curvature(self.shape(face))
+        assert len(face.asked) == CURVATURE_SAMPLES**2
+
+    def test_a_surface_that_cannot_say_is_asked(self):
+        """Which is what every caller here did before there was a way to skip
+        one, and it is the direction that costs a reading rather than an
+        answer."""
+        face = _Recording(-1 / 3.0)
+        curvature(self.shape(face))
+        assert len(face.asked) == CURVATURE_SAMPLES**2
+
+    def test_and_so_is_one_that_refuses_the_question(self):
+        face = _Recording(-1 / 3.0)
+        face.Surface = RefusingSurface(face)
+        curvature(self.shape(face))
+        assert len(face.asked) == CURVATURE_SAMPLES**2
+
+    def test_the_surface_is_asked_once_a_face_and_not_once_a_station(self):
+        """The answer is a property of the surface and not of any station on
+        it, so a question put per station is one asked as many times as the
+        readings it exists to save."""
+
+        class Counting(Surface):
+            """Records every time it is asked whether it is planar."""
+
+            def __init__(self, face, planar=None):
+                super().__init__(face, planar)
+                self.asked = []
+
+            def isPlanar(self):
+                self.asked.append(1)
+                return False
+
+        for reading in (self.by_lattice, self.by_stations):
+            face = self.face(curvature=(-1 / 3.0, 0.0), area=7.0)
+            face.Surface = Counting(face)
+            reading(face)
+            assert len(face.Surface.asked) == 1, (
+                f"{reading.__name__} asks the surface {len(face.Surface.asked)} times"
+            )
+            assert face.asked, f"{reading.__name__} never reached the face"
+
+    def face(self, **rest):
+        """A face that answers a curvature and records where it was asked."""
+
+        class Watched(Face):
+            def __init__(self, **given):
+                super().__init__(**given)
+                self.asked = []
+
+            def curvatureAt(self, u, v):
+                self.asked.append((u, v))
+                return super().curvatureAt(u, v)
+
+        return Watched(**rest)
+
+    def by_lattice(self, face):
+        """The fixed lattice a triangulation's request is bounded against."""
+        return curvature(self.shape(face))
+
+    def by_stations(self, face):
+        """The station lattice the mesh demands are measured on."""
+        body = Body("Rod", self.shape(face), metal=True)
+        return list(features([body], cap=1.0, edge_size=None))
+
+    def test_a_planar_face_raises_no_curvature_demand_and_is_not_asked(self):
+        """The station lattice, which is the larger of the two readings: it
+        takes as many samples off a face as the face has stations rather than
+        the fixed lattice's."""
+
+        curved = self.face(curvature=(-1 / 3.0, 0.0), area=7.0)
+        flat = self.face(curvature=(-1 / 3.0, 0.0), area=7.0, planar=True)
+        for face, wanted in ((curved, True), (flat, False)):
+            raised = [one for one in self.by_stations(face) if "curving" in one.source]
+            assert bool(raised) is wanted
+        assert curved.asked, "the face that curves was never asked"
+        assert flat.asked == []
+
+
+class TestWhatMeasuringADrawingCosts:
+    """The tally the measurement fills in, and what a reader divides it by.
+
+    What the drawing raised is counted here, and the phases that cost the most
+    to raise it: the gap walk's kernel calls and the rays a chord casts. What
+    dropping a redundant demand costs is counted where that happens, which is
+    the mesher - see ``TestWhatThePruningScanCosts`` in ``test_mesh_core``.
+    """
+
+    def slab(self, metal=True):
+        """A solid with a triangulation, so the chord is walked as well as the
+        demands pruned. Without the triangles no line is cast at all and half
+        the tally is filled by nothing."""
+        lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, 0.6)
+        shape = Shape(
+            lower,
+            upper,
+            faces=[Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, 0.6), size=8.0)],
+            solids=[Slab(lower, upper)],
+        )
+        vertices, faces = box_surface(lower, upper)
+        return Body("Wall", shape, metal=metal, vertices=vertices, faces=faces)
+
+    def gap_pair(self):
+        """Two solids a short way apart, which is what makes the walk run."""
+        run, gap = 4.0, 0.3
+        near = Shape(
+            (0.0, 0.0, 0.0),
+            (run, 1.0, 1.0),
+            faces=[_Wall((0.0, 1.0, 0.0), (run, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0))],
+            solids=[Slab((0.0, 0.0, 0.0), (run, 1.0, 1.0))],
+            distance=gap,
+            witnesses=[((0.0, 1.0, 0.5), (0.0, 1.0 + gap, 0.5))],
+        )
+        top = 2.0 + gap + 1.0
+        far = Shape(
+            (0.0, 1.0 + gap, 0.0),
+            (run, top, 1.0),
+            solids=[Slab((0.0, 1.0 + gap, 0.0), (run, top, 1.0))],
+        )
+        return [Body("Trace", near), Body("Keeper", far)]
+
+    def test_walking_a_gap_counts_every_point_it_asked_the_kernel_to_place(self):
+        """The walk marches outward and then halves, a kernel call apiece, and
+        it is the dearest phase a drawing with a neighbour pays for. Counted at
+        the one place the kernel is asked."""
+        spend = Spend()
+        features(self.gap_pair(), cap=10.0, spend=spend)
+        assert spend.probed > 0
+
+    def test_and_a_drawing_with_no_neighbour_asks_the_kernel_nothing(self):
+        """The guard on the count above. A tally that counted anything at all
+        would satisfy it, and a body with nothing beside it walks no gap."""
+        spend = Spend()
+        features([self.gap_pair()[0]], cap=10.0, spend=spend)
+        assert spend.probed == 0
+
+    def test_measuring_a_drawing_fills_the_tally_from_every_phase_it_reaches(self):
+        """The tally reaches each phase through :func:`lfs.features`, which is
+        the only route a drawing takes. An argument accepted and dropped on the
+        way down leaves the counts behind it at zero, and the phases are
+        separate arguments on separate paths - so the chord's counts and the
+        scan's are asserted apart.
+        """
+        spend = Spend()
+        found = features([self.slab()], cap=100.0, edge_size=0.1, spend=spend)
+        assert spend.raised >= len(found) > 0
+        assert spend.kept == 0, "the scan that fills this runs in the mesher"
+        assert spend.cast > 0
+        assert 0 < spend.tested <= spend.reachable
+
+    def test_and_a_dielectric_reaches_the_chord_by_its_own_route(self):
+        """A conductor is measured across itself and a dielectric is counted
+        across itself, and the two walk the same chord from different callers.
+        A tally dropped on one of them leaves the other's counts standing, so
+        the two are asserted apart."""
+        spend = Spend()
+        features([self.slab(metal=False)], cap=100.0, min_lines=4, spend=spend)
+        assert spend.cast > 0
+
+
+class TestWhatWalkingAGapCosts:
+    """The dearest phase a drawing with a neighbour pays for, read against what
+    it laid rather than against a figure.
+
+    The walk samples one body's surface and marches at the other from each
+    station, so what it costs is the arithmetic between a station and a
+    containment answer. A stand-in answers containment as the kernel does and
+    every count in the tally is a property of the code, so the cost is readable
+    here with no kernel and in the tier that runs before a commit. What a real
+    face adds is a trimmed lattice and a sample count that saturates;
+    ``tests/test_cost.py`` reads those through the cell on drawings the kernel
+    makes.
+
+    Two settings of the gap, because a count on one drawing is a figure nobody
+    can fail. The gap is what the lattice is spaced at, so it is what moves the
+    stations, and the cell is asserted to move nothing.
+    """
+
+    RUN = 10.0
+    CAP = 2.0
+
+    #: The two gaps, a factor of two apart. Both are coarse enough that the run
+    #: above asks for fewer stations than :data:`MAX_SAMPLES` allows, which the
+    #: guard below re-derives: a capped lattice stops following the gap, and a
+    #: growth read across one is a growth of nothing.
+    COARSE = 1.25
+    FINE = 0.625
+
+    #: The most probes one station of this pair can cost, from the constants the
+    #: walk is built out of and from nothing observed. The winding is settled in
+    #: at most two probes, the march stops at the reach over its own step, and
+    #: the halving stops at its own limit. The reach and the step are both shares
+    #: of the coarsest cell, so their ratio is a number the module states and
+    #: neither the drawing nor the mesh policy moves it.
+    #:
+    #: This is the bound for a body with an inside, which is what settles the
+    #: winding and leaves one way to walk. A body with none is walked both ways
+    #: and pays the march and the halving twice with no winding at all, so its
+    #: bound is a different one. The pair below has an inside.
+    STATION_CEILING = 2 + math.ceil(SEPARATION_REACH / MARCH_STEP) + MAX_HALVINGS
+
+    #: How far past the reach the extra wall below stands, in the cell the reach
+    #: is a multiple of. Anything positive puts it out of reach; a whole cell is
+    #: past the rounding either side of the comparison.
+    OUT_OF_REACH = SEPARATION_REACH * CAP + CAP
+
+    def pair(self, gap, far_wall=False):
+        """A body carrying a wall each way, ``gap`` from a box.
+
+        Each wall stands for a different station, and a real drawing pays for
+        both. The wall facing the box is struck as soon as the march reaches
+        across the gap, and the walk then halves. The wall facing away marches
+        its whole reach and finds nothing, which is the dearer of the two: a
+        face pointing away from its neighbour is still given a lattice, and
+        every station on it is paid for.
+
+        ``far_wall`` adds a third, standing out of reach of the box along the
+        run. The body's own extent holds it whether or not it is built, so the
+        pair itself is judged the same way either way and only the face differs.
+        The body is the one measured and the box is not, so which of the two is
+        sampled does not turn on how large either is.
+        """
+        walls = [
+            _Wall((0.0, 1.0, 0.0), (self.RUN, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),
+            _Wall((0.0, 0.0, 0.0), (self.RUN, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)),
+        ]
+        stands_at = self.RUN + self.OUT_OF_REACH
+        if far_wall:
+            walls.append(
+                _Wall((stands_at, 1.0, 0.0), (self.RUN, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0))
+            )
+        near = Shape(
+            (0.0, 0.0, 0.0),
+            (stands_at + self.RUN, 1.0, 1.0),
+            faces=walls,
+            solids=[Slab((0.0, 0.0, 0.0), (self.RUN, 1.0, 1.0))],
+            distance=gap,
+            witnesses=[((0.0, 1.0, 0.5), (0.0, 1.0 + gap, 0.5))],
+        )
+        top = 2.0 + gap + 1.0
+        far = Shape(
+            (0.0, 1.0 + gap, 0.0),
+            (self.RUN, top, 1.0),
+            solids=[Slab((0.0, 1.0 + gap, 0.0), (self.RUN, top, 1.0))],
+        )
+        return [Body("Trace", near), Body("Keeper", far, measured=False)]
+
+    def spent(self, gap, edge_size=None, far_wall=False):
+        spend = Spend()
+        features(self.pair(gap, far_wall), cap=self.CAP, edge_size=edge_size, spend=spend)
+        return spend
+
+    def test_narrowing_the_gap_lays_more_stations_to_grow_on(self):
+        """The guard under everything below. The lattice is spaced at the gap,
+        so narrowing the gap is what puts more stations on the same face - and a
+        lattice held at :data:`MAX_SAMPLES` stops following it, which would
+        leave every reading below taken on a walk that did not move. The finer
+        of the two gaps is the one that could reach that cap, so it is the one
+        asked about."""
+        assert self.RUN / self.FINE < MAX_SAMPLES
+        coarse, fine = self.spent(self.COARSE), self.spent(self.FINE)
+        assert 0 < coarse.walked < fine.walked
+        assert fine.walked / coarse.walked > GROWTH_WORTH_READING
+
+    def test_the_walk_costs_what_its_stations_cost(self):
+        """A station is walked once however far the march looks, so the probes
+        follow the lattice rather than outrunning it. This is what a march
+        stepping at the gap instead of at the cell fails: the stations double
+        and the probes more than double."""
+        coarse, fine = self.spent(self.COARSE), self.spent(self.FINE)
+        assert 0 < coarse.probed < fine.probed
+        grew = fine.probed / coarse.probed
+        assert grew <= (fine.walked / coarse.walked) ** LINEAR_ENOUGH
+
+    def test_a_station_costs_no_more_than_the_walk_s_own_constants_allow(self):
+        """What the ratio above rests on, stated from the constants rather than
+        read off a run. It holds that the march and the halving each stop where
+        this module says they do, which the ratio cannot see: one that stopped
+        bounding itself would cost the same multiple at either gap and leave the
+        ratio standing."""
+        for gap in (self.COARSE, self.FINE):
+            spend = self.spent(gap)
+            assert spend.walked > 0
+            assert spend.probed <= spend.walked * self.STATION_CEILING
+
+    def test_a_face_out_of_reach_of_the_neighbour_costs_nothing(self):
+        """A face is culled against the same reach that bounds the march, before
+        a station is laid on it. Without that cull a body pays a whole lattice
+        for every face pointing away from its neighbour, and each of those
+        stations marches its full reach to find nothing - which is the dearest
+        station there is."""
+        near, wider = self.spent(self.COARSE), self.spent(self.COARSE, far_wall=True)
+        assert 0 < near.walked == wider.walked
+        assert 0 < near.probed == wider.probed
+
+    def test_refining_the_cell_moves_nothing_the_walk_does(self):
+        """The lattice is spaced at the gap being measured, so the cell moves
+        nothing here. Held as an equality rather than as a ratio, there being
+        nothing to grow - and it is why the walk is read here rather than
+        through the probe that refines a cell."""
+        coarse = self.spent(self.COARSE, edge_size=0.5)
+        fine = self.spent(self.COARSE, edge_size=0.125)
+        assert 0 < coarse.walked == fine.walked
+        assert 0 < coarse.probed == fine.probed
+
+
+class Pair:
+    """A point in a face's own parameters, as a kernel's 2d point."""
+
+    def __init__(self, u, v):
+        self.x, self.y = float(u), float(v)
+
+
+class Pcurve:
+    """A run through a face's parameters, as a parameter curve.
+
+    ``walked`` is what the curve discretises to, and ``beyond`` is carried past
+    its own last parameter - a curve is trimmed by the edge that uses it, and a
+    caller reading the whole curve instead of the edge's own range gets a run
+    the face's boundary does not have.
+
+    What comes back is given rather than computed, so that a test can hand back
+    a loop whose two ends round apart, which is what a closed curve evaluated at
+    each end of its own period does.
+    """
+
+    def __init__(self, walked, beyond=()):
+        self._walked = [Pair(u, v) for u, v in walked]
+        self._beyond = [Pair(u, v) for u, v in beyond]
+
+    def discretize(self, Deflection, First, Last):  # noqa: N803 - the kernel's own spelling
+        held = self._walked + self._beyond
+        return held[: len(self._walked)] if Last <= 1.0 else held
+
+
+class TrimEdge:
+    def __init__(self, walked, beyond=()):
+        self.pcurve = Pcurve(walked, beyond)
+
+
+class TrimWire:
+    """One loop of a face's boundary.
+
+    ``Edges`` drops the seam the way a real wire's does - a wire running along
+    the seam of a periodic surface uses that edge at each end of the period, and
+    the edge list holds one of the two. ``OrderedEdges`` holds both.
+    """
+
+    def __init__(self, edges, dropped=None):
+        self.OrderedEdges = list(edges)
+        self.Edges = [e for i, e in enumerate(edges) if i != dropped]
+
+
+class TrimSurface:
+    """A surface whose patch over a parameter rectangle has the area of that
+    rectangle, times a scale. A caller handing over the wrong rectangle gets the
+    wrong area, which is what makes the rectangle load bearing."""
+
+    def __init__(self, scale):
+        self._scale = scale
+
+    def toShape(self, low_u, high_u, low_v, high_v):
+        area = abs((high_u - low_u) * (high_v - low_v)) * self._scale
+        return Shape((0.0,) * 3, (1.0,) * 3, area=area)
+
+
+class TrimmedFace(Face):
+    """A face stated as the loops its boundary makes in its own parameters.
+
+    The kernel's own answer is the same loops classified by parity, so the two
+    routes agree wherever both are asked and a test can see which one answered
+    by moving one of them.
+    """
+
+    def __init__(self, loops, area, whole, answer=None, dropped=None, beyond=()):
+        super().__init__()
+        self.ParameterRange = (0.0, 1.0, 0.0, 1.0)
+        self.Area = area
+        self.Surface = TrimSurface(whole)
+        # Each loop given whole, its first corner repeated at the end, because
+        # a polygon is a closed curve and one edge carrying a whole loop has to
+        # come back to where it started.
+        self.Wires = [
+            TrimWire([TrimEdge(loop + loop[:1], beyond=beyond)], dropped=dropped) for loop in loops
+        ]
+        self._loops = loops
+        self._answer = answer
+        self.asked = 0
+
+    def curveOnSurface(self, edge):
+        return edge.pcurve, 0.0, 1.0
+
+    def isPartOfDomain(self, u, v):
+        self.asked += 1
+        if self._answer is not None:
+            return self._answer(u, v)
+        return _enclosed(self._loops, u, v)
+
+
+def _enclosed(loops, u, v):
+    """Parity against the loops, worked out here so a test does not read the
+    module it is testing for its own expectation."""
+    crossings = 0
+    for loop in loops:
+        for (au, av), (bu, bv) in zip(loop, loop[1:] + loop[:1]):
+            if (av > v) != (bv > v) and u < au + (v - av) * (bu - au) / (bv - av):
+                crossings += 1
+    return crossings % 2 == 1
+
+
+def square(low, high):
+    """A closed loop, counter-clockwise, as a list of corners."""
+    return [(low, low), (high, low), (high, high), (low, high)]
+
+
+class Arc:
+    """A circle in a face's parameters, discretised to whatever is asked of it.
+
+    The count is what a chord of that sagitta needs, so a coarser request leaves
+    a polygon further inside the circle - which is the departure the band around
+    the boundary exists to absorb.
+    """
+
+    def __init__(self, centre, radius):
+        self._centre, self._radius = centre, radius
+
+    def discretize(self, Deflection, First, Last):  # noqa: N803 - the kernel's own spelling
+        held = max(-1.0, 1.0 - Deflection / self._radius)
+        steps = max(3, math.ceil(2.0 * math.pi / (2.0 * math.acos(held))))
+        centre_u, centre_v = self._centre
+        return [
+            Pair(
+                centre_u + self._radius * math.cos(2.0 * math.pi * i / steps),
+                centre_v + self._radius * math.sin(2.0 * math.pi * i / steps),
+            )
+            for i in range(steps + 1)
+        ]
+
+
+class RoundFace(Face):
+    """A face trimmed to a circle in its own parameters.
+
+    The kernel answers the circle itself and the boundary is the polygon that
+    circle discretises to, so the two agree only as far as the discretisation
+    reaches.
+    """
+
+    def __init__(self, centre, radius, area, whole):
+        super().__init__()
+        self.ParameterRange = (0.0, 1.0, 0.0, 1.0)
+        self.Area = area
+        self.Surface = TrimSurface(whole)
+        self.Wires = [TrimWire([TrimEdge([])])]
+        self.Wires[0].OrderedEdges[0].pcurve = Arc(centre, radius)
+        self._centre, self._radius = centre, radius
+        self.asked = 0
+
+    def curveOnSurface(self, edge):
+        return edge.pcurve, 0.0, 1.0
+
+    def isPartOfDomain(self, u, v):
+        self.asked += 1
+        return math.hypot(u - self._centre[0], v - self._centre[1]) <= self._radius
+
+
+class TestWhereALatticeLandsOnItsFace:
+    """A face is trimmed out of the rectangle its surface is stated over, and
+    the lattice is laid across the rectangle. Which of its pairs land on the
+    face is what these are about.
+    """
+
+    def lattice(self, count=8):
+        step = 1.0 / count
+        return (
+            [((i + 0.5) * step, (j + 0.5) * step) for i in range(count) for j in range(count)],
+            (0.0, 1.0, 0.0, 1.0),
+            (step, step),
+        )
+
+    def test_a_face_covering_its_own_range_keeps_every_pair(self):
+        pairs, span, steps = self.lattice()
+        face = TrimmedFace([square(0.0, 1.0)], area=4.0, whole=4.0)
+        assert _on_face(face, pairs, span, steps) == [True] * len(pairs)
+
+    def test_and_is_asked_nothing_at_all(self):
+        """The saving is the whole of it: a face that covers its range has no
+        pair the kernel could answer differently about."""
+        pairs, span, steps = self.lattice()
+        face = TrimmedFace([square(0.0, 1.0)], area=4.0, whole=4.0)
+        _on_face(face, pairs, span, steps)
+        assert face.asked == 0
+
+    def test_a_face_shy_of_its_range_by_more_than_a_rounding_is_not_excused(self):
+        """The slack is a tolerance on two readings of one area. A shortfall
+        larger than that is a region the trim leaves out, whatever its size
+        against the face."""
+        pairs, span, steps = self.lattice()
+        loops = [square(0.0, 1.0), square(0.375, 0.625)]
+        shy = TrimmedFace(loops, area=4.0 * (1.0 - 2.0 * UNTRIMMED_SHORTFALL), whole=4.0)
+        assert not all(_on_face(shy, pairs, span, steps)), "the hole was not taken out"
+        near = TrimmedFace(loops, area=4.0 * (1.0 - 0.5 * UNTRIMMED_SHORTFALL), whole=4.0)
+        assert all(_on_face(near, pairs, span, steps)), (
+            "a shortfall under the tolerance is two readings of one area"
+        )
+
+    def test_a_trimmed_face_answers_what_each_pair_answers_alone(self):
+        pairs, span, steps = self.lattice()
+        face = TrimmedFace([square(0.25, 0.75)], area=1.0, whole=4.0)
+        walked = _on_face(face, pairs, span, steps)
+        alone = [_enclosed(face._loops, u, v) for u, v in pairs]
+        assert walked == alone
+
+    def test_a_hole_takes_its_own_samples_out(self):
+        """Parity names no wire the outer one, so a hole subtracts itself."""
+        pairs, span, steps = self.lattice()
+        face = TrimmedFace([square(0.0, 1.0), square(0.375, 0.625)], area=3.75, whole=4.0)
+        walked = _on_face(face, pairs, span, steps)
+        assert any(walked) and not all(walked)
+        assert walked == [_enclosed(face._loops, u, v) for u, v in pairs]
+
+    def test_a_pair_beside_the_boundary_is_the_kernel_s_own_answer(self):
+        """Where a polygon stands for a curve it is only close to, the kernel
+        answers. What is asserted is that the kernel's answer is the one kept,
+        which a polygon agreeing with it could not show."""
+        step = 1.0 / 8.0
+        loop = [(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)]
+        # As near the boundary as the polygon itself may stand from the curve
+        # it was read off. Nearer than that the two say different things, so
+        # the band has to reach at least this far.
+        beside = 0.5 - BOUNDARY_FINENESS * step
+        pairs = [(0.25, 0.5), (beside, 0.5)]
+        face = TrimmedFace([loop], area=2.0, whole=4.0, answer=lambda u, v: False)
+        walked = _on_face(face, pairs, (0.0, 1.0, 0.0, 1.0), (step, step))
+        assert face.asked == 1, "only the pair beside the boundary is asked about"
+        assert walked == [True, False]
+
+    def test_a_face_that_cannot_state_its_boundary_is_asked_pair_by_pair(self):
+        pairs, span, steps = self.lattice(count=3)
+        face = Face(area=1.0)
+        face.isPartOfDomain = lambda u, v: u < 0.5
+        assert _on_face(face, pairs, span, steps) == [u < 0.5 for u, _ in pairs]
+
+    def test_a_wire_is_read_in_its_own_order_so_a_seam_is_not_dropped(self):
+        """A wire's edge list holds one occurrence of a seam edge and its
+        ordered edges hold both. Built from the list, the loop is open along one
+        side and everything inside it reads as outside."""
+        pairs, span, steps = self.lattice()
+        loop = square(0.0, 1.0)
+        face = TrimmedFace([loop], area=3.0, whole=4.0)
+        sides = [TrimEdge([a, b]) for a, b in zip(loop, loop[1:] + loop[:1])]
+        # The one dropped runs across the parity ray rather than along it, a
+        # side the ray never meets being a side no count can miss.
+        face.Wires = [TrimWire(sides, dropped=1)]
+        assert all(_on_face(face, pairs, span, steps))
+
+    def test_a_corner_spelled_twice_is_one_corner(self):
+        """A corner reached along two edges is computed from two parameter
+        curves, and the two do not always land on the same last bits. A parity
+        ray at that height passes between the two spellings, counts both
+        segments, and reads everything beyond the corner as the other side."""
+        pairs, span, steps = self.lattice()
+        # A diamond, so that the join is a corner rather than a run along the
+        # ray, and its own row carries stations that have to cross there.
+        row = 4.5 * steps[1]
+        loop = [(1.0, row), (0.5, 1.0), (0.0, row), (0.5, 0.0)]
+        walked = loop + [(loop[0][0], loop[0][1] + 1e-16)]
+        face = TrimmedFace([loop], area=2.0, whole=4.0)
+        face.Wires = [TrimWire([TrimEdge(walked)])]
+        assert _on_face(face, pairs, span, steps) == [_enclosed([loop], u, v) for u, v in pairs]
+
+    def test_a_face_with_no_pair_to_place_asks_nothing(self):
+        face = TrimmedFace([square(0.25, 0.75)], area=1.0, whole=4.0)
+        assert _on_face(face, [], (0.0, 1.0, 0.0, 1.0), (0.1, 0.1)) == []
+        assert face.asked == 0
+
+    def test_a_face_with_no_surface_to_ask_about_is_not_excused(self):
+        """A stand-in carries whatever it was given, and a face that cannot be
+        asked whether it covers its own range has to be classified rather than
+        kept whole."""
+        pairs, span, steps = self.lattice()
+        face = TrimmedFace([square(0.25, 0.75)], area=1.0, whole=4.0)
+        face.Surface = None
+        walked = _on_face(face, pairs, span, steps)
+        assert walked == [_enclosed(face._loops, u, v) for u, v in pairs]
+
+    def test_a_lattice_is_one_reading_of_the_face(self):
+        """The parameter rectangle is handed over rather than read again. A
+        second reading is a second document, which is the rule the adapter
+        states, and here it is also the reading the caller has already made."""
+        pairs, span, steps = self.lattice()
+        face = TrimmedFace([square(0.25, 0.75)], area=1.0, whole=4.0)
+        face.reads = 0
+        kind = type(face)
+
+        class Counted(kind):
+            @property
+            def ParameterRange(self):
+                face.reads += 1
+                return (0.0, 1.0, 0.0, 1.0)
+
+            @ParameterRange.setter
+            def ParameterRange(self, value):
+                pass
+
+        face.__class__ = Counted
+        _on_face(face, pairs, span, steps)
+        assert face.reads == 0
+
+    def test_a_lattice_spaced_differently_in_its_two_directions_answers_the_same(self):
+        """Every distance is measured in lattice steps, and the two directions
+        do not share one. A face read in one direction's steps is a face read
+        through a shear."""
+        across, along = 4, 16
+        steps = (1.0 / across, 1.0 / along)
+        pairs = [
+            ((i + 0.5) * steps[0], (j + 0.5) * steps[1])
+            for i in range(across)
+            for j in range(along)
+        ]
+        loops = [square(0.0, 1.0), square(0.375, 0.625)]
+        face = TrimmedFace(loops, area=3.75, whole=4.0)
+        walked = _on_face(face, pairs, (0.0, 1.0, 0.0, 1.0), steps)
+        assert walked == [_enclosed(loops, u, v) for u, v in pairs]
+        assert not all(walked), "the hole was not taken out"
+
+    def test_a_direction_of_no_width_is_asked_pair_by_pair(self):
+        """A step of nothing divides every distance by nothing, and what comes
+        back is not a distance. The kernel answers instead."""
+        pairs = [(0.5, 0.5), (0.25, 0.5)]
+        face = TrimmedFace([square(0.25, 0.75)], area=1.0, whole=4.0)
+        walked = _on_face(face, pairs, (0.0, 1.0, 0.0, 0.0), (0.125, 0.0))
+        assert face.asked == len(pairs)
+        assert walked == [_enclosed(face._loops, u, v) for u, v in pairs]
+
+    def test_the_boundary_is_followed_finely_enough_for_the_band_to_cover_it(self):
+        """The polygon departs from the curve it stands for, and the band around
+        it is what refers that departure to the kernel. Read at the band's own
+        fineness the polygon departs by as much as the band is wide, and a
+        station outside the band then gets an answer about no curve at all."""
+        count = 24
+        step = 1.0 / count
+        pairs = [((i + 0.5) * step, (j + 0.5) * step) for i in range(count) for j in range(count)]
+        face = RoundFace((0.5, 0.5), 0.4, area=math.pi * 0.16, whole=1.0)
+        walked = _on_face(face, pairs, (0.0, 1.0, 0.0, 1.0), (step, step))
+        alone = [face.isPartOfDomain(u, v) for u, v in pairs]
+        assert walked == alone
+        assert any(alone) and not all(alone), "the circle covered the whole lattice"
+
+    def test_a_run_the_width_of_the_face_is_not_taken_for_a_loop(self):
+        """A boundary closes where its two ends meet, and the seam of a periodic
+        surface has two ends a whole period apart while closing in space. Read
+        as a loop, such a run collapses and takes a side of the rectangle with
+        it."""
+        pairs, span, steps = self.lattice()
+        loop = [(0.25, 0.0), (0.75, 0.0), (0.75, 1.0), (0.25, 1.0)]
+        face = TrimmedFace([loop], area=2.0, whole=4.0)
+        # The full-height sides as runs of their own, each as long as the face.
+        face.Wires = [TrimWire([TrimEdge([a, b]) for a, b in zip(loop, loop[1:] + loop[:1])])]
+        assert _on_face(face, pairs, span, steps) == [_enclosed([loop], u, v) for u, v in pairs]
+
+    def test_the_rectangle_the_caller_read_is_the_one_the_face_is_held_to(self):
+        """The parameter rectangle comes from the caller, and the area a face is
+        compared against is the area over that rectangle. A face held to another
+        rectangle is compared against another area."""
+        pairs, _, steps = self.lattice()
+        face = TrimmedFace([square(0.0, 1.0)], area=1.0, whole=1.0)
+        face.ParameterRange = (0.0, 2.0, 0.0, 2.0)
+        assert _on_face(face, pairs, (0.0, 1.0, 0.0, 1.0), steps) == [True] * len(pairs)
+
+    def test_an_edge_is_read_over_its_own_run_and_no_further(self):
+        """A parameter curve is trimmed by the edge that uses it. Read past that
+        the boundary picks up a run the face does not have."""
+        pairs, span, steps = self.lattice()
+        loop = square(0.25, 0.75)
+        face = TrimmedFace([loop], area=1.0, whole=4.0, beyond=[(0.5, 0.0), (0.5, 1.0)])
+        assert _on_face(face, pairs, span, steps) == [_enclosed([loop], u, v) for u, v in pairs]
+
+    def test_a_boundary_of_many_runs_is_laid_down_a_block_at_a_time(self):
+        """The station-and-segment pairs are cut to a bound, and a face whose
+        boundary needs more than one block has to come back with the same answer
+        as one that fits in a block."""
+        count = 40
+        step = 1.0 / count
+        pairs = [((i + 0.5) * step, (j + 0.5) * step) for i in range(count) for j in range(count)]
+        sides = MOST_CROSSINGS // len(pairs) + 200
+        loop = [
+            (
+                0.5 + 0.4 * math.cos(2.0 * math.pi * i / sides),
+                0.5 + 0.4 * math.sin(2.0 * math.pi * i / sides),
+            )
+            for i in range(sides)
+        ]
+        face = TrimmedFace([loop], area=math.pi * 0.16, whole=1.0)
+        walked = _on_face(face, pairs, (0.0, 1.0, 0.0, 1.0), (step, step))
+        assert walked == [_enclosed([loop], u, v) for u, v in pairs]
+        assert any(walked) and not all(walked), "the boundary covered the whole lattice"
+
+    def test_a_face_whose_patch_the_kernel_refuses_is_not_excused(self):
+        """A refusal says nothing about whether the face covers its range, and a
+        face excused on a refusal keeps every station it was going to drop."""
+        pairs, span, steps = self.lattice()
+
+        class Refuses:
+            def toShape(self, low_u, high_u, low_v, high_v):
+                raise RuntimeError("no patch over that rectangle")
+
+        face = TrimmedFace([square(0.25, 0.75)], area=1.0, whole=4.0)
+        face.Surface = Refuses()
+        walked = _on_face(face, pairs, span, steps)
+        assert walked == [_enclosed(face._loops, u, v) for u, v in pairs]
+        assert not all(walked), "the trim took nothing out"
+
+    def test_a_corner_two_edges_spell_apart_is_still_one_corner(self):
+        """The two spellings come from two curves rather than from one, so
+        nothing about a loop closing catches this. A station row through the
+        corner is what sees it."""
+        pairs, span, steps = self.lattice()
+        row = 4.5 * steps[1]
+        loop = [(1.0, row), (0.5, 1.0), (0.0, row), (0.5, 0.0)]
+        face = TrimmedFace([loop], area=2.0, whole=4.0)
+        # Each side its own run, and the two meeting at the right-hand corner
+        # spell its height a rounding apart.
+        sides = [
+            TrimEdge([(0.5, 0.0), (1.0, row)]),
+            TrimEdge([(1.0, row + 1e-16), (0.5, 1.0)]),
+            TrimEdge([(0.5, 1.0), (0.0, row)]),
+            TrimEdge([(0.0, row), (0.5, 0.0)]),
+        ]
+        face.Wires = [TrimWire(sides)]
+        walked = _on_face(face, pairs, span, steps)
+        assert walked == [_enclosed([loop], u, v) for u, v in pairs]
+        assert any(walked) and not all(walked), "the trim took nothing out"
+
+    def test_and_two_corners_a_real_turn_apart_are_two(self):
+        """The guard on the one above. A boundary levelled to nothing turns
+        every height into one and puts the whole face on one side of itself."""
+        pairs, span, steps = self.lattice()
+        loop = [(1.0, 4.5 * steps[1]), (0.5, 1.0), (0.0, 4.5 * steps[1]), (0.5, 0.0)]
+        face = TrimmedFace([loop], area=2.0, whole=4.0)
+        walked = _on_face(face, pairs, span, steps)
+        assert walked == [_enclosed([loop], u, v) for u, v in pairs]
+        assert any(walked) and not all(walked), "the trim took nothing out"
+
+
+class _Declining:
+    """Whatever the kernel is asked for at a station, refused.
+
+    A pole, a seam and a degenerate edge are places a parameterisation carries
+    and cannot evaluate, and every site here absorbs one and carries on. What is
+    asserted below is that carrying on is recorded, so a place nothing could be
+    read at stops looking like a place with nothing to read.
+    """
+
+    def __call__(self, *ignored):
+        raise RuntimeError("no answer here")
+
+
+class TestWhatTheDrawingWouldNotAnswer:
+    """The record of stations the kernel declined, one site at a time.
+
+    Each site is asserted on its own, and on both halves of what it records.
+    They absorb different questions of different objects, and a site that
+    recorded only its refusals would file a rim answered at every station but
+    one as a rim answered at none.
+
+    The source each is filed under is the one the demand itself carries, so a
+    row about what could not be measured and a row about what was name the same
+    thing.
+
+    What is asserted is the source and how much of it was read, never how many
+    stations a site laid. That count is the sampler's and moves whenever the
+    spacing does, and a test pinned to it would fail on a change to the sampler
+    while saying nothing about the record.
+    """
+
+    def lost(self, spend):
+        return [source for source, _offered in spend.refused.lost]
+
+    def pad(self, edge):
+        """A sheet, which is the only kind of body a rim or an outline is read
+        off: on a closed surface an edge with one face beside it is a seam."""
+        shape = Shape((0.0,) * 3, (8.0,) * 3, faces=[Face(edges=[edge])])
+        return Body("Pad", shape, metal=True, sheet=True)
+
+    def wedge(self, edge, *faces):
+        """A join, which is an edge with two faces meeting along it."""
+        return Body("Wedge", Shape((0.0,) * 3, (8.0,) * 3, faces=list(faces)), metal=True)
+
+    def gap_pair(self, face):
+        """Two solids a short way apart, which is what makes the walk run.
+
+        The near body is sampled over its surface and the walk marches at the
+        far one, so the station is on the near body's face and the far one has
+        to carry a solid for a probe to land in.
+        """
+        run, gap = 4.0, 0.3
+        near = Shape(
+            (0.0, 0.0, 0.0),
+            (run, 1.0, 1.0),
+            faces=[face],
+            solids=[Slab((0.0, 0.0, 0.0), (run, 1.0, 1.0))],
+            distance=gap,
+            witnesses=[((0.0, 1.0, 0.5), (0.0, 1.0 + gap, 0.5))],
+        )
+        top = 2.0 + gap + 1.0
+        far = Shape(
+            (0.0, 1.0 + gap, 0.0),
+            (run, top, 1.0),
+            solids=[Slab((0.0, 1.0 + gap, 0.0), (run, top, 1.0))],
+        )
+        return [Body("Trace", near), Body("Keeper", far)]
+
+    def gap_face(self):
+        """A wall of the near body, facing the neighbour."""
+        return _Wall((0.0, 1.0, 0.0), (4.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0))
+
+    def slab(self, face):
+        """A solid with a triangulation, so the chord is walked as well."""
+        lower, upper = (-4.0, -4.0, 0.0), (4.0, 4.0, 0.6)
+        shape = Shape(lower, upper, faces=[face], solids=[Slab(lower, upper)])
+        vertices, faces = box_surface(lower, upper)
+        return Body("Wall", shape, metal=True, vertices=vertices, faces=faces)
+
+    def test_a_station_a_face_will_not_give_a_curvature_for_is_recorded(self):
+        face = sphere_face(3.0)
+        face.curvatureAt = _Declining()
+        spend = Spend()
+        features([self.slab(face)], cap=100.0, spend=spend)
+        assert self.lost(spend) == ["'Wall' curving on face 0"]
+        assert spend.refused.short == ()
+
+    def test_and_a_station_it_answers_is_recorded_as_answered(self):
+        """The guard on the one above. A record filled only where the kernel
+        declines cannot tell a face read nowhere from a face read everywhere,
+        which is the distinction it exists to make."""
+        spend = Spend()
+        features([self.slab(sphere_face(3.0))], cap=100.0, spend=spend)
+        assert spend.refused.lost == ()
+        assert spend.refused.short == ()
+        offered, declined = spend.refused.stations["'Wall' curving on face 0"]
+        assert offered > 0 and declined == 0
+
+    def test_a_flat_station_is_answered_rather_than_declined(self):
+        """A surface answering zero read the place and found it flat. Only the
+        surface can tell those apart - both leave the station raising nothing -
+        so the station is counted where the question is put."""
+        face = sphere_face(3.0)
+        face.curvatureAt = lambda u, v: (0.0, 0.0)
+        spend = Spend()
+        features([self.slab(face)], cap=100.0, spend=spend)
+        offered, declined = spend.refused.stations["'Wall' curving on face 0"]
+        assert offered > 0 and declined == 0
+
+    def test_a_station_a_face_will_not_give_a_normal_at_is_recorded(self):
+        """The chord's own question. It asks the face for a point and a normal
+        together, and a station giving neither is one no line is cast through.
+
+        The normal is what a stand-in declines, because the point is asked for
+        earlier and without a guard: :func:`lfs._steps` places three of them to
+        size the lattice, so a face that will not place a point stops the
+        measurement rather than reaching any site here.
+        """
+        face = Face(normal=(0.0, 0.0, 1.0), at=(0.0, 0.0, 0.6), size=8.0)
+        face.normalAt = _Declining()
+        spend = Spend()
+        features([self.slab(face)], cap=100.0, edge_size=0.1, spend=spend)
+        assert "'Wall' through face 0" in self.lost(spend)
+
+    def test_a_point_a_rim_will_not_give_a_curvature_for_is_recorded(self):
+        edge = Edge(key=1, length=8.0, curvature=1.0 / 20.0)
+        edge.curvatureAt = _Declining()
+        spend = Spend()
+        features([self.pad(edge)], cap=100.0, spend=spend)
+        assert self.lost(spend) == ["'Pad' rim curving"]
+
+    def test_a_point_an_outline_will_not_give_a_tangent_for_is_recorded(self):
+        edge = Edge(key=1, length=8.0)
+        edge.tangentAt = _Declining()
+        spend = Spend()
+        features([self.pad(edge)], cap=100.0, edge_size=1.0, spend=spend)
+        assert "'Pad' outline" in self.lost(spend)
+
+    def test_a_station_the_gap_walk_cannot_start_from_is_recorded(self):
+        """The walk samples one body's surface and marches at the other. A
+        station it cannot start from is a stretch of the gap nobody looked
+        along, and the pair keeps only the demand at its extremum."""
+        face = self.gap_face()
+        face.normalAt = _Declining()
+        spend = Spend()
+        features(self.gap_pair(face), cap=10.0, spend=spend)
+        assert self.lost(spend) == ["the gap between 'Trace' and 'Keeper'"]
+        assert spend.walked == 0, "no walk can have started"
+        assert spend.probed == 0, "and none can have asked the kernel anything"
+
+    def test_a_point_a_join_s_faces_will_not_answer_for_is_recorded(self):
+        """The point and the two normals are one question. A point its own faces
+        cannot answer for is one the join cannot be judged at, and guessing
+        sharp would refine it."""
+        edge = Edge(key=1, length=8.0)
+        one, other = (
+            Face(edges=[edge], normal=(0.0, 0.0, 1.0)),
+            Face(edges=[edge], normal=(0.0, 1.0, 0.0)),
+        )
+        other.normalAt = _Declining()
+        shape = Shape((0.0,) * 3, (8.0,) * 3, faces=[one, other])
+        spend = Spend()
+        features([Body("Wedge", shape, metal=True)], cap=100.0, edge_size=1.0, spend=spend)
+        assert "'Wedge' edge" in self.lost(spend)
+
+    def test_and_a_point_the_curve_will_not_place_goes_the_same_way(self):
+        """It is asked of the edge rather than of the faces and it is the same
+        event: one station on the join, read by nobody."""
+        edge = Edge(key=1, length=8.0)
+        edge.valueAt = _Declining()
+        one, other = (
+            Face(edges=[edge], normal=(0.0, 0.0, 1.0)),
+            Face(edges=[edge], normal=(0.0, 1.0, 0.0)),
+        )
+        shape = Shape((0.0,) * 3, (8.0,) * 3, faces=[one, other])
+        spend = Spend()
+        features([Body("Wedge", shape, metal=True)], cap=100.0, edge_size=1.0, spend=spend)
+        assert "'Wedge' edge" in self.lost(spend)
+
+    def test_a_site_read_at_some_stations_and_not_others_is_short_rather_than_lost(self):
+        """Two different rows, because they say different things. A place read
+        nowhere was sized by nothing; a place read in fewer places raised the
+        demand it would have raised anyway."""
+
+        class Sometimes:
+            def __init__(self):
+                self.asked = 0
+
+            def __call__(self, u, v):
+                self.asked += 1
+                if self.asked % 2:
+                    raise RuntimeError("no answer here")
+                return (-1 / 3.0, -1 / 3.0)
+
+        face = sphere_face(3.0)
+        face.curvatureAt = Sometimes()
+        spend = Spend()
+        features([self.slab(face)], cap=100.0, spend=spend)
+        assert spend.refused.lost == ()
+        ((source, answered, offered),) = spend.refused.short
+        assert source == "'Wall' curving on face 0"
+        assert 0 < answered < offered == 2 * answered
+
+    @pytest.mark.parametrize(
+        "site,source",
+        [
+            ("curvature", "'Wall' curving on face 0"),
+            ("chord", "'Wall' through face 0"),
+            ("rim", "'Pad' rim curving"),
+            ("outline", "'Pad' outline"),
+            ("join", "'Wedge' edge"),
+            ("gap", "the gap between 'Trace' and 'Keeper'"),
+        ],
+    )
+    def test_each_site_records_the_station_it_answered_as_well(self, site, source):
+        """The other half of every site, and the half a refusing stand-in cannot
+        reach. A site that counted only its refusals would put every source it
+        ever declined at into the lost row, whatever else it read there."""
+        spend = Spend()
+        if site in ("curvature", "chord"):
+            features([self.slab(sphere_face(3.0))], cap=100.0, edge_size=0.1, spend=spend)
+        elif site == "rim":
+            features([self.pad(Edge(key=1, length=8.0, curvature=1.0 / 20.0))], 100.0, spend=spend)
+        elif site == "outline":
+            features([self.pad(Edge(key=1, length=8.0))], 100.0, edge_size=1.0, spend=spend)
+        elif site == "join":
+            edge = Edge(key=1, length=8.0)
+            faces = (
+                Face(edges=[edge], normal=(0.0, 0.0, 1.0)),
+                Face(edges=[edge], normal=(0.0, 1.0, 0.0)),
+            )
+            features([self.wedge(edge, *faces)], 100.0, edge_size=1.0, spend=spend)
+        else:
+            features(self.gap_pair(self.gap_face()), cap=10.0, spend=spend)
+        offered, declined = spend.refused.stations[source]
+        assert offered > 0 and declined == 0
+
+    def test_a_drawing_the_kernel_answers_for_leaves_nothing_to_report(self):
+        """The whole of what the report reads. A record that filled on an
+        ordinary drawing would put a row under every mesh."""
+        spend = Spend()
+        features([self.slab(sphere_face(3.0))], cap=100.0, edge_size=0.1, spend=spend)
+        assert spend.refused.lost == ()
+        assert spend.refused.short == ()
+        assert spend.refused.stations, "no station was recorded, so nothing was scored"

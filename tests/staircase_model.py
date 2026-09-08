@@ -14,14 +14,12 @@ constructed here directly.
 A TEM line's impedance is the potential problem of its cross-section - the mode
 is the electrostatic solution, and ``Z0 = 1 / (v C)`` follows from it exactly. So
 the two together price a staircased conductor with a Laplace solve instead of an
-FDTD run: no excitation, no truncated record, no absorber, and a second rather
-than an hour.
+FDTD run: no excitation, no truncated record, no absorber, and orders less work.
 
 What it is for is a *displacement*: where the sampling rule puts a conductor's
-surface, on a shape whose answer is exact, in a second rather than in an hour.
-What it is not is the engine. It reproduces one rule of openEMS' faithfully and
-nothing else about it, so the acceptance suite's real solves remain what says the
-adapter is right.
+surface, on a shape whose answer is exact. What it is not is the engine. It
+reproduces one rule of openEMS' faithfully and nothing else about it, so the
+acceptance suite's real solves remain what says the adapter is right.
 
 **Do not read a convergence rate off it.** Against a solved coaxial line it has
 the scale and the sign and not the exponent, and it is pessimistic: openEMS
@@ -74,6 +72,17 @@ from scipy.sparse.linalg import spsolve
 #: Impedance of free space, in ohms. ``sqrt(mu0 / eps0)``.
 FREE_SPACE = 376.730313412
 
+#: How close to a plane a point has to be to be on it. The cross-sections here
+#: are built from the same coordinates the grid is, so this separates a line
+#: that was placed on a surface from one that was placed next to it, and needs
+#: only to be below the smallest cell anybody meshes.
+FLATNESS = 1e-12
+
+#: How fast the grid coarsens away from a conductor's edge, per cell. Slow,
+#: because the field outside a strip decays over the plate separation and cells
+#: spent just outside the metal are the ones that buy the answer.
+_OUTWARD_GROWTH = 1.05
+
 
 def annulus(inner: float, outer: float) -> Callable:
     """A coaxial line's cross-section, as a question about a point."""
@@ -83,6 +92,64 @@ def annulus(inner: float, outer: float) -> Callable:
         return (radius <= inner) | (radius >= outer)
 
     return metal
+
+
+def stripline(width: float, separation: float, wall: float) -> Callable:
+    """A shielded stripline's cross-section, as a question about a point.
+
+    A zero-thickness strip centred between two planes, inside a box. Shielded
+    rather than open because the two planes are separate conductors until
+    something joins them, and :func:`capacitance` takes as ground the one
+    holding the grid's far corner - so an open pair would put half the return
+    path outside the problem.
+    """
+
+    def metal(px, py):
+        on_strip = (np.abs(py) < FLATNESS) & (np.abs(px) <= width / 2 + FLATNESS)
+        on_shield = (np.abs(py) >= separation / 2 - FLATNESS) | (np.abs(px) >= wall - FLATNESS)
+        return on_strip | on_shield
+
+    return metal
+
+
+def stripline_grid(width: float, separation: float, cells: int, wall: float):
+    """Lines for :func:`stripline`, and the wall they actually reach.
+
+    Graded outward from the strip's edge geometrically rather than by spreading
+    a fixed number of lines across the gap, because a fixed count makes a wider
+    box a coarser one - and then moving the wall changes the grid everywhere the
+    field is, so anything comparing two wall positions reads the grading.
+
+    Lines land on the strip's own edges, on both planes and on the axis of
+    symmetry, so the conductor the sampling rule builds is the conductor drawn.
+    """
+    if wall <= width / 2:
+        raise ValueError(f"the wall at {wall:g} is inside a strip {width:g} wide")
+
+    across_gap = np.linspace(-separation / 2, separation / 2, 2 * cells + 1)
+    across = np.linspace(0.0, width / 2, max(4, int(cells * width / separation)) + 1)[1:]
+
+    step = across[-1] - across[-2]
+    beyond, edge = [], width / 2
+    while edge < wall:
+        step *= _OUTWARD_GROWTH
+        edge += step
+        beyond.append(edge)
+
+    lines = np.concatenate((-np.array(beyond[::-1]), -across[::-1], [0.0], across, beyond))
+    return lines, across_gap, beyond[-1]
+
+
+def stripline_impedance(width: float, separation: float, cells: int, wall: float) -> float:
+    """Z0 of a staircased stripline cross-section on this grid, in ohms.
+
+    The closed form's second opinion, sharing no arithmetic with it: conformal
+    mapping against a finite-volume potential solve. Vacuum, because what is
+    read off this is a ratio and a permittivity used throughout cancels out of
+    one.
+    """
+    lines, across_gap, reached = stripline_grid(width, separation, cells, wall)
+    return FREE_SPACE / capacitance(lines, across_gap, stripline(width, separation, reached))
 
 
 def _inside(x: np.ndarray, y: np.ndarray, metal: Callable):

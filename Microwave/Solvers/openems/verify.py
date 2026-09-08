@@ -1,31 +1,31 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-"""Checking that the grid still holds the shapes it was built for.
+"""The rule that says whether a grid still holds the shapes it was built for.
 
-The criterion in :mod:`~.sizing` is a guarantee, and this is a check. They are
-different things: the criterion is offset-independent and monotone, so once it
-holds, refining cannot break it - what this catches is the criterion being fed a
-feature size that was *underestimated*. A sliver no witness pair found, a
-curvature sampled between two creases, a self-intersection in imported geometry:
-each produces a sizing input that is wrong before any of the arithmetic runs.
+The criterion in :mod:`~.sizing` is a guarantee. This module models the rule a
+check is made against, and :mod:`~.conductors` asks the question with it. The
+criterion is offset-independent and monotone, so once it holds, refining cannot
+break it. What the check catches is the criterion being fed a feature size that
+was underestimated. A sliver no witness pair found, a curvature sampled between two
+creases, and a self-intersection in imported geometry each produce a sizing
+input that is wrong before any of the arithmetic runs.
 
-What it checks is the one thing that fails silently and fatally. openEMS makes a
-conductor by zeroing the update coefficients of individual Yee *edges*, and two
-zeroed edges carry current between them only if they share a node - touching at
-a corner is electrically open. So a conductor sampled too coarsely does not come
-out slightly wrong; it comes out as a chain of islands that conducts nothing,
-the run completes, and the S-matrix is clean, plausible and about a different
-device.
+The failure it checks for is silent and fatal. openEMS makes a conductor by
+zeroing the update coefficients of individual Yee edges, and two zeroed edges
+carry current between them only if they share a node. Edges in cells that meet
+only at a corner share no node and are electrically open. A conductor sampled
+too coarsely therefore comes out as a
+chain of islands that conducts nothing. The run completes, and the S-matrix is
+clean, plausible and about a different device.
 
 The model here is that rule and nothing else. Each Yee edge is sampled at the
-midpoint openEMS would sample it at, an edge that lands in metal joins the two
-nodes at its ends, and the conductor is whole exactly when those nodes form one
+midpoint openEMS would sample it at. An edge that lands in metal joins the two
+nodes at its ends. The conductor is whole exactly when those nodes form one
 connected group.
 
-Nothing in this module runs a simulation. It is geometry throughout, which is
-the acyclicity that matters: a grid decided by a solve would need the grid to
-decide it.
+Nothing in this module runs a simulation. It is geometry throughout, so the grid
+never depends on a solve that would itself need the grid.
 """
 
 from __future__ import annotations
@@ -34,19 +34,20 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 
-__all__ = ["Rasterised", "connectivity", "rasterise"]
+__all__ = ["Rasterised", "carried", "connectivity", "rasterise"]
 
 DIMENSIONS = 3
 
 #: How many rounds of label propagation before a component labelling is
 #: abandoned. A round sweeps each axis in turn, so a label travels at least one
-#: node along every axis and often much further; what bounds the count is the
-#: longest a conductor winds through the grid. This is what stops a pathological
-#: shape taking the session with it, and reaching it is reported, not answered.
+#: node along every axis and often much further. The number of rounds needed is
+#: set by how far a conductor winds through the grid. The limit stops a
+#: pathological shape from taking the session with it. Reaching it is reported
+#: rather than answered.
 MAX_ROUNDS = 4096
 
-#: The label of a node no conductor reaches. Above every real label, so that a
-#: minimum against it is always the real one and empty space never wins.
+#: The label of a node no conductor reaches. It sits above every real label, so
+#: a minimum against it returns the real label and empty space never wins.
 _EMPTY = np.iinfo(np.int64).max
 
 
@@ -78,10 +79,9 @@ def rasterise(
     can answer where it is.
 
     The sample point for an edge along axis ``n`` has its two transverse
-    coordinates *on* grid lines and its ``n``-th at the midpoint of the cell -
-    which is where ``GetYeeCoords`` puts it, with the dual line being the
-    arithmetic mean of its neighbours. Sampling anywhere else would check a
-    different simulation.
+    coordinates on grid lines and its ``n``-th at the midpoint of the cell.
+    ``GetYeeCoords`` puts it there. The dual line is the arithmetic mean of its
+    neighbours. Sampling anywhere else would check a different simulation.
     """
     axes = [np.asarray(line, dtype=float) for line in lines]
     found = []
@@ -95,34 +95,44 @@ def rasterise(
     return Rasterised(found)
 
 
-def connectivity(raster: Rasterised) -> tuple[int, int]:
-    """How many separate pieces the zeroed edges form, and how many nodes carry them.
+def carried(raster: Rasterised) -> np.ndarray:
+    """Which nodes a zeroed edge reaches, as a boolean over the node grid.
 
-    Two zeroed edges conduct only if they share a node, so the pieces are the
-    connected groups of the node graph those edges induce - and a conductor that
-    should be one object and comes back as two is one the grid has broken.
-
-    Labels are propagated rather than a union-find kept, because the whole
-    question is asked in array operations on a grid that already exists: each
-    round lowers a node's label to the smallest among itself and its neighbours
-    across a zeroed edge, and it settles when no label moves. Labels only ever
-    fall, so the order the axes are walked in cannot change where it settles.
+    An edge reaches the node it starts at and the node it ends at. Two zeroed
+    edges conduct only where they share a node, so the pieces one conductor
+    comes out in and whether two conductors are one are both read off this.
     """
-    if not raster.any_metal:
-        return (0, 0)
-
     shape = tuple(axis + 1 for axis in _cells(raster))
-    node = np.arange(int(np.prod(shape)), dtype=np.int64).reshape(shape)
-    carried = np.zeros(shape, dtype=bool)
+    found = np.zeros(shape, dtype=bool)
     for n in range(DIMENSIONS):
         lower = [slice(None)] * DIMENSIONS
         upper = [slice(None)] * DIMENSIONS
         lower[n] = slice(0, -1)
         upper[n] = slice(1, None)
-        carried[tuple(lower)] |= raster.edges[n]
-        carried[tuple(upper)] |= raster.edges[n]
+        found[tuple(lower)] |= raster.edges[n]
+        found[tuple(upper)] |= raster.edges[n]
+    return found
 
-    label = np.where(carried, node, _EMPTY)
+
+def connectivity(raster: Rasterised) -> tuple[int, int]:
+    """How many separate pieces the zeroed edges form, and how many nodes carry them.
+
+    Two zeroed edges conduct only if they share a node, so the pieces are the
+    connected groups of the node graph those edges induce. A conductor that
+    should be one object and comes back as two is one the grid has broken.
+
+    Labels are propagated rather than a union-find kept, because the question is
+    asked in array operations on a grid that already exists. Each round lowers a
+    node's label to the smallest among itself and its neighbours across a zeroed
+    edge, and it settles when no label moves. Labels only ever fall, so the order
+    the axes are walked in cannot change where it settles.
+    """
+    if not raster.any_metal:
+        return (0, 0)
+
+    holds = carried(raster)
+    node = np.arange(int(np.prod(holds.shape)), dtype=np.int64).reshape(holds.shape)
+    label = np.where(holds, node, _EMPTY)
     for _ in range(MAX_ROUNDS):
         before = label.copy()
         for n in range(DIMENSIONS):
@@ -133,13 +143,12 @@ def connectivity(raster: Rasterised) -> tuple[int, int]:
             joined = raster.edges[n]
             here, there = label[tuple(lower)], label[tuple(upper)]
             # An edge only ever pulls both its ends down to the lower of them.
-            # Written as a minimum *into* the array rather than assigned to it,
-            # because the two slices overlap wherever an axis has more than two
-            # lines - so these are views of the thing being written, and a plain
-            # second assignment puts pre-pass values back over what the first
-            # one just learned. That does not merely slow the walk down: the
-            # round becomes a fixed point, so it stops, and a conductor that is
-            # one piece is reported as several.
+            # Written as a minimum into the array rather than assigned to it.
+            # The two slices overlap wherever an axis has more than two lines, so
+            # they are views of the array being written, and a plain second
+            # assignment puts pre-pass values back over what the first one just
+            # learned. The round then becomes a fixed point, the walk stops, and
+            # a conductor that is one piece is reported as several.
             #
             # An edge in metal always has both its ends carrying metal, so the
             # empty label never takes part in a minimum here.
@@ -161,7 +170,8 @@ def connectivity(raster: Rasterised) -> tuple[int, int]:
 def _cells(raster: Rasterised) -> tuple[int, ...]:
     """Cells per axis, read back from the edge arrays.
 
-    An axis' edge array is one shorter along that axis than along the others,
-    because there is one edge per cell and one node per line.
+    The array of edges along one axis is one entry shorter along that axis than
+    the grid has lines there, because there is one edge per cell and one node
+    per line. Along the other two it is the line count.
     """
     return tuple(int(raster.edges[n].shape[n]) for n in range(DIMENSIONS))

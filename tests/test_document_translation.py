@@ -18,18 +18,22 @@ meaning rather than against whatever the code produced when it was written.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from Microwave import portbox, units
 from Microwave.Objects.ports import FIXED_IMPEDANCE, PORT_IMPEDANCE
-from Microwave.Solvers.openems import document, geometry, materials, ports, properties
-from Microwave.Solvers.openems.model import SPEED_OF_LIGHT, THROUGH, origin_offset
+from Microwave.Solvers.openems import document, geometry, lfs, materials, ports, properties
+from Microwave.Solvers.openems import policy as openems_policy
+from Microwave.Solvers.openems.model import SPEED_OF_LIGHT, THROUGH, Solid, origin_offset
 from Microwave.Solvers.openems.sizing import fits_inside
+from Microwave.Solvers.openems.surface import enclosed_volume
 
 # The acceptance line: a 3 mm trace on 1.6 mm FR4, ground underneath.
 WIDTH = 3.0
@@ -51,8 +55,18 @@ class BoundBox:
 
 
 class Point:
+    """A point that can be walked along a direction, as a kernel's own can: a ray
+    is a point plus a scaled direction.
+    """
+
     def __init__(self, x, y, z):
         self.x, self.y, self.z = x, y, z
+
+    def __add__(self, other):
+        return Point(self.x + other.x, self.y + other.y, self.z + other.z)
+
+    def __mul__(self, scale):
+        return Point(self.x * scale, self.y * scale, self.z * scale)
 
 
 class Vertex:
@@ -63,12 +77,53 @@ class Vertex:
 class Edge:
     """One edge, measured. ``Length`` is the arc, so a fake curve is a fake
     whose ``Length`` exceeds its chord - which is the only thing that tells the
-    translation a curve from a straight line."""
+    translation a curve from a straight line.
 
-    def __init__(self, start, end, length=None):
+    ``bend`` is the radius it curves through; a straight edge answers a curvature
+    of zero rather than refusing the question, as the kernel does for a polygon's
+    own edges.
+    """
+
+    def __init__(self, start, end, length=None, bend=None):
         self.Vertexes = [Vertex(start), Vertex(end)]
         chord = math.dist((start.x, start.y, start.z), (end.x, end.y, end.z))
         self.Length = chord if length is None else length
+        self.FirstParameter = 0.0
+        self.LastParameter = 1.0
+        self._bend = bend
+
+    def curvatureAt(self, t):
+        return 0.0 if self._bend is None else 1.0 / self._bend
+
+
+LOW = ("XMin", "YMin", "ZMin")
+HIGH = ("XMax", "YMax", "ZMax")
+
+
+class Meeting:
+    """What two shapes have in common, holding its corners or nothing at all.
+
+    Which way a port launches is read by stepping the picked face either way
+    and meeting it with the body, so what the reader asks of this is only
+    whether it holds anything.
+    """
+
+    def __init__(self, corners=()):
+        self.Faces = []
+        self.Edges = []
+        self.Vertexes = [Vertex(Point(*corner)) for corner in corners]
+
+
+def _meeting(one, two):
+    """Where two boxes overlap, as a meeting.
+
+    Closed on both sides, because two shapes touching on a plane do meet - and
+    that is what makes a face stepped by less than one tolerance answer the same
+    on both sides of itself.
+    """
+    lower = tuple(max(getattr(one, low), getattr(two, low)) for low in LOW)
+    upper = tuple(min(getattr(one, high), getattr(two, high)) for high in HIGH)
+    return Meeting((lower, upper) if all(a <= b for a, b in zip(lower, upper)) else ())
 
 
 class _Circle:
@@ -80,6 +135,48 @@ class _Circle:
 
     def wire(self):
         return type("Wire", (), {"Edges": [type("Edge", (), {"Curve": self})()]})()
+
+
+class CurvedFace:
+    """A face bending one way over a stated area.
+
+    Enough for what is read off a face outside the mesher: how much of the shape
+    curves, and which way it bends. It bends one way, so a shape built from these
+    never reads as a surface that nets - what nets is a pair of opposite
+    surfaces, which is a corpus specimen rather than a stub.
+    """
+
+    def __init__(self, area, radius=3.0, at=(0.0, 0.0, 0.0), size=1.0, bends_both_ways=False):
+        self.ParameterRange = (0.0, 1.0, 0.0, 1.0)
+        self.bends_both_ways = bends_both_ways
+        self.Area = area
+        #: Every parameter pair this face was asked about, so a test can see
+        #: how many times one triangulation read the surface.
+        self.asked = []
+        self.Orientation = "Forward"
+        # Square to no axis, which is what a curved face is: the reading that
+        # decides whether a solid is bounded by planes the grid pins asks every
+        # face for its bounds, and a face flat on one axis would answer that a
+        # curved body is rectilinear.
+        self.BoundBox = BoundBox(at, tuple(a + size for a in at))
+        self.Edges = []
+        self._at = at
+        self._radius = radius
+
+    def curvatureAt(self, u, v):
+        """Convex, unless this face is a saddle. A convex wall's centre of
+        curvature is in the metal, which the kernel answers as negative."""
+        self.asked.append((u, v))
+        return (-1.0 / self._radius, 1.0 / self._radius if self.bends_both_ways else 0.0)
+
+    def valueAt(self, u, v):
+        """One point, wherever it was placed. The sizing field that reads it
+        wants somewhere to hang a demand, and points that varied would put a
+        sampling question inside a test about arithmetic."""
+        return Point(*self._at)
+
+    def normalAt(self, u, v):
+        return Point(0.0, 0.0, 1.0)
 
 
 class Shape:
@@ -111,7 +208,12 @@ class Shape:
         unclosed=False,
         offsets=True,
         swells=1.0,
+        curves=None,
+        bends_both_ways=False,
+        bends=None,
     ):
+        self.bends_both_ways = bends_both_ways
+        self.curves = curves
         self.offsets = offsets
         self.swells = swells
         self.BoundBox = BoundBox(lower, upper)
@@ -135,7 +237,11 @@ class Shape:
             )
             self.Area = enclosed if area is None else area
             axes = [d for d in range(3) if d != flat[0]]
-            for ring in rings:
+            # One radius per ring, or none at all: a ground plane is a straight
+            # outer run around a curved hole, and what a request has to follow
+            # is the hole rather than the run.
+            radii = list(bends or ()) + [None] * len(rings)
+            for ring, bend in zip(rings, radii):
                 for start, end in zip(ring, ring[1:] + ring[:1]):
                     corners = []
                     for point in (start, end):
@@ -143,7 +249,7 @@ class Shape:
                         place[flat[0]] = lower[flat[0]]
                         place[axes[0]], place[axes[1]] = point
                         corners.append(Point(*place))
-                    self.Edges.append(Edge(*corners))
+                    self.Edges.append(Edge(*corners, bend=bend))
         elif flat and not solid:
             self.Area = math.prod(e for d, e in enumerate(extents) if d not in flat) * fill
             self.Volume = 0.0
@@ -164,7 +270,13 @@ class Shape:
         # none of them, and two empty counts answer it correctly for a compound
         # made of nothing else. A compound with a loose face in it is beyond
         # what these can say, and is a corpus specimen.
-        self.Faces = []
+        #
+        # ``curves`` is the exception: it carries what the departure arithmetic
+        # asks a face - how sharply it bends and how much area it has - so a
+        # shape given one has a triangulation with a distance to close.
+        self.Faces = (
+            [CurvedFace(self.curves, bends_both_ways=self.bends_both_ways)] if self.curves else []
+        )
         # The boundary the area sits inside, which a thickness is judged
         # against. A box's twelve edges, since that is the shape this is.
         self.Length = 4.0 * sum(extents)
@@ -211,6 +323,24 @@ class Shape:
         specimen."""
         return id(self)
 
+    def translated(self, step):
+        """The same shape, moved. One box, so the move is its corners."""
+        moved = self.copy()
+        moved.BoundBox = BoundBox(
+            tuple(getattr(self.BoundBox, low) + at for low, at in zip(LOW, step)),
+            tuple(getattr(self.BoundBox, high) + at for high, at in zip(HIGH, step)),
+        )
+        return moved
+
+    def common(self, other):
+        """Where this box and another one overlap.
+
+        A single box cannot be folded back on itself, so the shape the launch
+        direction exists for is a :class:`Compound` here and a drawn one in
+        ``tests/launch_probe.py``.
+        """
+        return _meeting(self.BoundBox, other.BoundBox)
+
     def copy(self):
         """A shape carrying no triangulation of its own.
 
@@ -223,6 +353,21 @@ class Shape:
         twin = Shape.__new__(Shape)
         twin.__dict__.update(self.__dict__)
         return twin
+
+    def isInside(self, point, tolerance, on_surface):
+        """Whether a point is in this shape, which here is its bounding box.
+
+        The stand-in's geometry is a box - ``fill`` says how much of that box the
+        shape holds and never where - so a finer containment answer would invent
+        a shape nothing else here agrees with. What reads it is the walk that
+        measures how thick a body is, and on a box the two answers are the same.
+        """
+        return all(
+            getattr(self.BoundBox, low) - tolerance
+            <= value
+            <= getattr(self.BoundBox, high) + tolerance
+            for low, high, value in zip(LOW, HIGH, (point.x, point.y, point.z))
+        )
 
     def distToShape(self, other):
         """The gap between two boxes, with the pair of points that realise it.
@@ -390,6 +535,27 @@ class Shape:
         return self._faces[name]
 
 
+def _opening(shape, box):
+    """:func:`geometry._opening` off one reading of the shape.
+
+    The three helpers here take the reading themselves, the way
+    :func:`geometry._triangulate` takes it once and hands it to all three. A
+    test naming a shape therefore reads as a test about that shape rather than
+    about the reading, and the reading is exercised every time one runs.
+    """
+    return geometry._opening(geometry.curvature(shape), box)
+
+
+def _within(shape, drawn, held_to):
+    """:func:`geometry._within` off one reading of the shape."""
+    return geometry._within(geometry.curvature(shape), drawn, held_to)
+
+
+def _departure(shape, drawn, enclosed):
+    """:func:`geometry._departure` off one reading of the shape."""
+    return geometry._departure(geometry.curvature(shape), drawn, enclosed)
+
+
 class Compound:
     """Several shapes in one, which is what a user drawing two lumps gets.
 
@@ -404,6 +570,7 @@ class Compound:
 
     def __init__(self, *lumps):
         self.lumps = list(lumps)
+        self._faces = {}
         self.Area = sum(lump.Area for lump in lumps)
         self.Volume = sum(lump.Volume for lump in lumps)
         self.Solids = [solid for lump in lumps for solid in lump.Solids]
@@ -417,6 +584,29 @@ class Compound:
         self.BoundBox = BoundBox(
             tuple(min(getattr(box, low) for box in corners) for low in ("XMin", "YMin", "ZMin")),
             tuple(max(getattr(box, high) for box in corners) for high in ("XMax", "YMax", "ZMax")),
+        )
+
+    def getElement(self, name):
+        return self._faces[name]
+
+    def translated(self, step):
+        """The same lumps, all moved together."""
+        return Compound(*(lump.translated(step) for lump in self.lumps))
+
+    def common(self, other):
+        """Whatever any lump has in common with the other shape.
+
+        The gap between two lumps is real here, which is what lets a compound
+        stand for a conductor folded back on itself - the one shape whose own
+        box says the wrong thing about which side of a face its metal is on.
+        """
+        met = [_meeting(lump.BoundBox, other.BoundBox) for lump in self.lumps]
+        return Meeting(
+            [
+                (vertex.Point.x, vertex.Point.y, vertex.Point.z)
+                for meeting in met
+                for vertex in meeting.Vertexes
+            ]
         )
 
     def distToShape(self, other):
@@ -683,6 +873,27 @@ def model(**overrides):
     )
 
 
+def _folded():
+    """The microstrip document with its trace folded back over itself.
+
+    A long arm, a spine at the far end, and a shorter arm returning over the
+    first - the shape a delay line or a hairpin resonator is, and the one whose
+    bounding box says the wrong thing about which side of a face its metal is
+    on. The port is moved to the shorter arm's own free end.
+    """
+    doc = model()
+    strip = part(doc, "Trace")
+    strip.Shape = Compound(
+        Shape((-LENGTH / 2, -WIDTH / 2, HEIGHT), (LENGTH / 2, WIDTH / 2, HEIGHT)),
+        Shape((-LENGTH / 2, -WIDTH / 2, HEIGHT), (-LENGTH / 2 + 3.0, 7.5, HEIGHT)),
+        Shape((-LENGTH / 2, 4.5, HEIGHT), (-10.0, 7.5, HEIGHT)),
+    )
+    strip.Shape._faces["End"] = Shape((-10.0, 4.5, HEIGHT), (-10.0, 7.5, HEIGHT))
+    part(doc, "Port1").TraceEnd = (strip, ["End"])
+    part(doc, "Port1").PropagationAxis = "-X"
+    return doc
+
+
 def refinement(name, *references, **overrides):
     """An ``EMMeshRegion`` aimed at whole objects."""
     properties = dict(
@@ -902,21 +1113,20 @@ class TestATranslatedProblemIsRunnable:
     def test_a_feed_inside_the_absorber_is_caught(self):
         """Not by the translation - by pre-flight, which is where it belongs.
 
-        With Through padding the domain is pulled in by the absorber's depth, so
-        the first several millimetres of the trace lie inside the PML: the
-        interior runs from -44.28 while the board starts at -50. A source 4 mm
-        in from the end face lands there, and the field it would drive is being
-        attenuated on purpose.
+        With Through padding the grid ends on the board and the absorber is
+                taken out of it, so the first several millimetres of the trace lie
+                inside the PML. A source that close to the end face lands there, and the
+                field it would drive is being attenuated on purpose.
 
-        The interior depends on what a THROUGH face reserves in - the
-        substrate's cell, which is what the absorber is laid in, not a vacuum
-        one. Change that and this offset moves with it; the case being tested
-        does not.
+                How far in the interior starts is the cell the mesher lays at that wall,
+                times the absorber's depth. Change the mesh and the offset moves with
+                it; the case being tested does not, which is why nothing here names a
+                distance.
 
-        This is the case FeedOffset exists for. It is the one number no geometry
-        can supply - how far past the absorber the source has to sit depends
-        on the grid, which does not exist yet when the port is drawn - so the
-        port states it and pre-flight, which does have the grid, checks it.
+                This is the case FeedOffset exists for. It is the one number no geometry
+                can supply - how far past the absorber the source has to sit depends
+                on the grid, which does not exist yet when the port is drawn - so the
+                port states it and pre-flight, which does have the grid, checks it.
         """
         from Microwave.Solvers.openems import preflight
 
@@ -989,9 +1199,9 @@ class TestThePortCarriesItsDirection:
     def test_a_cramped_port_is_warned_about_rather_than_refused(self):
         """The near-field error is real but its boundary is only bracketed.
 
-        A refusal would claim a threshold two measurements do not establish; a
-        silent pass would let a 1.7% error through as an answer. The finding
-        carries the separation it measured, so the user can judge.
+        A refusal would claim a threshold the measurements do not establish; a
+        silent pass would let a measurable error through as an answer. The
+        finding carries the separation it measured, so the user can judge.
         """
         from Microwave.Solvers.openems import preflight
 
@@ -1007,6 +1217,55 @@ class TestThePortCarriesItsDirection:
         """Not from a property on the port. Two places to state the same fact is
         two places for it to disagree."""
         assert document.problem(study).ports[0].metal == "Copper"
+
+    def test_a_direction_read_off_the_drawing_is_not_marked_as_unread(self, study):
+        """A mark set on every port would warn about every port, which reads as
+        the check having been lost rather than as a port worth looking at.
+
+        The guide as well as the strip, because those are what the gates driven
+        from a document solve: a mark on either would put a warning in front of
+        a run with nothing wrong with it.
+        """
+        assert document.problem(study).ports[0].direction_unchecked is False
+        guide = document.problem(waveguide_model().Objects[0])
+        assert guide.ports[0].direction_unchecked is False
+
+    def test_a_direction_the_drawing_does_not_answer_is_marked_as_unread(self):
+        """A pick with the guide on both sides of it: no side to launch into.
+
+        Nothing here can hold the declared axis against the shape, and the
+        declaration is then whatever it was set to - the enumeration's first
+        value, where nobody set it - so the silence is recorded on the port
+        rather than ending in the function that found it.
+        """
+        problem = document.problem(waveguide_model(inset=10.0).Objects[0])
+        assert problem.ports[0].direction_unchecked is True
+
+    def test_and_the_mark_is_warned_about_by_name_before_the_run(self):
+        """A warning rather than a refusal: reversed, such a port solves clean
+        with the phase inverted, and the direction is knowable by whoever drew
+        the shape - so refusing would make a conductor drawn as a surface
+        unsolvable in order to catch the declarations that are wrong.
+        """
+        from Microwave.Solvers.openems import preflight
+
+        problem = document.problem(waveguide_model(inset=10.0).Objects[0])
+        findings = preflight.check(problem)
+
+        warnings = [f for f in findings if f.severity == preflight.WARN]
+        assert any("nothing has checked it" in f.message for f in warnings)
+        assert [f.subject for f in warnings if "nothing has checked it" in f.message] == [
+            problem.ports[0].name
+        ]
+        assert preflight.refusals(findings) == []
+
+    def test_and_it_reaches_the_driver_through_the_envelope(self):
+        """The driver re-runs pre-flight over the file, which is the route a
+        headless run takes and the one where nobody is watching the panel."""
+        from Microwave.Solvers.openems.model import Problem
+
+        problem = document.problem(waveguide_model(inset=10.0).Objects[0])
+        assert Problem.from_json(problem.to_json()).ports[0].direction_unchecked is True
 
 
 class TestItRefusesRatherThanGuesses:
@@ -1076,14 +1335,53 @@ class TestItRefusesRatherThanGuesses:
 
         A ``BoundBox`` bounds the true surface, which lies marginally outside a
         triangulation that chords across every curve - and the corners are what
-        the domain, the absorber's reservation and every pre-flight check are
-        measured against, so they have to describe what is actually sent.
+        the domain, the block the absorber is laid in and every pre-flight check
+        are measured against, so they have to describe what is actually sent.
         """
         problem = document.problem(self.shape_filling(0.71).Objects[0])
         board = next(s for s in problem.solids if s.label == "Substrate")
         for dim in range(3):
             assert board.lower[dim] == pytest.approx(min(v[dim] for v in board.vertices))
             assert board.upper[dim] == pytest.approx(max(v[dim] for v in board.vertices))
+
+    def test_every_measured_body_carries_the_triangles_the_engine_is_sent(self):
+        """The mesher reads a thickness off the triangulation, so a body handed
+        over without one is never measured across itself and the grid coarsens
+        with nothing said. The two come off the same solid here, which is what
+        stops them describing different surfaces - and this is what says so, on
+        the route that actually builds them.
+        """
+        doc = self.shape_filling(0.71)
+        _, solids, _, bodies, _ = document._geometry(
+            [part(doc, "DielectricBinding")], 1.5e9, 0.035, {}
+        )
+        by_label = {solid.label: solid for solid in solids}
+        measured = [body for body in bodies if body.measured and not body.sheet]
+        assert measured, "no body was measured, so this asserts nothing"
+        for body in measured:
+            assert body.faces, f"{body.label!r} would be meshed without being measured"
+            assert tuple(body.faces) == by_label[body.label].faces
+            assert tuple(body.vertices) == by_label[body.label].vertices
+
+    def test_a_sheet_reaches_the_mesher_told_that_it_is_one(self):
+        """An area has no thickness, and the mesher is told so on the body.
+
+        The flag decides whether the body is cast at at all - a slab forced to a
+        sheet asks for no thickness, which ``tests/test_lfs.py`` holds - and it
+        is set here, off the same piece the engine gets its primitive from. Read
+        against the piece rather than asserted true, so that a body meshed as a
+        volume has to arrive as one.
+        """
+        _, solids, _, bodies, _ = document._geometry(
+            [part(diagonal_trace(), "TraceBinding")], 1.5e9, 0.035, {}
+        )
+        by_label = {solid.label: solid for solid in solids}
+        assert any(body.sheet for body in bodies), "nothing came back a sheet"
+        for body in bodies:
+            assert body.sheet == (by_label[body.label].sheet_normal is not None), (
+                f"{body.label!r} is measured as "
+                f"{'an area' if body.sheet else 'a volume'} and solved as the other"
+            )
 
     def test_an_l_is_cut_into_rectangles_rather_than_refused(self):
         """An L has no rotation in it and every edge axis-aligned, so a
@@ -1111,6 +1409,7 @@ class TestItRefusesRatherThanGuesses:
         body the mesher cannot ask a distance of."""
         trace = part(l_shaped_trace(), "Trace")
         pieces = geometry.solid_boxes(trace)
+        assert pieces, "the cut returned no rectangle, so the comparison below holds vacuously"
         assert [piece.shape for piece in pieces] == [trace.Shape] * len(pieces)
 
     def test_the_pieces_of_one_shape_are_told_apart_by_name(self):
@@ -1222,8 +1521,8 @@ class TestItRefusesRatherThanGuesses:
         assert "Port1" in message, "it should name the object to fix"
         # The property editor's spelling, not the envelope's. A message saying
         # "reference_impedance" sends a user looking for a property that is not
-        # there; this module already carries one scar from that - see the
-        # AXIS_NAMES import comment.
+        # there; the translation carries one scar from that - see the
+        # AXIS_NAMES import comment in Solvers/openems/ports.py.
         assert "ReferenceImpedance" in message
         assert "reference_impedance" not in message
 
@@ -1291,13 +1590,12 @@ class TestItRefusesRatherThanGuesses:
         ],
     )
     def test_every_property_that_reaches_the_envelope_is_named(self, obj_name, prop, value, names):
-        """One traceback fixed is one property fixed, and there are six more.
+        """One traceback fixed is one property fixed, and every row here is one.
 
-        Every row here is a separate route, so a fix covering three of them
-        cannot claim the rest. Two of the material rows reach the user through
-        *Update Mesh* rather than
-        Check, which is a path with an even thinner catch: the toolbar command
-        has no catch-all at all.
+        Each is a separate route, so a fix covering some of them cannot claim
+        the rest. The material rows also reach the user through *Update Mesh*,
+        which is the thinner catch of the two: the toolbar command has no
+        catch-all at all.
         """
         doc = model()
         target = doc.Objects[0] if obj_name == "Analysis" else part(doc, obj_name)
@@ -1316,13 +1614,12 @@ class TestItRefusesRatherThanGuesses:
 
     @pytest.mark.parametrize("prop", ["Permittivity", "Permeability"])
     def test_a_permittivity_on_a_conductor_is_named_not_ignored(self, prop):
-        """The QA step that found this set ``Permittivity = 20`` on Copper and
-        pressed Update Mesh. It meant nothing to openEMS - ``build_material``
-        gives a conductor its conductivity and nothing else - but it reached
-        ``_wavelength``, which sizes every cell in the model from
-        ``max(epsilon * mu)``, so the grid moved +30.5% and the run was then
-        refused by a THROUGH guard for a reason that named neither the material
-        nor the property. It has to arrive as this material's problem.
+        """A permittivity on a conductor means nothing to openEMS -
+        ``_add_material`` gives a conductor its conductivity and nothing else -
+        but it reaches ``_wavelength``, which sizes every cell in the model from
+        ``max(epsilon * mu)``. The grid moves, and the run is then refused by a
+        THROUGH guard naming neither the material nor the property. It has to
+        arrive as this material's problem.
         """
         doc = model()
         # Both of them: ``model()`` calls ``copper()`` twice, so editing one
@@ -1417,6 +1714,26 @@ class TestItRefusesRatherThanGuesses:
     def test_a_port_pointing_out_of_the_structure_is_reported(self):
         refuses_a_microstrip("out of the structure", PropagationAxis="-X")
 
+    def test_a_fold_is_judged_by_its_own_arm_and_not_by_its_box(self):
+        """A trace folded back on itself, fed at the end of its shorter arm.
+
+        The fold spans x -50..50 and the arm the port is on ends at x = -10, so
+        the centre of the trace's box lies *past* that face: measured against
+        the box, the wave would be sent away from the metal. The correct
+        declaration is asserted as well as the reversed one, because a check
+        that refused everything would pass on the reversed one alone.
+        """
+        doc = _folded()
+        problem = document.problem(doc.Objects[0])
+        port = problem.ports[0]
+        assert port.propagation_axis == 0
+        assert port.start[0] == pytest.approx(-10.0)
+        assert port.stop[0] < port.start[0]
+
+        part(doc, "Port1").PropagationAxis = "X"
+        with pytest.raises(document.TranslationError, match="out of the structure"):
+            document.problem(doc.Objects[0])
+
     def test_the_wrong_face_of_the_trace_is_reported(self):
         """A face running along the trace instead of across its end."""
         strip, plane = trace(), ground()
@@ -1460,22 +1777,23 @@ class TestItRefusesRatherThanGuesses:
         a file written with a longer list goes on offering it.
 
         What it prevents is the quiet kind. Nothing carries a waveform into the
-        envelope, ``SetGaussExcite`` is called either way, and the run would
-        finish with an S-matrix that answers a question nobody asked.
+        envelope, the same pulse is built either way, and the run would finish
+        with an S-matrix that answers a question nobody asked.
         """
         with pytest.raises(document.TranslationError, match="Sinusoid"):
             document.problem(model(analysis=analysis(Waveform="Sinusoid")).Objects[0])
 
 
 class TestPolicyMapsOntoThePhysics:
-    def test_through_padding_pulls_the_domain_in(self, study):
-        """The x faces run out through the absorber, so the grid must stop
-        inside the board rather than beyond it. That is what makes the line
-        infinite; without it the line ends in an open circuit and rings."""
+    def test_through_padding_lands_the_grid_on_the_board(self, study):
+        """The x faces run out through the absorber, so the grid must end on the
+        board rather than beyond it - the absorber stands on the line, which is
+        what makes the line infinite. Without it the line ends in an open
+        circuit and rings."""
         problem = document.problem(study)
         assert problem.grid.params["padding"][0] == [THROUGH, THROUGH]
-        assert problem.grid.x[0] > -LENGTH / 2
-        assert problem.grid.x[-1] < LENGTH / 2
+        assert problem.grid.x[0] == pytest.approx(-LENGTH / 2)
+        assert problem.grid.x[-1] == pytest.approx(LENGTH / 2)
 
     def test_air_padding_grows_the_domain_outward(self, study):
         problem = document.problem(study)
@@ -1722,6 +2040,22 @@ class TestThePreviewShowsWhatGetsSolved:
         plan = document.mesh(study)
         assert any(pin.required for pin in plan.lines.fixed[2])
         assert not hasattr(document.problem(study).grid, "fixed")
+
+    def test_the_plan_carries_what_laying_it_cost(self, study):
+        """A demand and its delivery are different claims, and what it took to
+        arrive at the delivery is a third. The other two are asserted above; a
+        reader of a finished plan has this one without asking the phases that
+        filled it.
+
+        The mesher's half only. This drawing is boxes, and a box states its own
+        extents rather than being measured, so nothing here is read off
+        geometry and the reading's counters are nought by the drawing rather
+        than by a tally that failed to arrive. ``TestItRefusesRatherThanGuesses``
+        drives a document that is measured.
+        """
+        spent = document.mesh(study).spent
+        assert spent.settling > 0
+        assert spent.absorbing > 0
 
     def test_the_plan_carries_the_regions_the_report_names(self, study):
         labels = {region.name for region in document.mesh(study).regions}
@@ -2019,7 +2353,7 @@ class TestCoarseningReachesTheMesher:
         region = refinement(
             "Loose", Mode="Coarsen", References=[(board, ["Face9"])], ElementSize=8.0
         )
-        _, solids, _, _ = document._geometry(
+        _, solids, _, _, _ = document._geometry(
             [plating], 1.5e9, 0.035, document._relaxations([region])
         )
         assert {s.relaxed_to for s in solids} == {0.0}
@@ -2035,7 +2369,7 @@ class TestCoarseningReachesTheMesher:
         """
         plating = self._plated(doc)
         bindings = [part(doc, "DielectricBinding"), plating]
-        _, solids, _, _ = document._geometry(
+        _, solids, _, _, _ = document._geometry(
             bindings, 1.5e9, 0.035, document._relaxations([region])
         )
         return {solid.label: solid.relaxed_to for solid in solids}
@@ -2207,8 +2541,8 @@ class TestOwnershipIsMembership:
 class TestARunStartsFromAStudy:
     """What ``problem()`` refuses when handed the wrong object.
 
-    Three classes of migration refusal stood here - pre-analysis documents,
-    property names that exist nowhere. Nothing outside this repository ever held
+    Migration refusals stood here - pre-analysis documents, property names that
+    exist nowhere. Nothing outside this repository ever held
     such a document and nothing has been released, so there is no migration to
     test. What survives is every refusal that can still fire for a document made
     today.
@@ -2256,6 +2590,29 @@ class TestTheSweepIsOneGeometry:
         problems = document.sweep(doc.Objects[0])
         assert len(problems) == 1
         assert len(problems[0].ports) == 2
+
+
+def test_the_drawn_line_and_the_hand_built_one_are_one_grid():
+    """What makes the gate below strong is that the two routes mesh the same
+    line, and each declares its own dimensions - so they can drift apart with
+    both still inside Hammerstad's own accuracy and neither gate noticing.
+
+    Compared line by line rather than by cell count: a count agrees whenever
+    two grids happen to be the same size.
+    """
+    from tests import test_acceptance_microstrip as hand_built
+
+    drawn = document.problem(model().Objects[0]).grid
+    hand = hand_built._problem().grid
+
+    for axis in ("x", "y", "z"):
+        theirs, ours = getattr(hand, axis), getattr(drawn, axis)
+        assert len(ours) == len(theirs), (
+            f"the drawn line's {axis} grid has {len(ours)} lines against the "
+            f"hand-built one's {len(theirs)}; the two gates are no longer "
+            "measuring one structure"
+        )
+        np.testing.assert_allclose(ours, theirs, rtol=0, atol=1e-9)
 
 
 @pytest.mark.slow
@@ -2918,6 +3275,24 @@ class TestOneObjectDrawnInSeveralLumps:
         lines = document.mesh(doc.Objects[0]).grid.x
         return min(b - a for a, b in zip(lines, lines[1:]) if a < -8.0 + gap and b > -8.0)
 
+    def test_what_reading_this_drawing_cost_reaches_the_plan_it_was_read_for(self):
+        """The reading and the mesher fill one tally through separate
+        arguments, so a tally that reaches one and not the other reads as a
+        whole cost and is part of one. Driven from here because the reading's
+        counters need a drawing that is measured: a box states its own extents
+        and is read off nothing, and the gap between these two lumps is found
+        by walking at the kernel, which is the dearest phase of the lot.
+        """
+        near = Shape((-12.0, -2.0, 5.0), (-8.0, 2.0, 9.0), fill=0.71)
+        far = Shape((-7.5, -2.0, 5.0), (-3.5, 2.0, 9.0), fill=0.71)
+        obj = Obj("Part::Feature", "Lumps", Compound(near, far))
+        doc = model()
+        _add(doc, obj)
+        _add(doc, binding("LumpBinding", fr4(), obj))
+        spent = document.mesh(doc.Objects[0]).spent
+        assert spent.raised > 0
+        assert spent.kept > 0
+
     def test_each_lump_reaches_the_mesher_as_itself(self):
         """The whole of the fault: a piece handed the object it came out of
         measures the distance from a shape to itself, which is zero, and zero
@@ -3304,7 +3679,6 @@ class TestMaterialsResolvePerFace:
         replaces(doc, "Trace", strip)
         part(doc, "TraceBinding").References = [(strip, ["Face1"])]
         doc.Objects.insert(8, binding("GoldBinding", gold, strip))
-        part(doc, "Port1").References = [(strip, ["Top"])]
 
         assert document.problem(doc.Objects[0]).ports[0].metal == "Copper"
 
@@ -3439,13 +3813,22 @@ class TestPreflightWarningsAreNotUnconditional:
         findings = preflight.check(document.problem(model().Objects[0]))
         warnings = [f for f in findings if f.severity == preflight.WARN]
         assert not [w for w in warnings if "near field" in w.message], (
-            "the acceptance configuration measures 30 mm from its feed, which "
-            "is 0.21 wavelengths; warning about it would make the check noise"
+            "the acceptance configuration measures its port at the distance "
+            "portbox.clearance asks for, and it asks by rounding up - so a "
+            "default port clears this threshold rather than sitting on it, and "
+            "warning about one would make the check noise"
         )
         assert not [w for w in warnings if "uneven" in w.message]
 
     def test_the_clearance_warning_tracks_the_separation(self):
-        """Fires below the limit, silent above it, on the same geometry."""
+        """Fires below the limit, silent above it, on the same geometry.
+
+        The two separations are derived from the threshold rather than typed, so
+        this says the check tracks the rule rather than making a claim about
+        either figure - a separation typed against one form of the threshold is
+        silent under it and warns under another while looking like the same test.
+        """
+        from Microwave.portbox import clearance
         from Microwave.Solvers.openems import preflight
 
         def warned(feed, separation):
@@ -3455,20 +3838,67 @@ class TestPreflightWarningsAreNotUnconditional:
             findings = preflight.check(document.problem(model(port=port).Objects[0]))
             return any("near field" in f.message for f in findings)
 
-        assert warned(13.6, 1.7), "1.7 mm apart is 0.012 wavelengths"
-        assert not warned(13.6, 18.0), "18 mm apart is 0.13 wavelengths"
+        limit = clearance(1e9)
+        assert warned(13.6, limit / 10), "a tenth of the threshold is inside it"
+        assert not warned(13.6, 1.5 * limit), "half again past the threshold is outside it"
 
 
 class TestTheGridInputsDigest:
     """A staleness key that is cheap enough to ask on every recompute.
 
-    The mesher is a pure function of exactly these inputs, so the key is
-    complete rather than an approximation - but it costs a translation and no
-    meshing, which is what makes an out-of-date badge affordable *and* precise.
+    It hashes the mesher's arguments but not the lengths measured off the
+    drawing, which is what makes an out-of-date badge affordable;
+    hashing nothing but mesh inputs is what keeps the badge from firing without
+    cause. What it is not is complete - two drawings that tile one region
+    differently hash alike - and the tests below say what it does cover rather
+    than that it covers everything.
     """
 
     def test_it_is_stable_across_calls(self, study):
         assert document.grid_inputs_digest(study) == document.grid_inputs_digest(study)
+
+    def test_a_plan_carries_a_key_and_it_is_this_one(self, study):
+        """That the plan's key is this key and not some other hash.
+
+        Both sides go through ``_digest_of``, so this says nothing about what
+        the payload covers - the tests around it do that. What it pins is that
+        a caller taking the key off the plan gets the same answer it would get
+        by asking, which is what makes the plan's key usable at all. That the
+        plan reads the document once for it is counted where the reading
+        happens, in ``tests/test_mesh_preview_gui.py``.
+        """
+        assert document.mesh(study).inputs_digest == document.grid_inputs_digest(study)
+
+    def test_a_plan_carries_what_the_study_held_when_it_was_laid(self, study):
+        """The other half of the one reading. The preview links itself to this
+        list, and the study compares its own membership against it."""
+        assert document.mesh(study).found == document.contents(study)
+
+    def test_it_measures_no_length_off_the_geometry(self, study, monkeypatch):
+        """The half of "cheap" that nothing else asserts.
+
+        A grid needs the lengths the drawing carries; a staleness key does not,
+        and it is asked for on every recompute of a document with a preview in
+        it. So a translation that reads them is a drawing that stalls on every
+        edit.
+
+        Reproduced rather than timed. A timing assertion here would pass on the
+        machine that wrote it and fail on somebody's laptop, and it would go on
+        passing once the reading crept back in behind a faster one.
+
+        It bites through the module global: ``_Translated.measured`` looks the
+        name up when it is called, so patching it here reaches the property.
+        Holding a direct reference in the property would disarm this silently.
+        """
+
+        def refuse(bodies, params, spend=None):
+            raise AssertionError("the staleness key measured the geometry")
+
+        monkeypatch.setattr(document, "measured", refuse)
+        assert document.grid_inputs_digest(study)
+
+        with pytest.raises(AssertionError, match="measured the geometry"):
+            document.mesh(study)
 
     def test_it_moves_when_the_mesh_policy_moves(self, study):
         before = document.grid_inputs_digest(study)
@@ -3656,6 +4086,227 @@ class TestATriangulationHasToStillBeTheShape:
             document.problem(doc.Objects[0])
 
 
+class TestTheRequestIsHeldToWhatTheShapeCurvesThrough:
+    """A share of the bounding box says nothing about a curve on a large body.
+
+    The two agree on a sphere and a cylinder, whose narrowest extent is twice the
+    radius they curve through, and part company on anything carrying a small
+    feature on a large one - a wire drawn along a diagonal, whose box is its own
+    length in every direction. Left there, the kernel is asked for something it
+    answers coarsely and the wire arrives as a prism.
+
+    Read off :func:`geometry._opening` rather than through a translation, because
+    the stub shape here is a box and a box has nothing to curve through; what a
+    real kernel does with the request is scored over the corpus.
+    """
+
+    class Face:
+        """One face, curving through ``radius`` or flat where that is ``None``.
+
+        A flat face answers a curvature of zero rather than refusing the
+        question, as a kernel does for a plane - so a box reaches the reading and
+        comes back with no radius, where a shape with no faces never reaches it
+        at all. Both routes have to end in the same request.
+
+        It carries no ``Surface``, which is a face the reading cannot identify
+        and therefore asks. That is the case every stand-in here is in.
+        """
+
+        def __init__(self, radius):
+            self.ParameterRange = (0.0, 1.0, 0.0, 1.0)
+            self.Area = 1.0
+            self._curvature = 0.0 if radius is None else 1.0 / radius
+
+        def curvatureAt(self, u, v):
+            return (self._curvature, 0.0)
+
+    class Shaped:
+        def __init__(self, *radii):
+            self.Faces = [TestTheRequestIsHeldToWhatTheShapeCurvesThrough.Face(r) for r in radii]
+
+    #: A body sixty across, which is what a request off its box is a share of.
+    BOX = geometry.Box(lower=(0.0, 0.0, 0.0), upper=(60.0, 60.0, 60.0))
+    OFF_THE_BOX = geometry.DEFLECTION_OF_EXTENT * 60.0
+
+    def opening(self, shape):
+        return _opening(shape, self.BOX)
+
+    def test_a_shape_with_no_face_at_all_asks_for_a_share_of_its_extent(self):
+        assert self.opening(type("Faceless", (), {"Faces": []})()) == pytest.approx(
+            self.OFF_THE_BOX, abs=0.0
+        )
+
+    def test_and_so_does_one_whose_faces_are_all_flat(self):
+        """A box, and every rectilinear boolean: the faces answer, and what
+        they answer is that nothing curves."""
+        assert self.opening(self.Shaped(None, None, None)) == pytest.approx(
+            self.OFF_THE_BOX, abs=0.0
+        )
+
+    def test_a_radius_the_box_says_nothing_about_holds_the_request_down(self):
+        """The wire's case, and the fault this exists for."""
+        assert self.opening(self.Shaped(0.02)) == pytest.approx(
+            geometry.COARSEST_OF_RADIUS * 0.02, abs=0.0
+        )
+
+    def test_a_shape_whose_box_is_its_own_diameter_is_left_exactly_alone(self):
+        """A sphere and a cylinder, where the two rules are one statement - so
+        a shape that was already asked the right thing is not moved."""
+        assert self.opening(self.Shaped(30.0)) == pytest.approx(self.OFF_THE_BOX, abs=0.0)
+
+    def test_the_sharpest_face_is_the_one_that_decides(self):
+        """A bead on a can. The kernel takes one deflection per call, so one
+        small feature settles the request the whole shape is triangulated at."""
+        assert self.opening(self.Shaped(30.0, 0.5)) == pytest.approx(
+            geometry.COARSEST_OF_RADIUS * 0.5, abs=0.0
+        )
+
+    def test_a_feature_far_below_the_band_is_followed_no_further(self):
+        """Which is what stops it refining the body it sits on.
+
+        Held only from above, a blend a fraction of a micron wide asks for a
+        deflection near zero, and the body around it is then triangulated into
+        vertices that collide once rounded or into a surface that no longer
+        closes. Either is a refusal blaming a drawing for a deflection the
+        translation chose.
+        """
+        held = self.opening(self.Shaped(30.0, 1e-4))
+        assert held == pytest.approx(geometry.FINEST_OF_RADIUS * 30.0, abs=0.0)
+        assert held > geometry.COARSEST_OF_RADIUS * 1e-4
+
+    def test_the_floor_is_taken_against_the_widest_curve_and_not_the_sharpest(self):
+        """The two are the same on a sphere and differ on everything else, and
+        it is the widest that says what refining the body is still buying."""
+        assert self.opening(self.Shaped(9.0, 1e-4)) == pytest.approx(
+            geometry.FINEST_OF_RADIUS * 9.0, abs=0.0
+        )
+
+    def test_a_curve_gentler_than_the_body_floors_against_the_body(self):
+        """A radius larger than the body does not bend within it, so past that
+        the length the cost is set against is the body rather than the curve."""
+        assert self.opening(self.Shaped(1e6, 1e-4)) == pytest.approx(
+            geometry.FINEST_OF_RADIUS * 60.0, abs=0.0
+        )
+
+    def test_the_floor_never_coarsens_a_request_that_was_already_asked(self):
+        """It holds the clamp up, never the drawing's own share down: a body
+        curving gently is asked exactly what its box asks."""
+        assert self.opening(self.Shaped(30.0, 25.0)) == pytest.approx(self.OFF_THE_BOX, abs=0.0)
+
+    def test_nor_one_asked_for_deliberately_below_it(self, monkeypatch):
+        """A caller asking for a fine surface is not over-refining anything: the
+        floor is there to stop the ceiling doing that rather than to overrule a
+        choice. Coarsened up to the floor, two requests either side of it would
+        be two names for one mesh.
+        """
+        monkeypatch.setattr(geometry, "DEFLECTION_OF_EXTENT", 0.001)
+        fine = 0.001 * 60.0
+        assert fine < geometry.FINEST_OF_RADIUS * 30.0, "this asks nothing of the floor"
+        assert self.opening(self.Shaped(30.0)) == pytest.approx(fine, abs=0.0)
+
+
+class TestASheetSRequestFollowsItsOutline:
+    """A flat sheet's face is flat, so its outline is the whole of what the
+    kernel is asked to follow.
+
+    A share of the sheet's extent is not merely a weaker criterion than the
+    radius: it points the other way. A clearance is a fixed size and the share
+    of the plane it occupies falls as the plane grows, so a request stated
+    against the extent asks for less of the same hole the more board there is
+    around it - and it saturates at a square. What a real kernel then returns is
+    scored over the corpus; what is read here is the request.
+    """
+
+    #: A hole small against every plane below, so the ceiling always binds.
+    HOLE = 0.5
+
+    #: Corners the clearance's ring is drawn with. What the reading needs from a
+    #: ring is edges carrying a radius, and how many there are decides nothing
+    #: here - the kernel hands a whole circle over as a single edge, and the
+    #: answer is the same either way.
+    RING = 8
+
+    def sheet(self, side, hole=HOLE, bend=None):
+        """A square sheet of ``side`` with a round clearance cut out of it."""
+        turn = [
+            (
+                hole * math.cos(2.0 * math.pi * i / self.RING),
+                hole * math.sin(2.0 * math.pi * i / self.RING),
+            )
+            for i in range(self.RING)
+        ]
+        square = [
+            (-side / 2, -side / 2),
+            (side / 2, -side / 2),
+            (side / 2, side / 2),
+            (-side / 2, side / 2),
+        ]
+        return Shape(
+            (-side / 2, -side / 2, 0.0),
+            (side / 2, side / 2, 0.0),
+            rings=[square, turn],
+            bends=(bend, hole),
+        )
+
+    def asked(self, shape):
+        geometry._boxes_of(shape, "Ground")
+        return shape.asked_deflection
+
+    def test_an_outline_of_straight_runs_asks_for_a_share_of_the_sheet(self):
+        """Every Manhattan sheet and every polygon: nothing bends, so there is
+        no radius to hold a request against and the drawing is followed exactly
+        whatever is asked."""
+        side = 60.0
+        flat = Shape(
+            (0.0, 0.0, 0.0),
+            (side, side, 0.0),
+            rings=[[(0.0, 0.0), (side, 0.0), (side, side * 0.5)]],
+        )
+        assert self.asked(flat) == pytest.approx(geometry.DEFLECTION_OF_EXTENT * side, abs=0.0)
+
+    def test_a_clearance_holds_the_request_down_to_what_it_bends_through(self):
+        """The fault this exists for. Off the extent alone a hole this size in a
+        plane this size is asked for a deflection larger than its own
+        diameter."""
+        assert self.asked(self.sheet(60.0)) == pytest.approx(
+            geometry.COARSEST_OF_RADIUS * self.HOLE, abs=0.0
+        )
+
+    def test_and_asks_the_same_however_much_sheet_is_around_it(self):
+        """The identity that says the radius is what is being followed. A bound
+        alone is passed by a criterion that still hands the engine a different
+        hole in every plane, so what has to hold is that the two agree."""
+        assert self.asked(self.sheet(60.0)) == pytest.approx(self.asked(self.sheet(300.0)), abs=0.0)
+
+    def test_a_sheet_whose_curve_is_its_own_size_is_left_exactly_alone(self):
+        """The case a share of the extent was written for, and it still holds: a
+        sheet already asked the right thing is not moved. Drawn as a clearance
+        spanning the whole board, so that the extent and twice the radius are
+        one length."""
+        whole = self.sheet(60.0, hole=30.0)
+        assert self.asked(whole) == pytest.approx(geometry.DEFLECTION_OF_EXTENT * 60.0, abs=0.0)
+
+    def test_a_wide_curve_on_the_same_outline_does_not_hold_the_request_up(self):
+        """A solid's request has a floor against the widest radius on it, because
+        past the band's fine edge a curved face goes on subdividing across its
+        whole area for an answer it did not need improved. A boundary subdivides
+        along a line, so there is no such place on an outline and no floor here -
+        and one taken against the widest curve would follow a via as coarsely as
+        the ground plane around it is wide.
+        """
+        held = self.asked(self.sheet(60.0, hole=0.2, bend=30.0))
+        assert held == pytest.approx(geometry.COARSEST_OF_RADIUS * 0.2, abs=0.0)
+        assert held < geometry.FINEST_OF_RADIUS * 30.0, "a floor is holding the request up"
+
+    def test_and_the_same_clearance_asks_the_same_in_a_curved_sheet_as_in_a_flat_one(self):
+        """The identity a floor breaks: a via in a round ground plane and the
+        same via in a square one are one drawing as far as the via is
+        concerned."""
+        assert self.asked(self.sheet(60.0, hole=0.2, bend=30.0)) == pytest.approx(
+            self.asked(self.sheet(60.0, hole=0.2)), abs=0.0
+        )
+
+
 class TestASolidBelowTheOriginIsCarriedAllTheSame:
     """openEMS casts its containment ray outward from a shape's *maximum*
     corner, and scaling a negative coordinate moves it further from the origin
@@ -3750,7 +4401,7 @@ class TestATriangulatedSolidIsSizedAsAMaterial:
         shape - pinning its faces, the thirds rule, asking whether another
         conductor covers it. Given a box that merely bounds one, each of those
         is wrong quietly."""
-        from Microwave.Solvers.openems.write import regions
+        from Microwave.Solvers.openems.plan import regions
 
         problem = self.problem()
         kinds = {m.name: m.kind for m in problem.materials}
@@ -3761,7 +4412,7 @@ class TestATriangulatedSolidIsSizedAsAMaterial:
     def test_it_keeps_its_material_bulk_size(self):
         """A rotated board must be meshed as finely inside as a flat one: the
         wave's speed is a property of the material, not of the shape."""
-        from Microwave.Solvers.openems.write import features
+        from Microwave.Solvers.openems.plan import features
 
         problem = self.problem()
         found = features(problem.solids, {"FR4": 0.5})
@@ -3769,7 +4420,7 @@ class TestATriangulatedSolidIsSizedAsAMaterial:
         assert found[0].cells()[0] == pytest.approx(0.5)
 
     def test_and_asks_nothing_when_no_bulk_size_was_given(self):
-        from Microwave.Solvers.openems.write import features
+        from Microwave.Solvers.openems.plan import features
 
         assert features(self.problem().solids, None) == []
 
@@ -3780,7 +4431,7 @@ class TestATriangulatedSolidIsSizedAsAMaterial:
         of what it asks the grid - and it is the geometry a coarsening is most
         likely to be aimed at, since a box carries no detail to give up.
         """
-        from Microwave.Solvers.openems.write import features
+        from Microwave.Solvers.openems.plan import features
 
         problem = self.problem()
         loose = [dataclasses.replace(s, relaxed_to=4.0) for s in problem.solids]
@@ -3825,9 +4476,9 @@ class TestASheetIsFoundAtItsOwnPlane:
         trace lying on a substrate proves nothing: the substrate's own top face
         asks for a line at the same plane.
         """
-        from Microwave.Solvers.openems.mesh import MeshParams
         from Microwave.Solvers.openems.model import Material, Port, Solid
-        from Microwave.Solvers.openems.write import plan_mesh
+        from Microwave.Solvers.openems.plan import plan_mesh
+        from Microwave.Solvers.openems.regions import MeshParams
 
         sheet = Solid(
             material="copper",
@@ -4072,6 +4723,9 @@ class TestAConductorDrawnAsASkinIsGivenThickness:
         """Nothing to say, and saying it anyway would put the note on every
         model anybody draws."""
         solved = document.problem(model().Objects[0])
+        assert solved.solids, (
+            "the translation returned no solid, so the comparison below holds vacuously"
+        )
         assert [solid.thickened for solid in solved.solids] == [0.0] * len(solved.solids)
 
     def test_but_not_where_the_thickness_is_a_large_share_of_the_width(self):
@@ -4213,3 +4867,527 @@ class TestADocumentOlderThanItsClasses:
         board = Obj("", "Board")
         board.Proxy = None
         assert properties.stale_document(error, [board]) is None
+
+
+class TestHowFarTheSolvedSurfaceStandsFromTheDrawnOne:
+    """A polygonised curve is a chord, and a chord lies off the arc.
+
+    How far is read off the volume the triangles lose over the area that curves,
+    which is an identity rather than a fit: the departure over one facet is a
+    quadratic vanishing at the three vertices the surface passes through, and the
+    mean of such a quadratic over a triangle is three quarters of its value at
+    the middle. So the mean displacement is four thirds of the lost volume over
+    the area, and no facet is measured against the surface to get it.
+
+    Read off :func:`geometry._departure` rather than through a translation,
+    because the arithmetic is what is under test; what a real kernel does with it
+    is scored over the corpus.
+    """
+
+    class Face:
+        def __init__(self, curvature, area, orientation="Forward"):
+            self.ParameterRange = (0.0, 1.0, 0.0, 1.0)
+            self.Area = area
+            self.Orientation = orientation
+            self._curvature = curvature
+
+        def curvatureAt(self, u, v):
+            return self._curvature
+
+    class Curved:
+        def __init__(self, *faces):
+            self.Faces = list(faces)
+
+    def sphere(self, radius=3.0, area=None):
+        """One face bending one way, of a stated area."""
+        area = 4.0 * math.pi * radius**2 if area is None else area
+        return self.Curved(self.Face((-1.0 / radius, -1.0 / radius), area))
+
+    def test_the_displacement_is_four_thirds_of_the_volume_over_the_curved_area(self):
+        found = _departure(self.sphere(area=12.0), drawn=100.0, enclosed=99.1)
+        assert found.displaced == pytest.approx((4.0 / 3.0) * 0.9 / 12.0)
+
+    def test_a_shape_that_does_not_curve_departs_by_nothing_rather_than_unmeasurably(self):
+        """Every facet of a planar face is a piece of a plane the drawing
+        already had, so there is nothing left to close - and no area to divide
+        by, which is a different thing from an unknown answer."""
+        flat = self.Curved(self.Face((0.0, 0.0), 12.0))
+        assert _departure(flat, drawn=100.0, enclosed=99.1) == geometry.EXACTLY
+
+    def test_a_flat_face_is_left_out_of_the_area_it_is_divided_by(self):
+        """It contributes nothing to the volume lost, so leaving it in the
+        denominator would say how much of the shape is flat rather than how far
+        the curved part moved."""
+        mostly_flat = self.Curved(self.Face((0.0, 0.0), 988.0), self.Face((-1 / 3.0, 0.0), 12.0))
+        assert _departure(mostly_flat, 100.0, 99.1) == _departure(
+            self.sphere(area=12.0), 100.0, 99.1
+        )
+
+    def test_a_triangulation_inside_the_drawing_reads_positive(self):
+        """Which is what a chord does to a convex wall: its centre of curvature
+        is in the metal, so every chord across it cuts inward."""
+        assert _departure(self.sphere(), drawn=100.0, enclosed=99.0).displaced > 0.0
+
+    def bore(self, radius=3.0, area=12.0):
+        """One face curving into the material, as a hole through a block does.
+
+        Its centre of curvature is outside the metal, which is what makes the
+        kernel answer positive there where a wall answers negative.
+        """
+        return self.Curved(self.Face((1.0 / radius, 0.0), area))
+
+    def test_and_one_outside_it_reads_negative(self):
+        """A bore's chords lie inside the circle, which is outside the metal, so
+        the triangulation encloses more than the drawing. The sign is the
+        information: it says which way an answer will move."""
+        assert _departure(self.bore(), drawn=100.0, enclosed=101.0).displaced < 0.0
+
+    def test_a_wall_the_triangulation_is_outside_of_states_no_distance(self):
+        """A polyhedron whose vertices lie on a wall curving one way is on one
+        known side of it. A difference of the other sign is therefore not a
+        departure: it is the drawn volume not being the shape's, which is what a
+        kernel integrating a re-fitted surface hands over. Saying nothing beats
+        saying a distance whose sign is wrong.
+        """
+        assert _departure(self.sphere(), drawn=100.0, enclosed=101.0) is None
+
+    def test_and_neither_does_a_bore_the_triangulation_is_inside_of(self):
+        assert _departure(self.bore(), drawn=100.0, enclosed=99.0) is None
+
+    def test_a_shape_bending_both_ways_is_held_to_neither_side(self):
+        """Its two surfaces move opposite ways, so the difference of the volumes
+        may legitimately come out either sign and there is nothing to contradict.
+        """
+        saddle = self.Curved(self.Face((1 / 3.0, -1 / 4.0), 12.0))
+        assert _departure(saddle, drawn=100.0, enclosed=101.0) is not None
+        assert _departure(saddle, drawn=100.0, enclosed=99.0) is not None
+
+    def test_a_surface_bending_both_ways_says_so(self):
+        saddle = self.Curved(self.Face((1 / 3.0, -1 / 4.0), 12.0))
+        assert _departure(saddle, 100.0, 99.1).turns_both_ways
+
+    def test_and_one_bending_one_way_does_not(self):
+        assert not _departure(self.sphere(), 100.0, 99.1).turns_both_ways
+
+
+class TestWhatARunSaysAboutTheShapeItSolved:
+    """One line per region, and the wording lives in one place.
+
+    The task panel, the file written beside an envelope and anything else asking
+    say the same thing, because a sentence written down twice is one that
+    drifts.
+    """
+
+    def test_a_region_that_departs_by_nothing_says_nothing(self):
+        """A box is emitted exactly. A line reading "0 mm" for each of them
+        would bury the ones that mean something."""
+        assert geometry.EXACTLY.said_of("Board") == ""
+
+    def test_a_surface_inside_the_drawing_is_said_to_be_inside_it(self):
+        said = geometry.Departure(displaced=0.0032, turns_both_ways=False).said_of("Shell")
+        assert "Shell" in said and "inside" in said and "0.0032" in said
+
+    def test_and_one_outside_it_is_said_to_be_outside(self):
+        said = geometry.Departure(displaced=-0.0032, turns_both_ways=False).said_of("Shell")
+        assert "outside" in said and "-" not in said.split("mm")[0], said
+
+    def test_it_says_the_figure_is_a_mean(self):
+        """The facet standing furthest from the surface is several times this on
+        a shape carrying one small curved feature, and finding it costs a kernel
+        query per facet."""
+        assert "average" in geometry.Departure(0.0032, False).said_of("Shell")
+
+    def test_a_net_over_a_surface_that_bends_both_ways_says_it_is_a_lower_bound(self):
+        """A tube's outer wall moves in while its bore moves out and the two
+        subtract, so the net reads near zero on exactly the drawings whose walls
+        moved most - which the line has to say."""
+        said = geometry.Departure(displaced=0.0001, turns_both_ways=True).said_of("Tube")
+        assert "lower bound" in said
+
+    def test_and_names_no_side_for_one(self):
+        """Which way the remainder points is a property of the cancellation and
+        not of either surface, so a line naming a side would be asserting
+        whichever half survived the subtraction."""
+        inward = geometry.Departure(displaced=0.0001, turns_both_ways=True).said_of("Tube")
+        outward = geometry.Departure(displaced=-0.0001, turns_both_ways=True).said_of("Tube")
+        assert "inside the drawing" not in inward and "outside the drawing" not in inward
+        assert inward == outward
+
+    def test_and_one_that_does_not_makes_no_such_excuse(self):
+        said = geometry.Departure(0.0032, False).said_of("Shell")
+        assert "lower bound" not in said and "inside the drawing" in said
+
+
+@contextlib.contextmanager
+def patch_facet_ceiling(facets):
+    """The facet ceiling moved down so a stub can reach it: a real ladder stops
+    there on a mesh nobody would want to build, which a stand-in cannot produce.
+    """
+    was = geometry.MOST_FACETS
+    geometry.MOST_FACETS = facets
+    try:
+        yield
+    finally:
+        geometry.MOST_FACETS = was
+
+
+class TestAskingForASurfaceWithinADistanceOfTheDrawing:
+    """The lever, which is off until somebody sets it.
+
+    Over wide bands of requests the kernel answers every one of them with about
+    the same departure, so a rung inside that band buys a different arrangement
+    of the error rather than less of it. A ladder that stopped after a stated
+    number of sharpenings would stop inside that band; this one stops on the
+    distance it was aimed at, or refuses.
+
+    The shapes here lose volume in proportion to the deflection they were asked
+    for, over a face of a stated area, so the departure responds to a request.
+    Every figure below is chosen against :data:`geometry.MAX_SHAPE_LOSS` so that
+    the volume rule is satisfied at the first rung and only the distance keeps
+    the ladder going.
+    """
+
+    #: The area that curves, in mm^2, and the shape's own volume. Together with
+    #: ``LOSES`` they fix the departure at a given request: it is four thirds of
+    #: the volume lost over this area.
+    CURVED_AREA = 0.1
+    #: How much of its own bounding box the shape fills. Not a round fraction: a
+    #: solid a rectilinear grid can hold is held as boxes and never triangulated
+    #: at all, so a figure a cut could reach would take this whole class down a
+    #: route with no ladder in it.
+    FILL = 0.71
+
+    #: Volume lost per millimetre of deflection asked for, as a share. Far under
+    #: the loss that would trip the check on whether the triangulation is still
+    #: the shape, so what the ladder responds to here is the distance alone.
+    LOSES = 1e-6
+
+    def shape(self, loses=None, **extra):
+        return Shape(
+            (0.0, 0.0, 0.0),
+            (10.0, 10.0, 10.0),
+            fill=self.FILL,
+            curves=self.CURVED_AREA,
+            coarsens=self.LOSES if loses is None else loses,
+            **extra,
+        )
+
+    def departs_by(self, deflection, loses=None):
+        """What this arrangement's departure works out to at one request.
+
+        Written out rather than taken from the code under test, so a target set
+        against it is a target and not the answer restated.
+        """
+        volume = self.FILL * 10.0**3
+        return (
+            (4.0 / 3.0)
+            * volume
+            * (self.LOSES if loses is None else loses)
+            * deflection
+            / (self.CURVED_AREA)
+        )
+
+    def test_nothing_is_asked_for_by_default(self):
+        """Every drawing is triangulated the way it was before there was
+        anything to set, and a document that has not set this is every
+        document."""
+        opening = _opening(self.shape(), geometry._bounds(self.shape().BoundBox))
+        plain, bare = self.shape(), self.shape()
+        geometry._boxes_of(plain, "Rod")
+        geometry._boxes_of(bare, "Rod", held_to=0.0)
+        # The last request each ladder made. A shape records every one it is
+        # asked, and the copy the translator tessellates shares that record - so
+        # a ladder that took a second rung would show a sharper figure here.
+        assert plain.asked_deflection == bare.asked_deflection == pytest.approx(opening)
+
+    def test_a_shape_already_within_the_distance_is_not_sharpened(self):
+        """A request that bought everything asked of it is not made again: a
+        rung costs a triangulation, and paying for one that changes nothing is
+        what a ladder counting sharpenings does."""
+        near = self.shape()
+        opening = _opening(near, geometry._bounds(near.BoundBox))
+        geometry._boxes_of(near, "Rod", held_to=10.0 * self.departs_by(opening))
+        assert near.asked_deflection == pytest.approx(opening)
+
+    def test_one_outside_it_is_sharpened_until_it_is_inside(self):
+        """Bounded by the measurement rather than by a count, so what says it
+        worked is the distance reached and not how many rungs it took."""
+        far = self.shape()
+        opening = _opening(far, geometry._bounds(far.BoundBox))
+        # Between what the first rung reaches and what the second does, so the
+        # ladder has to take exactly one step and a ladder that took none or
+        # never stopped both fail.
+        target = (self.departs_by(opening) + self.departs_by(opening / 4.0)) / 2.0
+        pieces = geometry._boxes_of(far, "Rod", held_to=target)
+        assert far.asked_deflection == pytest.approx(opening / 4.0)
+        assert abs(pieces[0].departure.displaced) <= target
+
+    def test_the_surface_is_read_once_however_far_the_ladder_climbs(self):
+        """The request to open at, the distance each rung is scored against and
+        the departure reported at the end are three questions about one shape,
+        and the shape does not move between them. Read separately they cost a
+        walk of the whole surface apiece, and the ladder multiplies that by the
+        rungs it takes.
+        """
+        far = self.shape()
+        opening = _opening(far, geometry._bounds(far.BoundBox))
+        target = (self.departs_by(opening) + self.departs_by(opening / 4.0)) / 2.0
+        # The reading this test took to work out its own target is not the
+        # translation's, and it walks the same lattice.
+        far.Faces[0].asked.clear()
+        geometry._boxes_of(far, "Rod", held_to=target)
+        assert far.asked_deflection == pytest.approx(opening / 4.0), "the ladder took no rung"
+        assert len(far.Faces[0].asked) == lfs.CURVATURE_SAMPLES**2
+
+    def test_a_distance_the_shape_cannot_reach_is_refused_and_not_quietly_missed(self):
+        """A study asking for a wall within a distance and silently getting ten
+        times it has measured something else. ``stubborn`` is a kernel answering
+        every sharper request with the mesh it gave the first one, which is what
+        a surface it re-fits rather than evaluates does."""
+        with pytest.raises(geometry.TranslationError) as raised:
+            geometry._boxes_of(self.shape(stubborn=True), "Rod", held_to=1e-9)
+        assert "Rod" in str(raised.value)
+
+    def test_and_the_refusal_says_what_was_asked_and_what_was_reached(self):
+        with pytest.raises(geometry.TranslationError) as raised:
+            geometry._boxes_of(self.shape(stubborn=True), "Rod", held_to=1e-9)
+        said = str(raised.value)
+        assert "1e-09" in said, said
+        assert "facets" in said
+
+    def test_a_shape_that_does_not_curve_is_not_held_to_anything(self):
+        """Its facets are pieces of planes the drawing already had, so there is
+        no distance left to close and sharpening would buy nothing."""
+        flat = Shape((0.0, 0.0, 0.0), (10.0, 10.0, 10.0), fill=self.FILL, stubborn=True)
+        geometry._boxes_of(flat, "Block", held_to=1e-9)
+
+    def test_the_magnitude_is_what_is_held_and_not_the_signed_figure(self):
+        """A bore's chords lie outside the metal and a wall's inside it. Both are
+        the surface being somewhere it was not drawn, and a rule that accepted
+        one for being negative would hold half of every shape to nothing."""
+        rule = _within(self.shape(), drawn=100.0, held_to=0.5)
+        assert rule is not None
+        # A volume lost and the same volume gained, which is a wall moved in and
+        # a bore moved out by exactly as much.
+        assert rule(100.0 - 0.1) is rule(100.0 + 0.1)
+
+    def test_asking_for_nothing_installs_no_rule_at_all(self):
+        assert _within(self.shape(), drawn=100.0, held_to=0.0) is None
+
+    def test_the_ladder_aimed_at_a_distance_climbs_past_where_the_other_stops(self):
+        """The request opens in the middle of the band where a kernel answers
+        every fineness with one mesh, and that band is wider than the volume
+        check's ladder is long - so a ladder of that length has about one rung
+        on the responsive side of it, and a distance one further rung reaches
+        would be refused as unreachable.
+        """
+        opening = _opening(self.shape(), geometry._bounds(self.shape().BoundBox))
+        # Past the last rung the volume check's own ladder would reach, and
+        # inside the one aimed at a distance.
+        beyond = self.departs_by(opening / 4.0 ** (geometry.REFINEMENTS - 1)) / 2.0
+        assert beyond > self.departs_by(opening / 4.0 ** (geometry.HELD_REFINEMENTS - 1))
+        far = self.shape()
+        pieces = geometry._boxes_of(far, "Rod", held_to=beyond)
+        assert abs(pieces[0].departure.displaced) <= beyond
+
+    def test_and_stops_where_the_facets_stop_being_worth_it(self):
+        """Bounded by what a structure build absorbs rather than by an accuracy
+        anybody chose - so a distance nothing reaches ends in a refusal naming
+        the count, and not in a kernel asked for a mesh nobody can hold."""
+        far = self.shape()
+        with pytest.raises(geometry.TranslationError) as raised:
+            geometry._boxes_of(far, "Rod", held_to=1e-30)
+        asked_without_a_ceiling = far.asked_deflection
+
+        near = self.shape()
+        with pytest.raises(geometry.TranslationError), patch_facet_ceiling(1):
+            geometry._boxes_of(near, "Rod", held_to=1e-30)
+        assert near.asked_deflection > asked_without_a_ceiling, (
+            "a ceiling of one facet should stop the ladder at its first rung"
+        )
+        assert "facets" in str(raised.value)
+
+    def test_a_shape_whose_surfaces_may_cancel_is_never_held_to_a_distance(self):
+        """A tube's outer wall moves in while its bore moves out and the volume
+        keeps only the difference, so a rule reading that would report a thin
+        shell held to any distance at all while both its walls stood far outside
+        it.
+        """
+        both_ways = type(
+            "Curved", (), {"Faces": [CurvedFace(self.CURVED_AREA, bends_both_ways=True)]}
+        )()
+        rule = _within(both_ways, drawn=100.0, held_to=1.0)
+        assert rule is not None
+        # A difference of nothing at all, which any tolerance would admit.
+        assert rule(100.0) is False
+
+    def test_and_that_is_a_refusal_rather_than_a_silent_pass(self):
+        shape = Shape(
+            (0.0,) * 3,
+            (10.0,) * 3,
+            fill=self.FILL,
+            curves=self.CURVED_AREA,
+            coarsens=self.LOSES,
+            bends_both_ways=True,
+        )
+        with pytest.raises(geometry.TranslationError) as raised:
+            geometry._boxes_of(shape, "Shield", held_to=1.0)
+        assert "bend both ways" in str(raised.value)
+
+
+class TestTheReportARunGivesAboutTheShapeItSolved:
+    """One line per region that departed, and silence said out loud where it is.
+
+    Against a translation handed to it rather than one read out of a document.
+    What the figures are worth is scored over the corpus; what is under test here
+    is the report - which regions get a line, which get none, and what is said
+    about the ones this measure cannot see at all.
+    """
+
+    def reporting(self, monkeypatch, departures, solids=()):
+        read = SimpleNamespace(departures=tuple(departures), solids=tuple(solids))
+        monkeypatch.setattr(document, "_translate", lambda analysis: read)
+        return document.geometry_report(object())
+
+    def test_a_region_that_departed_is_named_with_how_far(self, monkeypatch):
+        said = self.reporting(monkeypatch, [("Shell", geometry.Departure(0.0032, False))])
+        assert len(said) == 1
+        assert "Shell" in said[0] and "0.0032" in said[0] and "mm" in said[0]
+
+    def test_one_line_apiece_and_in_the_order_they_were_read(self, monkeypatch):
+        said = self.reporting(
+            monkeypatch,
+            [
+                ("Shell", geometry.Departure(0.0032, False)),
+                ("Bore", geometry.Departure(-0.0007, False)),
+            ],
+        )
+        assert [line.split()[0] for line in said] == ["Shell", "Bore"]
+
+    def test_a_region_that_departed_by_nothing_gets_no_line(self):
+        """Every line a reader learns to skip is a line the ones that matter are
+        hidden among, and a model is mostly boxes."""
+        assert geometry.EXACTLY.said_of("Board") == ""
+
+    def test_a_model_where_nothing_departed_says_nothing_at_all(self, monkeypatch):
+        assert self.reporting(monkeypatch, [("Board", geometry.EXACTLY)]) == []
+
+    def test_a_sheet_is_said_to_be_outside_what_the_figures_cover(self, monkeypatch):
+        """The measure divides a lost volume by an area, and a sheet has no
+        volume to lose - so its outline, which is where a sheet does depart, is
+        invisible to it. Reporting nothing without saying so reads as reporting
+        zero.
+        """
+        sheet = Solid(
+            material="Copper",
+            lower=(0.0, 0.0, 0.0),
+            upper=(1.0, 1.0, 0.0),
+            sheet_normal=2,
+            vertices=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)),
+            faces=((0, 1, 2),),
+        )
+        said = self.reporting(monkeypatch, [], solids=[sheet])
+        assert any("flat outline" in line for line in said), said
+
+    def test_and_a_model_carrying_no_sheet_is_not_told_about_sheets(self, monkeypatch):
+        solid = Solid(material="Copper", lower=(0.0,) * 3, upper=(1.0,) * 3)
+        assert self.reporting(monkeypatch, [], solids=[solid]) == []
+
+
+class TestTheLeverReachesTheTranslationFromTheDocument:
+    """A property nothing carries is a property nobody has.
+
+    The arithmetic that acts on the distance is scored elsewhere; what is under
+    test here is every join between the box a user types in and the ladder that
+    acts on it - the policy read, the translation that forwards it, and where a
+    run says what it found.
+    """
+
+    def study(self, tolerance=None, **overrides):
+        board = substrate()
+        board.Shape = Shape(
+            (-LENGTH / 2, -BOARD / 2, 0.0),
+            (LENGTH / 2, BOARD / 2, HEIGHT),
+            fill=0.71,
+            **overrides,
+        )
+        doc = model()
+        replaces(doc, "Substrate", board)
+        part(doc, "DielectricBinding").References = [(board, [])]
+        if tolerance is not None:
+            policy(doc.Objects[0]).CurveTolerance = tolerance
+        return doc.Objects[0], board
+
+    def test_the_policy_carries_the_distance_the_user_typed(self):
+        study, _ = self.study(tolerance=0.25)
+        assert policy(study).CurveTolerance == 0.25
+
+    def test_a_document_written_before_the_property_existed_asks_for_nothing(self):
+        """Zero is what such a document was solved at, so it is the right answer
+        for one - and reaching for a property that is not there would refuse a
+        file that used to open."""
+        settings = type("Older", (), {})()
+        assert not hasattr(settings, "CurveTolerance")
+        assert openems_policy._curve_tolerance(settings) == 0.0
+
+    def test_a_distance_set_on_the_policy_reaches_the_ladder(self):
+        """End to end: nothing between the property and the request is asserted,
+        only that setting it changes what the translation does with the shape.
+        The distance is one no ladder reaches, so the refusal is a state the
+        translation can only get into by having carried the number all the way
+        down.
+        """
+        tight, board = self.study(tolerance=1e-9, curves=0.1, coarsens=1e-6)
+        with pytest.raises(document.TranslationError) as raised:
+            document.problem(tight)
+        assert "1e-09" in str(raised.value)
+        assert board.Shape.asked_deflection is not None, "the ladder never ran"
+
+    def test_and_a_document_that_sets_nothing_is_translated_as_it_always_was(self):
+        plain, board = self.study(curves=0.1, coarsens=1e-6)
+        document.problem(plain)
+        asked = board.Shape.asked_deflection
+
+        zero, board = self.study(tolerance=0.0, curves=0.1, coarsens=1e-6)
+        document.problem(zero)
+        assert board.Shape.asked_deflection == asked
+
+    def test_what_the_ladder_aims_at_is_what_the_run_reports(self):
+        """Two figures computed two ways would come to disagree, and the
+        disagreement would surface as a run reporting one distance and refusing
+        over another. So they are one function, and this is what says so.
+        """
+        shape = Shape((0.0,) * 3, (10.0,) * 3, fill=0.71, curves=0.1, coarsens=1e-6)
+        pieces = geometry._boxes_of(shape, "Rod")
+        reported = abs(pieces[0].departure.displaced)
+        rule = _within(shape, float(shape.Volume), held_to=reported)
+        assert rule is not None
+        # The enclosed volume the reported figure was taken from, recovered from
+        # the triangles the run actually emitted.
+        enclosed = enclosed_volume(pieces[0].vertices, pieces[0].faces)
+        assert rule(enclosed) is True
+        assert _within(shape, float(shape.Volume), held_to=reported / 2.0)(enclosed) is False
+
+    def test_a_translation_carries_what_each_region_departed_by(self, monkeypatch):
+        """The report is rendered from the translation rather than from a second
+        read of the document, so what the translation carries is the whole of
+        what can be said."""
+        study, _ = self.study(curves=0.1, coarsens=1e-6)
+        read = document._translate(study)
+        assert read.departures, "a translation of a curved solid carried no departure"
+        assert any(
+            departure is not None and departure.displaced for _, departure in read.departures
+        )
+
+    def test_the_runs_and_the_report_come_out_of_one_translation(self, monkeypatch):
+        """Asking twice reads the document twice, and two reads of one document
+        are two documents as far as anything comparing their answers goes."""
+        study, _ = self.study(curves=0.1, coarsens=1e-6)
+        reads = []
+        original = document._translate
+        monkeypatch.setattr(
+            document, "_translate", lambda analysis: (reads.append(1), original(analysis))[1]
+        )
+        problems, said = document.sweep_and_report(study)
+        assert problems and said
+        assert len(reads) == 1, f"one call read the document {len(reads)} times"

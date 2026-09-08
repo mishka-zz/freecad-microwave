@@ -17,16 +17,13 @@ import math
 import numpy as np
 import pytest
 
-import Microwave.Solvers.openems.mesh as mesh
-from Microwave.Solvers.openems.mesh import (
-    FixedLine,
-    MaterialClass,
-    MeshLines,
-    Region,
-    generate_mesh_lines,
-)
+from Microwave.Solvers.openems.grid import BYTES_PER_CELL, LARGE_GRID_BYTES, FixedLine, MeshLines
+from Microwave.Solvers.openems.mesh import generate_mesh_lines
 from Microwave.Solvers.openems.model import SPEED_OF_LIGHT
+from Microwave.Solvers.openems.regions import MaterialClass, Region
 from Microwave.Solvers.openems.report import Extent, mesh_report
+from Microwave.Solvers.openems.sizing import Feature
+from Microwave.Solvers.openems.spend import Refused
 from tests.mesh_fixtures import DOMAIN, params, stackup
 
 
@@ -181,7 +178,7 @@ class TestCoverage:
 
     def test_a_padded_face_reports_clearance_instead_of_a_share(self):
         """Outward padding puts the domain *outside* the model, and a share
-        over 100% describes nothing. 180% was the first thing this printed."""
+        over 100% describes nothing, so clearance is reported instead."""
         text = self.report((9.0,) * 3, (11.0,) * 3).summary()
         assert "1 + 1 mm of air outside the structure" in text
         assert "% of the structure" not in text
@@ -374,7 +371,7 @@ class TestFeatureResolution:
         """*Update Mesh* never reaches pre-flight - it meshes, draws, and
         prints this. So the one route on which every runaway grid was actually
         met is the one that has to carry the sentence."""
-        side = round((mesh.LARGE_GRID_BYTES / mesh.BYTES_PER_CELL) ** (1 / 3)) + 2
+        side = round((LARGE_GRID_BYTES / BYTES_PER_CELL) ** (1 / 3)) + 2
         report = mesh_report(uniform(count=side), [], params())
 
         assert report.oversized is not None
@@ -450,6 +447,318 @@ class TestFeatureResolution:
         assert feature.is_sheet
         assert report.unresolved == ()
         assert "Speck: a point" in report.summary()
+
+
+class TestWhatTheGridPutAcrossAMeasuredChord:
+    """Delivery of a count, on the grid rather than on the intention.
+
+    Nothing else in the report can ask it. Every other verdict here is built one
+    per mesher region, and a shape a box cannot describe contributes none - which
+    is exactly the shape whose thickness had to be measured along a chord instead
+    of read off a box.
+    """
+
+    def chord(self, start, end, across=3, face=0):
+        """A count demand covering the segment from ``start`` to ``end``.
+
+        Built the way ``lfs._element_counts`` builds one - a box covering the
+        segment, plus the direction it ran - so the report has to put the two
+        back together to know which corner is which end.
+        """
+        span = tuple(far - near for near, far in zip(start, end))
+        return Feature(
+            thickness=math.sqrt(sum(n * n for n in span)),
+            normal=span,
+            lower=tuple(min(near, far) for near, far in zip(start, end)),
+            upper=tuple(max(near, far) for near, far in zip(start, end)),
+            across=across,
+            source=f"'Board' across its thickness on face {face}",
+        )
+
+    def scored(self, *measured, count=11):
+        return mesh_report(uniform(count=count), [], params(), measured=measured)
+
+    def test_a_layer_the_grid_counted_is_reported_as_counted(self):
+        report = self.scored(self.chord((2.0, 2.0, 2.0), (2.0, 2.0, 5.0)))
+        assert [(c.asked, c.across) for c in report.counted] == [(3, 3)]
+        assert report.undercounted == ()
+
+    def test_a_layer_it_did_not_is_named_and_says_both_numbers(self):
+        """The demand is not what failed - the grid is coarser than the demand
+        asked for, and until this the model returned a number saying so nowhere.
+        """
+        report = self.scored(self.chord((2.0, 2.0, 2.0), (2.0, 2.0, 3.0), across=4))
+        assert [(c.asked, c.across) for c in report.undercounted] == [(4, 1)]
+        assert "got 1 cell(s) where 4 were asked for" in report.summary()
+        assert "'Board' across its thickness on face 0" in report.summary()
+
+    def test_the_bar_is_the_count_itself_and_one_cell_short_is_short(self):
+        """Where the bar sits is the whole of the verdict. A count of n means n,
+        and a check that only speaks when the grid is far off says nothing about
+        the ordinary near miss - which is the one a relaxation produces.
+        """
+        span = ((2.0, 2.0, 2.0), (2.0, 2.0, 5.0))
+        assert self.scored(self.chord(*span, across=3)).undercounted == ()
+        short = self.scored(self.chord(*span, across=4)).undercounted
+        assert [(c.asked, c.across) for c in short] == [(4, 3)]
+
+    def test_a_chord_off_the_axes_is_counted_along_itself(self):
+        """Which is the case the count exists for. The pitch is along the
+        layer's own normal and the grid realises it on three coarser axis
+        pitches, so a per-axis reading of the same chord says a different thing -
+        and a chord's own count is what says whether the layer was resolved.
+        """
+        report = self.scored(self.chord((1.1, 1.2, 1.3), (4.1, 4.2, 4.3), across=6))
+        assert report.counted[0].across == 10
+        assert report.undercounted == ()
+
+    def skewed(self):
+        """A grid whose axes are spaced differently, so a chord walked one way
+        is not the mirror of the same chord walked the other."""
+        return MeshLines(
+            x=np.array([0.0, 1.0, 3.0, 10.0]),
+            y=np.array([0.0, 2.0, 3.0, 10.0]),
+            z=np.array([0.0, 10.0]),
+            fixed=((),) * 3,
+        )
+
+    def test_a_chord_that_ran_downward_is_the_same_chord(self):
+        """A count carries the box its segment covers and the way the segment
+        ran, and only the two together say which corner is which end. Walking
+        down along one axis while going out along another is an ordinary chord -
+        it is what the walk from a board's upper face does on a tilted layer -
+        and pairing the corners off axis by axis instead puts the segment
+        between two points nothing was measured along.
+
+        Read on a grid whose axes are spaced differently, because on a uniform
+        one the mispaired segment is the mirror of the real one and meets the
+        same number of planes.
+        """
+        down = self.chord((0.0, 3.0, 0.0), (3.0, 0.0, 0.0), across=4)
+        up = self.chord((0.0, 0.0, 0.0), (3.0, 3.0, 0.0), across=4, face=1)
+        report = mesh_report(self.skewed(), [], params(), measured=[down, up])
+        assert [chord.across for chord in report.counted] == [2, 3]
+
+    def test_a_chord_meeting_two_sets_of_planes_together_is_not_credited_twice(self):
+        """The score has to be the cells the layer is in. Summing each axis'
+        own count credits one step into one cell as two, and reports a layer as
+        resolved that is spanned by half what it asked for - which is the
+        direction a check must never fail in.
+        """
+        report = self.scored(self.chord((1.0, 1.0, 2.0), (4.0, 4.0, 2.0), across=6))
+        assert report.counted[0].across == 3
+        assert [(c.asked, c.across) for c in report.undercounted] == [(6, 3)]
+
+    def test_the_thinnest_chord_a_face_carries_is_the_one_reported(self):
+        """A face is measured all over because a layer is thin somewhere, and
+        that somewhere is the whole point of measuring it. One row per sample
+        would bury it."""
+        report = self.scored(
+            self.chord((2.0, 2.0, 2.0), (2.0, 2.0, 8.0)),
+            self.chord((3.0, 3.0, 2.0), (3.0, 3.0, 3.0)),
+            self.chord((4.0, 4.0, 2.0), (4.0, 4.0, 6.0)),
+        )
+        assert len(report.counted) == 1
+        assert report.counted[0].across == 1
+
+    def test_two_faces_are_two_rows(self):
+        report = self.scored(
+            self.chord((2.0, 2.0, 2.0), (2.0, 2.0, 5.0), face=0),
+            self.chord((3.0, 3.0, 2.0), (3.0, 3.0, 3.0), face=1),
+        )
+        assert [c.across for c in report.counted] == [3, 1]
+
+    def test_a_demand_that_is_not_a_count_is_not_scored(self):
+        """A gap and a cross-section ask that a cell *fit*, which is the
+        criterion the mesher works to and is met by construction. Scoring them
+        here would put a second, weaker check beside a guarantee."""
+        gap = Feature(
+            thickness=0.5,
+            normal=(0.0, 0.0, 1.0),
+            lower=(2.0, 2.0, 2.0),
+            upper=(2.0, 2.0, 2.0),
+            source="a gap",
+        )
+        assert self.scored(gap).counted == ()
+
+    def test_a_model_with_nothing_measured_says_nothing(self):
+        report = mesh_report(uniform(count=11), [], params())
+        assert report.counted == ()
+        assert report.undercounted == ()
+
+
+class TestWhatTheGridLaidAcrossAWalkedGap:
+    """Delivery of a gap, on the grid rather than on the demand.
+
+    The mesher meets a gap's demand by construction, so the flag names the
+    exception - a hand-built grid here stands in for a gap driven under the
+    minimum cell or a regression. The stations are built the way the walk
+    emits them: a point, a thickness, a normal whose magnitude is the
+    thickness, and the spacing the sampling realised.
+    """
+
+    SOURCE = "the gap between 'A' and 'B'"
+
+    def station(self, place, width, direction=(0.0, 0.0, 1.0), spaced=None, **extra):
+        length = math.sqrt(sum(c * c for c in direction))
+        return Feature(
+            thickness=width,
+            normal=tuple(c / length * width for c in direction),
+            lower=place,
+            upper=place,
+            source=extra.pop("source", self.SOURCE),
+            sampled_at=width if spaced is None else spaced,
+            **extra,
+        )
+
+    def scored(self, *measured, lines=None):
+        grid = uniform(count=11) if lines is None else lines
+        return mesh_report(grid, [], params(), measured=measured)
+
+    def straddle(self):
+        """What a cell across a climbing demand may reach, from the declared
+        grading - recomputed here so the threshold under test is arithmetic
+        and not the code's own answer."""
+        return 1.0 - math.log(params().max_ratio[0]) / 2.0
+
+    def test_a_gap_the_grid_holds_is_reported_and_not_flagged(self):
+        report = self.scored(self.station((2.5, 2.5, 2.5), width=2.0))
+        assert [(row.asked, row.delivered) for row in report.gapped] == [(2.0, 1.0)]
+        assert report.unheld == ()
+
+    def test_a_gap_it_did_not_hold_is_flagged_with_both_numbers(self):
+        report = self.scored(self.station((2.5, 2.5, 2.5), width=0.5))
+        assert [(row.asked, row.delivered) for row in report.unheld] == [(0.5, 1.0)]
+        assert "! the gap between 'A' and 'B' got a 1 mm cell across" in report.summary()
+        assert "where 0.5 mm was asked for" in report.summary()
+
+    def test_the_flag_sits_at_the_straddle_bound_not_at_the_width(self):
+        """A cell may sit across a demand that climbs along it, so a delivered
+        width inside the straddle of its own demand is the mesher's arithmetic
+        and not a shortfall."""
+        inside = self.station((2.5, 2.5, 2.5), width=self.straddle() * 1.01)
+        past = self.station(
+            (3.5, 3.5, 3.5),
+            width=self.straddle() * 0.99,
+            source="the gap between 'A' and 'C'",
+        )
+        report = self.scored(inside, past)
+        assert [row.source for row in report.unheld] == ["the gap between 'A' and 'C'"]
+
+    def test_an_oblique_gap_is_measured_along_its_own_normal(self):
+        """Each axis' cell counts by the normal's share of it - the quantity
+        the separation demand constrains. A max, a single axis or a Euclidean
+        norm all answer differently on a grid whose axes are spaced apart."""
+        lines = MeshLines(
+            x=np.array([0.0, 1.0, 3.0, 10.0]),
+            y=np.array([0.0, 2.0, 3.0, 10.0]),
+            z=np.array([0.0, 10.0]),
+            fixed=((),) * 3,
+        )
+        report = self.scored(
+            self.station((2.0, 2.5, 5.0), width=1.0, direction=(1.0, 1.0, 0.0)),
+            lines=lines,
+        )
+        assert report.gapped[0].delivered == pytest.approx(3.0 / math.sqrt(2.0))
+
+    def test_a_station_on_a_line_reads_the_wider_neighbour(self):
+        """A gap's wall lands exactly on a pinned line, and the two cells
+        meeting there are both laid against its demand - the narrower one
+        would flatter the grid."""
+        lines = MeshLines(
+            x=np.array([0.0, 1.0, 3.0, 10.0]),
+            y=np.array([0.0, 10.0]),
+            z=np.array([0.0, 10.0]),
+            fixed=((),) * 3,
+        )
+        report = self.scored(
+            self.station((1.0, 5.0, 5.0), width=4.0, direction=(1.0, 0.0, 0.0)),
+            lines=lines,
+        )
+        assert report.gapped[0].delivered == pytest.approx(2.0)
+
+    def test_the_worst_station_of_a_gap_is_the_row(self):
+        """Relative to its own width, not absolutely: a run's width varies,
+        and the station with the widest cell against what it asked is the one
+        that decides whether the gap was delivered."""
+        report = self.scored(
+            self.station((2.5, 2.5, 2.5), width=2.0),
+            self.station((3.5, 3.5, 3.5), width=0.6),
+        )
+        assert [(row.asked, row.delivered) for row in report.gapped] == [(0.6, 1.0)]
+
+    def test_two_gaps_are_two_rows(self):
+        report = self.scored(
+            self.station((2.5, 2.5, 2.5), width=2.0),
+            self.station((3.5, 3.5, 3.5), width=2.0, source="the gap between 'A' and 'C'"),
+        )
+        assert [row.source for row in report.gapped] == [
+            "the gap between 'A' and 'B'",
+            "the gap between 'A' and 'C'",
+        ]
+
+    def test_a_run_sampled_coarser_than_its_gap_states_what_may_lie_between(self):
+        """The cap is the sampler's policy, so the line is a statement and
+        never a flag - and the promise is arithmetic from the recorded
+        spacing: the demand plus the field's climb over half of it, through
+        the same straddle as the flag's own threshold."""
+        grading = math.log(params().max_ratio[0])
+        report = self.scored(self.station((2.5, 2.5, 2.5), width=2.0, spaced=8.0))
+        (row,) = report.gapped
+        assert row.capped
+        assert report.coarsely_walked == (row,)
+        assert row.between == pytest.approx(
+            (2.0 + grading * 8.0 * math.sqrt(3.0) / 2.0) / self.straddle()
+        )
+        assert "was walked every 8 mm" in report.summary()
+        assert f"held to {row.between:.4g} mm rather than 2 mm" in report.summary()
+        assert report.unheld == ()
+
+    def test_a_run_sampled_at_its_own_width_is_not_called_coarse(self):
+        report = self.scored(self.station((2.5, 2.5, 2.5), width=2.0))
+        assert report.coarsely_walked == ()
+        assert "was walked every" not in report.summary()
+
+    def test_a_witness_or_a_count_is_not_scored_as_a_gap(self):
+        """A witness stands alone - no spacing, no family, no run to promise
+        anything over - and a count is scored by its own row."""
+        witness = Feature(
+            thickness=0.5,
+            normal=(0.0, 0.0, 0.5),
+            lower=(2.5, 2.5, 2.5),
+            upper=(2.5, 2.5, 2.5),
+            source=self.SOURCE,
+        )
+        count = self.station((2.5, 2.5, 2.5), width=0.5, across=3)
+        assert self.scored(witness, count).gapped == ()
+
+    def test_a_relaxed_gap_is_left_out(self):
+        """A relaxation says this body's lengths may not ask finer than that,
+        and warning about a coarseness somebody asked for is how a section
+        gets skipped - the stance the count rows already take."""
+        relaxed = self.station((2.5, 2.5, 2.5), width=0.5, relaxed_to=1.0)
+        assert self.scored(relaxed).gapped == ()
+
+    def test_a_model_with_nothing_walked_says_nothing(self):
+        report = self.scored()
+        assert report.gapped == ()
+        assert report.unheld == ()
+        assert "walked every" not in report.summary()
+
+    def test_a_grading_too_steep_for_the_straddle_flags_nothing(self):
+        """The straddle is linearised in the slope, and MeshParams accepts a
+        ratio that drives it to zero - the thresholds must go unbounded there,
+        not negative, or every walked gap is flagged against arithmetic that
+        stopped meaning anything."""
+        report = mesh_report(
+            uniform(count=11),
+            [],
+            params(max_ratio=(8.0,) * 3),
+            measured=[self.station((2.5, 2.5, 2.5), width=0.5)],
+        )
+        (row,) = report.gapped
+        assert row.allowed == math.inf
+        assert report.unheld == ()
 
 
 class TestAgainstTheRealMesher:
@@ -530,3 +839,66 @@ class TestSummary:
         # z is the flat axis, so it must not appear as a cell count at all.
         assert "across z" not in text
         assert "across x" in text
+
+
+class TestWhatCouldNotBeMeasured:
+    """The one thing in the report that is not read off the grid.
+
+    A face nothing was read at and a face with nothing to read leave the same
+    grid, so the report cannot separate them by looking at it. What separates
+    them is the record the measurement kept while it was being refused, and
+    these hold the report to saying which it was.
+    """
+
+    def record(self, *filled):
+        found = Refused()
+        for source, answered, declined in filled:
+            for _ in range(answered):
+                found.answered(source)
+            for _ in range(declined):
+                found.declined(source)
+        return found
+
+    def report(self, record=None):
+        return mesh_report(uniform(count=11), [], params(), refused=record)
+
+    def test_a_report_handed_no_record_says_nothing_about_it(self):
+        """A caller that reached the mesher on its own and kept no tally has
+        nothing to say here, and a report volunteering a row about a record it
+        never had would be describing the caller rather than the drawing."""
+        assert self.report().unmeasured == ()
+        assert self.report().partly_measured == ()
+
+    def test_a_source_answered_nowhere_is_named_with_what_it_was_asked(self):
+        report = self.report(self.record(("'Reflector' rim curving", 0, 12)))
+        assert report.unmeasured == (("'Reflector' rim curving", 12),)
+        assert report.partly_measured == ()
+
+    def test_a_source_answered_in_places_is_the_other_row(self):
+        """It raised the demand it would have raised anyway, over fewer places,
+        so it is not the same claim as a source read nowhere."""
+        report = self.report(self.record(("'Reflector' curving on face 3", 12, 52)))
+        assert report.unmeasured == ()
+        assert report.partly_measured == (("'Reflector' curving on face 3", 12, 64),)
+
+    def test_a_source_the_drawing_answered_throughout_is_neither(self):
+        """The guard on the two above. A report flagging a source that answered
+        every station would put a row under every mesh."""
+        report = self.report(self.record(("'Reflector' rim curving", 12, 0)))
+        assert report.unmeasured == () and report.partly_measured == ()
+
+    def test_both_rows_are_flagged_and_name_the_source(self):
+        """Flagged, because a kernel declining a station is neither this
+        workbench's policy nor its arithmetic. Named, because the reader's next
+        act is to open the object."""
+        text = self.report(
+            self.record(
+                ("'Reflector' rim curving", 0, 12),
+                ("'Reflector' curving on face 3", 12, 52),
+            )
+        ).summary()
+        assert "  ! 'Reflector' rim curving answered none of its 12 station(s)" in text
+        assert "  ! 'Reflector' curving on face 3 answered 12 of its 64 stations" in text
+
+    def test_and_a_drawing_that_answered_throughout_puts_no_row_in_the_summary(self):
+        assert "answered" not in self.report(self.record(("'Pad' outline", 9, 0))).summary()

@@ -3,24 +3,32 @@
 
 """Building, refreshing and ageing the mesh preview.
 
-Solver-aware glue: it knows both the document objects and the openEMS adapter,
-which is what ``Gui/`` is for. It imports **no Qt**, so all of it is testable
-without a display - the task panel is a few lines of wiring on top.
+This module is solver-aware glue. It knows both the document objects and the
+openEMS adapter, which is what ``Gui/`` is for. It imports no Qt, so all of it
+is testable without a display, and the task panel is a few lines of wiring on
+top.
 
 Staleness
 ---------
 
-Meshing is manual, following FreeCAD's own FEM workbench. The cost of that
-choice is that a preview can quietly stop describing the document, which is
-precisely the failure a preview exists to prevent. So the preview records the
-*grid* digest it was built from and :func:`staleness` re-derives it on demand;
-a preview that no longer matches says so.
+Meshing is manual, following FreeCAD's own FEM workbench. That choice costs
+this: a preview can stop describing the document without reporting it.
 
-The grid digest, not the envelope's. Raising ``MaxTimesteps`` moves the envelope
-and changes nothing about the mesh, and a preview that cried stale for that
-would train people to ignore it. What re-deriving costs, and why that is cheap
-enough to do whenever the panel opens, is on
-:func:`~..Solvers.openems.document.grid_inputs_digest`.
+:func:`staleness` reads two records, in this order. The
+preview carries a badge, which anything that moves a cell writes as it is
+edited - ``Objects/staleness.py``. Behind that the preview records the grid
+digest it was built from, and this module re-derives that digest when the badge
+says the drawing still stands, which catches what no property edit announces.
+
+The digest a preview carries comes off the plan that drew it, and so does the
+list of what it was meshed from. Both describe the reading the grid was laid
+from. A second read of the document can differ from the first, so both are
+taken off the plan.
+
+The digest covers the grid rather than the envelope. Raising ``MaxTimesteps``
+moves the envelope and changes nothing about the mesh. What re-deriving costs
+is on :func:`~..Solvers.openems.document.grid_inputs_digest`, and it is why the
+badge is read first.
 """
 
 import time
@@ -29,11 +37,16 @@ import FreeCAD
 
 from ..Objects import _vp_hook
 from ..Objects import preview as _preview_objects
-from ..Objects.analysis import analysis_of, members
-from ..Objects.kinds import kind_of
-from ..Objects.preview import createEMMeshPreview, set_segments
+from ..Objects.analysis import find_preview
+from ..Objects.preview import (
+    createEMMeshPreview,
+    set_grid,
+    set_provenance,
+    set_segments,
+    stored_grid,
+)
 from ..Solvers.openems import document as _document
-from ..Solvers.openems.preview import preview_segments
+from ..Solvers.openems.preview import DrawnGrid, preview_segments
 from ..Solvers.openems.report import Extent, mesh_report
 from ..undo import transaction
 
@@ -41,27 +54,14 @@ from ..undo import transaction
 CURRENT = None
 
 
-def find_preview(analysis):
-    """The analysis's mesh preview, or ``None``. One per analysis.
-
-    Per analysis and not per document: two studies over one board have two
-    grids, and a document-wide lookup would hand the second one the first one's
-    picture. That is exactly the ownership-by-scan the container replaced.
-    """
-    for member in members(analysis):
-        if kind_of(member) == "EMMeshPreview":
-            return member
-    return None
-
-
 def refresh(analysis):
     """Mesh the analysis, draw it, and describe it.
 
-    Returns ``(preview, report)``. Creates the preview object if there is none,
-    so the first Update is also the thing that puts it in the tree.
+    Returns ``(preview, report)``. It creates the preview object if there is
+    none, so the first Update also puts the preview in the tree.
 
     Any :class:`~..Solvers.openems.document.TranslationError` is left to
-    propagate: a model that cannot be meshed must not leave a stale picture on
+    propagate. A model that cannot be meshed must not leave a stale picture on
     screen looking current.
     """
     doc = analysis.Document
@@ -69,8 +69,8 @@ def refresh(analysis):
     # Settle the graph first. Anything the user just edited is still touched,
     # and recomputing it afterwards would reach the preview through its links,
     # call execute(), and mark the drawing stale on the strength of having just
-    # been drawn - the panel saying "Mesh drawn" in green beside an amber
-    # out-of-date badge.
+    # been drawn. The panel would then say "Mesh drawn" in green beside an
+    # amber out-of-date badge.
     try:
         doc.recompute()
     except Exception:  # pragma: no cover - a broken feature elsewhere
@@ -80,13 +80,14 @@ def refresh(analysis):
     plan = _document.mesh(analysis)
     elapsed = time.perf_counter() - started
 
-    # Safe now: mesh() went through contents() and would have refused first.
-    solver = _document.contents(analysis).solver
+    # Off the plan, so the solver read here is the one the grid was laid from
+    # rather than whatever the study holds by now.
+    solver = plan.found.solver
 
     # From here down the document changes, so from here down is one undo
-    # step. Not the settling recompute above, which is housekeeping and
-    # belongs to whatever the user did before this; and not
-    # ``_document.mesh``, which touches nothing and can refuse, and a
+    # step. The transaction excludes the settling recompute above, which is
+    # housekeeping and belongs to whatever the user did before this. It also
+    # excludes ``_document.mesh``, which touches nothing and can refuse, and a
     # transaction opened around a refusal is an empty one. See
     # ``Microwave/undo.py`` for what Ctrl-Z did without this.
     with transaction(doc, "Update Mesh"):
@@ -94,82 +95,136 @@ def refresh(analysis):
         if preview is None:
             preview = createEMMeshPreview(doc)
             analysis.addObject(preview)
-        segments = preview_segments(
-            plan.lines,
-            plan.params,
-            str(preview.Display),
-            slices=[bool(getattr(preview, f"ShowSlice{a}")) for a in "XYZ"],
-            positions=[float(getattr(preview, f"Slice{a}")) for a in "XYZ"],
+        # Stored first, then drawn from what was stored. Drawing from the plan
+        # and storing beside it would let the two part. This way every Update
+        # Mesh walks the same round trip a redraw walks.
+        set_grid(
+            preview,
+            (plan.lines.x, plan.lines.y, plan.lines.z),
+            [[pin.position for pin in axis if pin.required] for axis in plan.lines.fixed],
+            plan.params.absorber,
         )
+        segments = _drawing(preview)
         report = mesh_report(
             plan.lines,
             plan.regions,
             plan.params,
+            measured=plan.measured,
             structure=Extent(*plan.structure) if plan.structure else None,
             max_timesteps=int(solver.MaxTimesteps),
             # Scaling the reported bound is honest because the factor reaches
-            # openEMS. Read through ``document`` so that a
-            # factor openEMS would ignore is refused here too, rather than drawn:
-            # this path never builds an envelope, so it does not otherwise meet the
-            # bound. It is not in the preview's staleness digest, and deliberately
-            # so - the factor moves the timestep and not one grid line, so the
-            # drawing on screen is still the grid that was meshed. What keeps that
-            # from being a trap is ``MeshReport.summary``, which names the factor
-            # beside the number it scaled.
+            # openEMS. The factor is read through ``document`` so that a factor
+            # openEMS would ignore is refused here too rather than drawn: this
+            # path never builds an envelope, so it does not otherwise meet the
+            # bound. The factor is left out of the preview's staleness digest.
+            # It moves the timestep and not one grid line, so the drawing on
+            # screen is still the grid that was meshed. ``MeshReport.summary``
+            # keeps that from being a trap by naming the factor beside the
+            # number it scaled.
             timestep_factor=_document.timestep_factor(solver),
             elapsed=elapsed,
+            # The measurement's own record, and not the rest of the tally,
+            # which holds what the mesh cost and is not shown here.
+            refused=plan.spent.refused,
         )
-        set_segments(
+        set_segments(preview, segments)
+        set_provenance(
             preview,
-            segments,
-            digest=_document.grid_inputs_digest(analysis),
+            # The plan's own key, not a fresh one. Deriving it here would
+            # read the document again, and a second read can differ from the
+            # one the grid was laid from.
+            digest=plan.inputs_digest,
             cells=report.cells,
         )
-        _link(preview, analysis)
+        _link(preview, plan.found)
         _mark_current(preview)
     return preview, report
 
 
+def _drawing(preview):
+    """The segments one view of this preview's own stored grid is made of.
+
+    ``None`` where the preview carries no grid to draw. Both routes go through
+    here, so the picture Update Mesh draws is the picture a redraw would draw
+    from the same stored grid. On the Update Mesh route the answer is never
+    ``None``: a grid the mesher laid has just been stored, and the mesher
+    refuses an axis with fewer than two positions.
+    """
+    grid = stored_grid(preview)
+    if grid is None:
+        return None
+    axes, anchors, absorber = grid
+    return preview_segments(
+        DrawnGrid(axes=axes, anchors=anchors, absorber=absorber),
+        str(preview.Display),
+        slices=[bool(getattr(preview, f"ShowSlice{a}")) for a in "XYZ"],
+        positions=[float(getattr(preview, f"Slice{a}")) for a in "XYZ"],
+    )
+
+
 def _mark_current(preview):
-    """Say the drawing matches, and stop it being told otherwise by its own work.
+    """Record that the drawing matches, and keep its own work from undoing that."""
+    preview.Status = _preview_objects.CURRENT
+    _untouch(preview)
+
+
+def _untouch(preview):
+    """Keep a drawing from marking its own work stale.
 
     Assigning the Shape touches the preview, so the next recompute would call
-    ``execute`` - which exists to notice that something changed - and it
-    would mark the drawing stale on the strength of having just been drawn.
-    Purging the touched flag is what breaks that loop.
+    ``execute``, which exists to notice that something changed, and it would
+    mark the drawing stale on the strength of having just been drawn. Purging
+    the touched flag breaks that loop.
+
+    On the redraw route it does more than tidy up. A display property does not
+    touch the preview - ``Objects/staleness`` marks them so - but the Shape
+    written here does, and a preview left touched is recomputed, which marks the
+    drawing it has just made out of date.
+
+    A touch the redraw did not cause survives it. Measured on FreeCAD 1.1.1, a
+    dependent is marked when the graph is walked rather than when the object it
+    depends on is edited, so an edit made before a slice is nudged still moves
+    the badge on the next recompute.
     """
-    preview.Status = _preview_objects.CURRENT
     try:
         preview.purgeTouched()
     except AttributeError:  # a stand-in object in a test
         pass
 
 
-def _link(preview, analysis):
+def _link(preview, found):
     """Put the preview into FreeCAD's dependency graph.
 
-    Group membership is ownership, not dependency: FreeCAD does not touch a
-    preview because a solid inside the same study moved. These links are what
-    make the graph reach it, and FEM's mesh objects carry the same kind for the
-    same reason.
+    Group membership is ownership rather than dependency. FreeCAD does not
+    touch a preview because a solid inside the same study moved. These links
+    make the graph reach it, and FEM's mesh objects carry the same kind of link
+    for the same reason.
 
-    Rebuilt on every refresh rather than maintained, because what a grid was
-    meshed from is exactly what the last translation found, and anything else
-    would be a second opinion about the document.
+    The links are rebuilt on every refresh rather than maintained, and from
+    what the translation found rather than from the study as it stands now. A
+    grid was meshed from the one, and the other would be a second opinion about
+    the document.
 
-    Failures are swallowed. A missing marker is cosmetic; a preview that
-    refuses to draw because a link could not be set is not.
+    Failures are swallowed. A missing marker is cosmetic, and a preview that
+    refuses to draw because a link could not be set is worse.
     """
     try:
-        found = _document.contents(analysis)
-        # Refinement regions belong here as much as bindings do: a region that
+        # Refinement regions belong here as much as bindings do. A region that
         # is not linked never touches the preview, so editing its ElementSize
-        # leaves the badge saying Current while the grid it describes has moved.
-        # The geometry a region points at needs linking too, or a cylinder
-        # referenced only by a region is invisible to the badge.
-        # Everything except the analysis itself. The preview is *in* that
-        # group, and a link back at it would close a cycle - see the note in
-        # Objects/preview.py. Its members are siblings, so linking them is fine.
+        # leaves the badge saying Current while the grid it describes has
+        # moved. The geometry a region points at needs linking too, or a
+        # cylinder referenced only by a region is invisible to the badge.
+        # The list holds everything except the analysis itself. The preview is
+        # inside that group, and a link back at it would close a cycle. See the
+        # note in Objects/preview.py. The group's members are siblings, so
+        # linking them is fine.
+        #
+        # This list is what the study compares its membership against, so it
+        # is how moving a port into the study or out of it reaches the badge:
+        # nothing touches the preview for that, and no property announces it.
+        # See Objects/analysis.py::_the_meshed_membership_moved. Rebuilt here
+        # and nowhere else, which is why an object added after an Update Mesh
+        # is invisible to the graph until the next one.
         meshed = [
             found.solver,
             found.settings,
@@ -188,63 +243,75 @@ def _link(preview, analysis):
 
 
 def redraw(preview):
-    """Redraw an existing preview without remeshing it.
+    """Redraw an existing preview from the grid it already carries.
 
-    For the display properties only. Changing ``Display`` or a slice position is
-    a request to look at the same grid differently, and a display property that
-    needs a button press is not how FreeCAD behaves anywhere else - a user does not
-    presses Apply after changing Transparency.
+    This is for the display properties only. Changing ``Display`` or a slice
+    position is a request to look at the same grid differently, and a display
+    property that needs a button press is not how FreeCAD behaves anywhere
+    else. Nobody presses Apply after changing Transparency.
 
-    Meshing is still manual, and this does not change that: it re-runs the
-    translation to get the lines back, so it costs what a mesh costs. Returns
-    ``False`` if it could not, which is not an error - a preview whose model
-    no longer translates keeps the picture it has, and the panel says why.
+    It re-runs neither the translation nor the mesher. The preview stores the
+    grid it was drawn from, so a different view of that grid is a different
+    drawing of the same numbers. It therefore leaves ``Digest`` and ``Status``
+    alone. Nothing it does can change what the drawn grid matches, and
+    re-deriving the digest here would stamp the preview with a hash of a
+    different read of the document than the grid it shows.
+
+    It returns ``False`` if it could not, which is not an error. A preview whose
+    stored grid is empty or does not describe a grid keeps the picture it has,
+    and so does one that is in no document.
     """
-    analysis = analysis_of(preview)
-    if analysis is None:
+    doc = getattr(preview, "Document", None)
+    if doc is None:
         return False
-    try:
-        plan = _document.mesh(analysis)
-    except Exception:
+    segments = _drawing(preview)
+    if segments is None:
         return False
 
-    # The other caller of set_segments, and it rewrites the same Shape:
-    # untransacted, one change of Display replaces the whole drawing with no
-    # undo entry, so Ctrl-Z reaches past it and removes the entire Update Mesh
-    # step, leaving Display where the user just put it. FreeCAD's own
-    # AutoTransaction covers an edit made through the property editor; nothing
-    # covers one made from a macro or the Python console.
-    with transaction(analysis.Document, "Redraw Mesh Preview"):
-        set_segments(
-            preview,
-            preview_segments(
-                plan.lines,
-                plan.params,
-                str(preview.Display),
-                slices=[bool(getattr(preview, f"ShowSlice{a}")) for a in "XYZ"],
-                positions=[float(getattr(preview, f"Slice{a}")) for a in "XYZ"],
-            ),
-            digest=_document.grid_inputs_digest(analysis),
-            cells=plan.lines.cell_count,
-        )
-        _mark_current(preview)
+    # This is the other caller of set_segments, and it rewrites the same
+    # Shape. Untransacted, one change of Display replaces the whole drawing
+    # with no undo entry, so Ctrl-Z reaches past it and removes the entire
+    # Update Mesh step, leaving Display where the user just put it. FreeCAD's
+    # own AutoTransaction covers an edit made through the property editor.
+    # Nothing covers one made from a macro or the Python console.
+    with transaction(doc, "Redraw Mesh Preview"):
+        set_segments(preview, segments)
+        _untouch(preview)
     return True
 
 
 def staleness(analysis):
     """Why the preview no longer describes the document, or :data:`CURRENT`.
 
-    A sentence fit to show a user, not a boolean, because each way a preview can
-    be wrong needs something different done about it.
+    The return is a sentence fit to show a user rather than a boolean. Each way
+    a preview can be wrong needs something different done about it.
 
-    Never raises. It is called to decorate a panel, and a model too broken to
-    translate has a better message waiting for it on Check.
+    The badge is read before the key is derived, and the key only where the
+    badge says the drawing still stands. The two answer different questions and
+    each sees what the other cannot: the badge fires for anything that moved a
+    cell, and it over-reports, while the key catches what no property edit
+    announces - a solid renamed. Deriving the key against a badge already
+    reading stale would let this print a green line under an amber icon.
+
+    So an edit undone is still reported. A solid nudged and put back leaves
+    the badge stale, and this takes the badge at its word rather than
+    re-deriving. That costs one press of Update Mesh.
+
+    Nothing here writes the badge. Healing it from the key would put a document
+    write on opening a panel, and would turn a correct verdict into a wrong one
+    wherever the key is the blind half - two tilings of one region hash alike
+    and mesh differently.
+
+    This never raises. It is called to decorate a panel, and Check has a better
+    message for a model too broken to translate.
     """
     preview = find_preview(analysis)
     if preview is None:
         return "no mesh preview yet"
     if not preview.Digest:
         return "the preview was never built"
+    if str(preview.Status) != _preview_objects.CURRENT:
+        return "the model has changed since the preview was built"
 
     try:
         current = _document.grid_inputs_digest(analysis)
@@ -258,22 +325,4 @@ def staleness(analysis):
 
 # Registered at import so a display-property change redraws even if the task
 # panel has never been opened. InitGui imports this module for that reason.
-def status_of(preview):
-    """``Current`` or ``Out of date`` for one preview. Never raises.
-
-    Called from the object's ``execute``, so it runs during a recompute - it
-    must be cheap and it must not throw. A model that no longer translates is
-    reported out of date, which is true and is the safe direction to be wrong in.
-    """
-    analysis = analysis_of(preview)
-    if analysis is None or not getattr(preview, "Digest", ""):
-        return _preview_objects.OUT_OF_DATE
-    try:
-        matches = _document.grid_inputs_digest(analysis) == preview.Digest
-    except Exception:
-        return _preview_objects.OUT_OF_DATE
-    return _preview_objects.CURRENT if matches else _preview_objects.OUT_OF_DATE
-
-
 _vp_hook.register_preview_redraw(redraw)
-_vp_hook.register_preview_status(status_of)

@@ -139,11 +139,11 @@ class TestOneNameForOneThing:
         assert set(properties.AXIS_NAMES) <= offered
 
     def test_the_air_padding_default_is_one_number(self, doc):
-        """``write.DEFAULT_PADDING`` and ``EMMeshPolicy.AirCells*`` are the same
+        """``plan.DEFAULT_PADDING`` and ``EMMeshPolicy.AirCells*`` are the same
         fact in two layers that may not import each other. They agree today; the
         point is that nothing made them, which is how FLATNESS diverged."""
         from Microwave.Objects.mesh import createEMMeshPolicy
-        from Microwave.Solvers.openems.write import DEFAULT_PADDING
+        from Microwave.Solvers.openems.plan import DEFAULT_PADDING
 
         settings = createEMMeshPolicy(doc=doc)
         declared = {
@@ -213,10 +213,10 @@ def test_every_waveguide_mode_the_gui_offers_can_actually_be_built(doc):
 class TestEachKindDeclaresItsOwnSurface:
     """One table: what every port has, what each kind adds, and what it must not.
 
-    One table, not a function per kind: that shape makes a new port kind six
-    edits, and leaves the *isolation* claim to a hand-written test naming two
-    kinds out of five. Here a kind that leaks a property into another is caught
-    by that other kind's own row, and adding a kind is adding a row.
+    One table, not a function per kind: a function per kind leaves the
+    *isolation* claim to a hand-written test naming whichever kinds its author
+    had in mind. Here a kind that leaks a property into another is caught by
+    that other kind's own row, and adding a kind is adding a row.
 
     ``must_not_have`` is not decoration. ``Length`` on the base class was a
     silent no-op of exactly that kind - a lumped port's box is the
@@ -367,10 +367,10 @@ class TestNoPortPropertyIsANoOp:
         **What this still cannot see** is *which kind* reaches a read. ``Length``
         is read as ``obj.Length`` - but only the microstrip and waveguide
         builders read it, so on the base class it was a no-op for lumped ports
-        and this check would pass it either way. What found
-        it by setting it to 999 and watching the box not move. The guard for that
-        is structural, in ``test_port_subclass_property_isolation``: the property
-        is not on the kind that ignores it. This one is the coarser net that
+        and this check would pass it either way. What found it was setting it
+        to 999 and watching the box not move. The guard for that is structural,
+        in ``TestEachKindDeclaresItsOwnSurface``: the property is not on the
+        kind that ignores it. This one is the coarser net that
         catches a property no kind reads at all.
         """
         import ast

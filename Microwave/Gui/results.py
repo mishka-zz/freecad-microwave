@@ -3,19 +3,19 @@
 
 """Turning a sweep's output into the document's result object.
 
-Solver-aware glue, exactly like :mod:`.mesh_preview`: it knows both the openEMS
-adapter and the neutral document objects, which is what ``Gui/`` is for. It
-imports **no Qt**, so all of it is testable without a display and the task panel
-is a few lines of wiring on top.
+This module is solver-aware glue, like :mod:`.mesh_preview`. It knows both the
+openEMS adapter and the neutral document objects, which is what ``Gui/`` is
+for. It imports no Qt, so all of it is testable without a display and the task
+panel is a few lines of wiring on top.
 
 The sweep's shape
 -----------------
 
 FDTD drives one port per run, so an N-port matrix is N solves and column *j*
-comes from the run that excited port *j*. Each gets its own directory, named
-after the port it drives - ``<simdir>/port2/`` - so every run keeps its
-envelope, its digest file and its results beside each other. One directory per
-solve, always: the one-port case is a sweep of length one.
+comes from the run that excited port *j*. Each run gets its own directory,
+named after the port it drives, such as ``<simdir>/port2/``, so every run keeps
+its envelope, its digest file and its results beside each other. There is one
+directory per solve in every case. The one-port case is a sweep of length one.
 """
 
 import os
@@ -30,9 +30,9 @@ from ..Solvers.openems import read as _read
 from ..undo import transaction
 
 #: What the matrix is referenced to, in ohms, unless a caller says otherwise.
-#: 50 is the convention every microwave instrument and Touchstone file assumes,
-#: and it is *not* what the ports measured - that is kept separately, per port
-#: per frequency, in ``EMSParameters.PortImpedance*``.
+#: 50 is the convention every microwave instrument and Touchstone file assumes.
+#: It is not what the ports measured. That is kept separately, per port per
+#: frequency, in ``EMSParameters.PortImpedance*``.
 REFERENCE = 50.0
 
 
@@ -48,9 +48,9 @@ class NoResult(Exception):
 def results_of(analysis):
     """Every stored matrix in this analysis, in group order.
 
-    Usually one - :func:`record` overwrites. Several is reachable by hand and
-    will be reachable by feature the day a result can be kept, and the export
-    has to know the difference.
+    Usually there is one, because :func:`record` overwrites. Several is
+    reachable by hand, and will be reachable by feature the day a result can be
+    kept. The export has to know the difference.
     """
     return [member for member in members(analysis) if kind_of(member) == "EMSParameters"]
 
@@ -58,27 +58,29 @@ def results_of(analysis):
 def find_results(analysis):
     """The analysis's result object, or ``None``. One per analysis.
 
-    Per analysis and not per document, for the same reason the mesh preview is:
-    two studies over one board produce two matrices, and a document-wide lookup
-    would overwrite the first study's answer with the second's.
+    The lookup is per analysis rather than per document, for the same reason
+    the mesh preview is. Two studies over one board produce two matrices, and a
+    document-wide lookup would overwrite the first study's answer with the
+    second's.
 
-    The *first*, deliberately: this answers where a study's matrix lives for
-    writing and reading back, and both want the same one every time. Choosing
-    which of several to hand a *user* is :func:`result_in_hand`'s job.
+    This returns the first. It answers where a study's matrix lives for writing
+    and for reading back, and both want the same one every time. Choosing which
+    of several to hand a user is :func:`result_in_hand`'s job.
     """
     found = results_of(analysis)
     return found[0] if found else None
 
 
 def result_in_hand(document, selection=()):
-    """The stored matrix a toolbar command was aimed at - to draw, or to write.
+    """The stored matrix a toolbar command was aimed at, to draw or to write.
 
     The selection decides whenever it can, including for a result dragged out
     of its group, which has no analysis to be found through.
 
-    Otherwise the study's own - nothing selected, one analysis, one matrix.
-    Where that is ambiguous this raises :class:`NoResult` rather than taking
-    the first in group order, which would act on the wrong matrix in silence.
+    Otherwise this takes the study's own matrix: nothing selected, one
+    analysis, one matrix. Where that is ambiguous this raises :class:`NoResult`
+    rather than taking the first in group order, which would act on the wrong
+    matrix without reporting it.
     """
     for chosen in selection:
         if kind_of(chosen) == "EMSParameters":
@@ -101,12 +103,13 @@ def result_in_hand(document, selection=()):
 def load_runs(locations):
     """One adapter ``Results`` per location, in the order given.
 
-    A location is either a results file or the directory holding one -
+    A location is either a results file or the directory holding one.
     ``read.read`` accepts both, so callers hand it whatever they have.
 
-    Separate from :func:`assemble` so a caller can look at the runs before they
-    are folded into a matrix: checking each against the envelope digest it came
-    from is worth reporting per run rather than as one verdict about the set.
+    This is separate from :func:`assemble` so that a caller can look at the
+    runs before they are folded into a matrix. Checking each run against the
+    envelope digest it came from is worth reporting per run rather than as one
+    verdict about the set.
     """
     return [_read.read(location) for location in locations]
 
@@ -114,8 +117,8 @@ def load_runs(locations):
 def declared_symmetry(analysis):
     """The study's symmetry declaration, in the result layer's vocabulary.
 
-    ``None`` when the user has not claimed one, which is the default and the
-    honest state: a result then holds only what was measured.
+    ``None`` when the user has not claimed one. That is the default and the
+    honest state, because a result then holds only what was measured.
     """
     if str(getattr(analysis, "Symmetry", NO_SYMMETRY)) == MIRROR_SYMMETRY:
         return MIRROR
@@ -126,23 +129,24 @@ def reference_for(analysis) -> float | list[float | None]:
     """What each port's S-parameters are reported against, in matrix order.
 
     ``EMPort.ReferenceImpedance`` is the "50" in "50-ohm system". It has to be
-    passed to ``assemble``, whose default is 50: leave it out and a 75-ohm
-    study comes back renormalised to 50 and *labelled* 50, in the panel and in
+    passed to ``assemble``, whose default is 50. Leave it out and a 75-ohm
+    study comes back renormalised to 50 and labelled 50, in the panel and in
     every Touchstone file.
 
-    ``None`` for a port referenced to its own impedance, which ``from_runs``
-    reads as "resolve this one against what the runs measured". The editor
-    hides the number in that mode, so whatever it holds is stale.
+    The entry is ``None`` for a port referenced to its own impedance, which
+    ``from_runs`` reads as a request to resolve that port against what the runs
+    measured. The editor hides the number in that mode, so whatever it holds is
+    stale.
 
-    Ordered by port number, which is how :meth:`SParameters.from_runs` indexes
-    the matrix. Falls back to the scalar :data:`REFERENCE` when the analysis
-    declares no ports.
+    The list is ordered by port number, which is how
+    :meth:`SParameters.from_runs` indexes the matrix. It falls back to the
+    scalar :data:`REFERENCE` when the analysis declares no ports.
     """
     from ..Objects.ports import PORT_IMPEDANCE, is_port
 
-    # Sorted by number alone. Two ports carrying one number is the
-    # translation's refusal to make, and ordering by the pair would meet it
-    # here first as a TypeError comparing None against a float.
+    # The sort key is the number alone. Two ports carrying one number is the
+    # translation's refusal to make, and ordering by the pair would meet that
+    # case here first, as a TypeError comparing None against a float.
     declared = sorted(
         (
             (
@@ -160,9 +164,9 @@ def reference_for(analysis) -> float | list[float | None]:
 def assemble(runs, reference: float | list[float | None] = REFERENCE, symmetry=None) -> SParameters:
     """Build the matrix a set of runs describes.
 
-    Every consistency question - same frequencies, same ports, same grid, no
-    port driven twice - is :meth:`SParameters.from_runs`'s to refuse. Nothing
-    is re-checked here: a second opinion eventually disagrees with the first.
+    :meth:`SParameters.from_runs` refuses every consistency question: same
+    frequencies, same ports, same grid, no port driven twice. Nothing is
+    re-checked here; :meth:`SParameters.from_runs` owns those refusals.
 
     ``symmetry`` is the study's declaration, which fills the columns a single
     solve could not measure.
@@ -173,15 +177,16 @@ def assemble(runs, reference: float | list[float | None] = REFERENCE, symmetry=N
 def record(analysis, result: SParameters):
     """Put ``result`` into the analysis's result object. Returns the object.
 
-    Creates it on the first run, so the first solve is also what puts it in the
-    tree - as the first Update Mesh is what creates the preview.
+    It creates the object on the first run, so the first solve also puts it in
+    the tree, as the first Update Mesh creates the preview.
 
-    It **overwrites**: a study holds the answer to the question it currently
-    asks. Exporting a Touchstone file is how a matrix is kept.
+    It overwrites, so a study holds only its latest matrix. To keep an earlier
+    one, export it to a Touchstone file.
     """
-    # One undo step, as Update Mesh is, so that Ctrl-Z after a run takes the
-    # S-parameters back out rather than reversing something earlier. Named for
-    # what disappears, not for the button. See ``Microwave/undo.py``.
+    # This is one undo step, as Update Mesh is, so that Ctrl-Z after a run
+    # takes the S-parameters back out rather than reversing something earlier.
+    # The transaction is named for what disappears rather than for the button.
+    # See ``Microwave/undo.py``.
     with transaction(analysis.Document, "Store Results"):
         found = find_results(analysis)
         if found is None:
@@ -189,8 +194,8 @@ def record(analysis, result: SParameters):
             analysis.addObject(found)
         store(found, result)
         # Writing a property touches the object, and the touched mark reads as
-        # "this is stale" on a matrix measured a second ago. Purged rather than
-        # recomputed: ``execute`` has nothing to do.
+        # "this is stale" on a matrix measured a second ago. The mark is purged
+        # rather than recomputed, because ``execute`` has nothing to do.
         found.purgeTouched()
     return found
 
@@ -198,7 +203,7 @@ def record(analysis, result: SParameters):
 def stored(analysis):
     """The matrix this analysis last produced, or ``None`` if it has none.
 
-    ``None`` means *absent* and nothing else. A damaged result raises, because
+    ``None`` means absent and nothing else. A damaged result raises, because
     reading it as "no result yet" would offer Run as the fix for a problem
     running does not fix.
     """
@@ -212,9 +217,9 @@ def stored(analysis):
 class TouchstoneExport:
     """What exporting one result would write, and what to say before writing it.
 
-    Qt-free, like everything else here, so the decision is testable and the
-    command on the toolbar is wiring. The outcomes are different conversations
-    with the user:
+    This is Qt-free, like everything else here, so the decision is testable and
+    the command on the toolbar is wiring. Each outcome asks the user for
+    something different:
 
     * ``refusal`` set - nothing can be written, and the message says what to
       do about it. The command shows it and stops.
@@ -226,8 +231,8 @@ class TouchstoneExport:
     result: SParameters | None = None
     refusal: str = ""
     caveat: str = ""
-    #: A filename without a suffix. ``write_touchstone`` appends ``.sNp`` from
-    #: the port count, which is the only thing that knows how many there are.
+    #: A filename without a suffix. ``write_touchstone`` appends ``.sNp``,
+    #: taking N from the matrix's port count.
     stem: str = ""
 
     @property
@@ -241,17 +246,19 @@ def touchstone_export(holder) -> TouchstoneExport:
 
     The ways a matrix can fall short have different fixes:
 
-    * **Undriven columns.** No file: a ``.sNp`` has a column for every term
-      and no way to mark one as invented. Another solve, or a symmetry.
-    * **A reference the format cannot hold.** No file: Touchstone states one
-      real impedance per port per frequency, and a port reported against its
-      own has none to state. The fix is in the ports.
-    * **Frequency points that hold no numbers.** A file of the points that do,
-      once the user has said so, with the reason in its own header.
+    * **Undriven columns.** No file is written. A ``.sNp`` has a column for
+      every term and no way to mark one as invented. The fix is another solve,
+      or a symmetry.
+    * **A reference the format cannot hold.** No file is written. Touchstone
+      states one real impedance per port per frequency, and a port reported
+      against its own has none to state. The fix is in the ports.
+    * **Frequency points that hold no numbers.** A file of the points that do
+      hold numbers, once the user has said so, with the reason in its own
+      header.
 
     This asks ahead so the command does not open a file dialog it will have to
-    abandon. :meth:`SParameters.write_touchstone` refuses all three on its own,
-    and would still refuse if this were wrong.
+    abandon. :meth:`SParameters.write_touchstone` refuses each of them on its
+    own, and would still refuse if this were wrong.
     """
     try:
         result = load(holder)
@@ -285,10 +292,10 @@ def touchstone_export(holder) -> TouchstoneExport:
 
     caveat = ""
     if result.discarded and len(result.discarded) >= result.frequency.size:
-        # Every point. from_runs refuses this outright, so it arrives only from
-        # a document written by something else - but without it the caveat
-        # offers to write zero points, and saying yes reaches an IndexError
-        # inside scikit-rf.
+        # Every point was discarded. from_runs refuses this outright, so it
+        # arrives only from a document written by something else. Without this
+        # branch the caveat offers to write zero points, and accepting that
+        # reaches an IndexError inside scikit-rf.
         return TouchstoneExport(
             refusal=(
                 f"{_label(holder)} holds no usable numbers: all "
@@ -319,10 +326,10 @@ def _label(obj) -> str:
 def _stem(holder) -> str:
     """A default filename: the document and the result, both as the user named them.
 
-    Sanitised down to word characters and the hyphen, because a FreeCAD label
-    is free text - ``"50 Ω line / rev B"`` is an ordinary one. The dot goes
-    too: ``write_touchstone`` appends the suffix itself, and a label of ``".."``
-    would otherwise name the directory above.
+    The name is sanitised down to word characters and the hyphen, because a
+    FreeCAD label is free text. ``"50 Ω line / rev B"`` is an ordinary one. The
+    dot goes too. ``write_touchstone`` appends the suffix itself, and a label
+    of ``".."`` would otherwise name the directory above.
     """
     document = getattr(getattr(holder, "Document", None), "Name", "")
     parts = [part for part in (document, _label(holder)) if part]
@@ -332,13 +339,13 @@ def _stem(holder) -> str:
 def impedance_lines(result: SParameters):
     """One line per port: the impedance the solver measured, at band centre.
 
-    One frequency, named, because a microstrip's Z0 is dispersive and the whole
-    curve is in the result object anyway.
+    The line quotes one frequency and names it, because a microstrip's Z0 is
+    dispersive and the whole curve is in the result object anyway.
 
-    The centre of the points that *hold* numbers. ``measured_impedance`` is
-    kept at a discarded frequency, but it is exactly the number that went
-    wrong, and a half-wave resonance puts its null at band centre by
-    construction.
+    The frequency is the centre of the points that hold numbers.
+    ``measured_impedance`` is kept at a discarded frequency, but it is exactly
+    the number that went wrong there, and a half-wave resonance puts its null
+    at band centre by construction.
     """
     kept = [i for i in range(result.frequency.size) if i not in set(result.discarded)]
     if not kept:

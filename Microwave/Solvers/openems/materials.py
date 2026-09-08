@@ -3,8 +3,8 @@
 
 """An ``EMMaterial`` object, as the material openEMS is given.
 
-Refused here, by name: a dispersive material, which needs a fitted pole set this
-adapter cannot write.
+One kind is refused here by name: a dispersive material, which needs a fitted
+pole set this adapter cannot write.
 """
 
 from __future__ import annotations
@@ -16,13 +16,14 @@ from ... import units
 from .model import CONDUCTOR_KINDS, Material
 from .properties import TranslationError, _label, _model_fault, _value
 
-#: Re-exported, not redefined: see :data:`Microwave.units.VACUUM_PERMITTIVITY`
-#: for the number and the reasoning. A second copy here is a fact that drifts.
+#: Re-exported rather than redefined. See
+#: :data:`Microwave.units.VACUUM_PERMITTIVITY` for the number and the reasoning.
+#: A second copy of the figure here would drift.
 VACUUM_PERMITTIVITY = units.VACUUM_PERMITTIVITY
 
 
-#: Document ``MaterialType`` to the adapter's material kinds. Absent entries are
-#: refusals, not defaults.
+#: Document ``MaterialType`` to the adapter's material kinds. An absent entry
+#: is a refusal rather than a default.
 _MATERIAL_KINDS = {
     "Dielectric": "dielectric",
     "PEC": "pec",
@@ -38,18 +39,19 @@ _MATERIAL_KINDS = {
 def _material(obj: Any, center_hz: float) -> Material:
     """One ``EMMaterial`` as the adapter sees it.
 
-    Loss tangent becomes a conductivity, ``kappa = 2*pi*f*eps0*eps_r*tand``,
-    evaluated at the centre of the band. That is openEMS' own convention and it
-    is an approximation with a name: a fixed kappa gives a loss tangent that
-    falls as 1/f, so the model is exact at band centre and drifts either side of
-    it. Wideband accuracy needs a dispersive fit, which is why
-    ``FrequencyDependentDielectric`` is refused rather than quietly flattened.
+    The loss tangent becomes a conductivity,
+    ``kappa = 2*pi*f*eps0*eps_r*tand``, evaluated at the centre of the band.
+    That is openEMS' own convention, and it is an approximation: a fixed kappa
+    gives a loss tangent that falls as 1/f, so the model is exact at band centre
+    and drifts either side of it. Wideband accuracy needs a dispersive fit, so
+    ``FrequencyDependentDielectric`` is refused rather than flattened without a
+    word.
 
-    ``MeasuredAt`` travels beside the kappa it was folded into, because nothing
-    below this can recover where that loss tangent was true, and pre-flight -
-    which sees the envelope and never the document - is what holds it against
-    the band. The band's own width is the other half of the same question, and
-    pre-flight reads that off the envelope without help from here.
+    ``MeasuredAt`` travels beside the kappa it was folded into. Nothing below
+    this point can recover where that loss tangent was true, and pre-flight,
+    which sees the envelope and never the document, holds it against the band.
+    The band's own width is the other half of the same question, and pre-flight
+    reads that off the envelope without help from here.
     """
     declared = str(obj.MaterialType)
     kind = _MATERIAL_KINDS.get(declared)
@@ -63,9 +65,9 @@ def _material(obj: Any, center_hz: float) -> Material:
 
     epsilon = float(obj.Permittivity)
     loss_tangent = float(obj.LossTangent)
-    # Checked here because this is the last place the value exists: below it
-    # becomes kappa, and `> 0` sends anything else down the lossless branch as
-    # a clean 0.0, which every guard downstream then passes.
+    # Checked here because this is the last place the value exists. Below this
+    # it becomes kappa, and `> 0` sends anything else down the lossless branch
+    # as a clean 0.0, which every guard downstream then passes.
     if not math.isfinite(loss_tangent) or loss_tangent < 0:
         raise TranslationError(
             f"{_label(obj)!r}: loss tangent is {loss_tangent:g}. It must be a "
@@ -74,8 +76,8 @@ def _material(obj: Any, center_hz: float) -> Material:
         )
     # Only a dielectric's loss tangent becomes anything. A conductor's loss is
     # its conductivity and its thickness, so a loss tangent on one reaches
-    # neither the envelope nor the engine - and dropping a number the user
-    # typed is the silent no-op 4.2 forbids, whatever it would have meant.
+    # neither the envelope nor the engine, and dropping a number the user typed
+    # is a silent no-op, whatever it would have meant.
     if loss_tangent > 0 and kind != "dielectric":
         raise TranslationError(
             f"{_label(obj)!r}: a {declared} carries a loss tangent of "

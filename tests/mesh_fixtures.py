@@ -18,11 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from Microwave.Solvers.openems.mesh import (
-    MaterialClass,
-    MeshParams,
-    Region,
-)
+from Microwave.Solvers.openems.regions import MaterialClass, MeshParams, Region
 
 #: 20 x 20 x 10 mm, comfortably larger than the stackup so the absorber has
 #: somewhere to sit without touching the board.

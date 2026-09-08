@@ -11,6 +11,8 @@ cannot be checked this way is whether the solver agrees - that is
 
 from __future__ import annotations
 
+import ast
+import collections
 import dataclasses
 import hashlib
 import json
@@ -24,18 +26,32 @@ import time
 import numpy as np
 import pytest
 
+from Microwave.portbox import KERNEL_TOLERANCE
 from Microwave.Solvers.openems import (
     capabilities,
     mesh,
     model,
+    plan,
     preflight,
     read,
+    regions,
     run,
+    staircase,
     verify,
     write,
 )
+from Microwave.Solvers.openems.absorber import absorber_walls
 from Microwave.Solvers.openems.containment import contains
-from Microwave.Solvers.openems.mesh import MeshError, MeshLines, MeshParams
+from Microwave.Solvers.openems.grid import (
+    BYTES_PER_CELL,
+    MAX_GRID_BYTES,
+    SAME_CROSSING,
+    MeshLines,
+    cells_across,
+    cells_along,
+    width_spanned,
+)
+from Microwave.Solvers.openems.metal import CONDUCTOR_WIDTH_KEPT, conductor_faces, conductor_run
 from Microwave.Solvers.openems.model import (
     CONDUCTOR_KINDS,
     THROUGH,
@@ -48,6 +64,12 @@ from Microwave.Solvers.openems.model import (
     Solid,
     Termination,
 )
+from Microwave.Solvers.openems.regions import MeshError, MeshParams
+from Microwave.Solvers.openems.sizing import Feature
+from Microwave.Solvers.openems.sizing import demands as sizing_demands
+from Microwave.Solvers.openems.sizing_field import _Constraint, _pruned, _SizingField
+from Microwave.Solvers.openems.spend import Spend
+from tests import import_sweep, triangulated
 
 SUBSTRATE = Solid(
     material="FR4",
@@ -93,7 +115,7 @@ def build_problem(**overrides) -> Problem:
     # the microstrip padding cannot take raised from the argument it overrode.
     grid = overrides.pop("grid", None)
     if grid is None:
-        grid = write.plan_grid(solids, ports, materials, PARAMS, PADDING)
+        grid = plan.plan_grid(solids, ports, materials, PARAMS, PADDING)
     return Problem(
         frequency=overrides.pop("frequency", Frequency(1e9, 10e9, 51)),
         grid=grid,
@@ -113,29 +135,10 @@ _PORT_KIND_SUBSETS = {
     if name.startswith("_") and isinstance(value, frozenset) and value and value <= model.PORT_KINDS
 }
 
-#: The adapter modules that exist to load the engine, and so are the ones no
-#: import sweep may hold to importing without it. ``driver`` is the solver-side
-#: entry point; ``coaxial`` is a port class built out of openEMS' own, which the
-#: bindings do not ship. Both are reached only from a path that has already
-#: loaded the engine - ``driver`` imports ``coaxial`` inside the branch that
-#: builds one.
-_SOLVER_SIDE_MODULES = frozenset({"driver", "coaxial"})
-
 #: Adapter modules that must import on a machine with neither FreeCAD nor
-#: openEMS. Discovered rather than listed, because a hand-maintained list is how
-#: a new module goes silently uncovered - ``report`` was very nearly the first.
-#:
-#: Sub-packages count as one name each. Importing the package runs its
-#: ``__init__``, which is where a package that eagerly imports its own modules
-#: pulls all of them in, so the sweep still judges every file underneath.
-_FREECAD_SIDE_MODULES = sorted(
-    path.stem
-    for path in (
-        pathlib.Path(__file__).resolve().parents[1] / "Microwave" / "Solvers" / "openems"
-    ).iterdir()
-    if (path.suffix == ".py" or (path / "__init__.py").is_file())
-    and path.stem not in {"__init__", *_SOLVER_SIDE_MODULES}
-)
+#: openEMS. Taken from the script CI runs, so the environment the rule is about
+#: and the suite that states the rule are held to one list.
+_FREECAD_SIDE_MODULES = import_sweep.swept()
 
 #: Document-layer modules, on the same terms and for the same reason. Every one
 #: of them must import without reaching *up* to the GUI, and globbing is what
@@ -197,17 +200,17 @@ def import_leaks():
     on ``sys.modules`` in-process would pass vacuously, and the whole claim is
     about a machine that has neither engine nor CAD kernel.
 
-    One child for all ten rather than one each - ten interpreters were a second
-    of a fifteen-second suite. Each module is charged only with the names it
-    *added*, because ``sys.modules`` is cumulative and charging it with everything
-    present would blame all ten for the first one's leak.
+    One child for the whole list rather than one each, because this asks what a
+    module pulled in and not whether it imports. Each module is charged only with
+    the names it *added*, because ``sys.modules`` is cumulative and charging it
+    with everything present would blame the whole list for the first one's leak.
 
     What that costs: the module blamed is the first one whose import pulls the
     banned name in, which may be an importer of the real culprit rather than the
     culprit. Adding ``import skrf`` to ``report`` reports ``preview``, because
     ``preview`` imports ``report`` and sorts before it. What is reported is the
-    banned root, so the chase is one grep; ten processes would have named both
-    ends. Roots and not module names because a single ``import pandas`` puts
+    banned root, so the chase is one grep; a process apiece would have named
+    both ends. Roots and not module names because a single ``import pandas`` puts
     some hundreds of ``pandas.*`` in ``sys.modules``, and an assertion message
     that lists them all says less than one that says ``pandas``.
 
@@ -368,15 +371,16 @@ class TestImportsStayClean:
     def test_every_freecad_side_module_is_swept(self):
         """A floor on names, not on a count.
 
-        ``>= 9`` against a real ten let any one module drop out of the glob and
-        take its leak test with it, silently. Naming them costs a line when a
-        module is added and buys the guarantee the class is named for.
+        A floor on a count holds while a module drops out of the discovery and
+        takes its leak test with it. Naming them costs a line when a module is
+        added and buys the guarantee the class is named for.
         """
         assert {
             "capabilities",
             "document",
             "mesh",
             "model",
+            "plan",
             "preflight",
             "preview",
             "read",
@@ -384,24 +388,26 @@ class TestImportsStayClean:
             "run",
             "write",
         } <= set(_FREECAD_SIDE_MODULES)
-        assert not _SOLVER_SIDE_MODULES & set(_FREECAD_SIDE_MODULES)
 
-    def test_ci_sweeps_the_same_modules_this_one_does(self):
-        """``imports-stay-clean`` runs the same sweep on a bare runner, and
-        states the exclusions itself because a shell loop cannot read this file.
+    def test_ci_runs_the_same_sweep_this_one_does(self):
+        """``imports-stay-clean`` asks the same question on a bare runner, which
+        is the environment the rule is about.
 
-        Both directions break something, and neither breaks visibly here. A
-        module excluded there and not here is one nothing checks on an
-        environment without the engine, which is the environment the rule is
-        about. A module excluded here and not there fails CI on a red that is
-        correct about nothing - which is how this test came to exist.
+        Both sides read ``tests/import_sweep.py``, and what is left to hold is
+        that the job still runs it. Two lists is the arrangement to avoid, and
+        the one that goes stale is the job's: it is written in shell, where a
+        glob for files skips ``preflight`` because that is a package, and the
+        rest of the sweep carries on looking exactly as it does now.
         """
         workflow = (
             pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "tests.yml"
         )
-        cases = re.findall(r'case "\$module" in ([^)]+)\)', workflow.read_text())
-        assert len(cases) == 1, f"expected one module sweep in CI, found {cases}"
-        assert set(cases[0].split("|")) == {"__init__", *_SOLVER_SIDE_MODULES}
+        job = re.split(r"\n {2}\S", workflow.read_text().partition("\n  imports-stay-clean:")[2])
+        assert job[0], "the bare-import job is gone"
+        assert "python -m tests.import_sweep" in job[0], (
+            "the bare-import job no longer runs the sweep this file reads, so the two "
+            "can sweep different sets again"
+        )
 
     def test_capabilities_is_pure_data(self):
         """The set, not a non-membership.
@@ -466,6 +472,193 @@ class TestImportsStayClean:
     def test_capabilities_names_a_reason_for_each_caveat(self):
         for key, note in capabilities.capabilities().notes.items():
             assert note.strip(), f"note {key!r} is empty"
+
+
+class TestWhatAModuleSaysItOffers:
+    """``__all__`` against what the rest of the workbench actually imports.
+
+    A module's ``__all__`` drifts in both directions and neither shows. A name
+    another module imports and this list omits leaves the list describing less
+    than the module offers, so a reader looking for the surface finds an
+    incomplete one. This holds the direction that can be established
+    mechanically: what is imported must be declared.
+
+    The other direction is left alone. A name reached only by a test is still
+    part of what the module offers, and a rule that dropped it would make the
+    list a description of the callers rather than of the module.
+
+    Read out of the source rather than by importing, so a module that needs
+    FreeCAD or the engine is judged the same as one that does not.
+    """
+
+    PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "Microwave"
+
+    def _modules(self):
+        """Every module under ``Microwave``, by dotted name, ``_vendor`` aside."""
+        found = {}
+        for path in self.PACKAGE.rglob("*.py"):
+            parts = path.relative_to(self.PACKAGE.parent).with_suffix("").parts
+            if "_vendor" in parts:
+                continue
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            found[".".join(parts)] = path
+        return found
+
+    def _declared(self, tree):
+        """The module's ``__all__``, or ``None`` where it declares none."""
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+            ):
+                return set(ast.literal_eval(node.value))
+        return None
+
+    def test_every_name_another_module_imports_is_in_that_modules_all(self):
+        modules = self._modules()
+        trees = {name: ast.parse(path.read_text()) for name, path in modules.items()}
+        declared = {name: self._declared(tree) for name, tree in trees.items()}
+
+        taken = collections.defaultdict(set)
+        for name, tree in trees.items():
+            package = name.rsplit(".", 1)[0] if modules[name].name != "__init__.py" else name
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if node.level:
+                    base = package
+                    for _ in range(node.level - 1):
+                        base = base.rsplit(".", 1)[0]
+                    target = f"{base}.{node.module}" if node.module else base
+                else:
+                    target = node.module or ""
+                if target in modules and target != name:
+                    taken[target] |= {alias.name for alias in node.names}
+
+        missing = {
+            name: sorted(taken[name] - names)
+            for name, names in declared.items()
+            if names is not None and taken[name] - names
+        }
+        assert not missing, (
+            "these modules are imported for names their own __all__ leaves out, so "
+            f"the list is not the surface: {missing}"
+        )
+
+
+class TestWhichWayTheMesherPoints:
+    """The mesher is a stack, and this is where the stack is written down.
+
+    Nothing above a module reaches back into it, which is what lets a reader
+    open one and be done. The claim is not enforced by the interpreter: an
+    import that runs the wrong way only fails where it happens to make a cycle,
+    and adding one that does not is an ordinary edit nobody would question. So
+    the direction is stated here, and a new edge that runs the wrong way names
+    itself. Several of these modules state their own place as well, and where
+    one does the two agree; the rest are held by this list alone.
+
+    Read out of the source rather than by importing, so the order is judged on
+    what is written rather than on what happened to be imported first.
+    """
+
+    #: The mesher's modules, each importing only those before it. `regions` is
+    #: the vocabulary a mesh is asked in, `mesh` lays the lines, and `plan`
+    #: settles the domain and asks, which puts it above the mesher rather than
+    #: in it - `document.py` calls `plan`, and `plan` calls these. It is on the
+    #: list because the edge worth naming runs the other way: nothing the mesher
+    #: is built from may reach up to whatever briefed it. `surface`, `staircase`
+    #: and `model` are neither - the triangle arithmetic, the half-cell growth
+    #: and the envelope - and they are here because `plan` and `model` import
+    #: them, which puts them under the same rule.
+    #: `test_the_order_names_everything_the_stack_reaches` holds this list to
+    #: naming the whole of what the stack imports.
+    ORDER = (
+        "sizing",
+        "spend",
+        "regions",
+        "grid",
+        "metal",
+        "sizing_field",
+        "absorber",
+        "mesh",
+        "surface",
+        "staircase",
+        "model",
+        "plan",
+    )
+
+    PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "Microwave/Solvers/openems"
+
+    #: The package the stack sits in, as an import writes it.
+    DOTTED = "Microwave.Solvers.openems"
+
+    def _reached(self, tree):
+        """Every module of this package the source names, whichever way it says it.
+
+        Each import is resolved to the module it names and then compared with
+        this package, rather than matched against the spelling this stack
+        happens to use. ``from .absorber import`` reaches one, ``from . import
+        staircase`` reaches one, and so does an absolute ``import``. Reading the
+        first alone would make this a rule about how an import is written: the
+        second form is already used here, so an edge written that way would go
+        past without being looked at.
+
+        An import computed at run time is invisible to this, as it is to a
+        reader of the file, and this says nothing about one.
+        """
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                base = self.DOTTED
+                for _ in range(node.level - 1):
+                    base = base.rpartition(".")[0]
+                target = f"{base}.{node.module}" if node.module else base
+                if node.level == 0:
+                    target = node.module or ""
+                names = {alias.name for alias in node.names}
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith(f"{self.DOTTED}."):
+                        found.add(alias.name[len(self.DOTTED) + 1 :].partition(".")[0])
+                continue
+            else:
+                continue
+
+            if target == self.DOTTED:
+                found |= names
+            elif target.startswith(f"{self.DOTTED}."):
+                found.add(target[len(self.DOTTED) + 1 :].partition(".")[0])
+        return found
+
+    def test_no_module_of_the_mesher_imports_one_after_it(self):
+        wrong = {}
+        for at, name in enumerate(self.ORDER):
+            tree = ast.parse((self.PACKAGE / f"{name}.py").read_text())
+            back = sorted(self._reached(tree) & set(self.ORDER[at:]))
+            if back:
+                wrong[name] = back
+        assert not wrong, (
+            "the mesher's modules are written as a stack, and these imports run back "
+            f"up it: {wrong}"
+        )
+
+    def test_the_order_names_everything_the_stack_reaches(self):
+        """The list is a claim about coverage as well as about direction.
+
+        A module the stack imports and this list omits is one nothing here says
+        anything about, and it goes unnoticed: the test above compares against
+        the names it was given, so an edge to an absent module reads as clean.
+        """
+        off = {}
+        for name in self.ORDER:
+            tree = ast.parse((self.PACKAGE / f"{name}.py").read_text())
+            missing = sorted(self._reached(tree) - set(self.ORDER))
+            if missing:
+                off[name] = missing
+        assert not off, (
+            "these are imported by the stack and named nowhere in the order, so "
+            f"nothing says which way the edge to them runs: {off}"
+        )
 
 
 class TestPortGeometry:
@@ -603,7 +796,7 @@ class TestDomain:
     CAPPED = dataclasses.replace(PARAMS, cap=2.5)
 
     def test_padding_in_cells_pushes_the_domain_out(self):
-        lower, upper = write.domain([SUBSTRATE], [], self.CAPPED, ((4, 4), (4, 4), (4, 4)))
+        lower, upper = plan.domain([SUBSTRATE], [], self.CAPPED, ((4, 4), (4, 4), (4, 4)))
         assert lower[0] == pytest.approx(-50.0 - 4 * 2.5)
         assert upper[2] == pytest.approx(1.6 + 4 * 2.5)
 
@@ -617,18 +810,20 @@ class TestDomain:
         slower = dataclasses.replace(self.CAPPED, dielectric_res=0.5, metal_res=0.25)
         assert slower.ceiling == self.CAPPED.ceiling
         for params in (self.CAPPED, slower):
-            lower, _ = write.domain([SUBSTRATE], [], params, ((4, 4),) * 3)
+            lower, _ = plan.domain([SUBSTRATE], [], params, ((4, 4),) * 3)
             assert lower[0] == pytest.approx(-50.0 - 4 * 2.5)
 
-    def test_through_pulls_the_domain_in_by_the_absorber_depth(self):
-        """So the absorber lands on the structure, which is what makes a line
-        infinite rather than open-circuited."""
-        lower, upper = write.domain(
+    def test_through_leaves_the_domain_on_the_structure(self):
+        """Nothing is predicted here any more. The absorber comes out of the
+        structure's own extent inside the mesher, where the pitch it will be
+        laid at is a property of the settled sizing field - so the domain this
+        function returns is the drawing, and how deep the block reaches is not
+        its question."""
+        lower, upper = plan.domain(
             [SUBSTRATE], [], self.CAPPED, ((THROUGH, THROUGH), (4, 4), (4, 4))
         )
-        depth = self.CAPPED.pml_cells[0] * 2.5
-        assert lower[0] == pytest.approx(-50.0 + depth)
-        assert upper[0] == pytest.approx(50.0 - depth)
+        assert lower[0] == pytest.approx(-50.0)
+        assert upper[0] == pytest.approx(50.0)
 
     #: FR4 at the acceptance cap: 2.5 / sqrt(4.4).
     FR4_SIZE = 2.5 / math.sqrt(4.4)
@@ -636,107 +831,90 @@ class TestDomain:
     def sizes(self):
         return {"FR4": self.FR4_SIZE, "Metal": 2.5, "Foil": 2.5}
 
-    def test_through_reserves_the_size_of_the_material_at_the_wall(self):
-        """Not a vacuum cell. The absorber is laid in whatever crosses the
-        face, and reserving a vacuum cell over-reserved by sqrt(eps)."""
-        lower, upper = write.domain(
-            [SUBSTRATE],
-            [],
-            self.CAPPED,
-            ((THROUGH, THROUGH), (4, 4), (4, 4)),
-            self.sizes(),
+    def laid(self, solids, ports, params=None, materials=MATERIALS):
+        """Each THROUGH face's block, and how far the grid falls short of the
+        structure there. The second is the quantity the whole rule is about."""
+        params = params or dataclasses.replace(PARAMS, cap=2.5)
+        grid = plan.plan_grid(solids, ports, materials, params, PADDING)
+        lows, highs = plan.structure_bounds(solids, ports)
+        cells = params.pml_cells[0]
+        return (
+            (grid.x[cells] - grid.x[0], grid.x[0] - lows[0]),
+            (grid.x[-1] - grid.x[-1 - cells], highs[0] - grid.x[-1]),
         )
-        # Both faces: each looks inward from its own end, and a window that
-        # reached the wrong way would find air and reserve a ceiling.
-        assert lower[0] == pytest.approx(-50.0 + 8 * self.FR4_SIZE)
-        assert upper[0] == pytest.approx(50.0 - 8 * self.FR4_SIZE)
 
-    def test_a_face_meeting_air_still_reserves_a_vacuum_cell(self):
-        """Nothing constrains the field there, so it relaxes to the ceiling -
-        which is what the reservation has to assume. Reserving the slowest
-        material's size on a face that material does not cross lets the absorber
-        overrun the structure."""
-        offset = Solid(material="FR4", lower=(-20.0, -10, 0), upper=(20.0, 10, 1.6))
-        wide = Solid(material="Metal", lower=(-50.0, -10, 0), upper=(50.0, 10, 0))
-        lower, _ = write.domain(
-            [offset, wide],
-            [],
-            self.CAPPED,
-            ((THROUGH, THROUGH), (4, 4), (4, 4)),
-            {"FR4": self.FR4_SIZE},
+    def test_the_grid_ends_where_the_structure_does(self):
+        """The whole point of the rule. A reservation can only bound what will
+        be laid, so a grid built from one ends short of the drawing by however
+        much the mesher refines past the prediction, and on a line whose
+        conductor runs its whole length that is a large share of the block."""
+        for _, shortfall in self.laid((SUBSTRATE, GROUND), (PORT,)):
+            assert shortfall == pytest.approx(0.0, abs=1e-9)
+
+    def test_the_block_is_one_size_throughout(self):
+        """openEMS samples its own grading over whatever lines it is handed, so
+        a block that grades reflects - measured, and worth 12 dB of reflection
+        floor at the spread a mesh leaves near its own boundary."""
+        grid = plan.plan_grid(
+            (SUBSTRATE, GROUND), (PORT,), MATERIALS, dataclasses.replace(PARAMS, cap=2.5), PADDING
         )
-        assert lower[0] == pytest.approx(-50.0 + 8 * 2.5)
+        cells = PARAMS.pml_cells[0]
+        for block in (np.diff(grid.x[: cells + 1]), np.diff(grid.x[-cells - 1 :])):
+            assert np.allclose(block, block[0], rtol=1e-9, atol=0.0)
 
-    def test_the_coarsest_material_in_the_window_wins(self):
-        """The wall lands somewhere in the window and we cannot know where, so
-        the reservation must bound every candidate. Taking the *finest* would
-        let a fine region elsewhere shrink the reservation below what a coarse
-        region at the wall actually lays - an overrun, which reflects."""
-        coarse = Solid(material="FR4", lower=(-50.0, -10, 0), upper=(50.0, 10, 1.6))
-        fine = Solid(material="Slow", lower=(-49.0, -10, 0), upper=(-48.0, 10, 1.6))
-        lower, _ = write.domain(
-            [coarse, fine],
-            [],
-            self.CAPPED,
-            ((THROUGH, THROUGH), (4, 4), (4, 4)),
-            {"FR4": self.FR4_SIZE, "Slow": 0.1},
-        )
-        assert lower[0] == pytest.approx(-50.0 + 8 * self.FR4_SIZE)
+    @pytest.mark.parametrize("fine", [0.05, 0.2, 0.9])
+    @pytest.mark.parametrize("at", [0.5, 3.0, 12.0, 60.0])
+    def test_the_block_is_no_coarser_than_the_field_inside_it(self, fine, at):
+        """The invariant the one-step reading rests on, stated on its own.
 
-    def test_the_finest_material_over_a_station_is_what_bounds_its_pitch(self):
-        """Two regions over the same span: the grid there is as fine as the
-        finer of them, because constraints compete by minimum. So a station
-        contributes its *smallest* size, and the window contributes its
-        largest station. Both halves are needed and they pull opposite ways.
+        ``_absorber_cell`` starts from the size the field wants at the wall and
+        takes the field's minimum over the block *that* size implies. The block
+        it returns is finer, so the block it describes is a sub-band of the one
+        it was read over - and the minimum over a band only falls as the band
+        grows, so nothing inside the real block is finer than the answer. Were
+        that false the interior cell meeting the block would be the finer of the
+        two and the seam would break the smoothness rule with nothing to fix it.
+
+        Asserted against a field, not a grid, because the claim is about the
+        function rather than about any drawing: one demand for a fine cell, slid
+        from just inside the wall to well past where any block could reach.
         """
-        board = Solid(material="FR4", lower=(-50.0, -10, 0), upper=(50.0, 10, 1.6))
-        dense = Solid(material="Slow", lower=(-50.0, -10, 0), upper=(50.0, 10, 0.2))
-        lower, _ = write.domain(
-            [board, dense],
-            [],
-            self.CAPPED,
-            ((THROUGH, THROUGH), (4, 4), (4, 4)),
-            {"FR4": self.FR4_SIZE, "Slow": 0.1},
+        params = dataclasses.replace(PARAMS, cap=2.5)
+        cells, floor = params.pml_cells[0], float(params.min_cell)
+        field = _SizingField(
+            [_Constraint(at, at, fine, "a demand")],
+            params.ceiling,
+            math.log(params.max_ratio[0]),
+            floor,
         )
-        assert lower[0] == pytest.approx(-50.0 + 8 * 0.1)
+        size = mesh._absorber_cell(field, 0.0, 1.0, cells, floor)
+        inside = np.linspace(0.0, cells * size, 200)
+        assert size <= float(np.min(field(inside))) * (1.0 + 1e-9) or size == floor
 
-    def test_a_window_of_pure_air_reserves_a_full_ceiling(self):
-        """Nothing covers it, so every station relaxes to the ceiling. This is
-        the branch that stops a metal-only face under-reserving."""
-        assert write._coarsest_in([], {"FR4": 0.1}, 0, (-50.0, -30.0), 2.5, 1e-4) == 2.5
+    def test_a_slower_material_at_the_wall_takes_a_finer_block(self):
+        """Not by arithmetic over the material list, which is what the old
+        reservation did - by the mesher laying finer cells in a slower medium
+        and the block copying them. Asserted as an ordering rather than a
+        figure, because what the field settles to is not something this test
+        should be restating."""
+        slow = tuple(
+            dataclasses.replace(material, epsilon=20.0)
+            if material.kind == "dielectric"
+            else material
+            for material in MATERIALS
+        )
+        (fast_block, _), _ = self.laid((SUBSTRATE, GROUND), (PORT,))
+        (slow_block, _), _ = self.laid((SUBSTRATE, GROUND), (PORT,), materials=slow)
+        assert slow_block < fast_block
 
-    def test_without_per_material_sizes_nothing_changes(self):
-        """A caller with no vacuum cap gets what the ceiling alone reserves."""
-        lower, _ = write.domain([SUBSTRATE], [], self.CAPPED, ((THROUGH, THROUGH), (4, 4), (4, 4)))
-        assert lower[0] == pytest.approx(-50.0 + 8 * 2.5)
-
-    def test_the_reservation_is_what_the_mesher_then_lays(self):
-        """The point of the whole rule: reserved and realised must agree.
-
-        Counting a THROUGH face in a vacuum cell instead makes them disagree by
-        sqrt(eps) on the acceptance line, which is what lets the domain
-        collapse at a low band.
-        """
-        capped = dataclasses.replace(PARAMS, cap=2.5)
-        grid = write.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, capped, PADDING)
-        reserved = 8 * self.FR4_SIZE
-        for laid in (grid.x[8] - grid.x[0], grid.x[-1] - grid.x[-9]):
-            # Never past: that is the reflector, and the guard refuses it.
-            assert laid <= reserved + 1e-9
-            # And close, which is the new part. Reserving a vacuum cell gave
-            # 0.44 of this on the same fixture.
-            assert laid / reserved > 0.9
-
-    #: Displacements the mesher merges away, so the reservation must too. The
-    #: series runs from the smallest a double can express at this magnitude up
-    #: to the cell floor itself, which is where the mesher stops merging - and
-    #: :meth:`test_a_gap_the_grid_can_hold_still_reserves_a_vacuum_cell` stands
-    #: just the other side of it, so the pair fence the threshold from both
-    #: sides rather than leaving it free to be anything.
+    #: Displacements the mesher merges away, so the grid must land in the same
+    #: place either way. The series runs from the smallest a double can express
+    #: at this magnitude up to the cell floor itself, which is where the mesher
+    #: stops merging.
     #:
     #: Two ulps and not one: for adjacent doubles ``0.5 * (a + b)`` rounds onto
-    #: one of them, the station stays inside the solid, and a test written with
-    #: a single step passes whether the rule is there or not.
+    #: one of them, and a test written with a single step passes whether the
+    #: rule is there or not.
     MERGED_AWAY = (
         2 * math.ulp(50.0),
         4 * math.ulp(50.0),
@@ -749,8 +927,8 @@ class TestDomain:
         """``PORT`` with its ends pushed out past the substrate's by that much.
 
         Outward, so the port sets the structure bound and the substrate's own
-        face lands strictly inside the window - which is the arrangement that
-        splits a band off, and the one a kernel hands over.
+        face lands strictly inside - which is the arrangement a kernel hands
+        over when a drawing says two faces are one.
         """
         return dataclasses.replace(
             PORT,
@@ -758,90 +936,383 @@ class TestDomain:
             stop=(50.0 + high, *PORT.stop[1:]),
         )
 
-    def reserved(self, port):
-        """What each THROUGH face on x takes off the structure bound."""
-        padding = ((THROUGH, THROUGH), (4, 4), (4, 4))
-        lows, highs = write.structure_bounds([SUBSTRATE], [port])
-        lower, upper = write.domain([SUBSTRATE], [port], self.CAPPED, padding, self.sizes())
-        return lower[0] - lows[0], highs[0] - upper[0]
-
     @pytest.mark.parametrize("end", ("low", "high"))
     @pytest.mark.parametrize("displacement", MERGED_AWAY)
-    def test_a_face_the_mesher_merges_away_does_not_change_the_reservation(self, end, displacement):
-        """The reservation is what must not move, not the wall.
+    def test_two_faces_a_kernel_split_still_land_the_grid_on_the_structure(self, end, displacement):
+        """The precision case that made the old reservation misread a wall.
 
-        The domain follows the structure bound by construction, so a face
-        displaced by d moves the wall by d whatever this rule does; the depth
-        taken off that bound is the quantity the rule is about. Both ends,
-        because they are each other's reflection in the code as much as in the
-        model, and perturbing one proves half of it.
+        Two faces a drawing says are one arrive from the geometry kernel a few
+        ulps apart, and the band between them is nowhere a cell can sit. The
+        rule has nothing to read there any more - the block is laid at what the
+        mesher lays - so the grid lands on the structure whichever face won.
         """
-        displaced = self.overhanging(**{end: displacement})
-        exact = self.reserved(PORT)
-        assert self.reserved(displaced) == pytest.approx(exact, rel=0.0, abs=1e-9)
+        port = self.overhanging(**{end: displacement})
+        for _, shortfall in self.laid((SUBSTRATE, GROUND), (port,)):
+            assert shortfall == pytest.approx(0.0, abs=1e-9)
 
-    @pytest.mark.parametrize("end", ("low", "high"))
     @pytest.mark.parametrize("gap", (2 * CAPPED.min_cell, 10.0))
-    def test_a_gap_the_mesher_keeps_still_reserves_a_vacuum_cell(self, end, gap):
-        """The far fence, so a failure above cannot be answered by widening the
-        threshold. A line genuinely running out past the board has air at the
-        wall, and air is a ceiling - the behaviour the rule above must leave
-        alone. The narrower gap sits just the other side of the cell floor, so
-        the two tests together pin the threshold to the floor and nothing else.
-        """
-        depth = self.CAPPED.pml_cells[0] * self.CAPPED.ceiling
-        low_end, high_end = self.reserved(self.overhanging(**{end: gap}))
-        assert (low_end if end == "low" else high_end) == pytest.approx(depth)
-
-    def test_a_window_with_no_room_for_a_cell_is_the_vacuum_answer(self):
-        """The same rule at its limit: no band at all is nowhere a cell could
-        sit, and that is what a window of air answers. Zero would be a
-        reservation of nothing, which puts the absorber past the structure.
-
-        Called directly because :func:`write.domain` cannot show it - a window
-        collapses only when the absorber is zero cells deep, and the offset is
-        then multiplied by zero whatever this returns.
-        """
-        floor = float(self.CAPPED.min_cell)
-        assert write._coarsest_in([SUBSTRATE], self.sizes(), 0, (-50.0, -50.0), 2.5, floor) == 2.5
-
-    @pytest.mark.parametrize("displacement", (0.0, *MERGED_AWAY))
-    def test_the_grid_still_reaches_the_structure_it_was_reserved_against(self, displacement):
-        """Where the reservation is spent, rather than what it was computed to be.
-
-        The absorber is laid at the pitch the domain wall happens to have, so
-        comparing laid depth against a depth the test computes itself agrees
-        with the code whichever reservation it used. What a wrong reservation
-        moves is the outer grid line *relative to the structure*, and only
-        measuring that catches it.
-        """
-        capped = dataclasses.replace(PARAMS, cap=2.5)
-        port = self.overhanging(low=displacement)
-        grid = write.plan_grid((SUBSTRATE, GROUND), (port,), MATERIALS, capped, PADDING)
-        lows, highs = write.structure_bounds([SUBSTRATE, GROUND], [port])
-        for shortfall in (grid.x[0] - lows[0], highs[0] - grid.x[-1]):
-            # Never past the structure: that is the reflector the guard refuses.
-            assert shortfall >= -1e-9
-            # And not far short either, which is what a vacuum reservation on a
-            # substrate wall gives. The bound is a fraction of the reservation
-            # rather than a length, so it moves with the fixture.
-            assert shortfall < 0.1 * 8 * self.FR4_SIZE
-
-    def test_the_absorber_cannot_land_beyond_the_structure(self):
-        """The guarantee behind THROUGH: dielectric_res caps every cell."""
-        grid = write.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
-        assert grid.x[0] >= -50.0 - 1e-9
-        assert grid.x[-1] <= 50.0 + 1e-9
-
-    def test_an_absorber_that_eats_the_structure_is_refused(self):
-        thin = Solid(material="FR4", lower=(-1.0, -10, 0), upper=(1.0, 10, 1.6))
-        with pytest.raises(EnvelopeError, match="consume the whole structure"):
-            write.domain([thin], [], PARAMS, ((THROUGH, THROUGH), (4, 4), (4, 4)))
+    def test_a_line_running_out_past_the_board_still_lands_on_its_own_end(self, gap):
+        """The far fence. A port strip genuinely running out past the substrate
+        puts air at the wall rather than a merged face, and the grid has to end
+        on the strip - which is now the structure bound - rather than on the
+        board behind it."""
+        port = self.overhanging(low=gap)
+        (_, shortfall), _ = self.laid((SUBSTRATE, GROUND), (port,))
+        assert shortfall == pytest.approx(0.0, abs=1e-9)
 
     def test_the_port_conductor_counts_toward_the_extent(self):
         stub = Solid(material="FR4", lower=(-5, -5, 0), upper=(5, 5, 1.6))
-        lower, upper = write.domain([stub], [PORT], PARAMS, ((1, 1), (1, 1), (1, 1)))
+        lower, upper = plan.domain([stub], [PORT], PARAMS, ((1, 1), (1, 1), (1, 1)))
         assert lower[0] < -50.0, "the port's strip must widen the domain"
+
+    @pytest.mark.parametrize("padding", [(THROUGH, THROUGH), (0, 0)])
+    def test_an_axis_with_no_extent_and_no_air_is_refused(self, padding):
+        """A THROUGH face adds nothing, so an axis the drawing is flat on and
+        that asks for no air has no volume to mesh at all.
+
+        A conducting sheet is drawn flat on one axis and is the ordinary case,
+        so the refusal has to name the axis rather than arrive as an empty grid
+        or a division somewhere further down. Zero air cells reach the same
+        place by the other route, which is why both are here.
+        """
+        sheet = Solid(material="Metal", lower=(-5, -5, 1.6), upper=(5, 5, 1.6))
+        faces = ((1, 1), (1, 1), padding)
+        with pytest.raises(EnvelopeError, match="no extent in z"):
+            plan.domain([sheet], [], PARAMS, faces)
+
+
+class TestWhatAThroughWallExcusesFromResolution:
+    """A cut end is fictitious; the body it cuts is not.
+
+    Declaring a face THROUGH says the structure runs on past it, so the ring or
+    edge the drawing stops at measures nothing real and refining to it puts the
+    model's finest cells inside the absorber. A boxed solid gets that exemption
+    from ``_edge_to_resolve``; a triangulated one carries no region and reaches
+    the sizing field only through measured demands, which is the asymmetry the
+    wall rule closes.
+
+    It is a narrow exemption, and the width is the whole subject. A solid's own
+    bulk cell size is a measured demand too, spanning the body from end to end,
+    and it is the *only* way a triangulated solid is resolved as a material -
+    so a rule that dropped whatever crossed the wall would mesh a substrate at
+    the vacuum cell and under-sample it by the root of its permittivity, along
+    the one axis the declaration was about.
+    """
+
+    #: A board with the same extent as ``SUBSTRATE``, so the two are one drawing
+    #: differing only in how the kernel handed it over.
+    LOW, HIGH = (-50.0, -10.0, 0.0), (50.0, 10.0, 1.6)
+
+    #: Vacuum-capped, so ``cap`` is what a material coarser than FR4 would get
+    #: and the two answers are far enough apart to tell apart.
+    CAPPED = dataclasses.replace(PARAMS, cap=2.5)
+
+    @staticmethod
+    def brick(low, high):
+        """The corners and outward-wound triangles of an axis-aligned box."""
+        (x0, y0, z0), (x1, y1, z1) = low, high
+        corners = (
+            (x0, y0, z0),
+            (x1, y0, z0),
+            (x1, y1, z0),
+            (x0, y1, z0),
+            (x0, y0, z1),
+            (x1, y0, z1),
+            (x1, y1, z1),
+            (x0, y1, z1),
+        )
+        faces = (
+            (0, 3, 2),
+            (0, 2, 1),
+            (4, 5, 6),
+            (4, 6, 7),
+            (0, 1, 5),
+            (0, 5, 4),
+            (3, 7, 6),
+            (3, 6, 2),
+            (0, 4, 7),
+            (0, 7, 3),
+            (1, 2, 6),
+            (1, 6, 5),
+        )
+        return dict(vertices=corners, faces=faces)
+
+    def board(self, *, triangulated):
+        extra = self.brick(self.LOW, self.HIGH) if triangulated else {}
+        return Solid(material="FR4", lower=self.LOW, upper=self.HIGH, label="Substrate", **extra)
+
+    def cells(self, *, triangulated):
+        """The coarsest interior cell along the axis that runs out through."""
+        lines, _, _ = plan.plan_mesh(
+            (self.board(triangulated=triangulated),), (), MATERIALS, self.CAPPED, PADDING
+        )
+        block = self.CAPPED.pml_cells[0]
+        return float(np.diff(np.asarray(lines.x, dtype=float))[block:-block].max())
+
+    def test_a_triangulated_board_is_meshed_as_the_material_it_is(self):
+        """Not as vacuum, which is what losing the bulk demand costs."""
+        assert self.cells(triangulated=True) == pytest.approx(2.5 / math.sqrt(4.4), rel=0.02)
+
+    def test_the_two_drawings_of_one_board_agree(self):
+        """The stronger form, and the one that does not restate the arithmetic:
+        how the kernel handed the shape over is not a property of the wave in
+        it, so the two have to be meshed alike."""
+        assert self.cells(triangulated=True) == pytest.approx(
+            self.cells(triangulated=False), rel=0.02
+        )
+
+    def test_a_demand_at_the_wall_is_still_excused(self):
+        """The other half. A point demand on the wall is the cut end itself -
+        the finest thing in the model, asked for where the absorber will be."""
+        wall = self.LOW[0]
+        cut = Feature(
+            thickness=0.05,
+            normal=None,
+            lower=(wall, 0.0, 0.0),
+            upper=(wall, 0.0, 0.0),
+            source="'Shield' edge",
+        )
+        walls = absorber_walls(wall, self.HIGH[0], (True, True))
+        assert list(mesh._measured_features((cut,), 0, self.CAPPED, walls)) == []
+        assert [c.source for c in mesh._measured_features((cut,), 0, self.CAPPED, ())] == [
+            "'Shield' edge"
+        ], "with no wall declared there is nothing to excuse it"
+
+    def test_a_demand_reaching_in_from_the_wall_is_kept(self):
+        """Where the line between them is drawn: touching the wall is a cut,
+        crossing it is a body."""
+        wall = self.LOW[0]
+        walls = absorber_walls(wall, self.HIGH[0], (True, True))
+        body = Feature(
+            thickness=0.05,
+            normal=None,
+            lower=(wall, 0.0, 0.0),
+            upper=(wall + 1.0, 0.0, 0.0),
+            source="'Substrate' bulk",
+        )
+        assert [c.source for c in mesh._measured_features((body,), 0, self.CAPPED, walls)] == [
+            "'Substrate' bulk"
+        ]
+
+    def test_a_demand_measured_elsewhere_does_not_size_the_block(self):
+        """The grid is separable, so a demand is spent on each axis on its own -
+        and one that misses the model on *another* axis would still refine the
+        slab it projects onto here, somewhere the geometry it was measured from
+        is not. The mesher drops such a demand before meshing; the pass that
+        sizes the block settles a field of its own and has to drop it too, or
+        the two are sized from different demands.
+
+        Placed inside the board along the axis under test and well outside it
+        across, so nothing but the projection could bring it in.
+        """
+        outside = (self.LOW[0] + 20.0, self.HIGH[1] + 500.0, 0.8)
+        stray = Feature(
+            thickness=0.01, normal=None, lower=outside, upper=outside, source="'Elsewhere' edge"
+        )
+        board = self.board(triangulated=True)
+
+        def block(measured):
+            lines, _, _ = plan.plan_mesh(
+                (board,), (), MATERIALS, self.CAPPED, PADDING, measured=measured
+            )
+            return float(np.diff(np.asarray(lines.x, dtype=float))[0])
+
+        assert block((stray,)) == pytest.approx(block(()), rel=1e-12)
+
+    def test_an_axis_with_no_absorber_of_its_own_still_excuses_its_cut(self):
+        """The declaration is what makes a cut end fictitious, not the absorber.
+
+        ``pml_cells`` is per axis, and an axis walled by a conductor or closed
+        with Mur gets none - Mur absorbs, so a face declared THROUGH against one
+        is as legitimate as any. Nothing is then taken off the inside, so the
+        interior is meshed right up to the declared wall and the block that
+        excuses the cut end everywhere else does not exist. Left to that, the
+        end sets the finest cell in the model, and through the Courant limit the
+        timestep of the whole run.
+        """
+        wall = self.LOW[0]
+        cut = Feature(
+            thickness=0.02,
+            normal=None,
+            lower=(wall, 0.0, 0.8),
+            upper=(wall, 0.0, 0.8),
+            source="'Substrate' cut end",
+        )
+        board = self.board(triangulated=True)
+        params = dataclasses.replace(self.CAPPED, pml_cells=(0, 8, 8))
+
+        def finest(measured):
+            lines, _, _ = plan.plan_mesh(
+                (board,), (), MATERIALS, params, PADDING, measured=measured
+            )
+            return float(np.diff(np.asarray(lines.x, dtype=float)).min())
+
+        assert finest((cut,)) == pytest.approx(finest(()), rel=1e-12)
+
+    def test_the_rule_reaches_the_block(self):
+        """The rule has to be *wired in*, and this is the half that acts where
+        there is a block to act on.
+
+        The mesher is told about walls too, and where an absorber comes out of
+        the domain that second telling decides nothing: the interior starts one
+        block in, so a demand measured at the wall is outside it before any rule
+        is consulted. What decides it there is the pass that sizes the block,
+        whose field spans the structure - so this is asserted on the block.
+        :meth:`test_an_axis_with_no_absorber_of_its_own_still_excuses_its_cut`
+        is the other half, where there is no block and the mesher is all there
+        is.
+
+        A demand measured off the drawing arrives from the document layer, so a
+        cut end is reproduced here by handing one to ``plan_mesh`` the way that
+        layer does. The same demand is then moved a millimetre inward, where it
+        is no longer a cut end but a feature standing in the absorber, and is
+        resolved. Both grids are meshed the same way and differ in nothing else.
+        """
+        board = self.board(triangulated=True)
+
+        def block(at):
+            place = (self.LOW[0] + at, 0.0, 0.8)
+            cut = Feature(
+                thickness=0.05, normal=None, lower=place, upper=place, source="'Substrate' cut end"
+            )
+            lines, _, _ = plan.plan_mesh(
+                (board,), (), MATERIALS, self.CAPPED, PADDING, measured=(cut,)
+            )
+            return float(np.diff(np.asarray(lines.x, dtype=float))[0])
+
+        excused, resolved = block(0.0), block(1.0)
+        assert excused > 10 * resolved, (
+            "a demand on a THROUGH wall sized the absorber block: it came out "
+            f"{excused:g} mm against {resolved:g} mm for the same demand a "
+            "millimetre inside the model"
+        )
+
+
+class TestADroppedDemandTakesNothingWithIt:
+    """A demand another one covers is dropped where the axis' field is built.
+
+    That is the only place it can be dropped. Deciding that one demand covers
+    another rests on the covering demand reaching the field, and two rules
+    decide which demands reach it: the interior the mesher is given, which stops
+    one absorber block short of a face the structure runs out through, and the
+    wall rule that excuses a cut end standing on such a face. A scan run before
+    either of them credits a demand they take away with covering the demands
+    beside it, and those are gone before anything notices.
+
+    The demands here are handed in the way the document layer hands them over,
+    so what is under test is the order the mesher works in rather than any
+    measurement off a drawing.
+    """
+
+    LOW, HIGH = (-50.0, -10.0, 0.0), (50.0, 10.0, 1.6)
+
+    #: A growth ratio shallow enough that the cut end's ramp reaches well past
+    #: the absorber block, and a block shallow enough to be reached. Domination
+    #: reaches ``(coarse - fine) / slope``, so a steeper ratio or a deeper block
+    #: puts the two demands out of each other's range and the pair says nothing.
+    RATIO, BLOCK = 1.05, 4
+
+    #: The cut end, on the face the structure runs out through, and a demand
+    #: standing inside the model that the cut end's ramp covers. The inside one
+    #: is finer than the board's own bulk size, or losing it would cost nothing.
+    CUT, INSIDE, AT = 0.05, 0.3, -46.0
+
+    def params(self):
+        return MeshParams(
+            metal_res=0.05,
+            dielectric_res=1.0,
+            cap=2.5,
+            max_ratio=(self.RATIO,) * 3,
+            pml_cells=self.BLOCK,
+        )
+
+    def board(self):
+        return Solid(material="FR4", lower=self.LOW, upper=self.HIGH, label="Substrate")
+
+    def point(self, size, at, name):
+        """A point demand asking ``size`` on every axis."""
+        place = (at, 0.0, 0.8)
+        return Feature(
+            thickness=size * math.sqrt(3.0), normal=None, lower=place, upper=place, source=name
+        )
+
+    #: Demands standing beside the one inside the model, each coarser than it
+    #: and near enough that it covers them. They are what gives the scan
+    #: something to do on this model: without them it is handed one demand an
+    #: axis and drops nothing, and a run with the scan disabled is the same run.
+    BESIDE, STEP = 4, 0.4
+
+    def demands(self):
+        covered = tuple(
+            self.point(self.INSIDE * (1.0 + step), self.AT + step * self.STEP, f"beside {step}")
+            for step in range(1, self.BESIDE + 1)
+        )
+        return (
+            self.point(self.CUT, self.LOW[0], "cut end"),
+            self.point(self.INSIDE, self.AT, "inside"),
+            *covered,
+        )
+
+    def lines(self, measured):
+        got, _, _ = plan.plan_mesh(
+            (self.board(),), (), MATERIALS, self.params(), PADDING, measured=tuple(measured)
+        )
+        return [np.asarray(got[dim], dtype=float) for dim in range(3)]
+
+    def test_a_demand_the_absorber_swallows_leaves_the_one_it_covered_standing(self):
+        """The grid a cut end and the demand it covers give is the grid that
+        demand gives on its own. The cut end reaches no line either way - it is
+        excused at the block and outside the interior - so the two runs differ
+        in nothing but whether a scan was told about it.
+        """
+        with_cut, alone = self.lines(self.demands()), self.lines(self.demands()[1:])
+        assert with_cut[0].size > self.lines(())[0].size, (
+            "the demand inside the model reached no line, so a grid that lost "
+            "it would look the same and this asserts nothing"
+        )
+        for dim, (mine, theirs) in enumerate(zip(with_cut, alone)):
+            assert mine.tolist() == theirs.tolist(), (
+                f"the cut end changed the {'xyz'[dim]} lines: {mine.size} against {theirs.size}"
+            )
+
+    def test_and_the_grid_is_the_one_every_demand_gives(self, monkeypatch):
+        """The form that does not rest on which rule did the dropping: the grid
+        carries the same lines whether the scan prunes or keeps everything.
+
+        The count and not the positions. What the scan leaves alone exactly is
+        the field, and ``TestRedundantDemandsAreDropped`` in ``test_mesh_core``
+        asserts that directly. The lines are laid from the integral of the
+        field, and a constraint contributes a bend that integral is summed
+        piece by piece over, so dropping one moves every line in its last
+        digits - the same effect :func:`~.mesh._constraints` names for the
+        demands the ceiling drops.
+
+        The count is exact on this model and is not a property of every model:
+        a gap holds a whole number of cells, so a move in the last digits can
+        tip one between counts and the settling loop carries that forward. What
+        a demand actually lost costs is a grid coarser than the field asks for,
+        and the test above holds that at the place it happens.
+        """
+        spend = Spend()
+        was = _pruned
+
+        def counting(demands, slope, _=None):
+            return was(demands, slope, spend)
+
+        monkeypatch.setattr(mesh, "_pruned", counting)
+        pruned = self.lines(self.demands())
+        raised = sum(len(sizing_demands(self.demands())[dim]) for dim in range(3))
+        assert spend.kept < raised, (
+            "the scan dropped nothing while this grid was laid, so a run with "
+            "it disabled is the same run and this asserts nothing"
+        )
+        monkeypatch.setattr(mesh, "_pruned", lambda demands, slope, spend=None: list(demands))
+        whole = self.lines(self.demands())
+        for dim, (mine, theirs) in enumerate(zip(pruned, whole)):
+            assert mine.size == theirs.size, (
+                f"the scan changed how many lines the {'xyz'[dim]} axis carries: "
+                f"{mine.size} against {theirs.size}"
+            )
 
 
 class TestAThroughFaceLandsOnTheStructure:
@@ -865,7 +1336,7 @@ class TestAThroughFaceLandsOnTheStructure:
     THROUGH_X = ((THROUGH, THROUGH), (8, 8), (8, 8))
 
     def check(self, lines, padding=None):
-        write._check_through_faces_land_on_the_structure(
+        plan._check_through_faces_land_on_the_structure(
             lines, (SUBSTRATE,), (), padding or self.THROUGH_X
         )
 
@@ -873,8 +1344,10 @@ class TestAThroughFaceLandsOnTheStructure:
         self.check(self.lines_ending_at(-50.0, 50.0))
 
     def test_a_grid_ending_short_is_accepted(self):
-        """Short is the over-reservation this guard sits beside, and pre-flight
-        already reports it as a SUBSTITUTE. Only the overrun is wrong."""
+        """Short is what THROUGH declares - the structure runs on past the wall.
+        Nothing this mesher builds ends short any more, but an envelope reaching
+        pre-flight from elsewhere may, and there it is a SUBSTITUTE naming what
+        got clipped. Only the overrun is wrong in itself."""
         self.check(self.lines_ending_at(-43.29, 43.63))
 
     def test_a_grid_running_past_the_structure_is_refused(self):
@@ -899,15 +1372,205 @@ class TestAThroughFaceLandsOnTheStructure:
     def test_an_under_reserving_domain_is_caught_through_the_real_path(self, monkeypatch):
         """The guard has to be *wired in*, not merely correct.
 
-        No reachable configuration overruns today - the reservation is `cap`,
-        which over-reserves - so asserting that a real plan passes proves
-        nothing and passed with the call deleted. This reproduces the fault
-        instead: a THROUGH face that pulls the domain in by nothing at all, so
-        the absorber appended outside it necessarily lands beyond the structure.
+        No reachable configuration overruns today - the block comes out of the
+        structure's own extent, so the grid ends on it by arithmetic - and
+        asserting that a real plan passes proves nothing, having passed with the
+        call deleted. This reproduces the fault instead: a mesher that appends
+        the absorber beyond the domain on a face declared THROUGH, which is what
+        the guard exists to catch and what every route did before the block was
+        taken from the inside.
         """
-        monkeypatch.setattr(write, "domain", lambda *a, **k: write.structure_bounds(a[0], a[1]))
+        monkeypatch.setattr(plan, "inside_the_absorber", lambda domain, params, pitches: domain)
+        monkeypatch.setattr(plan, "absorber_pitches", lambda *a, **k: ((None, None),) * 3)
         with pytest.raises(MeshError, match="past the structure"):
-            write.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
+            plan.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
+
+    def test_a_grid_the_judge_would_reject_does_not_get_out_of_plan_mesh(self, monkeypatch):
+        """The judging call has to be wired in too, and it is no longer structural.
+
+        Judging each axis inside the loop that builds it makes an unjudged grid
+        unreachable, and that is not what happens here. It is judged at the end,
+        after the absorber's pitch has been reconciled - the passes before the
+        last hold a block the interior did not grade into, which is the thing
+        being iterated and not a fault. That leaves one call standing between
+        every grid this workbench builds and no smoothness check, no cell floor
+        and no missing-line check at all.
+
+        Reproduced rather than asserted about a good plan, which would pass with
+        the call deleted: a block far coarser than the interior beside it, held
+        there by a seam test that concedes immediately, is exactly what the
+        reconciliation exists to prevent and exactly what the judge names.
+        """
+        monkeypatch.setattr(
+            plan, "absorber_pitches", lambda *a, **k: ((3.0, 3.0), (None, None), (None, None))
+        )
+        monkeypatch.setattr(plan, "rough_seams", lambda laid, pitches, params: [])
+        with pytest.raises(MeshError, match="violates smoothness"):
+            plan.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
+
+    def test_a_block_the_interior_undercuts_is_laid_again_at_what_it_laid(self, monkeypatch):
+        """The one direction the seam demand cannot bound is repaired by a pass.
+
+        A feature just inside the seam sets the field there instead of the
+        block's own demand, and the interior then comes out finer than the
+        block. The block is laid again at what the interior laid, which is the
+        only move this loop makes.
+
+        Driven so the interior reports half the block it was given, then agrees
+        with what that produced. Both sizes mesh cleanly, so nothing here is
+        judged on smoothness.
+        """
+        block, undercut = 1.0, 0.5
+        asked = []
+        monkeypatch.setattr(
+            plan, "absorber_pitches", lambda *a, **k: ((block, block), (None, None), (None, None))
+        )
+
+        def laid_pitches(lines, params, pitches):
+            asked.append(pitches[0][0])
+            return ((undercut, undercut), (None, None), (None, None))
+
+        monkeypatch.setattr(plan, "laid_pitches", laid_pitches)
+        grid = plan.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
+        assert asked == [block, undercut]
+        laid = float(np.diff(np.asarray(grid.x, dtype=float))[0])
+        assert laid == pytest.approx(undercut, abs=0.0), (
+            f"the block kept the pitch the interior would not meet: {laid:g}"
+        )
+
+    def test_a_model_that_reconciles_takes_one_pass_and_says_so(self):
+        """The count the loop takes, read off the run rather than assumed.
+
+        Every pass but the last lays a whole grid on three axes and throws it
+        away, so this is most of what meshing a reconciling model would cost if
+        it stopped reconciling. Nothing else notices: a loop that took every
+        pass it was allowed and kept the last one produces the same grid this
+        does, and differs only in the wait.
+        """
+        spend = Spend()
+        plan.plan_mesh((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING, spend=spend)
+        assert spend.absorbing == 1
+
+    AIR = ((8, 8),) * 3
+
+    def test_and_the_grid_each_pass_lays_is_counted_too(self):
+        """A pass lays a whole grid, and what that grid spent settling is most
+        of what the pass costs. The loop's own count says how many passes were
+        made and nothing about what one cost, so the two are asserted apart: a
+        tally dropped where the pass builds its grid leaves the pass count
+        standing and reads the settling as nothing at all.
+
+        Driven with air on every face, which is the only arrangement where the
+        answer is the grid's alone. A face the structure runs out through
+        settles the absorber's own pitch first, off a second field, and then
+        the count is a sum of the two and holds up whichever half went missing.
+        """
+        spend = Spend()
+        plan.plan_mesh((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, self.AIR, spend=spend)
+        assert spend.settling > 0
+
+    def test_and_a_block_the_interior_undercuts_takes_a_second(self, monkeypatch):
+        """The guard against the count above holding for nothing. A tally that
+        never moved would satisfy it, and the loop's own repair is what it has
+        to move for."""
+        block, undercut = 1.0, 0.5
+        monkeypatch.setattr(
+            plan, "absorber_pitches", lambda *a, **k: ((block, block), (None, None), (None, None))
+        )
+        monkeypatch.setattr(
+            plan,
+            "laid_pitches",
+            lambda lines, params, pitches: ((undercut, undercut), (None, None), (None, None)),
+        )
+        spend = Spend()
+        plan.plan_mesh((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING, spend=spend)
+        assert spend.absorbing == 2
+
+    def test_the_interior_can_overshoot_the_block_too_and_that_is_laid_again(self, monkeypatch):
+        """The bound on the coarser direction has a hole, and a drawing reaches it.
+
+        A cell laid from the seam carries one unit of arclength in the sizing
+        field, so it is coarser than the block by at most
+        ``(exp(slope) - 1) / slope``, which is inside ``max_ratio``. That is why
+        most models take one pass. ``_cell_count`` rounds a gap's cell count
+        *down* where rounding up would put its cells under the floor, and every
+        cell in that gap then carries more than one unit - so a cell floor
+        comparable to what the mesh wants beside the block puts the interior
+        past the bound, and the block has to move up to meet it.
+
+        Driven from geometry rather than from a stub. The claim is about what
+        the placement does with a floor in the way, and a stub asserting the
+        ratio would be the claim written twice.
+        """
+        materials = (
+            Material(name="Air", kind="dielectric", epsilon=1.0),
+            Material(name="Metal", kind="pec"),
+        )
+        solids = (
+            Solid(material="Air", lower=(0.0, -5.0, -5.0), upper=(40.0, 5.0, 5.0), label="Block"),
+            Solid(material="Metal", lower=(3.0, -1.0, -1.0), upper=(4.0, 1.0, 1.0), label="Bar"),
+        )
+        params = MeshParams(
+            metal_res=0.5,
+            dielectric_res=1.0,
+            min_cell=0.4,
+            cap=1.5,
+            min_lines=1,
+            pml_cells=(4, 0, 0),
+        )
+        padding = ((THROUGH, THROUGH), (4, 4), (4, 4))
+
+        seen = []
+        reading = plan.laid_pitches
+
+        def laid_pitches(lines, settings, pitches):
+            out = reading(lines, settings, pitches)
+            seen.append((pitches[0][0], out[0][0]))
+            return out
+
+        monkeypatch.setattr(plan, "laid_pitches", laid_pitches)
+        lines, _, _ = plan.plan_mesh(solids, (), materials, params, padding)
+
+        asked, laid = seen[0]
+        assert laid / asked > params.max_ratio[0], (
+            "the fixture no longer reaches the floor branch: the interior laid "
+            f"{laid:g} against a block of {asked:g}"
+        )
+        assert len(seen) > 1, "the block was never laid again at what the interior laid"
+
+        spacings = np.diff(np.asarray(lines[0], dtype=float))
+        block, interior = spacings[0], spacings[params.absorber[0]]
+        assert max(block, interior) / min(block, interior) <= params.max_ratio[0]
+
+    def test_a_block_the_interior_never_meets_is_refused_by_name(self, monkeypatch):
+        """A model this mesher cannot lay is said out loud rather than handed back.
+
+        A gap holds a whole number of cells, so the map from the block to the
+        cell the interior lays beside it is a step function, and a short orbit
+        is available to it. Whichever member the budget stops on is an arbitrary
+        one: two runs of the same drawing under different budgets would mesh
+        differently, which is a property of the loop and not of the model. So
+        the model gets a refusal naming the face, rather than a grid.
+
+        Driven as a two-cycle the mesher cannot escape, with the two sizes far
+        enough apart that no member of it grades into the interior.
+        """
+        first, second = 1.0, 1.4
+        monkeypatch.setattr(
+            plan, "absorber_pitches", lambda *a, **k: ((first, first), (None, None), (None, None))
+        )
+        monkeypatch.setattr(
+            plan,
+            "laid_pitches",
+            lambda lines, params, pitches: (
+                ((second, second) if pitches[0][0] == first else (first, first)),
+                (None, None),
+                (None, None),
+            ),
+        )
+        with pytest.raises(MeshError, match=r"absorber does not meet the interior") as raised:
+            plan.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
+        assert "the x axis lower face lays 1 against a block of 1.4" in str(raised.value)
 
     def test_the_driver_route_refuses_it_too(self):
         """Refusing while meshing covers the workbench and misses the driver.
@@ -919,37 +1582,67 @@ class TestAThroughFaceLandsOnTheStructure:
         for. The grid is therefore built here rather than meshed: the mesher
         refuses to produce one, which is what leaves this route the only way in.
         """
-        good = write.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
+        good = plan.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
         overrun = np.concatenate(([float(good.x[0]) - 2.0], np.asarray(good.x, dtype=float)))
         grid = MeshGrid(x=overrun, y=good.y, z=good.z, params=dict(good.params))
 
         blocking = preflight.refusals(preflight.check(build_problem(grid=grid)))
         assert any("past the structure" in finding.message for finding in blocking)
 
-    def test_a_padding_shape_no_mesher_would_produce_is_not_a_traceback(self):
+    def test_padding_nobody_declared_leaves_nothing_to_report(self):
+        """A face nobody declared is not declared ``THROUGH``."""
+        lines = self.lines_ending_at(-50.0, 50.0)
+        for padding in (None, ()):
+            assert plan.through_faces_past_the_structure(lines, (SUBSTRATE,), (), padding) == []
+
+    def test_a_padding_shape_no_mesher_would_produce_is_a_finding(self):
         """Pre-flight reads padding off a stored envelope, where it is whatever
         the file says. The mesher's copy has already been through ``domain``,
-        which refuses a malformed one; this one has not."""
+        which refuses a malformed one; this one has not - so a shape this
+        comparison cannot read arrives on the one route it exists for, and
+        saying nothing there reads as an envelope with nothing wrong with it."""
         lines = self.lines_ending_at(-50.0, 50.0)
-        for padding in (None, (), ((THROUGH,), (8, 8), (8, 8)), ((THROUGH, THROUGH),)):
-            assert write.through_faces_past_the_structure(lines, (SUBSTRATE,), (), padding) == []
+
+        axes = plan.through_faces_past_the_structure(lines, (SUBSTRATE,), (), ((THROUGH, THROUGH),))
+        assert [subject for subject, _ in axes] == ["padding"]
+        assert "one entry per axis" in axes[0][1]
+
+        faces = plan.through_faces_past_the_structure(
+            lines, (SUBSTRATE,), (), ((THROUGH,), (8, 8), (8, 8))
+        )
+        assert [subject for subject, _ in faces] == ["x padding"]
+        assert "two faces" in faces[0][1]
+
+        # One number per axis has no length to ask about, so the question has
+        # to be about the value.
+        flat = plan.through_faces_past_the_structure(lines, (SUBSTRATE,), (), (8, 8, 8))
+        assert [subject for subject, _ in flat] == ["x padding", "y padding", "z padding"]
+
+    def test_a_malformed_padding_is_a_refusal_rather_than_a_silence(self):
+        """The finding has to reach the caller pre-flight was written around."""
+        good = plan.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
+        params = dict(good.params, padding=((THROUGH,), (8, 8), (8, 8)))
+        grid = MeshGrid(x=good.x, y=good.y, z=good.z, params=params)
+
+        blocking = preflight.refusals(preflight.check(build_problem(grid=grid)))
+        assert any("two faces" in finding.message for finding in blocking)
 
 
 class TestRegions:
     def test_material_outside_the_domain_is_clipped_not_dropped(self):
         bounds = ((-40.0, -20.0, -5.0), (40.0, 20.0, 6.0))
-        built = write.regions([SUBSTRATE], [], {"FR4": "dielectric"}, bounds)
+        built = plan.regions([SUBSTRATE], [], {"FR4": "dielectric"}, bounds)
         assert built[0].lower[0] == -40.0 and built[0].upper[0] == 40.0
 
     def test_material_that_misses_the_domain_is_refused(self):
         far = Solid(material="FR4", lower=(500, 0, 0), upper=(600, 1, 1), label="Stray")
         bounds = ((-40.0, -20.0, -5.0), (40.0, 20.0, 6.0))
         with pytest.raises(EnvelopeError, match="Stray.*entirely outside"):
-            write.regions([far], [], {"FR4": "dielectric"}, bounds)
+            plan.regions([far], [], {"FR4": "dielectric"}, bounds)
 
     def test_conductors_are_classified_as_metal(self):
         bounds = ((-60.0, -20.0, -5.0), (60.0, 20.0, 6.0))
-        built = write.regions([GROUND], [], {"Metal": "pec"}, bounds)
+        built = plan.regions([GROUND], [], {"Metal": "pec"}, bounds)
         assert built[0].material.value == "metal"
 
     def test_a_clipped_region_remembers_what_was_drawn(self):
@@ -961,13 +1654,13 @@ class TestRegions:
         by 14.5x.
         """
         bounds = ((-40.0, -20.0, -5.0), (40.0, 20.0, 6.0))
-        built = write.regions([SUBSTRATE], [], {"FR4": "dielectric"}, bounds)[0]
+        built = plan.regions([SUBSTRATE], [], {"FR4": "dielectric"}, bounds)[0]
         assert built.extent(0) == 80.0
         assert built.thickness(0) == 100.0
 
     def test_an_unclipped_axis_reads_the_same_either_way(self):
         bounds = ((-60.0, -20.0, -5.0), (60.0, 20.0, 6.0))
-        built = write.regions([SUBSTRATE], [], {"FR4": "dielectric"}, bounds)[0]
+        built = plan.regions([SUBSTRATE], [], {"FR4": "dielectric"}, bounds)[0]
         assert built.thickness(0) == built.extent(0) == 100.0
 
 
@@ -1156,6 +1849,31 @@ class TestEnvelope:
         assert (tmp_path / "envelope.sha256").read_text().strip() == problem.digest()
         assert write.read_envelope(path).digest() == problem.digest()
 
+    def test_what_the_shapes_lost_is_written_beside_the_envelope(self, tmp_path):
+        """A driver started from an envelope has never seen a drawing, so this
+        is the only point on a headless route where both are in hand."""
+        problem = build_problem()
+        write.write(problem, tmp_path, ["Shell is solved 0.003 mm inside the drawing."])
+        assert (tmp_path / write.REPORT_NAME).read_text().startswith("Shell is solved")
+
+    def test_and_it_does_not_reach_the_envelope_the_digest_is_taken_over(self, tmp_path):
+        """A figure nothing on the driver's side reads has no business moving
+        the hash a result is matched against its input by."""
+        problem = build_problem()
+        bare, said = tmp_path / "bare", tmp_path / "said"
+        write.write(problem, bare)
+        write.write(problem, said, ["Shell is solved 0.003 mm inside the drawing."])
+        assert (bare / write.ENVELOPE_NAME).read_bytes() == (
+            said / write.ENVELOPE_NAME
+        ).read_bytes()
+        assert (bare / "envelope.sha256").read_text() == (said / "envelope.sha256").read_text()
+
+    def test_a_model_with_nothing_to_say_leaves_no_file_to_read(self, tmp_path):
+        """An empty file says "measured, and nothing" where none says "not
+        measured", and only the second is true of a model made of boxes."""
+        write.write(build_problem(), tmp_path)
+        assert not (tmp_path / write.REPORT_NAME).exists()
+
     def test_exactly_one_port_is_excited(self):
         quiet = Port(**{**PORT.to_dict(), "excite": False})
         with pytest.raises(EnvelopeError, match="exactly one port"):
@@ -1202,6 +1920,57 @@ class TestEnvelope:
         """Two results solved at different steps do not agree, so they must not
         claim to have come from the same input."""
         assert build_problem(timestep_factor=0.5).digest() != build_problem().digest()
+
+    def test_the_growth_survives_the_process_boundary(self):
+        """It decides what conductor the driver builds, so a run reproduced from
+        the file has to build the same one."""
+        problem = build_problem(grown_by=0.0)
+        assert Problem.from_json(problem.to_json()).grown_by == 0.0
+
+    def test_what_the_translation_writes_is_what_the_correction_ships_at(self):
+        """Everything that predicts where a conductor landed reads the constant
+        and not the envelope, so the two may not part."""
+        assert build_problem().grown_by == staircase.GROWN_BY
+
+    @pytest.mark.parametrize("share", [-0.1, 0.6])
+    def test_a_growth_outside_what_a_cell_holds_is_refused(self, share):
+        """Below zero the surface is pulled in on top of the rounding; above half
+        a cell the growth reaches the next line out, and the conductor openEMS
+        builds lands past the drawing instead of on it."""
+        with pytest.raises(EnvelopeError, match="grown_by"):
+            build_problem(grown_by=share)
+
+    def test_the_growth_moves_the_digest(self):
+        """Two runs that were given different conductors do not agree, so they
+        must not claim to have come from the same input."""
+        assert build_problem(grown_by=0.0).digest() != build_problem().digest()
+
+    def test_the_clearance_survives_the_process_boundary(self):
+        """It decides whether a flat conductor face is a boundary at all, so a
+        run reproduced from the file has to build the same wall."""
+        problem = build_problem(pinned_clearance=0.0)
+        assert Problem.from_json(problem.to_json()).pinned_clearance == 0.0
+
+    def test_what_the_translation_writes_is_the_clearance_the_adapter_ships(self):
+        """The field's default and the constant everything else reads are one
+        figure, so a translation that names neither still writes what the adapter
+        ships rather than something the two have drifted apart to."""
+        assert build_problem().pinned_clearance == staircase.PINNED_CLEARANCE
+
+    @pytest.mark.parametrize("clearance", [-0.1, 0.5, 0.6])
+    def test_a_clearance_outside_what_a_cell_holds_is_refused(self, clearance):
+        """Below zero the face is pulled back into the metal, so the line pinned
+        to it is outside the conductor and the wall is certainly not built. At
+        half a cell the displacement reaches the field edge normal to the face on
+        the void side, and zeroing that stands the wall a cell inside the drawing
+        - the same fault with its sign turned round."""
+        with pytest.raises(EnvelopeError, match="pinned_clearance"):
+            build_problem(pinned_clearance=clearance)
+
+    def test_the_clearance_moves_the_digest(self):
+        """A cavity whose caps conduct and one whose caps do not are different
+        structures, so they must not claim to have come from the same input."""
+        assert build_problem(pinned_clearance=0.0).digest() != build_problem().digest()
 
     def test_the_smallest_response_survives_the_process_boundary(self):
         """The driver decides on the far side of it whether the run was long
@@ -1591,10 +2360,8 @@ class TestPreflight:
         )
 
     def test_a_grid_solved_far_above_the_band_it_was_meshed_for_is_refused(self):
-        """The mesh policy derives its resolutions from the band, so a document
-        built through it cannot reach this. A hand-written envelope can, and
-        one coarse enough returns |S11| above unity with no finding of any
-        severity."""
+        """A grid meshed for one band and a frequency stop in another. Nothing
+        else compares the two."""
         problem = build_problem(frequency=Frequency(1e9, 300e9, 51))
         refused = [
             f
@@ -1603,6 +2370,65 @@ class TestPreflight:
         ]
         assert len(refused) == 1
         assert refused[0].subject == "grid"
+
+    def test_a_coarse_policy_reaches_the_floor_through_the_mesher(self):
+        """The policy's own way in.
+
+        ``ElementsPerWavelength`` is refused at or below zero and bounded
+        nowhere else. What keeps an ordinary model far above the floor is that
+        something in it asks for a finer cell than the policy's bulk one, and
+        this model is built to ask for as little as it can: one dielectric
+        block, no conductor edge to refine, no thin layer, and a port whose box
+        is wide. Coarsen the policy far enough and the grid the mesher lays is
+        refused by the check below it.
+
+        The policy is shaped as ``policy._mesh_params`` shapes one, the ceiling
+        included: deriving that from the wavelength in the dielectric instead
+        would refine every dielectric by sqrt(epsilon) for a caller who asked
+        for nothing of the sort, which is a fault of this fixture rather than
+        of the mesher.
+        """
+        block = Solid(
+            material="FR4",
+            lower=(-20.0, -20.0, 0.0),
+            upper=(20.0, 20.0, 20.0),
+            label="Block",
+        )
+        port = Port(
+            number=1,
+            kind="lumped",
+            start=(-18.0, -8.0, 20.0),
+            stop=(-2.0, 8.0, 0.0),
+            propagation_axis=0,
+            excitation_axis=2,
+            excite=True,
+            feed_resistance=50.0,
+        )
+        materials = (Material(name="FR4", kind="dielectric", epsilon=4.4),)
+        padding = ((8, 8), (8, 8), (8, 8))
+        top = 10e9
+        in_vacuum = model.SPEED_OF_LIGHT / top * 1e3
+        in_fr4 = in_vacuum / math.sqrt(4.4)
+
+        def refusals_at(per_wavelength):
+            bulk = in_fr4 / per_wavelength
+            params = MeshParams(
+                metal_res=bulk / 6.0,
+                dielectric_res=bulk,
+                min_lines=6,
+                pml_cells=8,
+                cap=in_vacuum / per_wavelength,
+            )
+            grid = plan.plan_grid((block,), (port,), materials, params, padding)
+            problem = build_problem(solids=(block,), ports=(port,), materials=materials, grid=grid)
+            return [
+                f
+                for f in preflight.refusals(preflight.check(problem))
+                if "cells per wavelength" in f.message
+            ]
+
+        assert refusals_at(20.0) == []
+        assert refusals_at(3.0), "a policy well under the floor meshed and was not refused"
 
     def test_the_index_of_the_dielectric_counts(self):
         """A wavelength in vacuum is not the one the grid has to carry - the
@@ -1642,9 +2468,8 @@ class TestPreflight:
     def test_and_still_is_two_decades_up(self):
         """openEMS' silence here reads as a missing guard: ordinary foil
         quoted to 100 GHz is 167 skin depths thick. Against its own table that
-        is Omega = 7e3 against a limit of 2.6e6 - the engine is right, and a
-        guard written from the QA note's reasoning would have refused a sound
-        model."""
+        is Omega = 7e3 against a limit of 2.6e6 - the engine is right here, and
+        a guard drawn from the thickness alone would refuse a sound model."""
         assert self._fit(0.035, top=100e9) == []
 
     def test_a_sheet_past_the_last_fitted_row_is_refused(self):
@@ -1718,16 +2543,16 @@ class TestPreflight:
         """The pulse length is set by the bandwidth and the step count by the
         cell size, and nothing relates the two.
 
-        openEMS cuts the source to the steps available and says so on stderr,
-        one line among thousands; the run then exits 0 with a matching digest.
-        A 2.4-2.5 GHz band at the shipped 30,000 steps is cut at its own peak.
+        The run simply stops partway through its own drive: it exits 0 with a
+        matching digest, and nothing in the output says the source was still
+        going. A 2.4-2.5 GHz band at the shipped 30,000 steps stops at its peak.
         """
         blocking = preflight.refusals(self._excitation((2.4e9, 2.5e9), 30_000))
         assert any(f.subject == "excitation" for f in blocking)
-        assert any("through it" in f.message for f in blocking)
+        assert any("through the pulse" in f.message for f in blocking)
 
     def test_a_run_shorter_than_three_excitations_warns(self):
-        """openEMS' own threshold - it warns below three lengths itself."""
+        """openEMS' own threshold - three excitation lengths is what it asks for."""
         findings = [f for f in self._excitation((1e9, 10e9), 2_000) if f.subject == "excitation"]
         assert [f.severity for f in findings] == [preflight.WARN]
 
@@ -1764,14 +2589,14 @@ class TestPreflight:
         assert "at x=max" in message and "at x=min" not in message
 
     @pytest.mark.parametrize(
-        "padding, shift, depths, expected",
+        "padding, shift, end, expected",
         [
-            (((THROUGH, 8), (8, 8), (8, 8)), 5.0, (7.270, 7.756), "7.27 mm deep at x=min"),
-            (((8, THROUGH), (8, 8), (8, 8)), 95.0, (7.756, 7.805), "7.805 mm deep at x=max"),
+            (((THROUGH, 8), (8, 8), (8, 8)), 5.0, 0, "at x=min"),
+            (((8, THROUGH), (8, 8), (8, 8)), 95.0, 1, "at x=max"),
         ],
         ids=["min", "max"],
     )
-    def test_the_depth_quoted_is_the_end_it_fell_off(self, padding, shift, depths, expected):
+    def test_the_depth_quoted_is_the_end_it_fell_off(self, padding, shift, end, expected):
         """The name and the number come from the same end, which a symmetric
         grid cannot show. One end is THROUGH and the other padded 8 cells of
         air, so the two absorbers differ; the probe is 3 mm into the near one.
@@ -1782,8 +2607,14 @@ class TestPreflight:
         """
         params = MeshParams(metal_res=0.5, dielectric_res=1.0, min_lines=6, pml_cells=8, cap=1.0)
         vacuum = TestTheAbsorberMustLeaveAModel.VACUUM
-        grid = write.plan_grid((SUBSTRATE, GROUND), (PORT,), vacuum, params, padding)
-        assert preflight.absorber._absorber_depth(grid, 0) == pytest.approx(depths, abs=1e-3)
+        grid = plan.plan_grid((SUBSTRATE, GROUND), (PORT,), vacuum, params, padding)
+        # Read off the grid rather than restated: what this is about is *which*
+        # of the two the message quotes, and a literal pair would fail whenever
+        # the mesh moved for reasons that have nothing to do with the indexing.
+        depths = preflight.absorber._absorber_depth(grid, 0)
+        assert depths[0] != pytest.approx(depths[1], abs=1e-3), (
+            "the two ends must differ, or this cannot show which was named"
+        )
 
         problem = build_problem(
             grid=grid,
@@ -1792,7 +2623,7 @@ class TestPreflight:
         )
         blocking = preflight.refusals(preflight.check(problem))
         message = next(f.message for f in blocking if "absorber" in f.message)
-        assert expected in message
+        assert f"{depths[end]:.4g} mm deep {expected}" in message
 
     def test_a_waveguide_plane_is_not_said_to_snap(self):
         """It does not. ``required_lines`` pins a waveguide's two coordinates
@@ -1859,6 +2690,33 @@ class TestPreflight:
     def test_a_face_that_does_not_absorb_is_not_compared(self):
         assert self._absorber(("PEC", "MUR") + ("PML_8",) * 4) == []
 
+    def _mur(self, boundary):
+        return [f for f in preflight.check(build_problem(boundary=boundary)) if "Mur" in f.message]
+
+    def test_a_mur_wall_a_driven_port_stands_on_is_reported(self):
+        """The port runs out through both x faces, so a source of its own can
+        land on either wall - and openEMS holds a wall shut until the drive is
+        over, which for this adapter's drive is never."""
+        said = self._mur(("MUR", "MUR") + ("PML_8",) * 4)
+        assert [f.severity for f in said] == [preflight.WARN] * 2
+        assert {f.subject for f in said} == {"boundary xmin", "boundary xmax"}
+
+    def test_a_mur_wall_the_port_does_not_reach_says_nothing(self):
+        """The same boundary on the axes the port is narrow across. Nothing can
+        be excited on a wall the port's own box stops short of."""
+        assert self._mur(("PML_8", "PML_8", "MUR", "MUR", "PEC", "MUR")) == []
+
+    def test_and_neither_does_an_absorber_that_is_not_mur(self):
+        assert self._mur(("PML_8",) * 6) == []
+
+    def test_each_wall_is_asked_about_its_own_end_of_the_axis(self):
+        """A port stopping halfway along x reaches the wall behind it and not
+        the one in front, so the two faces must answer differently."""
+        short = dataclasses.replace(PORT, stop=(0.0, 1.5, 0.0), measurement_shift=20.0)
+        problem = build_problem(ports=(short,), boundary=("MUR", "MUR") + ("PML_8",) * 4)
+        said = [f for f in preflight.check(problem) if "Mur" in f.message]
+        assert [f.subject for f in said] == ["boundary xmin"]
+
     def _guide_problem(
         self, mode="TE10", band=(20e9, 26e9), section=(10.7, 4.3), fill=1.0, stray=None
     ):
@@ -1892,7 +2750,7 @@ class TestPreflight:
             excite=True,
         )
         params = MeshParams(metal_res=0.4, dielectric_res=0.4, min_lines=10, pml_cells=(0, 0, 8))
-        grid = write.plan_grid(
+        grid = plan.plan_grid(
             solids,
             (port,),
             materials,
@@ -1909,8 +2767,8 @@ class TestPreflight:
         )
 
     def test_a_dielectric_filled_guide_is_refused(self):
-        """The adapter leaves ``ref_index`` at 1, so a filled guide is reported
-        as an empty one. Measured: Z_ref out by +197%, power summing to 1.244."""
+        """The adapter leaves ``ref_index`` at 1, so a filled guide reported as
+        an empty one puts Z_ref badly out and breaks the power balance."""
         blocking = preflight.refusals(preflight.check(self._guide_problem(fill=2.0)))
         assert any("filled with" in f.message for f in blocking)
 
@@ -1978,7 +2836,7 @@ class TestPreflight:
             reference_impedance=50.0,
         )
         params = MeshParams(metal_res=cell, dielectric_res=cell, min_lines=4, pml_cells=8)
-        grid = write.plan_grid((box,), (port,), air, params, padding=((8, 8), (8, 8), (8, 8)))
+        grid = plan.plan_grid((box,), (port,), air, params, padding=((8, 8), (8, 8), (8, 8)))
         return build_problem(
             solids=(box,),
             ports=(port,),
@@ -1991,8 +2849,16 @@ class TestPreflight:
 
         Measured on this grid: a 0.1 mm gap produced "Lumped Element with zero
         (snapped) length is invalid! skipping" and a run of NaN.
+
+        Read off a grid meshed for a healthy port and then handed a thin one,
+        because a grid planned *around* the thin port holds both its faces -
+        :meth:`model.Port.element_lines` asks for them - and the element then
+        survives however thin the gap. What is left for this check to guard is
+        the envelope whose grid came from somewhere else, which is every replay.
         """
-        blocking = preflight.refusals(preflight.check(self._lumped_problem(0.1)))
+        problem = self._lumped_problem(2.0)
+        thin = dataclasses.replace(problem.ports[0], stop=(8.0, 8.0, 6.1))
+        blocking = preflight.refusals(preflight.check(dataclasses.replace(problem, ports=(thin,))))
         assert any("snap to the single grid line" in f.message for f in blocking)
 
     def test_a_gap_of_several_cells_is_not(self):
@@ -2035,7 +2901,7 @@ class TestPreflight:
             measurement_shift=20.0,
         )
         params = MeshParams(metal_res=cell, dielectric_res=cell, min_lines=4, pml_cells=8)
-        grid = write.plan_grid((box,), (port,), air, params, padding=((8, 8), (8, 8), (8, 8)))
+        grid = plan.plan_grid((box,), (port,), air, params, padding=((8, 8), (8, 8), (8, 8)))
         return build_problem(solids=(box,), ports=(port,), materials=air, grid=grid)
 
     def test_an_annulus_no_grid_line_falls_in_is_refused(self):
@@ -2114,6 +2980,122 @@ class TestPreflight:
         assert severities == sorted(severities, key=order.__getitem__)
 
 
+class TestVerticesTheEngineCannotTellApart:
+    """openEMS holds a polyhedron's corner as a single-precision float, so two
+    corners the CAD kernel held apart can arrive at one point.
+
+    The check is made on the structure as the adapter hands it over, which is
+    not the structure as it was drawn: every model is translated so its minimum
+    corner is at the origin. Single precision spaces its values by a share of
+    their magnitude, so those two frames give different answers, and only one of
+    them is about the numbers openEMS stores.
+    """
+
+    #: Two corners this far apart, in mm. Wide enough that the kernel and the
+    #: drawing hold them apart at any distance, and narrow enough that the
+    #: rounding closes them across a structure the size of the fixture board.
+    PINCH = 1e-6
+
+    #: Where a part imported from an assembly can carry its own datum, in mm.
+    #: Far enough that the fixture's own features round away there.
+    DATUM = 1e6
+
+    def pinched(self, gap=PINCH):
+        """A conductor on the board, held as triangles, with two of its corners
+        ``gap`` apart along x."""
+        vertices, faces = triangulated.bar((6.0, 4.0, 1.0), centre=(0.0, 0.0, 2.6))
+        vertices[1] = (vertices[0][0] + gap, vertices[0][1], vertices[0][2])
+        return Solid(
+            material="Metal",
+            lower=tuple(min(point[dim] for point in vertices) for dim in range(3)),
+            upper=tuple(max(point[dim] for point in vertices) for dim in range(3)),
+            vertices=tuple(vertices),
+            faces=tuple(faces),
+            label="Trace",
+        )
+
+    def carried_to(self, problem, distance):
+        """The same problem drawn at a datum ``distance`` away on every axis.
+
+        Everything moves together - solids, ports and the grid - so this is the
+        model the user drew somewhere else, rather than one solid displaced
+        inside it.
+        """
+        offset = (distance, distance, distance)
+        return dataclasses.replace(
+            problem,
+            solids=tuple(solid.moved(offset) for solid in problem.solids),
+            ports=tuple(port.moved(offset) for port in problem.ports),
+            grid=problem.grid.moved(offset),
+        )
+
+    def test_a_pair_the_placed_structure_cannot_hold_is_refused(self):
+        trace = self.pinched()
+        problem = build_problem(solids=(SUBSTRATE, GROUND, trace))
+        blocking = preflight.refusals(preflight.check(problem))
+        assert any(f.subject == "Trace" for f in blocking)
+        said = next(f for f in blocking if f.subject == "Trace")
+        assert "single-precision" in said.message
+
+    def test_and_the_run_stops_on_it(self):
+        problem = build_problem(solids=(SUBSTRATE, GROUND, self.pinched()))
+        with pytest.raises(preflight.UnsupportedModel, match="Trace"):
+            preflight.refuse_if_blocked(preflight.check(problem))
+
+    def test_a_pair_it_can_hold_is_accepted(self):
+        """A separation the rounding still resolves across this structure."""
+        problem = build_problem(solids=(SUBSTRATE, GROUND, self.pinched(gap=1e-2)))
+        assert not any(f.subject == "Trace" for f in preflight.check(problem))
+
+    def test_the_same_model_drawn_at_a_distant_datum_is_accepted(self):
+        """The whole structure is translated to the origin before anything is
+        built, so where it was drawn decides nothing. Asked in the drawing's own
+        coordinates instead, this is refused: a corner a hundredth of a
+        millimetre from its neighbour rounds onto it a kilometre out.
+        """
+        problem = build_problem(solids=(SUBSTRATE, GROUND, self.pinched(gap=1e-2)))
+        carried = self.carried_to(problem, self.DATUM)
+        assert not any(f.subject == "Trace" for f in preflight.check(carried))
+
+    def test_and_a_pair_it_cannot_hold_is_still_refused_there(self):
+        """The translation does not excuse the model, it only decides which
+        coordinates the question is about."""
+        problem = build_problem(solids=(SUBSTRATE, GROUND, self.pinched()))
+        carried = self.carried_to(problem, self.DATUM)
+        assert any(f.subject == "Trace" for f in preflight.refusals(preflight.check(carried)))
+
+    def test_the_message_quotes_the_position_the_user_drew(self):
+        """The translation is the adapter's own. A refusal quoting the placed
+        coordinate names a place nobody can find in the model."""
+        problem = build_problem(solids=(SUBSTRATE, GROUND, self.pinched()))
+        carried = self.carried_to(problem, self.DATUM)
+        said = next(f for f in preflight.check(carried) if f.subject == "Trace")
+        drawn = next(solid for solid in carried.solids if solid.name == "Trace")
+        assert f"{drawn.vertices[0][0]:g}" in said.message
+
+    def test_a_sheet_is_not_asked_either(self):
+        """A sheet is emitted as coplanar polygons, and those carry doubles too.
+        Held to the same rounding, a foil with two corners this close would be
+        refused for a collision the engine never makes."""
+        elevation = 2.6
+        foil = Solid(
+            material="Foil",
+            lower=(-2.0, -2.0, elevation),
+            upper=(2.0, 2.0, elevation),
+            label="Foil",
+            vertices=(
+                (-2.0, -2.0, elevation),
+                (-2.0 + self.PINCH, -2.0, elevation),
+                (2.0, 2.0, elevation),
+                (-2.0, 2.0, elevation),
+            ),
+            faces=((0, 1, 2), (0, 2, 3)),
+            sheet_normal=2,
+        )
+        problem = build_problem(solids=(SUBSTRATE, GROUND, foil))
+        assert not any("single-precision" in f.message for f in preflight.check(problem))
+
+
 class TestAThicknessNobodyDrew:
     """A conductor drawn as a surface arrives as a solid, and the thickness is ours.
 
@@ -2188,6 +3170,34 @@ class TestAThicknessNobodyDrew:
         replayed envelope holds."""
         with pytest.raises(EnvelopeError):
             Solid.from_dict({**GROUND.to_dict(), "thickened": value})
+
+
+class TestAnUncheckedDirectionCrossesTheEnvelope:
+    """A port whose launch nothing held against the drawing.
+
+    The driver re-runs pre-flight over the file rather than trusting whoever
+    wrote it, so a mark the file drops is a warning a headless run never makes -
+    and headless is the route with nobody watching a panel.
+    """
+
+    UNCHECKED = dataclasses.replace(PORT, direction_unchecked=True)
+
+    def test_it_survives_the_json(self):
+        reopened = Problem.from_json(build_problem(ports=(self.UNCHECKED,)).to_json())
+        assert reopened.ports[0].direction_unchecked is True
+
+    def test_and_a_port_read_off_its_drawing_writes_no_key_at_all(self):
+        """A key on every port would move every envelope this adapter has ever
+        produced and say nothing on any of them."""
+        assert "direction_unchecked" not in PORT.to_dict()
+        assert Port.from_dict(PORT.to_dict()).direction_unchecked is False
+
+    def test_an_envelope_written_by_hand_is_not_warned_about(self):
+        """There is no drawing behind one, so there is nothing that failed to
+        answer - and a warning on every hand-written envelope would be a
+        warning nobody can act on."""
+        findings = preflight.check(build_problem())
+        assert not any("nothing has checked it" in f.message for f in findings)
 
 
 class TestARelaxedSolidCrossesTheEnvelope:
@@ -2903,27 +3913,167 @@ class TestALargeGridIsSaidOutLoud:
     def test_a_grid_past_the_mesher_s_own_ceiling_is_refused(self):
         """Only an envelope nobody meshed can be this big - and then neither
         the property names nor the advice apply, because nothing here built it."""
-        cells = int(mesh.MAX_GRID_BYTES / mesh.BYTES_PER_CELL * 2)
+        cells = int(MAX_GRID_BYTES / BYTES_PER_CELL * 2)
         found = self._severities(cells)
         assert [f.severity for f in found] == [preflight.REFUSE]
         assert "refuses to build" in found[0].message
 
 
-class TestTheAbsorberMustLeaveAModel:
-    """A THROUGH face pulls the domain in; say when it pulls in nearly all of it.
+class TestAnAxisTooShortForItsAbsorber:
+    """An axis declaring more absorber than it has cells to hold at both ends.
 
-    This is the cause, not the symptom: the microstrip example over 2.4-2.5 GHz
-    keeps 4% of its board as interior and every port then fails to fit, so
-    without this check the only findings are about the ports. ``cap`` is what
-    does it, and ``cap`` grows when the band falls *or* the mesh is coarsened.
+    ``preflight.absorber._check_the_absorber_fits_the_axis`` says why the case
+    reaches pre-flight at all. Such an axis has no interior, and every check
+    that measures against one has to say so rather than read the axis as
+    absorbing nowhere.
+
+    ``COVERED`` holds the boundary and the case below it. At ``2 * cells + 1``
+    lines the blocks meet on one line rather than overlapping, and that line is
+    still inside the absorber - it carries an absorbing cell on each side of it
+    - so a rule written with the wrong comparison passes on every count but
+    that one. ``ROOM`` is the first count that fits, where the predicate has to
+    turn the other way.
+    """
+
+    COVERED = (16, 17)
+
+    #: The first line count that holds two blocks and a cell between them.
+    ROOM = 18
+
+    def _problem(self, lines, pml_cells=8):
+        grid = MeshGrid(
+            x=np.linspace(-50.0, 50.0, lines),
+            y=np.linspace(-10.0, 10.0, 41),
+            z=np.linspace(0.0, 20.0, 41),
+            params={"pml_cells": pml_cells, "padding": None},
+        )
+        return build_problem(grid=grid)
+
+    @pytest.mark.parametrize("lines", COVERED)
+    def test_the_axis_is_refused_and_says_what_it_would_take(self, lines):
+        """The same comparison the mesher raises on, so the two agree about
+        which grids are legal."""
+        findings = preflight.refusals(preflight.check(self._problem(lines)))
+        axis = [f for f in findings if f.subject == "x domain"]
+        assert axis, [f.subject for f in findings]
+        assert f"{lines} lines" in axis[0].message
+        assert "8 absorber cells" in axis[0].message
+        assert "needs 18" in axis[0].message
+
+    def test_an_axis_with_room_is_not_refused(self):
+        """Asked at the first count that fits, which is where the predicate has
+        to turn, and floored on the covered grid beside it so that a check which
+        had stopped running would not answer this.
+        """
+        assert preflight.check(self._problem(16)), "the checks under test say nothing at all"
+        for lines in (self.ROOM, 41):
+            problem = self._problem(lines)
+            assert not preflight.absorber._absorber_covers_the_axis(problem.grid, 0)
+            refused = preflight.refusals(preflight.check(problem))
+            assert [f for f in refused if f.subject == "x domain"] == []
+
+    @pytest.mark.parametrize("lines", COVERED)
+    def test_the_checks_that_measure_against_the_absorber_still_speak(self, lines):
+        """The reading that finds the fault must not mute the ones that name
+        the objects.
+
+        A port whose feed or measurement plane stands in the attenuating region
+        is a refusal of its own, and it is the finding a user acts on. An axis
+        read as absorbing nowhere has no interior for either to be outside of,
+        so both go with it.
+        """
+        findings = preflight.refusals(preflight.check(self._problem(lines)))
+        ports = [f for f in findings if f.subject == "port 1" and "absorber" in f.message]
+        assert all("covers this axis end to end" in f.message for f in ports)
+        for what in ("its feed sits at", "its measurement plane sits at"):
+            assert any(f.message.startswith(what) for f in ports), (
+                f"nothing refused the port's {what.split()[1]}: {[f.message for f in ports]}"
+            )
+
+    @pytest.mark.parametrize("lines", COVERED)
+    def test_the_axis_is_covered_rather_than_absorbing_nowhere(self, lines):
+        """Two states answered by one number is what silenced the checks.
+        ``_absorber_cells`` says what is declared, and
+        ``_absorber_covers_the_axis`` says whether it left an interior."""
+        grid = self._problem(lines).grid
+        assert preflight.absorber._absorber_cells(grid, 0) == 8
+        assert preflight.absorber._absorber_covers_the_axis(grid, 0)
+        assert preflight.absorber._absorber_bounds(grid, 0) is None
+        assert not preflight.absorber._absorber_covers_the_axis(grid, 1)
+        assert preflight.absorber._absorber_bounds(grid, 1) is not None
+
+    def test_a_declaration_below_nothing_is_no_absorber_rather_than_a_crash(self):
+        """The envelope's ``params`` are provenance and nothing validates them,
+        so a hand-edited one carries whatever was typed. A check returns
+        findings and never raises."""
+        problem = self._problem(41, pml_cells=-2)
+        assert preflight.absorber._absorber_cells(problem.grid, 0) == 0
+        assert preflight.absorber._absorber_bounds(problem.grid, 0) is None
+        said = preflight.check(problem)
+        assert not [f for f in said if "absorber" in f.message and f.subject == "port 1"]
+
+
+class TestTheBoundaryAndTheMeshAgreeOnDepth:
+    """``PML_<n>`` against the cells the mesher set aside, which are two numbers
+    arrived at independently.
+
+    openEMS absorbs in the cells it was told to. Where the mesher reserved a
+    different depth, every clearance check in the package measures against the
+    other edge, and a deeper absorber can make the answer better - so the
+    disagreement has no symptom of its own.
+    """
+
+    def _problem(self, reserved, boundary):
+        grid = MeshGrid(
+            x=np.linspace(-50.0, 50.0, 81),
+            y=np.linspace(-10.0, 10.0, 41),
+            z=np.linspace(0.0, 20.0, 41),
+            params={"pml_cells": reserved, "padding": None},
+        )
+        return build_problem(grid=grid, boundary=boundary)
+
+    def _said(self, problem):
+        return [f for f in preflight.check(problem) if "cells of PML" in f.message]
+
+    def test_matching_depths_say_nothing(self):
+        """Floored against the same fixture disagreeing, so a check that had
+        stopped running would not answer this."""
+        assert self._said(self._problem((8, 8, 8), ("PML_4", *("PML_8",) * 5)))
+        assert self._said(self._problem((8, 8, 8), ("PML_8",) * 6)) == []
+
+    def test_a_disagreement_is_reported(self):
+        said = self._said(self._problem((8, 8, 8), ("PML_4", *("PML_8",) * 5)))
+        assert [f.subject for f in said] == ["boundary xmin"]
+        assert "asks for 4 cells of PML and the mesh set aside 8" in said[0].message
+
+    def test_a_reservation_of_nothing_is_reported_and_not_exempt(self):
+        """The quietest form of the disagreement, and so the one worth saying.
+
+        An axis reserving no cells against a boundary that absorbs leaves every
+        clearance check with no absorber to measure against, so each says
+        nothing, while openEMS attenuates the field at that wall regardless.
+        """
+        said = self._said(self._problem((0, 8, 8), ("PML_8",) * 6))
+        assert [f.subject for f in said] == ["boundary xmin and boundary xmax"]
+        assert "the mesh set aside 0 on x" in said[0].message
+
+
+class TestTheAbsorberMustLeaveAModel:
+    """A THROUGH face takes the absorber out of the structure; say when it takes
+    nearly all of it.
+
+    This is the cause, not the symptom: a band low enough leaves a board with a
+    sliver of itself as interior and every port then fails to fit, so without
+    this check the only findings are about the ports. ``cap`` is what does it,
+    and ``cap`` grows when the band falls *or* the mesh is coarsened.
     """
 
     #: Every dielectric at vacuum permittivity, so its bulk size *is* ``cap``
-    #: and a THROUGH face reserves the full ``pml_cells * cap``. Otherwise the
-    #: reservation correctly shrinks by sqrt(eps) and
-    #: this fixture stops being absorber-dominated, which is the one thing it
-    #: exists to be. What is under test here is the warning, not the rule that
-    #: decides how deep to reserve.
+    #: and the block the mesher lays at a THROUGH face is the full ``cap``.
+    #: Otherwise the field correctly asks for sqrt(eps) less there and this
+    #: fixture stops being absorber-dominated, which is the one thing it exists
+    #: to be. What is under test here is the warning, not the rule that decides
+    #: how deep the block goes.
     VACUUM = tuple(
         dataclasses.replace(material, epsilon=1.0) if material.kind == "dielectric" else material
         for material in MATERIALS
@@ -2937,99 +4087,130 @@ class TestTheAbsorberMustLeaveAModel:
             pml_cells=pml_cells,
             cap=cap,
         )
-        grid = write.plan_grid((SUBSTRATE, GROUND), (PORT,), self.VACUUM, params, padding)
+        grid = plan.plan_grid((SUBSTRATE, GROUND), (PORT,), self.VACUUM, params, padding)
         return build_problem(grid=grid, materials=self.VACUUM)
 
     def _domain_findings(self, problem):
         return [f for f in preflight.check(problem) if f.subject.endswith("domain")]
 
+    def _blocks(self, problem, dim=0):
+        """What the absorber covers at each end, off the finished grid."""
+        cells = problem.grid.params["pml_cells"]
+        cells = cells[dim] if isinstance(cells, (list, tuple)) else cells
+        axis = np.asarray(problem.grid[dim], dtype=float)
+        return axis[cells] - axis[0], axis[-1] - axis[-1 - cells]
+
+    #: A cap that leaves most of this board inside the absorber. Named rather
+    #: than repeated, because what makes it the interesting one is that it still
+    #: meshes - see :meth:`test_it_speaks_before_the_mesher_refuses`.
+    #:
+    #: Chosen well clear of the limit rather than just past it. The block is the
+    #: finest cell the sizing field asks for near the wall, and how far the band
+    #: it is read over reaches in moves with the cap - so the share this fixture
+    #: lands on is not a smooth function of it, and a cap picked at the edge of
+    #: the limit would flip the whole class between warning and silence on a
+    #: change to the mesher that has nothing to do with the warning.
+    CROWDED = 5.0
+
     def test_a_healthy_model_says_nothing(self):
-        """8 cells of 1 mm off a 100 mm board leaves 84%."""
         assert self._domain_findings(self._problem(1.0)) == []
 
-    def test_an_absorber_that_took_most_of_the_model_is_reported(self):
-        """6 mm cells: 48 mm off each end of 100 mm, the 2.4 GHz case."""
-        findings = self._domain_findings(self._problem(6.0))
+    def test_an_absorber_that_covers_most_of_the_model_is_reported(self):
+        findings = self._domain_findings(self._problem(self.CROWDED))
         assert [f.subject for f in findings] == ["x domain"]
-        assert "leaves 4% of the structure as interior" in findings[0].message
+        assert "of the structure outside it" in findings[0].message
 
     def test_it_warns_rather_than_refuses(self):
         """A long line measured only in the middle is legitimate. What decides
         it is whether the ports still fit, and two other checks refuse that."""
-        findings = self._domain_findings(self._problem(6.0))
+        findings = self._domain_findings(self._problem(self.CROWDED))
         assert findings[0].severity == preflight.WARN
         assert preflight.refusals(findings) == []
 
-    def test_the_message_names_the_reservation_that_caused_it(self):
-        """The number a user cannot otherwise get at: what each end gave up.
+    def test_the_message_names_what_each_end_covers(self):
+        """The number a user cannot otherwise get at: how far in the absorber
+        reaches at each face, and against how much drawing."""
+        problem = self._problem(self.CROWDED)
+        low, high = self._blocks(problem)
+        message = self._domain_findings(problem)[0].message
+        assert f"covers {low:.4g} mm at x=min and {high:.4g} mm at x=max" in message
+        assert "of a 100 mm model" in message
 
-        The *reservation*, measured as the interior against the structure - not
-        the absorber as laid, which is 16 mm here against the 48 mm that
-        actually removed model, because a collapsed interior lays its absorber
-        at its own fine edge pitch.
-        """
-        message = self._domain_findings(self._problem(6.0))[0].message
-        assert "reserves 8 cells and takes" in message
-        assert "48 mm at x=min and 48 mm at x=max off a 100 mm model" in message
+    def test_what_it_reports_is_what_the_grid_carries(self):
+        """What removes model and what absorbs have to be one block. A
+        reservation counted in a cell chosen before the mesh exists and an
+        absorber laid at the interior's own edge pitch are different quantities,
+        and the report would then quote a depth the grid does not carry."""
+        problem = self._problem(self.CROWDED)
+        low, _ = self._blocks(problem)
+        lower, _ = plan.structure_bounds(problem.solids, problem.ports)
+        interior = float(np.asarray(problem.grid.x, dtype=float)[8])
+        assert interior - float(lower[0]) == pytest.approx(low, rel=1e-12)
 
-    def test_the_reservation_is_named_and_not_the_absorber_as_laid(self):
-        """Guards the confusion directly: the two differ threefold here."""
-        problem = self._problem(6.0)
-        laid = float(problem.grid.x[8]) - float(problem.grid.x[0])
-        assert laid == pytest.approx(16.0, abs=0.5)
-        assert "16 mm" not in self._domain_findings(problem)[0].message
+    def test_it_speaks_before_the_mesher_refuses(self):
+        """The point is to say so while there is still room to act: this cap
+        meshes and warns, and a coarser one never gets here at all - the
+        absorber takes the whole axis and meshing refuses it by name."""
+        assert self._domain_findings(self._problem(self.CROWDED))
+        with pytest.raises(MeshError, match="consume the whole x axis"):
+            self._problem(8.0)
 
-    def test_it_fires_before_the_cliff_rather_than_at_it(self):
-        """4.8 mm cells still mesh; the point is to speak while there is room
-        to act. `write.domain` raises only once the absorber takes everything."""
-        findings = self._domain_findings(self._problem(4.8))
-        assert "leaves 23% of the structure as interior" in findings[0].message
-
-    def test_only_the_ends_that_pulled_in_are_counted(self):
+    def test_only_the_ends_that_absorb_are_counted(self):
         """An axis can be THROUGH at one end and padded outward at the other,
-        and a padded end gives up nothing - its gap is negative. 30 cells of
-        2 mm take 60 mm off x=min; x=max is padded a single cell and must not
-        appear at all, as a negative distance or otherwise.
+        and a padded end covers none of the model - its gap is negative. It must
+        not appear at all, as a negative distance or otherwise.
         """
         problem = self._problem(2.0, padding=((THROUGH, 1), (8, 8), (8, 8)), pml_cells=30)
+        low, _ = self._blocks(problem)
         message = self._domain_findings(problem)[0].message
-        assert "takes 60 mm at x=min off a 100 mm model" in message
-        assert "x=max" not in message and "-" not in message.split("off a")[0]
+        assert f"covers {low:.4g} mm at x=min of a 100 mm model" in message
+        assert "x=max" not in message and "-" not in message.split("of a")[0]
 
-    def test_a_point_past_the_grid_is_not_called_inside_the_absorber(self):
+    def test_a_feed_inside_the_absorber_is_described_against_the_interior(self):
         """Where it ends up, not where it was asked for.
 
-        This fixture's grid stops at -18 and the port feeds at -30. Reporting
-        that as "inside the absorber (the interior runs -2.033 to 2.033)"
-        describes a point 12 mm short of the grid as though it were somewhere in
-        it. ``MSLPort`` moves it onto the nearest line it has and says nothing,
-        so how far the grid falls short is the whole finding.
+        This port feeds at -30, and the absorber reaches past that - so the
+        finding has to say which interior it is outside of and how deep in it
+        sits. The grid itself no longer stops short of the drawing on a face the
+        structure runs out through, so a feed on the board is always on the
+        grid, and the question is only ever how far into the absorber it fell.
         """
-        blocking = preflight.refusals(preflight.check(self._problem(6.0)))
+        blocking = preflight.refusals(preflight.check(self._problem(self.CROWDED)))
         message = next(f.message for f in blocking if f.subject == "port 1")
-        assert "outside the grid, which runs -18 to 18" in message
-        assert "stops 12 mm short of it" in message
-        assert "moves it onto the nearest line it has" in message
-        assert "the interior runs" not in message
+        assert "inside the absorber" in message
+        assert "the interior runs" in message
 
     def test_an_outward_padded_face_is_never_described(self):
         """Its domain is larger than the structure by design, so its share is
         above one and means nothing. y and z are padded 8 cells outward here."""
-        subjects = [f.subject for f in self._domain_findings(self._problem(6.0))]
+        subjects = [f.subject for f in self._domain_findings(self._problem(self.CROWDED))]
         assert "y domain" not in subjects and "z domain" not in subjects
 
     def test_an_axis_with_no_absorber_is_not_described(self):
-        problem = self._problem(6.0, pml_cells=(0, 8, 8))
+        problem = self._problem(self.CROWDED, pml_cells=(0, 8, 8))
         assert self._domain_findings(problem) == []
 
-    def test_the_share_is_of_the_structure_and_not_of_the_grid(self):
-        """Of the grid it is near-constant and says nothing - the real model
-        reads 87% and 46% of grid where the true figures are 76% and 4%."""
-        problem = self._problem(6.0)
-        interior = float(problem.grid.x[8]) - float(problem.grid.x[0])
-        outer = float(problem.grid.x[-1]) - float(problem.grid.x[0])
-        assert interior / outer > 0.1  # the grid-relative share is not 4%
-        assert "leaves 4%" in self._domain_findings(problem)[0].message
+    def test_the_grid_is_the_structure_so_only_one_of_them_can_be_the_share(self):
+        """Which is why the share is taken against the structure.
+
+        On a face the structure runs out through, the two coincide - so this
+        cannot tell them apart on its own, and does not try to: what it fixes is
+        the premise. A share taken against the grid would be one on this fixture
+        however much of the model the absorber had swallowed, and it is
+        :meth:`test_only_the_ends_that_absorb_are_counted`, with one end padded
+        outward and one through, where the two are different numbers and the
+        wrong one is caught.
+        """
+        problem = self._problem(self.CROWDED)
+        axis = np.asarray(problem.grid.x, dtype=float)
+        lower, upper = plan.structure_bounds(problem.solids, problem.ports)
+        drawn = float(upper[0]) - float(lower[0])
+        assert axis[-1] - axis[0] == pytest.approx(drawn)
+
+        cells = problem.grid.params["pml_cells"][0]
+        share = (axis[-1 - cells] - axis[cells]) / drawn
+        assert f"leaves {share:.0%} of the structure" in self._domain_findings(problem)[0].message
+        assert share < 1.0, "the share has to be of a model larger than the interior"
 
 
 class TestAPortMustReachTheGrid:
@@ -3227,13 +4408,246 @@ class TestAPortMustReachTheGrid:
         assert any("hanging 2 mm past x=min and 3 mm past x=max" in m for m in messages)
 
 
+class TestAFlatFaceInsideAConductorGetsALine:
+    """A solid's box says where its outside is and nothing about what is hollowed
+    out of it. A can's bore has two flat end walls that lie nowhere on that box,
+    and a flat conductor face the grid does not hold is a wall placed wherever
+    the cell happened to fall."""
+
+    WALL = 2.0
+    RADIUS = 6.0
+    HEIGHT = 5.0
+
+    def _cylinder(self, radius, half, base, facets, outward):
+        """One closed cylinder's points and triangles, capped by fans from its
+        own rim. ``outward`` is false for the bore, whose surface faces into the
+        metal around it."""
+        points = [
+            (
+                radius * math.cos(2 * math.pi * step / facets),
+                radius * math.sin(2 * math.pi * step / facets),
+                end,
+            )
+            for end in (half, -half)
+            for step in range(facets)
+        ]
+        faces = []
+        for step in range(facets):
+            here, ahead = step % facets, (step + 1) % facets
+            faces.append((here, facets + here, facets + ahead))
+            faces.append((here, facets + ahead, ahead))
+        for step in range(1, facets - 1):
+            faces.append((0, step, step + 1))
+            faces.append((facets, facets + step + 1, facets + step))
+        turned = faces if outward else [(a, c, b) for a, b, c in faces]
+        return points, [(base + a, base + b, base + c) for a, b, c in turned]
+
+    def _can(self, facets=32):
+        """A closed metal can on ``z``, as triangles - a bore inside a cylinder.
+
+        Two surfaces, and only the outer one is anywhere near the solid's box.
+        The bore's end walls are the faces this is about.
+        """
+        outer, outer_faces = self._cylinder(
+            self.RADIUS + self.WALL, self.HEIGHT / 2.0 + self.WALL, 0, facets, True
+        )
+        bore, bore_faces = self._cylinder(self.RADIUS, self.HEIGHT / 2.0, len(outer), facets, False)
+        return outer + bore, outer_faces + bore_faces
+
+    def test_the_bore_puts_a_line_on_each_of_its_end_walls(self):
+        vertices, faces = self._can()
+        lower = tuple(min(point[dim] for point in vertices) for dim in range(3))
+        upper = tuple(max(point[dim] for point in vertices) for dim in range(3))
+        can = Solid(
+            material="Metal",
+            lower=lower,
+            upper=upper,
+            priority=10,
+            label="Can",
+            vertices=vertices,
+            faces=faces,
+        )
+        port = Port(
+            number=1,
+            kind="lumped",
+            start=(-0.5, -0.5, -0.5),
+            stop=(0.5, 0.5, 0.5),
+            propagation_axis=1,
+            excitation_axis=2,
+            excite=True,
+            feed_resistance=50.0,
+            reference_impedance=50.0,
+        )
+        params = MeshParams(metal_res=0.8, dielectric_res=0.8, min_lines=4, pml_cells=0)
+        grid = plan.plan_grid((can,), (port,), MATERIALS, params, ((2, 2), (2, 2), (2, 2)))
+        for wall in (-self.HEIGHT / 2.0, self.HEIGHT / 2.0):
+            assert min(abs(line - wall) for line in grid.z) == pytest.approx(0.0, abs=1e-9), (
+                f"the bore's end wall at z={wall} has no line on it, and the grid "
+                f"nearest it is {min(grid.z, key=lambda line: abs(line - wall)):.4f}"
+            )
+
+    def test_the_drawing_is_asked_for_them_once_for_the_whole_mesh(self, monkeypatch):
+        """The mesher gathers its anchors once to size the absorber and again on
+        every pass of the loop that lays it. The drawing does not move between
+        those, so a reading taken where the anchors are gathered is the same
+        reading again."""
+        vertices, faces = self._can()
+        lower = tuple(min(point[dim] for point in vertices) for dim in range(3))
+        upper = tuple(max(point[dim] for point in vertices) for dim in range(3))
+        can = Solid(
+            material="Metal",
+            lower=lower,
+            upper=upper,
+            priority=10,
+            label="Can",
+            vertices=vertices,
+            faces=faces,
+        )
+        port = Port(
+            number=1,
+            kind="lumped",
+            start=(-0.5, -0.5, -0.5),
+            stop=(0.5, 0.5, 0.5),
+            propagation_axis=1,
+            excitation_axis=2,
+            excite=True,
+            feed_resistance=50.0,
+            reference_impedance=50.0,
+        )
+        params = MeshParams(metal_res=0.8, dielectric_res=0.8, min_lines=4, pml_cells=0)
+
+        asked = []
+        read = staircase.flat_planes
+
+        def counted(vertices, faces):
+            asked.append(len(faces))
+            return read(vertices, faces)
+
+        monkeypatch.setattr(staircase, "flat_planes", counted)
+        plan.plan_grid((can,), (port,), MATERIALS, params, ((2, 2), (2, 2), (2, 2)))
+        assert asked == [len(faces)]
+
+    def test_a_sheet_beside_the_can_keeps_its_plane_and_leaves_the_bore_walls(self):
+        """A sheet is placed by its own elevation and a triangulated conductor by
+        the faces read off its triangles, and one pass over the model gathers
+        both. A pass that dropped the solids it has nothing to read off would
+        take the sheet with them, and one that mixed up which answer belonged to
+        which solid would mesh the can as though its bore had no end walls."""
+        vertices, faces = self._can()
+        lower = tuple(min(point[dim] for point in vertices) for dim in range(3))
+        upper = tuple(max(point[dim] for point in vertices) for dim in range(3))
+        can = Solid(
+            material="Metal",
+            lower=lower,
+            upper=upper,
+            priority=10,
+            label="Can",
+            vertices=vertices,
+            faces=faces,
+        )
+        elevation = self.HEIGHT / 2.0 + self.WALL + 2.0
+        trace = Solid(
+            material="Foil",
+            lower=(-2.0, -2.0, elevation),
+            upper=(2.0, 2.0, elevation),
+            label="Trace",
+            vertices=(
+                (-2.0, -2.0, elevation),
+                (2.0, -2.0, elevation),
+                (2.0, 2.0, elevation),
+                (-2.0, 2.0, elevation),
+            ),
+            faces=((0, 1, 2), (0, 2, 3)),
+            sheet_normal=2,
+        )
+        port = Port(
+            number=1,
+            kind="lumped",
+            start=(-0.5, -0.5, -0.5),
+            stop=(0.5, 0.5, 0.5),
+            propagation_axis=1,
+            excitation_axis=2,
+            excite=True,
+            feed_resistance=50.0,
+            reference_impedance=50.0,
+        )
+        params = MeshParams(metal_res=0.8, dielectric_res=0.8, min_lines=4, pml_cells=0)
+        grid = plan.plan_grid((can, trace), (port,), MATERIALS, params, ((2, 2), (2, 2), (2, 2)))
+        for wall in (-self.HEIGHT / 2.0, self.HEIGHT / 2.0, elevation):
+            assert min(abs(line - wall) for line in grid.z) == pytest.approx(0.0, abs=1e-9), (
+                f"z={wall} has no line on it, and the grid nearest it is "
+                f"{min(grid.z, key=lambda line: abs(line - wall)):.4f}"
+            )
+
+    def test_and_the_faces_asked_for_are_the_ones_the_drawing_has(self):
+        """Read off the triangles, so a solid that is all curve asks for
+        nothing and cannot crowd the grid with planes it does not have."""
+        vertices, faces = self._can()
+        outside = self.HEIGHT / 2.0 + self.WALL
+        assert staircase.flat_planes(vertices, faces) == (
+            (2, -outside),
+            (2, -self.HEIGHT / 2.0),
+            (2, self.HEIGHT / 2.0),
+            (2, outside),
+        )
+
+
+class TestAFaceBlendedIntoACurveGetsALineToo:
+    """A rounded edge is ordinary CAD, and it runs into the face beside it at no
+    angle at all - so a bar with its edges rounded reads as one curved surface
+    unless something other than the angle recognises the flat parts. Nothing is
+    pinned to a face the mesher was never told about, and the wall then lands
+    wherever the grading left a line."""
+
+    WIDTH = 8.0
+    HEIGHT = 6.0
+    LENGTH = 20.0
+
+    def _bar(self):
+        return triangulated.rounded_bar(
+            width=self.WIDTH, height=self.HEIGHT, length=self.LENGTH, radius=1.0
+        )
+
+    def test_each_of_its_flat_faces_has_a_line_on_it(self):
+        vertices, faces = self._bar()
+        lower = tuple(min(point[dim] for point in vertices) for dim in range(3))
+        upper = tuple(max(point[dim] for point in vertices) for dim in range(3))
+        bar = Solid(
+            material="Metal",
+            lower=lower,
+            upper=upper,
+            priority=10,
+            label="Bar",
+            vertices=vertices,
+            faces=faces,
+        )
+        params = MeshParams(metal_res=0.8, dielectric_res=0.8, min_lines=4, pml_cells=0)
+        grid = plan.plan_grid((bar,), (), MATERIALS, params, ((2, 2), (2, 2), (2, 2)))
+        lines = (grid.x, grid.y, grid.z)
+        for axis, plane in staircase.flat_planes(vertices, faces):
+            nearest = min(lines[axis], key=lambda line: abs(line - plane))
+            assert nearest == pytest.approx(plane, abs=1e-9), (
+                f"the face at {'xyz'[axis]}={plane} has no line on it, and "
+                f"the grid nearest it is {nearest:.4f}"
+            )
+
+    def test_and_there_are_six_of_them_to_ask_about(self):
+        """So the test above cannot pass by asking for nothing: a tangent join
+        hides the runs of the outline, and without them every assertion over the
+        list is vacuously true.
+        """
+        vertices, faces = self._bar()
+        assert len(staircase.flat_planes(vertices, faces)) == 2 * 3
+
+
 class TestAPinnedPlaneMustHaveALineOnIt:
     """The mesher pins them, and the mesher is not on every route.
 
-    ``Port.required_lines`` is read by ``write.plan_grid`` alone. A driver
-    handed a finished envelope re-runs pre-flight over a grid it did not build,
-    and nothing there had ever confirmed the pinned planes survived into it.
-    A guard that only one route runs is a guard the other route does without.
+    ``plan.plan_grid`` reads ``Port.required_lines`` to pin those planes, and
+    it is not on every route: a driver handed a finished envelope meshes
+    nothing. What re-runs there is pre-flight, over a grid it did not build, so
+    ``preflight.ports._check_required_lines_exist`` reads the same planes off
+    the finished axes and says whether they survived.
     """
 
     NEEDS_A_LINE = "needs a grid line"
@@ -3262,7 +4676,7 @@ class TestAPinnedPlaneMustHaveALineOnIt:
         solids = (Solid(material="Air", lower=(0.0, 0.0, 0.0), upper=(10.7, 4.3, 50.0)),)
         params = MeshParams(metal_res=0.4, dielectric_res=0.4, min_lines=10, pml_cells=(0, 0, 8))
         padding = ((0, 0), (0, 0), (THROUGH, THROUGH))
-        grid = write.plan_grid(solids, (self._guide((4.0, 6.0)),), materials, params, padding)
+        grid = plan.plan_grid(solids, (self._guide((4.0, 6.0)),), materials, params, padding)
         return build_problem(
             grid=grid,
             solids=solids,
@@ -3315,7 +4729,7 @@ class TestNoNumberReachesTheEngineUnchecked:
     Every range check in the envelope was a ``<`` comparison, and every ``<``
     comparison is ``False`` for NaN - so the guards were not weak, they were
     absent for exactly the values most worth refusing. ``mu`` was never checked
-    at all: zero reached ``write.plan_mesh`` as a ``ZeroDivisionError`` and
+    at all: zero reached ``plan.plan_mesh`` as a ``ZeroDivisionError`` and
     negative as a math domain error.
 
     Parametrised over the fields rather than written out per case, so a field
@@ -3359,25 +4773,24 @@ class TestNoNumberReachesTheEngineUnchecked:
             Material(name="X", kind=kind, conductivity=5.8e7, kappa=1.5)
 
     def test_both_conductor_kinds_are_named(self):
-        """Spelled out, because parametrizing the two tests below over
-        ``CONDUCTOR_KINDS`` itself and so could not see it shrink. Dropping
-        ``conducting_sheet`` from it passed the whole suite while restoring the
-        original bug in full: the shipped example's copper is a conducting
-        sheet, so it went back to resizing the grid *and* lost its ``metal_res``
-        edges, 909,440 cells to 723,800.
+        """The set is asserted here because nothing else in this class reads
+        it: the tests below name their kinds literally, so a kind dropped from
+        ``CONDUCTOR_KINDS`` leaves every one of them passing. Dropping
+        ``conducting_sheet`` did exactly that while restoring the original bug
+        in full: the shipped example's copper is a conducting sheet, so it went
+        back to resizing the grid *and* lost its ``metal_res`` edges.
         """
         assert {"pec", "conducting_sheet"} == CONDUCTOR_KINDS
 
     @pytest.mark.parametrize("kind", ["pec", "conducting_sheet"])
     @pytest.mark.parametrize("field, value", [("epsilon", 20.0), ("mu", 2.0)])
     def test_a_conductor_carrying_a_permittivity_is_refused(self, kind, field, value):
-        """``driver.build_material`` hands a conductor its conductivity and
+        """``driver._add_material`` hands a conductor its conductivity and
         nothing else, so these two reach openEMS nowhere - but they are not
         inert. ``policy._wavelength`` takes ``max(epsilon * mu)`` over every
         material and sizes the whole grid from it, and two pre-flight thresholds
-        are computed the same way. Measured on the acceptance example: copper at
-        epsilon 20 moved the cell count +30.5% and took the feed-clearance
-        threshold from 14.29 mm to 6.70 mm.
+        are computed the same way - so a permittivity on a conductor moves the
+        cell count and both thresholds with it.
         """
         legal = {"conductivity": 5.8e7, "thickness": 0.035}
         with pytest.raises(EnvelopeError, match="conductor"):
@@ -3585,7 +4998,7 @@ class TestWaveguidePorts:
         guide = Solid(material="Air", lower=(0.0, 0.0, 0.0), upper=(10.7, 4.3, 50.0))
         air = (Material(name="Air", kind="dielectric", epsilon=1.0),)
         params = MeshParams(metal_res=0.4, dielectric_res=0.4, min_lines=10, pml_cells=(0, 0, 8))
-        grid = write.plan_grid(
+        grid = plan.plan_grid(
             (guide,),
             (WAVEGUIDE_PORT,),
             air,
@@ -3604,7 +5017,7 @@ class TestWaveguidePorts:
         guide = Solid(material="Air", lower=(0.0, 0.0, 0.0), upper=(10.7, 4.3, 50.0))
         air = (Material(name="Air", kind="dielectric", epsilon=1.0),)
         params = MeshParams(metal_res=0.4, dielectric_res=0.4, min_lines=10, pml_cells=(0, 0, 8))
-        grid = write.plan_grid(
+        grid = plan.plan_grid(
             (guide,),
             (WAVEGUIDE_PORT,),
             air,
@@ -3618,9 +5031,9 @@ class TestWaveguidePorts:
         assert grid.y[0] == pytest.approx(0.0)
         assert grid.y[-1] == pytest.approx(4.3)
 
-        # Along it, THROUGH pulls the domain in so the absorber lands *on* the
-        # guide and never past its end - so the mesh still spans exactly the
-        # guide, with its outermost cells absorbing.
+        # Along it, THROUGH takes the absorber out of the guide rather than
+        # adding it beyond, so the mesh spans exactly the guide with its
+        # outermost cells absorbing, and never reaches past its end.
         assert grid.z[0] >= -1e-9
         assert grid.z[-1] <= 50.0 + 1e-9
 
@@ -3645,7 +5058,7 @@ class TestWaveguidePorts:
         guide = Solid(material="Air", lower=(0.0, 0.0, 0.0), upper=(10.7, 4.3, 50.0))
         air = (Material(name="Air", kind="dielectric", epsilon=1.0),)
         params = MeshParams(metal_res=0.4, dielectric_res=0.4, min_lines=10, pml_cells=(0, 0, 8))
-        grid = write.plan_grid(
+        grid = plan.plan_grid(
             (guide,),
             (WAVEGUIDE_PORT,),
             air,
@@ -3740,7 +5153,11 @@ class TestTheProbeAsymmetryLimit:
         The binding assertion is the second one: it fails if the limit is
         loosened by much, which is what makes 0.02 a number rather than a taste.
         """
-        at_limit = _worst_error(preflight.probes._PROBE_ASYMMETRY_LIMIT, 0.1, 20.0)
+        at_limit = _worst_error(
+            preflight.probes._PROBE_ASYMMETRY_LIMIT,
+            0.1,
+            preflight.probes._CELLS_PER_WAVELENGTH_ASSUMED,
+        )
         assert at_limit == pytest.approx(3.2e-4, rel=0.05, abs=0.0)
         assert at_limit < 5e-4
 
@@ -3796,17 +5213,20 @@ class TestSilentWrongAnswers:
         the only check on the replayed-envelope route, where nothing meshes.
         """
         air, guide, params = self._guide()
-        # Planes inside the absorber, i.e. outside the meshed domain.
+        # Planes inside the absorber, i.e. outside the meshed domain, and off
+        # the block's own lattice. The block is uniform, so a plane landing on
+        # one of its lines is found there and says nothing about the mesher
+        # having placed it.
         port = Port(
             number=1,
             kind="rect_waveguide",
             mode="TE10",
-            start=(0.0, 0.0, 0.5),
-            stop=(10.7, 4.3, 1.0),
+            start=(0.0, 0.0, 0.6),
+            stop=(10.7, 4.3, 1.1),
             propagation_axis=2,
             excite=True,
         )
-        grid = write.plan_grid(
+        grid = plan.plan_grid(
             (guide,),
             (port,),
             air,
@@ -3824,7 +5244,8 @@ class TestSilentWrongAnswers:
         sparse one yields a strictly increasing, perfectly uniform grid that
         satisfies every check in _validate, having averaged the grading away.
         """
-        from Microwave.Solvers.openems.mesh import MeshError, _symmetrize
+        from Microwave.Solvers.openems.regions import MeshError
+        from Microwave.Solvers.openems.sizing_field import _symmetrize
 
         mismatched = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5]
         with pytest.raises(MeshError, match="different numbers of cells"):
@@ -3832,7 +5253,7 @@ class TestSilentWrongAnswers:
 
     def test_a_genuine_fold_is_still_allowed(self):
         """The guard must not reject the case it exists to protect."""
-        from Microwave.Solvers.openems.mesh import _symmetrize
+        from Microwave.Solvers.openems.sizing_field import _symmetrize
 
         symmetric = [0.0, 0.1, 0.3, 0.6, 1.0, 1.4, 1.7, 1.9, 2.0]
         assert _symmetrize(symmetric) == pytest.approx(symmetric)
@@ -3840,18 +5261,16 @@ class TestSilentWrongAnswers:
     def test_the_limit_is_a_fraction_of_a_cell_not_of_the_span(self):
         """What the guard is asking about is a cell-count mismatch, and that
         moves lines by a fraction of a *cell*. Measuring against the span
-        instead is a different quantity that merely sat between the two regimes
-        on the grids that existed when it was written - an axis with one long
-        uninterrupted gap accumulates rounding along it and tripped it at
-        1.5e-6 of a cell, which is not a mismatch by any reading.
+        instead asks a different question: an axis with one long uninterrupted
+        gap accumulates rounding along it and trips a span-relative limit at an
+        offset that is no mismatch by any reading.
 
-        Both rows below are the same grid, perturbed by different amounts, and
-        they sit one decade either side of the thousandth-of-a-cell limit -
-        which is what the limit's own comment claims for it. Bracketing at
-        1e-5 and half a cell instead left four and a half decades of slack, and
-        moving the constant two orders in either direction went unnoticed.
+        Both rows below are the same grid perturbed by different amounts, and
+        they sit one decade either side of the thousandth-of-a-cell limit, which
+        is what the limit's own comment claims for it.
         """
-        from Microwave.Solvers.openems.mesh import MeshError, _symmetrize
+        from Microwave.Solvers.openems.regions import MeshError
+        from Microwave.Solvers.openems.sizing_field import _symmetrize
 
         even = [0.0, 0.1, 0.3, 0.6, 1.0, 1.4, 1.7, 1.9, 2.0]
         smallest = 0.1
@@ -4046,6 +5465,119 @@ class TestSilentWrongAnswers:
         problem = build_problem(materials=(MATERIALS[0], MATERIALS[1], fat))
         assert any(f.subject == "Foil" for f in preflight.refusals(preflight.check(problem)))
 
+    def test_a_conducting_sheet_bound_to_something_solid_is_refused(self):
+        """openEMS would solve it as PEC, and say so only in its own output.
+
+        The surface-impedance model reaches a shape spanning two axes and
+        nothing else; a shape with a volume the engine writes as a perfect
+        conductor, discarding the conductivity and the thickness. The run
+        finishes and returns a lossless conductor's answer for a lossy foil.
+
+        The label shares no substring with the material, so an assertion that
+        the material was named cannot be satisfied by the subject line.
+        """
+        slab = Solid(
+            material="Foil",
+            lower=(-20.0, -5.0, 0.0),
+            upper=(20.0, 5.0, 0.4),
+            label="Upper trace",
+        )
+        problem = build_problem(solids=(SUBSTRATE, GROUND, slab))
+
+        refused = preflight.refusals(preflight.check(problem))
+        message = str(next(f for f in refused if f.subject == "Upper trace"))
+
+        assert [f.subject for f in refused if f.subject == "Upper trace"] == ["Upper trace"]
+        assert "Foil" in message, "the refusal must name the material, not only the solid"
+
+    @pytest.mark.parametrize("spanned", [0, 1, 3])
+    def test_a_conducting_sheet_that_does_not_span_a_surface_is_refused(self, spanned):
+        """What openEMS asks is the dimension, and two is the only one that
+        works: a line and a point fail the same test in the engine as a volume
+        does, and are written as a perfect conductor just as loudly. The driver
+        re-runs pre-flight over whatever envelope it is handed, so the guard
+        cannot rest on the drawing having been refused first.
+        """
+        upper = [-20.0, -5.0, 0.0]
+        for dim in range(spanned):
+            upper[dim] += 4.0
+        thin = Solid(
+            material="Foil", lower=(-20.0, -5.0, 0.0), upper=tuple(upper), label="Upper trace"
+        )
+        problem = build_problem(solids=(SUBSTRATE, GROUND, thin))
+
+        assert any(f.subject == "Upper trace" for f in preflight.refusals(preflight.check(problem)))
+
+    @pytest.mark.parametrize("axis", [0, 1, 2])
+    def test_a_conducting_sheet_laid_flat_is_untouched(self, axis):
+        """The other half, on every axis a sheet can be flat on: refusing every
+        conducting sheet would pass the tests above and refuse each shipped
+        example, whose copper is all sheet material.
+
+        Read off the message rather than the subject - ``_check_sheet_thickness``
+        raises its refusals against the material, so an assertion phrased over
+        subjects alone would hold two checks at once and pass for either one's
+        reason.
+        """
+        lower = [-20.0, -5.0, 0.0]
+        upper = [20.0, 5.0, 0.0]
+        upper[axis] = lower[axis]
+        for dim in range(3):
+            if dim != axis and upper[dim] == lower[dim]:
+                upper[dim] = lower[dim] + 4.0
+        flat = Solid(material="Foil", lower=tuple(lower), upper=tuple(upper), label="Upper trace")
+        problem = build_problem(solids=(SUBSTRATE, GROUND, flat))
+
+        assert not any(
+            "surface-impedance model only to a shape" in str(f) for f in preflight.check(problem)
+        )
+
+    def test_a_solid_conductor_that_is_not_a_sheet_is_untouched(self):
+        """The check is about the material, not about having a volume: a perfect
+        conductor is drawn solid all the time - ``GROUND`` above is one - and
+        reads the same way to anything looking at geometry alone.
+        """
+        block = Solid(
+            material="Metal",
+            lower=(-20.0, -5.0, 0.0),
+            upper=(20.0, 5.0, 0.4),
+            label="Block",
+        )
+        problem = build_problem(solids=(SUBSTRATE, GROUND, block))
+
+        assert not any(f.subject == "Block" for f in preflight.refusals(preflight.check(problem)))
+
+    def test_a_sheet_the_mesher_thickened_says_where_the_metal_came_from(self):
+        """The route that reaches this without anybody drawing a volume.
+
+        A conductor drawn as a surface that cannot be laid flat is offset into a
+        solid, and the length it is offset by is the mesh policy's rather than
+        the drawing's. Naming it separates this from a shape drawn solid
+        deliberately, which gets a remedy this one cannot use.
+
+        The supplied length and the solid's own thickness differ, so a message
+        quoting the wrong one does not pass for the right one.
+        """
+        skin = Solid(
+            material="Foil",
+            lower=(-20.0, -5.0, 0.0),
+            upper=(20.0, 5.0, 0.4),
+            label="Upper trace",
+            thickened=0.05,
+        )
+        problem = build_problem(solids=(SUBSTRATE, GROUND, skin))
+
+        findings = preflight.check(problem)
+        message = str(next(f for f in preflight.refusals(findings) if f.subject == "Upper trace"))
+
+        assert "0.05" in message
+        assert "built off it" in message
+        assert "0.4" not in message, "the drawing's own thickness is not what was supplied"
+        assert not any(f.severity == preflight.SUBSTITUTE for f in findings), (
+            "the invented-thickness note advises closing the shape, which is what "
+            "the refusal is about"
+        )
+
     def _driver_on(self, tmp_path, monkeypatch, problem):
         """Run ``driver.main`` over ``problem``, refusing to let it solve.
 
@@ -4114,7 +5646,7 @@ class TestDefaultsThatProtectTheRun:
         assert params.min_cell < params.metal_res / 100
 
     def test_a_frequency_band_reports_its_own_centre_and_width(self):
-        """These drive SetGaussExcite; a wrong centre shifts the whole spectrum
+        """These two shape the pulse; a wrong centre shifts the whole spectrum
         off the band being asked about."""
         band = Frequency(start=1e9, stop=10e9)
         assert band.center == pytest.approx(5.5e9)
@@ -4154,37 +5686,38 @@ class TestPerMaterialSizingIsOptIn:
     """
 
     def _regions(self, params):
-        lines, shapes, _ = write.plan_mesh((SUBSTRATE, GROUND), (PORT,), MATERIALS, params, PADDING)
+        lines, shapes, _ = plan.plan_mesh((SUBSTRATE, GROUND), (PORT,), MATERIALS, params, PADDING)
         return {region.label: region for region in shapes}
 
     def test_without_a_cap_no_region_carries_a_size(self):
         shapes = self._regions(PARAMS)
         assert all(region.size is None for region in shapes.values())
 
-    def test_a_conductor_never_sizes_the_reservation(self):
+    def test_a_permittivity_smuggled_onto_a_conductor_still_sizes_nothing(self):
         """A conductor is left out of the per-material sizes entirely.
 
-        ``Material`` refuses a conductor carrying a permittivity, so this cannot
-        arise through the envelope - the constructor is bypassed here on
-        purpose. It is the second of two guards, and the one that matters to
-        ``domain``: ``regions`` discarding a conductor's size on its own
-        while ``_coarsest_in`` read the same dict and did not, so a THROUGH face
-        was reserved in a size the mesher could not lay. On the acceptance
-        example that put the x wall 2.85 mm outside the board. The rule now
-        lives at the dict instead, so both readers get it.
+        ``Material`` refuses a conductor carrying a permittivity, so the only
+        way to reach this at all is to bypass the constructor, which is what is
+        done here. The rule is stated once, where the dict is built, so no
+        reader of it has to restate it: what is resolved inside a conductor is
+        nothing, and what is resolved at its faces is a field singularity, which
+        is ``metal_res``' job rather than a bulk size's.
 
-        ``GROUND`` spans the whole x range, so it covers both THROUGH windows:
-        counted, it would drag each reservation from FR4's cell down to its own.
+        Asserted on the region rather than on the grid. A bulk size only reaches
+        the sizing field through a *dielectric* span, so a conductor carrying
+        one moves no line - it would instead be a number in the envelope that
+        describes nothing, and one the region size checks judge against a floor
+        and a ceiling it was never meant to be inside.
         """
         capped = dataclasses.replace(PARAMS, cap=2.5)
         dirty = Material(name="Metal", kind="pec")
         object.__setattr__(dirty, "epsilon", 20.0)
         materials = (MATERIALS[0], dirty, MATERIALS[2])
 
-        with_metal, _, _ = write.plan_mesh((SUBSTRATE, GROUND), (PORT,), materials, capped, PADDING)
-        clean, _, _ = write.plan_mesh((SUBSTRATE, GROUND), (PORT,), MATERIALS, capped, PADDING)
-        assert with_metal.x[0] == pytest.approx(clean.x[0], abs=0.0)
-        assert with_metal.x[-1] == pytest.approx(clean.x[-1], abs=0.0)
+        _, shapes, _ = plan.plan_mesh((SUBSTRATE, GROUND), (PORT,), materials, capped, PADDING)
+        sized = {region.label: region for region in shapes}
+        assert sized["Ground"].size is None
+        assert sized["Substrate"].size == pytest.approx(2.5 / math.sqrt(4.4))
 
     def test_with_a_cap_each_dielectric_gets_its_own(self):
         capped = dataclasses.replace(PARAMS, cap=2.0)
@@ -4200,7 +5733,7 @@ class TestPerMaterialSizingIsOptIn:
         magnetic = Material(name="Ferrite", kind="dielectric", epsilon=1.0, mu=4.0)
         core = Solid(material="Ferrite", lower=(-50.0, -1.5, 0.0), upper=(50.0, 1.5, 1.6))
         capped = dataclasses.replace(PARAMS, cap=2.0)
-        _, shapes, _ = write.plan_mesh((core,), (), (magnetic,), capped, PADDING)
+        _, shapes, _ = plan.plan_mesh((core,), (), (magnetic,), capped, PADDING)
         sized = {region.label: region for region in shapes}
         assert sized["Ferrite"].size == pytest.approx(2.0 / math.sqrt(4.0))
 
@@ -4225,12 +5758,12 @@ class TestPerMaterialSizingIsOptIn:
             priority=2,
             label="Sheet",
         )
-        lines, shapes, _ = write.plan_mesh(
+        lines, shapes, _ = plan.plan_mesh(
             (SUBSTRATE, GROUND, sheet), (PORT,), MATERIALS, capped, PADDING
         )
         region = {region.label: region for region in shapes}["Sheet"]
         assert region.size is None
-        assert region.material is write.MaterialClass.METAL
+        assert region.material is regions.MaterialClass.METAL
 
     def test_a_cap_coarsens_the_air_and_not_the_board(self):
         """Judged on cell sizes rather than on a cell count. The count is not a
@@ -4240,7 +5773,7 @@ class TestPerMaterialSizingIsOptIn:
         """
 
         def sizes(params):
-            grid = write.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, params, PADDING)
+            grid = plan.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, params, PADDING)
             below = grid.z[grid.z <= 0.0]
             inside = grid.z[(grid.z >= 0.0) & (grid.z <= 1.6)]
             return max(np.diff(below)), max(np.diff(inside))
@@ -4303,16 +5836,19 @@ class TestAnExcitationIsNotSnapped:
         with pytest.raises(model.EnvelopeError, match="zero extent along the propagation axis"):
             _lumped(propagation_axis=0)
 
-    def test_a_port_with_thickness_pins_nothing(self):
+    def test_a_port_with_thickness_requires_nothing(self):
         """One cell along the line is what the TDR acceptance fixture draws, and
-        a box that spans lines needs none of them named."""
+        a box that spans lines catches one whatever the grading did, so nothing
+        here is unsurvivable. Where its faces land is a separate question, and
+        :class:`TestTheElementIsTheBoxSnapped` is where it is asked."""
         thick = _lumped(stop=(-49.6, 1.5, 0.0))
         assert thick.required_lines() == ([], [], [])
 
-    def test_a_termination_pins_nothing(self):
-        """Nothing to excite. The resistor and the probes are both snapped, so
-        pinning here would constrain the mesh for no gain - and would move the
-        grid of every study that terminates a line."""
+    def test_a_termination_requires_nothing(self):
+        """Nothing to excite, and the excitation is the whole of what is
+        unsurvivable. The resistor and the probes are snapped, so a termination
+        on a grid that missed its plane still reads - at the size the snapping
+        left it, which is what :meth:`model.Port.element_lines` is for."""
         assert _lumped(excite=False).required_lines() == ([], [], [])
 
     def test_what_it_asks_for_is_what_the_mesh_contains(self):
@@ -4320,7 +5856,7 @@ class TestAnExcitationIsNotSnapped:
         it: this is the whole route from the port to the grid it is solved on."""
         board = Solid(material="FR4", lower=(-50.0, -15.0, 0.0), upper=(50.0, 15.0, 1.6))
         materials = (Material(name="FR4", kind="dielectric", epsilon=4.4),)
-        grid = write.plan_grid(
+        grid = plan.plan_grid(
             [board],
             [_lumped()],
             materials,
@@ -4346,9 +5882,124 @@ class TestAnExcitationIsNotSnapped:
         assert "0/0" in findings[0].message
 
 
+class TestTheElementIsTheBoxSnapped:
+    """What openEMS builds for a lumped port is its box moved onto the grid, so
+    it is the box that was drawn only where the grid holds every face.
+
+    Each face goes to the line nearest it - ``Calc_LumpedElements`` snaps with
+    the default method (``openEMS/FDTD/operator.cpp``:1625,
+    ``openEMS/FDTD/operator.h``:202) and ``SnapToMeshLine``
+    (``openEMS/FDTD/operator.cpp``:253) answers with the line whose dual cell
+    holds the coordinate - and the resistance is integrated over what that
+    leaves. A face the grid missed is therefore a gap the excitation drives
+    across, and a cross-section the resistance spreads over, that the model
+    never stated.
+    """
+
+    def test_a_box_with_extent_names_both_faces_on_every_axis(self):
+        thick = _lumped(start=(-50.0, -1.5, 1.6), stop=(-49.0, 1.5, 0.0))
+        assert thick.element_lines() == ([-50.0, -49.0], [-1.5, 1.5], [1.6, 0.0])
+
+    def test_an_axis_it_is_flat_across_names_its_one_plane_once(self):
+        """The two faces are one position there, and writing it down twice would
+        have the mesher pin what it has already pinned."""
+        assert _lumped().element_lines()[0] == [-50.0]
+
+    def test_a_termination_asks_for_what_a_source_asks_for(self):
+        """openEMS snaps a resistor whether or not anything is driving it, so
+        the size the element is built at does not depend on which end excites."""
+        assert _lumped(excite=False).element_lines() == _lumped().element_lines()
+
+    def test_the_grid_gives_back_the_element_that_was_drawn(self):
+        """End to end, and stated as the length rather than as the lines,
+        because the length is what the resistance and the excitation act over.
+
+        On a box standing free in a dielectric, which is the case nothing else
+        settles: a port drawn against a conductor's face has that face pinned as
+        metal, and one inside a triangulated solid has no region to pin at all.
+        """
+        block = Solid(material="Air", lower=(0.0, 0.0, 0.0), upper=(20.0, 20.0, 20.0))
+        materials = (Material(name="Air", kind="dielectric", epsilon=1.0),)
+        port = Port(
+            number=1,
+            kind="lumped",
+            start=(9.3, 9.3, 9.3),
+            stop=(10.7, 10.7, 10.7),
+            propagation_axis=0,
+            excitation_axis=2,
+            excite=True,
+            feed_resistance=50.0,
+            reference_impedance=50.0,
+        )
+        grid = plan.plan_grid(
+            [block],
+            [port],
+            materials,
+            MeshParams(metal_res=1.0, dielectric_res=1.0, min_lines=4, pml_cells=8),
+            padding=((4, 4), (4, 4), (4, 4)),
+        )
+        for axis, lines in enumerate((grid.x, grid.y, grid.z)):
+            low, high = sorted((port.start[axis], port.stop[axis]))
+            built = [min(lines, key=lambda line: abs(line - face)) for face in (low, high)]
+            assert built[1] - built[0] == high - low, (
+                f"axis {axis}: drawn {low} to {high} and built {built[0]} to {built[1]}"
+            )
+
+    def test_a_conductor_the_port_is_drawn_against_keeps_its_own_edge(self):
+        """The one request a solid outranks.
+
+        A conductor's edge is settled by the thirds rule - lines either side of
+        it and never on it, a field singularity sitting there - so a line laid
+        on a face the port shares with a trace would give that one edge a
+        different treatment from the rest of the same trace, and the element
+        would span something other than what the conductor conducts. The port's
+        own face, which no solid stands on, is placed.
+        """
+        board = Solid(material="FR4", lower=(-50.0, -15.0, 0.0), upper=(50.0, 15.0, 1.6))
+        trace = Solid(material="Copper", lower=(-50.0, -1.5, 1.6), upper=(50.0, 1.5, 1.7))
+        materials = (
+            Material(name="FR4", kind="dielectric", epsilon=4.4),
+            Material(name="Copper", kind="pec"),
+        )
+        port = _lumped(start=(-50.0, -1.5, 1.6), stop=(-49.0, 1.5, 0.0))
+        grid = plan.plan_grid(
+            [board, trace],
+            [port],
+            materials,
+            MeshParams(metal_res=0.5, dielectric_res=1.0, min_lines=6, pml_cells=8),
+            padding=((8, 8), (8, 8), (8, 8)),
+        )
+        for edge in (-1.5, 1.5):
+            assert min(abs(line - edge) for line in grid.y) > 0.0, (
+                f"a line landed on the trace's own edge at y={edge}"
+            )
+        assert min(abs(line - (-49.0)) for line in grid.x) == 0.0, (
+            "the port's own face is not a line, and no solid stands on it"
+        )
+
+    def test_a_strip_a_port_lays_outranks_it_like_any_other_conductor(self):
+        """A microstrip port builds its own strip, and that strip has edges the
+        thirds rule settles exactly as a drawn trace's are. A lumped element at
+        the end of one is drawn against metal that is in no solid."""
+        board = Solid(material="FR4", lower=(-50.0, -15.0, 0.0), upper=(50.0, 15.0, 1.6))
+        materials = (
+            Material(name="FR4", kind="dielectric", epsilon=4.4),
+            Material(name="Foil", kind="pec"),
+        )
+        feed = PORT
+        load = _lumped(start=(49.0, -1.5, 1.6), stop=(50.0, 1.5, 0.0), excite=False)
+        grid = plan.plan_grid(
+            [board], [feed, load], materials, PARAMS, padding=((8, 8), (8, 8), (8, 8))
+        )
+        for edge in (-1.5, 1.5):
+            assert min(abs(line - edge) for line in grid.y) > 0.0, (
+                f"a line landed on the laid strip's edge at y={edge}"
+            )
+
+
 class TestAnExcitationWithExtentStillHasToCatchALine:
-    """The other half of it: a box that spans cells names no plane to pin, so
-    nothing asks the mesher for a line and nothing checked that one arrived.
+    """The other half of it: a box that spans cells names no plane the mesher
+    must place, so nothing refuses a grid whose lines all fell outside it.
 
     Where the box is drawn against a conductor's face the mesher pins that face
     and refines around it, and lines land inside; where it is not - a box in the
@@ -4811,6 +6462,30 @@ class TestAnElementSnappedOffItsMetal:
             == []
         )
 
+    def test_and_the_share_it_is_asked_at_is_the_one_the_run_will_be_built_at(self):
+        """The case above with the correction switched off. Nothing about the
+        drawing changes, so the same terminal is now outside the metal and the
+        check has a fault to name - which is what says pre-flight reads the
+        envelope's share rather than the constant, and so cannot come to hold an
+        opinion about a conductor the run will not build."""
+        vertices, faces = _octahedron(0.2)
+        foil = Solid(
+            material="Copper",
+            lower=(-4, -4, -0.2),
+            upper=(4, 4, 0.2),
+            vertices=vertices,
+            faces=faces,
+        )
+        port = _lumped(start=(-0.5, -0.5, 0.2), stop=(0.5, 0.5, 3.0), propagation_axis=0)
+        problem = self.problem(
+            (-6.0, -3.0, 1.0, 3.0, 6.0),
+            solids=(foil,),
+            port=port,
+            x=(-6.0, -4.0, 0.0, 4.0, 6.0),
+            y=(-6.0, -4.0, 0.0, 4.0, 6.0),
+        )
+        assert self.met(dataclasses.replace(problem, grown_by=0.0)) != []
+
     def test_the_metal_a_port_lays_itself_counts_as_metal(self):
         """A microstrip port builds its own strip, and it is the finest metal in
         the model rather than an afterthought."""
@@ -4863,38 +6538,55 @@ class TestAnElementSnappedOffItsMetal:
         assert any("where nothing conducts" in f.message for f in blocking)
 
 
-class TestAConductorTheGridBarelySpans:
-    """How much of a conductor's drawn width the grid still holds, off the grid.
+class TestAConductorTheGridDoesNotBuildAsDrawn:
+    """How near a conductor's drawn width the grid builds the metal, off the grid.
 
     Off it rather than predicted from the policy, and that is the whole reason
     the check exists in this form. No policy setting spans metal - the global
     element count is dielectrics only and the edge size is a length rather than
-    a count - so what a given policy leaves of a trace is decided by where its
-    lines happen to fall, and a policy the user refined can leave less of one
-    than before.
+    a count - so what a given policy makes of a trace is decided by where its
+    lines happen to fall, and a policy the user refined can build one further
+    from the drawing than before.
+
+    Every specimen here is stated as a count of cells and an *overhang*, and has
+    a face on a line, because that is what a uniform grid leaves anything to act
+    on. Each face arrives on the nearer of the two lines straddling it, so a
+    span that is a whole number of cells arrives exactly as drawn wherever the
+    grid sits, and one drawn a fraction of a cell longer arrives short by that
+    fraction.
+
+    The exception is a face falling exactly midway between two lines, where
+    neither is the nearer and the drawing decides: the sample lands on the face
+    itself, which counts as inside, so both faces tie outward and a whole number
+    of cells arrives a cell **wider**. The overhang keeps every specimen off
+    that, and one test pins it.
     """
 
-    BAR = mesh.CONDUCTOR_WIDTH_KEPT
+    BAR = CONDUCTOR_WIDTH_KEPT
+
+    #: How far past a whole number of cells a specimen is drawn, as a share of
+    #: the pitch. Under a half, so the far face is nearer the line inside it and
+    #: the metal arrives that whole number of cells wide. Not a half, where the
+    #: face is equidistant from both lines and the answer would rest on how that
+    #: tie is broken rather than on the rule.
+    OVERHANG = 0.4
 
     def _grid(self, pitch=0.1, reach=60.0, params=None, pitches=None):
-        """A uniform grid, so the share is arithmetic and not a mesh.
-
-        Offset by half a pitch, so that a span placed at a round coordinate has
-        its faces *between* lines rather than on them. On them the conductor
-        reaches its own boundary and nothing is lost, which is a real case and
-        not the one this check is about; between them each face gives up half a
-        cell, and a span of ``width`` keeps ``1 - pitch / width``.
-        """
+        """A uniform grid, so the share is arithmetic and not a mesh."""
         axes = []
         for one in pitches or (pitch, pitch, pitch):
             steps = int(round(reach / one))
-            axes.append((np.arange(-steps, steps + 1) + 0.5) * one)
+            axes.append(np.arange(-steps, steps + 1) * one)
         return MeshGrid(
             x=axes[0],
             y=axes[1],
             z=axes[2],
             params={"cap": 1.0} if params is None else params,
         )
+
+    def _across(self, cells, pitch=0.1):
+        """A width drawn to arrive ``cells`` cells across, and the share of it."""
+        return (cells + self.OVERHANG) * pitch, cells / (cells + self.OVERHANG)
 
     def _trace(self, width, thickness=0.0, at=0.0, **fields):
         return Solid(
@@ -4913,26 +6605,51 @@ class TestAConductorTheGridBarelySpans:
 
     # ------------------------------------------------------- the share itself
 
-    def test_a_face_between_two_lines_gives_up_the_gap(self):
-        """A conductor whose faces fall between lines arrives inscribed: it
-        conducts from the first line it contains to the last, and the two
-        part-cells at its ends are lost."""
-        assert mesh.width_spanned(np.arange(6.0), 1.5, 4.5) == pytest.approx(2 / 3, abs=0.0)
+    def test_a_face_nearer_the_line_within_the_metal_gives_up_the_gap(self):
+        """A face closer to the line inside it than to the one beyond arrives on
+        that inner line, and the part-cell past it is lost."""
+        assert width_spanned(np.arange(6.0), 1.7, 4.3) == pytest.approx(2 / 2.6, rel=1e-12, abs=0.0)
+
+    def test_a_face_nearer_the_line_beyond_it_takes_the_gap(self):
+        """And the other way round it arrives on the outer line, which the
+        drawing does not contain: the transverse edge between the two samples
+        inside the metal, so openEMS ties both of them to the conductor."""
+        assert width_spanned(np.arange(6.0), 1.3, 4.7) == pytest.approx(4 / 3.4, rel=1e-12, abs=0.0)
 
     def test_a_line_on_the_face_conducts(self):
         """openEMS applies the metal at sample points the drawing contains, and
         a point on the boundary is one of them - which is why an axis-aligned
         conductor pinned at both faces arrives exactly as drawn."""
-        assert mesh.width_spanned(np.arange(6.0), 1.0, 5.0) == pytest.approx(1.0, abs=0.0)
+        assert width_spanned(np.arange(6.0), 1.0, 5.0) == pytest.approx(1.0, abs=0.0)
 
-    def test_a_span_holding_one_line_has_no_width_left(self):
-        assert mesh.width_spanned(np.arange(6.0), 0.5, 1.5) == 0.0
+    def test_a_face_exactly_between_two_lines_arrives_on_the_outer_one(self):
+        """The one tie the rule has to break, and it breaks outward: the sample
+        lands *on* the drawing's boundary, which openEMS counts as inside."""
+        assert width_spanned(np.arange(6.0), 1.5, 4.5) == pytest.approx(4 / 3, rel=1e-12, abs=0.0)
 
-    def test_a_span_holding_no_line_has_none_either(self):
-        assert mesh.width_spanned(np.arange(6.0), 1.2, 1.8) == 0.0
+    def test_a_span_both_of_whose_faces_round_to_one_line_has_no_width(self):
+        assert width_spanned(np.arange(6.0), 1.2, 1.4) == 0.0
 
     def test_a_span_with_no_extent_is_not_a_share_of_anything(self):
-        assert mesh.width_spanned(np.arange(6.0), 2.0, 2.0) == 0.0
+        assert width_spanned(np.arange(6.0), 2.0, 2.0) == 0.0
+
+    @pytest.mark.parametrize("low", [1.0, 1.05, 1.3, 1.7, 1.95])
+    @pytest.mark.parametrize("high", [3.0, 3.05, 3.3, 3.7, 3.95])
+    def test_the_share_is_the_span_between_the_nearest_line_to_each_face(self, low, high):
+        """The rule stated as what it does rather than as how it is computed.
+
+        openEMS samples a transverse edge at its own midpoint, which puts the
+        face on the nearer of the two lines straddling it - so the metal it
+        builds spans nearest line to nearest line, and the midpoint arithmetic
+        is one way of saying that rather than the claim itself. The face that
+        falls exactly between two lines is the one case the two ways of saying
+        it have to agree about by convention, and it is asserted on its own.
+        """
+        lines = np.arange(6.0)
+        nearest = [lines[int(np.argmin(np.abs(lines - face)))] for face in (low, high)]
+        assert width_spanned(lines, low, high) == pytest.approx(
+            (nearest[1] - nearest[0]) / (high - low), rel=1e-12, abs=0.0
+        )
 
     # ``cells_across`` is the other reading of a finished grid, and the mesh
     # report publishes it. It answers a different question and is kept apart
@@ -4940,62 +6657,180 @@ class TestAConductorTheGridBarelySpans:
 
     def test_the_count_is_the_cells_and_not_the_lines(self):
         """Two lines strictly inside a span cut it into three."""
-        assert mesh.cells_across(np.arange(6.0), 1.0, 4.0) == 3
+        assert cells_across(np.arange(6.0), 1.0, 4.0) == 3
 
     def test_a_span_inside_one_cell_is_counted_as_that_cell(self):
-        assert mesh.cells_across(np.arange(6.0), 1.2, 1.8) == 1
+        assert cells_across(np.arange(6.0), 1.2, 1.8) == 1
 
     def test_a_span_with_no_width_at_all_is_still_one_cell(self):
         """The floor in ``cells_across``, which no caller of it can reach:
         each rules out a flat axis first. It is reachable through the function,
         which is exported."""
-        assert mesh.cells_across(np.arange(6.0), 2.0, 2.0) == 1
+        assert cells_across(np.arange(6.0), 2.0, 2.0) == 1
+
+    # ``cells_along`` is the same reading of a segment rather than of one axis,
+    # which is what a layer off the axes needs. Each of these is checked against
+    # the cells the segment is *in*, counted by walking it, rather than against
+    # arithmetic that could agree with the implementation by sharing its mistake.
+
+    def visited(self, grid, start, end, samples=200_000):
+        """The cells the segment really lies in, by walking it."""
+        steps = np.linspace(0.0, 1.0, samples)[1:-1, None]
+        points = np.asarray(start) + steps * (np.asarray(end) - np.asarray(start))
+        indices = np.stack(
+            [np.searchsorted(grid[dim], points[:, dim], side="right") for dim in range(3)], axis=1
+        )
+        return len({tuple(row) for row in indices})
+
+    @pytest.mark.parametrize(
+        "start, end",
+        [
+            ((1.0, 2.0, 2.0), (4.0, 2.0, 2.0)),  # along one axis
+            ((1.2, 1.2, 1.2), (1.8, 1.8, 1.8)),  # inside a single cell
+            ((1.0, 1.0, 2.0), (4.0, 3.0, 2.0)),  # two axes, crossings apart
+            ((1.1, 1.2, 1.3), (4.1, 4.2, 4.3)),  # a diagonal off the lattice
+            ((1.0, 1.0, 1.0), (4.0, 4.0, 4.0)),  # a diagonal through lattice points
+        ],
+    )
+    def test_it_counts_the_cells_the_segment_is_in(self, start, end):
+        grid = [np.arange(6.0)] * 3
+        assert cells_along(grid, start, end) == self.visited(grid, start, end)
+
+    def test_crossings_meeting_at_one_point_are_one_step_into_one_cell(self):
+        """The case that separates this from summing each axis' own count, and
+        it is not a curiosity: a layer facing two axes equally is given equal
+        pitches on them, so its chord meets both sets of planes together. Summed,
+        a layer reads as spanned by up to three times the cells it has.
+        """
+        grid = [np.arange(6.0)] * 3
+        summed = 1 + sum(cells_across(grid[dim], 1.0, 4.0) - 1 for dim in range(3))
+        assert summed == 7
+        assert cells_along(grid, (1.0, 1.0, 1.0), (4.0, 4.0, 4.0)) == 3
+
+    def test_which_way_it_was_walked_does_not_change_the_count(self):
+        grid = [np.arange(6.0)] * 3
+        there = cells_along(grid, (1.0, 1.0, 2.0), (4.0, 3.0, 2.0))
+        back = cells_along(grid, (4.0, 3.0, 2.0), (1.0, 1.0, 2.0))
+        assert there == back == 4
+
+    def test_a_segment_with_no_length_lies_in_one_cell(self):
+        grid = [np.arange(6.0)] * 3
+        assert cells_along(grid, (2.0, 2.0, 2.0), (2.0, 2.0, 2.0)) == 1
+
+    def straddling(self, apart):
+        """A y line placed that far along the segment from an x line's crossing.
+
+        Both crossings are at the middle of the segment, so ``apart`` is what
+        decides whether they are read as one meeting or two - and nothing else
+        about the geometry moves with it.
+        """
+        middle = 0.5
+        grid = [np.array([0.0, middle]), np.array([0.0, middle + apart]), np.array([0.0])]
+        return cells_along(grid, (0.0, 0.0, 0.0), (1.0, 1.0, 0.0))
+
+    def test_two_crossings_closer_than_the_tolerance_are_one(self):
+        assert self.straddling(0.1 * SAME_CROSSING) == 2
+
+    def test_and_the_narrowest_cell_a_grid_can_hold_is_still_two(self):
+        """The other half, and stated against a length rather than against the
+        constant under test - a multiple of that constant moves with it and says
+        nothing about where it belongs.
+
+        A real interval between two crossings is a cell, and the narrowest thing
+        the mesher will place is bounded below by the kernel's own tolerance:
+        below that two surfaces are one surface. So a gap that wide, on a segment
+        a millimetre long, is a gap this must keep.
+        """
+        assert self.straddling(KERNEL_TOLERANCE) == 3
+
+    def test_the_tolerance_is_not_a_grid_a_pair_can_straddle(self):
+        """Rounding to a fixed number of places would separate two crossings a
+        hair apart whenever they fall either side of one of its edges, however
+        close they are. Placed here at the worst case for that: the middle of
+        the segment, which is where a bucket boundary of any decimal size lies.
+        """
+        assert self.straddling(1e-16) == 2
 
     # ------------------------------------------------------------ the verdict
 
     def test_a_wide_conductor_is_not_remarked_on(self):
-        assert self._said(self._trace(width=8.0)) == []
+        assert self._said(self._trace(width=self._across(80)[0])) == []
 
     def test_a_narrow_one_is_named(self):
-        said = self._said(self._trace(width=1.0))
+        said = self._said(self._trace(width=self._across(4)[0]))
         assert [f.severity for f in said] == [preflight.WARN]
         assert said[0].subject == "Trace"
 
-    def test_a_conductor_exactly_at_the_bar_passes(self):
-        """The bar is a floor, not a target: at it there is nothing to say.
-        Pitch and width are both dyadic here so the share lands on the bar
-        exactly rather than a rounding above it, which is the difference
-        between testing the boundary and testing beside it."""
-        at_it = self._said(self._trace(width=1.25), grid=self._grid(pitch=0.0625))
-        assert at_it == []
-        assert self._said(self._trace(width=1.0), grid=self._grid(pitch=0.0625)) != []
+    @pytest.mark.parametrize("sign", [1.0, -1.0])
+    def test_a_conductor_exactly_at_the_bar_passes(self, sign):
+        """The bar is a tolerance, not a target: on it there is nothing to say.
+
+        The overhang is taken from the bar itself rather than from the class's
+        own, so the departure lands on it exactly rather than a rounding inside
+        it - which is the difference between testing the boundary and testing
+        beside it. Both signs, because a conductor built too wide is on the half
+        of the bar nothing measured and is the half most easily left open.
+        """
+        cells, pitch = 7, 0.1
+        allowed = 1.0 - self.BAR
+        overhang = sign * cells * allowed / (self.BAR if sign > 0 else 1.0 + allowed)
+        assert abs(overhang) < self.OVERHANG, (
+            "the class's own overhang no longer clears the bar, so the second half of "
+            "this test is not past what the first half sits on"
+        )
+        grid = self._grid(pitch=pitch)
+        assert self._said(self._trace(width=(cells + overhang) * pitch), grid=grid) == []
+        past = (cells + sign * self.OVERHANG) * pitch
+        assert self._said(self._trace(width=past), grid=grid) != []
 
     def test_the_share_reported_is_the_one_the_grid_reached(self):
         """One trace, two grids, and the policy is not consulted for either."""
-        trace = self._trace(width=1.0)
-        assert "spans 90%" in self._said(trace, grid=self._grid(pitch=0.1))[0].message
-        assert self._said(trace, grid=self._grid(pitch=0.02)) == []  # 98%
+        width, share = self._across(4)
+        assert f"builds it {share:.0%}" in self._said(self._trace(width=width))[0].message
+        # The same drawing on a grid ten times finer, where the same overhang is
+        # a tenth of the share of it.
+        assert self._said(self._trace(width=width), grid=self._grid(pitch=0.01)) == []
+
+    def test_metal_the_grid_gains_is_the_same_fault_and_is_named_too(self):
+        """A width drawn a little *short* of a whole number of cells has its far
+        face rounded outward, so openEMS builds a conductor wider than anything
+        drawn. That is the same defect with the other sign and is held to the
+        same tolerance: an impedance follows a width smoothly through the drawn
+        one, so there is no reason for the check to see only one side of it.
+        """
+        cells, pitch = 4, 0.1
+        width = (cells - self.OVERHANG) * pitch
+        said = self._said(self._trace(width=width), grid=self._grid(pitch=pitch))
+        assert [f.subject for f in said] == ["Trace"]
+        assert f"builds it {cells / (cells - self.OVERHANG):.0%}" in said[0].message
 
     def test_the_count_of_cells_across_does_not_decide_it(self):
-        """The finding this check was rebuilt on. Two conductors spanned by the
-        same number of cells keep different amounts of their width, because what
-        survives is set by where the lines fell against the edges - and the two
-        return answers a factor of six apart. A bar on the count would clear one
-        of these and refuse the other for no reason a solve can see."""
-        loses = self._trace(width=0.62, at=0.049)
-        keeps = self._trace(width=0.63, at=0.025)
+        """The finding this check was rebuilt on. One drawn width, one grid, one
+        count of cells across it - and sliding the trace twenty microns changes
+        which conductor openEMS builds, because what it builds is set by where
+        the lines fell against the faces. A bar on the count would clear one of
+        these and refuse the other for no reason a solve can see."""
+        width, misses_at, lands_at = 0.695, 0.0275, 0.0075
+        misses = self._trace(width=width, at=misses_at)
+        lands = self._trace(width=width, at=lands_at)
         grid = self._grid(pitch=0.05)
         lines = np.asarray(grid[1])
+        spans = [
+            (cells_across(lines, at, at + width), width_spanned(lines, at, at + width))
+            for at in (misses_at, lands_at)
+        ]
 
-        assert mesh.cells_across(lines, 0.049, 0.669) == mesh.cells_across(lines, 0.025, 0.655)
-        assert mesh.width_spanned(lines, 0.049, 0.669) < mesh.width_spanned(lines, 0.025, 0.655)
-        assert [f.subject for f in self._said(loses, grid=grid)] == ["Trace"]
-        assert self._said(keeps, grid=grid) == []
+        assert spans[0][0] == spans[1][0], "the two are not spanned by the same cells"
+        assert abs(spans[0][1] - 1.0) > abs(spans[1][1] - 1.0)
+        assert [f.subject for f in self._said(misses, grid=grid)] == ["Trace"]
+        assert self._said(lands, grid=grid) == []
 
     def test_the_message_locates_the_span_it_measured(self):
         """A share with no axis and no length beside it names no dimension of
         the drawing, and the object is where the user has to go."""
-        assert "90% of its span, 1 mm in y" in self._said(self._trace(width=1.0))[0].message
+        width, share = self._across(4)
+        message = self._said(self._trace(width=width))[0].message
+        assert f"{share:.0%} of its span, {width:.4g} mm in y" in message
 
     # ------------------------------------------------- what is not a width
 
@@ -5008,27 +6843,42 @@ class TestAConductorTheGridBarelySpans:
         """One cell through a conductor is what the mesher deliberately lays,
         and a check that fires on the mesher's own policy is one a reader
         stops reading."""
-        assert self._said(self._trace(width=8.0, thickness=0.035)) == []
+        assert self._said(self._trace(width=self._across(80)[0], thickness=0.035)) == []
 
     def test_a_solid_conductor_is_still_judged_on_its_width(self):
         """Excluding the thickness must not excuse the two axes beside it."""
-        said = self._said(self._trace(width=1.0, thickness=0.035))
+        said = self._said(self._trace(width=self._across(4)[0], thickness=0.035))
         assert said and "in y" in said[0].message
 
     def test_the_worst_held_span_is_the_one_reported(self):
         """A short pad is under-held along whichever axis is worst, and naming
         the first axis instead would report the wrong length."""
-        pad = Solid(material="Foil", lower=(-2.0, 0.0, 1.6), upper=(2.0, 1.0, 1.6), label="Pad")
-        assert "1 mm in y" in self._said(pad)[0].message
+        width, _ = self._across(4)
+        pad = Solid(material="Foil", lower=(-2.0, 0.0, 1.6), upper=(2.0, width, 1.6), label="Pad")
+        assert f"{width:.4g} mm in y" in self._said(pad)[0].message
 
-    def test_worst_held_is_the_least_share_and_not_the_shortest_span(self):
+    def test_the_axis_reported_is_the_furthest_off_and_not_the_shortest_span(self):
         """The two agree on a uniform grid and part company on a graded one,
-        which is every grid the mesher makes. A long span in coarse cells can
-        keep less of itself than a short one beside a refined edge."""
-        pad = Solid(material="Foil", lower=(-2.0, 0.0, 1.6), upper=(-1.0, 8.0, 1.6), label="Pad")
+        which is every grid the mesher makes. A long span in coarse cells can be
+        built further from itself than a short one beside a refined edge.
+
+        The long one is drawn *short* of a whole number of cells and so arrives
+        wider, while the short one arrives narrower - so an axis picked by the
+        least share picks the wrong one of the two, and one picked by the
+        distance from the drawing picks the right one.
+        """
+        along, _ = self._across(50, 0.02)
+        across = (7 - self.OVERHANG) * 1.0
+        share = 7 / (7 - self.OVERHANG)
+        pad = Solid(
+            material="Foil",
+            lower=(-2.0, 0.0, 1.6),
+            upper=(-2.0 + along, across, 1.6),
+            label="Pad",
+        )
         said = self._said(pad, grid=self._grid(pitches=(0.02, 1.0, 0.1)))
         about = next(f for f in said if f.subject == "Pad")
-        assert "88% of its span, 8 mm in y" in about.message
+        assert f"{share:.0%} of its span, {across:.4g} mm in y" in about.message
 
     def test_a_conductor_with_one_span_is_left_alone(self):
         """A wire has a length and no width, and a share of a thing with no
@@ -5039,24 +6889,28 @@ class TestAConductorTheGridBarelySpans:
     def test_a_coarsened_conductor_is_not_argued_with(self):
         """A mesh region set to Coarsen is the user answering this question,
         and asking it again is how a section gets skipped."""
-        assert self._said(self._trace(width=1.0)) != []
-        assert self._said(self._trace(width=1.0, relaxed_to=2.0)) == []
+        width, _ = self._across(4)
+        assert self._said(self._trace(width=width)) != []
+        assert self._said(self._trace(width=width, relaxed_to=2.0)) == []
 
     def test_a_shape_held_as_triangles_says_the_span_is_its_box(self):
         """Its box is not a length anybody drew - a bar turned on the diagonal
         has a box wider than the metal on both axes - so a message quoting one
         as the object's own span sends the user to look for something that is
         not there."""
+        width, _ = self._across(4)
         turned = Solid(
             material="Foil",
             lower=(-1.0, 0.0, 1.6),
-            upper=(1.0, 1.0, 1.6),
+            upper=(1.0, width, 1.6),
             label="Turned",
-            vertices=((-1.0, 0.0, 1.6), (1.0, 0.0, 1.6), (1.0, 1.0, 1.6), (-1.0, 1.0, 1.6)),
+            vertices=((-1.0, 0.0, 1.6), (1.0, 0.0, 1.6), (1.0, width, 1.6), (-1.0, width, 1.6)),
             faces=((0, 1, 2), (0, 2, 3)),
             sheet_normal=2,
         )
-        assert "of the span of its bounding box, 1 mm in y" in self._said(turned)[0].message
+        assert (
+            f"of the span of its bounding box, {width:.4g} mm in y" in self._said(turned)[0].message
+        )
 
     # ------------------------------------------------------------ the remedy
 
@@ -5072,7 +6926,9 @@ class TestAConductorTheGridBarelySpans:
         mesher compares it against the ceiling strictly, so a figure shortened
         by rounding to nearest sits above it about half the time - and the
         advice then costs the user the run it was given to save."""
-        said = self._said(self._trace(width=1.0), grid=self._grid(params={"cap": ceiling}))
+        said = self._said(
+            self._trace(width=self._across(4)[0]), grid=self._grid(params={"cap": ceiling})
+        )
         quoted = float(re.search(r"global ([\d.eE+-]+) mm", said[0].message).group(1))
 
         assert quoted <= ceiling, "the mesher refuses anything above the ceiling"
@@ -5081,17 +6937,19 @@ class TestAConductorTheGridBarelySpans:
     def test_and_the_mesher_does_accept_it(self):
         """The comparison above, made against the mesher itself rather than
         against a restatement of what it does."""
-        said = self._said(self._trace(width=1.0), grid=self._grid(params={"cap": PARAMS.ceiling}))
+        said = self._said(
+            self._trace(width=self._across(4)[0]), grid=self._grid(params={"cap": PARAMS.ceiling})
+        )
         quoted = float(re.search(r"global ([\d.eE+-]+) mm", said[0].message).group(1))
 
-        write.plan_grid(
+        plan.plan_grid(
             (SUBSTRATE, GROUND),
             (PORT,),
             MATERIALS,
             PARAMS,
             PADDING,
             sizing=(
-                mesh.SizingRegion(
+                regions.SizingRegion(
                     lower=(-4.0, 0.0, 1.6), upper=(4.0, 1.0, 1.6), size=quoted, label="R"
                 ),
             ),
@@ -5100,7 +6958,7 @@ class TestAConductorTheGridBarelySpans:
     def test_an_envelope_that_carries_no_policy_still_gets_the_warning(self):
         """``params`` is provenance, and a hand-written envelope may have none.
         The remedy loses its number there; the finding does not go away."""
-        said = self._said(self._trace(width=1.0), grid=self._grid(params={}))
+        said = self._said(self._trace(width=self._across(4)[0]), grid=self._grid(params={}))
         assert said and "MinElementsAcross" in said[0].message
         assert "global" not in said[0].message
 
@@ -5109,7 +6967,7 @@ class TestAConductorTheGridBarelySpans:
         an envelope with no policy has none to read. The grid's own finest cell
         is the same quantity measured rather than declared - on *any* axis, and
         a board's finest is routinely the one through its foil."""
-        foil = self._trace(width=8.0, thickness=0.05, at=0.0)
+        foil = self._trace(width=8.0, thickness=self._across(5, 0.01)[0], at=0.0)
         assert self._said(foil, grid=self._grid(pitches=(0.06, 0.06, 0.2), params={})) == []
         # It is measured and not assumed: refine z alone and the same foil is
         # thick enough to be a width, and is then held to the bar like one.
@@ -5117,10 +6975,11 @@ class TestAConductorTheGridBarelySpans:
 
     def test_it_runs_in_the_ordinary_check(self):
         problem = build_problem(
-            solids=(SUBSTRATE, GROUND, self._trace(width=0.3)), grid=self._grid()
+            solids=(SUBSTRATE, GROUND, self._trace(width=self._across(2)[0])), grid=self._grid()
         )
         assert any(
-            "the grid spans" in f.message and f.subject == "Trace" for f in preflight.check(problem)
+            "the grid builds it" in f.message and f.subject == "Trace"
+            for f in preflight.check(problem)
         )
 
     def test_a_grid_the_mesher_made_leaves_it_nothing_to_say(self):
@@ -5144,8 +7003,9 @@ class TestAConductorTheGridBarelySpans:
         lines, so a conductor the mesher held perfectly well collects a warning
         per rectangle - each naming a width the drawing does not have, with a
         remedy that would make the grid worse."""
-        whole = self._trace(width=3.0, at=3.0)
-        pieces = (self._trace(width=1.0, at=3.0), self._trace(width=2.0, at=4.0))
+        width, _ = self._across(6, 0.5)
+        whole = self._trace(width=width, at=3.0)
+        pieces = (self._trace(width=1.0, at=3.0), self._trace(width=width - 1.0, at=4.0))
         grid = build_problem(solids=(SUBSTRATE, GROUND, whole)).grid
 
         assert self._said(whole, grid=grid) == self._said(*pieces, grid=grid) == []
@@ -5153,4 +7013,108 @@ class TestAConductorTheGridBarelySpans:
         # one apiece - or the report counts a conductor once per rectangle.
         said = self._said(*pieces, grid=self._grid(pitch=0.5))
         assert [f.subjects for f in said] == [("Trace", "Trace")]
-        assert "3 mm in y" in said[0].message
+        assert f"{width:.4g} mm in y" in said[0].message
+
+    def test_but_a_block_lying_across_another_is_judged_on_its_own_width(self):
+        """Butted is not the same as touching. A conductor drawn in more than
+        one layer - a ridge on a plane, a pin flaring into its pad - arrives as
+        the blocks it stands in, and the narrow one does not continue the wide
+        one's cross-section: it meets it over part of a face rather than across
+        the whole of one. So each keeps the width it has, where the box around
+        the pair is as wide as the wider and the grid holds enough of *that* for
+        the narrow one to pass unremarked.
+        """
+        thick, _ = self._across(24, 0.5)
+        thin, _ = self._across(4, 0.5)
+        wide = Solid(material="Foil", lower=(-8.0, 0.0, 1.6), upper=(8.0, thick, 1.8), label="Pad")
+        narrow = Solid(
+            material="Foil", lower=(-8.0, 0.0, 1.8), upper=(8.0, thin, 2.0), label="Ridge"
+        )
+        said = self._said(wide, narrow, grid=self._grid(pitch=0.5))
+        assert [finding.subjects for finding in said] == [("Ridge",)]
+        assert f"{thin:.4g} mm in y" in said[0].message
+
+    def test_a_sheet_fused_to_a_solid_is_not_asked_to_hold_its_own_plane(self):
+        """A conducting sheet standing on a ground plane is one piece of metal
+        with it, so that axis becomes a width of the piece. The sheet's own run
+        through its plane has no length, and a share of nothing would be
+        reported as none of the drawing built - for a plane the mesher pins
+        exactly and loses nothing of."""
+        block = Solid(material="Foil", lower=(-1.0, -1.0, 0.0), upper=(1.0, 1.0, 1.0), label="Post")
+        said = self._said(block, grid=self._grid(pitch=0.1, reach=60.0))
+        assert not [finding for finding in said if " 0 mm in " in finding.message]
+
+    def test_a_run_under_a_cell_is_not_asked_to_hold_a_share_either(self):
+        """The other end of the same rule. A piece of metal can have a fin
+        thinner than a cell standing on an arm that is not, so the axis is a
+        width of the piece while that run is not one. The mesher declines the
+        fin and pins both its faces plainly, which is exact - measuring it here
+        would report a conductor as barely built for a run held perfectly."""
+        fin, arm = 0.05, 8.0
+        stack = [
+            Solid(material="Foil", lower=(-4.0, -1.0, 1.6), upper=(4.0, 1.0, 1.8), label="Arm"),
+            Solid(
+                material="Foil", lower=(-4.0, -1.0, 1.8), upper=(-4.0 + fin, 1.0, 3.0), label="Fin"
+            ),
+        ]
+        said = self._said(*stack, grid=self._grid(pitch=0.4, reach=60.0))
+        assert arm == stack[0].upper[0] - stack[0].lower[0]
+        assert not [finding for finding in said if f"{fin:.4g} mm in " in finding.message]
+
+    def test_the_run_measured_is_one_the_metal_has(self):
+        """A step's middle box runs no further than its own faces across its whole
+        cross-section, while every column of metal through it is longer. The
+        mesher sizes that face's cells from the column; measuring the box's run
+        instead complains that the grid did not build a length the metal has
+        nowhere, on a conductor that was held to what was asked for.
+        """
+        step = 0.35
+        # Clear of the ground plane, which is metal too: touching it would make
+        # one piece of the two and the run measured would be the plane's.
+        base = 1.6
+        stack = [
+            Solid(
+                material="Foil",
+                lower=(0.0, 0.0, base),
+                upper=(step, step, base + step),
+                label="lower",
+            ),
+            Solid(
+                material="Foil",
+                lower=(0.0, step, base),
+                upper=(step, 2 * step, base + 2 * step),
+                label="middle",
+            ),
+            Solid(
+                material="Foil",
+                lower=(0.0, 2 * step, base + step),
+                upper=(step, 3 * step, base + 2 * step),
+                label="upper",
+            ),
+        ]
+        boxes = [(solid.lower, solid.upper) for solid in stack]
+        middle = boxes[1]
+        assert conductor_run(middle[0], middle[1], boxes, 1) == (step, 2 * step), (
+            "the middle box's run is not short of the metal, so nothing here is at stake"
+        )
+        assert (
+            min(
+                depth
+                for face in conductor_faces(boxes, boxes, 1)
+                for depth in face.depths
+                if not face.at_high
+            )
+            > step
+        ), "every column through it is longer than that run"
+        lines = mesh.generate_mesh_lines(
+            [
+                regions.Region(solid.lower, solid.upper, regions.MaterialClass.METAL, solid.label)
+                for solid in stack
+            ],
+            ((-5.0, -5.0, -5.0), (6.0, 8.0, 7.0)),
+            regions.MeshParams(metal_res=0.4, dielectric_res=2.0),
+        )
+        # The ground plane reaches far outside a grid built for the stack alone,
+        # so it is what this grid genuinely fails to build; the stack is not.
+        said = self._said(*stack, grid=MeshGrid(x=lines.x, y=lines.y, z=lines.z, params={}))
+        assert [finding.subjects for finding in said] == [("Ground",)]

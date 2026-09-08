@@ -3,24 +3,25 @@
 
 """Where a port's box is, and where its two planes sit inside it.
 
-One answer, used twice: the openEMS adapter builds its envelope from this, and
-the document object draws its own shape from it. They cannot disagree, because
-there is nothing to disagree with - which matters more here than usual, since
-the whole point of drawing the box is that the picture is what the solver gets.
+The openEMS adapter builds its envelope from this module, and the document
+object draws its own shape from it. Both read one answer, so the envelope and
+the drawing cannot disagree. The box is drawn so that the user sees what the
+solver gets.
 
-At the package root, not under ``Objects``, for a mechanical reason:
-``Microwave.Objects.__init__`` imports FreeCAD, so an adapter importing anything
-from that package would break the rule that adapters run without it - and a
-test enforces that in a clean interpreter. ``Microwave.__init__`` imports
-nothing but ``sys.path``.
+This module is at the package root rather than under ``Objects``, for a
+mechanical reason. ``Microwave.Objects.__init__`` imports FreeCAD, so an adapter
+importing anything from that package would break the rule that adapters run
+without it, and a test enforces that rule in a clean interpreter.
+``Microwave.__init__`` imports nothing but ``sys.path``.
 
-Pure arithmetic on boxes. A box is ``(lower, upper)``, two triples of
-millimetres, exactly as in ``Objects.port_setup``.
+Everything here is arithmetic on boxes. A box is ``(lower, upper)``, two triples
+of millimetres, exactly as in ``Objects.port_setup``.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 from . import units
@@ -28,78 +29,93 @@ from . import units
 DIMENSIONS = 3
 AXIS_NAMES = ("X", "Y", "Z")
 
+#: A corner: one coordinate per axis, in the order the axes are numbered.
+Corner = tuple[float, float, float]
+
+#: A box: its two corners. They are sequences rather than :data:`Corner`,
+#: because callers build them a list at a time and a bounding box arrives as
+#: whatever the CAD kernel handed over.
+Box = tuple[Sequence[float], Sequence[float]]
+
 #: Below this a difference in millimetres is arithmetic rather than drawing.
 #:
-#: One nanometre, and a **margin** rather than a reading of the kernel. What was
+#: One nanometre. It is a margin rather than a reading of the kernel. What was
 #: measured is the smallest box OCC will build at all, which
 #: ``Objects.port_shape._FLAT_BOX`` records and which is itself strictly above
-#: ``Precision::Confusion()``; this stands a decade clear of that. The other side
-#: of it is the models: four orders under the thinnest conductor drawn in practice,
-#: 35 um of plated copper being far above it.
+#: ``Precision::Confusion()``. This constant stands a decade clear of that
+#: measurement. On the model side it is four orders under the thinnest conductor
+#: drawn in practice: 35 um of plated copper is far above it.
 #:
-#: **One length under one name**, because the questions asked at it share an
-#: answer - is this extent flat, is this point inside, do these two surfaces
-#: touch. Each is named for its own question below or where it is asked, and
-#: none of them carries a figure of its own. So they move together or not at
-#: all, and that is the trade: two copies a decade apart agree about every model
-#: that does not sit between them, and one length means a change made for the
-#: drawing side lands on the meshing side too. What a demand at this size costs
-#: there is at :data:`~Microwave.Solvers.openems.lfs.TOUCHING`.
+#: There is one length under one name, because the questions asked at this size
+#: share an answer: whether an extent is flat, whether a point lies inside,
+#: whether two surfaces touch. Each question has a constant named for it, below
+#: or where the question is asked, and none of those carries a figure of its own.
+#: They therefore move together or not at all. That is the trade: two copies a
+#: decade apart would agree about every model that does not sit between them,
+#: and one length means a change made for the drawing side lands on the meshing
+#: side too. What a demand at this size costs there is at
+#: :data:`~Microwave.Solvers.openems.lfs.TOUCHING`.
 KERNEL_TOLERANCE = 1e-6
 
-#: Below this an extent is a plane rather than a solid, in mm. The tolerance
-#: above, asked of a thickness: a selected face is exactly flat, but a face read
-#: back through a bounding box is only flat to within the arithmetic that
-#: produced it, so the test cannot be against zero.
+#: Below this an extent is a plane rather than a solid, in mm. This is the
+#: tolerance above, asked of a thickness. A selected face is exactly flat, but a
+#: face read back through a bounding box is only flat to within the arithmetic
+#: that produced it, so the test cannot be against zero.
 FLATNESS = KERNEL_TOLERANCE
 
 #: In millimetres per second, because every length here is in millimetres.
 SPEED_OF_LIGHT = units.SPEED_OF_LIGHT * units.MM_PER_M
 
-#: How far the probes must sit from the source, as a fraction of a wavelength at
-#: the *bottom* of the band, where it is longest.
+#: How far the probes must sit from the source, as a fraction of the free-space
+#: wavelength at the bottom of the band, where the wavelength is longest.
 #:
-#: This is the one number that decides whether an extracted impedance is right.
-#: The source is a sheet of current across the strip and it radiates a near
-#: field that is not the transmission-line mode; the probes have to sit far
-#: enough downstream for it to have decayed.
+#: This number decides whether an extracted impedance is right. The source is a
+#: sheet of current across the strip, and it radiates a near field that is not
+#: the transmission-line mode. The probes have to sit far enough downstream for
+#: that field to have decayed.
 #:
-#: **The fraction is the physics; which wavelength it is a fraction of depends
-#: on who is asking.** :func:`clearance` below places a port and takes free
-#: space, and that is a choice about what is knowable: what governs the decay is
-#: the guided wavelength, lambda_0 / sqrt(eps_eff), and eps_eff needs the strip
-#: width, the substrate height and which substrate the line sits on - none of
-#: which exist when a port is created and this number is written into it. Of the
-#: two knowable bounds free space is the conservative one, since eps_eff >= 1
-#: always: too short returns a plausible impedance and no complaint, while too
-#: long costs line the engineer can see and can edit. The openEMS adapter's
-#: ``preflight.probes`` reads the same fraction against the slowest material the
-#: study actually binds, because by then there is one.
+#: A fraction of a wavelength is not the law the decay follows. A set of
+#: evanescent modes has to die away, and a mode below its cutoff dies over a
+#: length its own cross-section sets - on a shielded line, the shield's width
+#: over pi. A plane standing more wavelengths clear at the top of a band
+#: therefore reads further out rather than nearer. An open line behaves the same
+#: way, although it radiates and carries a surface wave nothing cuts off. The
+#: gates are ``tests/test_acceptance_stripline.py`` and
+#: ``tests/test_acceptance_microstrip.py``, on their ``clearance`` lines.
 #:
-#: Bracketed by two solves and no more, so it is known to about one significant
-#: figure.
+#: The figure stays a fraction because no cross-section is available at the
+#: moment it is needed. A port is created before there is a strip, a substrate
+#: or a binding to read one off, and no permittivity is available either. Free
+#: space is the conservative bound of the two that can be had, since eps_eff is
+#: never below one. The longest wavelength errs long. Too much clearance costs
+#: feed line the engineer can see; too little costs an extracted impedance with
+#: no symptom.
+#:
+#: The figure is good to about one significant figure.
+#: ``tests/test_acceptance_stripline.py`` solves a ladder of clearances and
+#: measures what each buys.
 CLEARANCE = 0.1
 
 
 class BoxError(ValueError):
-    """The geometry does not describe a port, and the message says why."""
+    """The geometry does not describe a port. The message names the reason."""
 
 
 @dataclass(frozen=True)
 class PortBox:
     """The volume openEMS builds the port in, and the planes inside it.
 
-    ``start`` and ``stop`` are corners in the order the solver wants them, not
-    sorted: for a microstrip ``start`` is on the trace and ``stop`` on the
-    ground, because ``MSLPort`` integrates the voltage from one to the other and
-    the direction of that integration is the sign of the excitation.
+    ``start`` and ``stop`` are corners in the order the solver wants them, and
+    are not sorted. For a microstrip, ``start`` is on the trace and ``stop`` on
+    the ground: ``MSLPort`` integrates the voltage from one to the other, and the
+    direction of that integration is the sign of the excitation.
 
     ``feed`` and ``measurement`` are distances from ``start`` along the
-    propagation axis, in millimetres - not fractions of the box length, which
-    would make the two things an engineer has to get right depend on a third
-    they mostly do not care about: 0.5 puts the probes 50 mm along a 100 mm line
-    and 10 mm along a 20 mm one, and only one of those is far enough from the
-    source.
+    propagation axis, in millimetres. They are not fractions of the box length.
+    A fraction would make the two distances an engineer has to get right depend
+    on a third they mostly do not care about: 0.5 puts the probes 50 mm along a
+    100 mm line and 10 mm along a 20 mm one, and only one of those is far enough
+    from the source.
     """
 
     start: tuple[float, float, float]
@@ -108,18 +124,20 @@ class PortBox:
     feed: float = 0.0
     measurement: float = 0.0
     #: Distance from ``start`` along the propagation axis to where openEMS reads
-    #: this port's numbers, in millimetres. Which plane that is belongs to the
-    #: port kind and to nothing else, so each constructor below sets it. It is
-    #: separate from :attr:`measurement`, which a
-    #: microstrip's probes happen to share and the other two kinds do not.
+    #: this port's numbers, in millimetres. The port kind decides which plane
+    #: that is, and nothing else does, so each constructor below sets it. It is
+    #: separate from :attr:`measurement`. A microstrip, a coaxial line and a
+    #: waveguide set both to the same distance; a lumped port sets only this
+    #: one, having no measurement plane.
     #:
-    #: Named for the probes and not for the reference plane the user knows it
-    #: as, because ``reference`` is already an entity in :func:`lumped` and an
-    #: impedance everywhere in the result layer.
+    #: It is named for the probes rather than for the reference plane the user
+    #: knows it as, because ``reference`` already names an entity in
+    #: :func:`lumped` and an impedance everywhere in the result layer.
     #:
-    #: Where the plane is *asked* for. A microstrip's probes land on the nearest
-    #: grid line instead, which is sub-cell and so does not reach a distance
-    #: axis, but it does mean this is not the coordinate openEMS used.
+    #: This is where the plane is asked for. A microstrip's probes land on the
+    #: nearest grid line instead, which is a sub-cell move and so does not reach
+    #: a distance axis, but it does mean this is not the coordinate openEMS
+    #: used.
     probe: float = 0.0
 
     @property
@@ -139,13 +157,13 @@ class PortBox:
     def probe_point(self) -> tuple[float, float, float]:
         """Where in the model this port's numbers are read, in millimetres.
 
-        On the propagation axis it is :attr:`probe`; across the other two it
-        is the middle of the box, which is where every kind's probes sit. The
+        On the propagation axis the point is :attr:`probe`. Across the other two
+        axes it is the middle of the box, where every kind's probes sit. The
         distance between two ports' reference points is the length a velocity
-        divides into, and it is a straight line - so on a line with a bend in it
-        the velocity that comes back is an average over the real path and the
-        drawn one together, which is the number a velocity factor calibrated
-        against a ruler would give.
+        divides into, and that distance is a straight line. On a line with a
+        bend in it, the velocity that comes back is an average over the real
+        path and the drawn one together. That is the number a velocity factor
+        calibrated against a ruler would give.
         """
         axis = self.propagation_axis
         point = [(a + b) / 2.0 for a, b in zip(self.start, self.stop)]
@@ -160,18 +178,28 @@ class PortBox:
 
 
 # The box vocabulary, defined once here and imported by everything that speaks
-# it. The import direction is legal in only this order, because
-# ``Objects/__init__.py`` pulls in FreeCAD and this module must stay importable
-# without it.
-def middle(box, axis: int) -> float:
+# it. The import runs in this direction only, because ``Objects/__init__.py``
+# imports FreeCAD and this module must stay importable without it.
+def corner(values: Iterable[float]) -> Corner:
+    """Three coordinates as the fixed-width triple a corner is.
+
+    The values are unpacked rather than cast. A comprehension over the axes
+    cannot state how wide it is, and unpacking refuses anything that is not
+    three values, where a cast would only assert it.
+    """
+    x, y, z = values
+    return (x, y, z)
+
+
+def middle(box: Box, axis: int) -> float:
     return (box[0][axis] + box[1][axis]) / 2.0
 
 
-def extent(box, axis: int) -> float:
+def extent(box: Box, axis: int) -> float:
     return box[1][axis] - box[0][axis]
 
 
-def _nearest(box, axis: int, to: float) -> float:
+def _nearest(box: Box, axis: int, to: float) -> float:
     """Whichever of the box's two faces on ``axis`` is closer to ``to``."""
     low, high = box[0][axis], box[1][axis]
     return low if abs(low - to) <= abs(high - to) else high
@@ -184,20 +212,20 @@ def third_axis(first: int, second: int) -> int:
 def clearance(frequency: float) -> float:
     """How far the probes must sit from the source, in millimetres.
 
-    ``frequency`` is the *bottom* of the band, where the wavelength is longest
-    and the requirement is tightest. See :data:`CLEARANCE` for why no
-    permittivity comes into it.
+    ``frequency`` is the bottom of the band, where the wavelength is longest and
+    the requirement is tightest. See :data:`CLEARANCE` for why no permittivity
+    comes into it.
 
-    Rounded **up** to the next whole millimetre, because :data:`CLEARANCE` is
-    known to about one significant figure and a default carrying three decimals
-    claims a precision that does not exist. Up rather than to nearest, so that
-    rounding cannot shave the requirement below the distance actually measured.
-    At millimetre wavelengths this is a coarse step, and it is a starting value
-    an engineer edits.
+    The result is rounded up to the next whole millimetre. :data:`CLEARANCE` is
+    known to about one significant figure, and a default carrying three decimals
+    claims a precision that does not exist. Rounding up rather than to nearest
+    keeps the requirement from being shaved below the distance actually
+    measured. At millimetre wavelengths this is a coarse step, and the result is
+    a starting value an engineer edits.
 
-    Returns ``0.0`` when there is no band to derive it from - a document with
-    no study yet is an ordinary state, not an error, and the caller writes the
-    number into the port where the engineer can see and change it.
+    Returns ``0.0`` when there is no band to derive it from. A document with no
+    study yet is an ordinary state rather than an error, and the caller writes
+    the number into the port, where the engineer can see it and change it.
     """
     if frequency <= 0:
         return 0.0
@@ -223,8 +251,8 @@ def length_of(stated: float, fallback: float, subject: str) -> float:
 
 
 def microstrip(
-    trace_face,
-    ground,
+    trace_face: Box,
+    ground: Box,
     *,
     propagation_axis: int,
     direction: int,
@@ -237,32 +265,34 @@ def microstrip(
 ) -> PortBox:
     """A strip over a ground plane, fed across the substrate.
 
-    The box is the port's *requirement*, not a reading of the geometry: it runs
-    from the picked face inward as far as the measurement plane has to be,
+    The box states the port's requirement rather than reading the geometry. It
+    runs from the picked face inward as far as the measurement plane has to be,
     whether or not the trace under it is that long. A box that ends where the
-    copper ends always looks like it fits, and a short feed line is exactly
-    what an engineer needs to be shown.
+    copper ends always looks as though it fits, and an engineer needs to be
+    shown a short feed line.
 
     The distances from the picked face, all in millimetres and all absolute:
 
     ``feed_offset``
-        where the source sits. Zero is the ordinary case - the trace ends at
-        the port and the source sits on that end face. It is not zero when the
-        line deliberately runs out through the absorber, where the field is
+        where the source sits. Zero is the ordinary case: the trace ends at the
+        port and the source sits on that end face. It is not zero when the line
+        deliberately runs out through the absorber, where the field is
         attenuated on purpose and a source in it excites nothing.
     ``measurement_distance``
-        how far downstream of the **source** the probes sit, not of the picked
-        face. The source is a sheet of current and the probes have to be clear
-        of its near field, which knows nothing about where the face is; the two
-        are equal only while the feed sits at zero. See :data:`CLEARANCE`.
+        how far downstream of the source the probes sit. It is measured from the
+        source and not from the picked face. The source is a sheet of current
+        and the probes have to be clear of its near field, which does not depend
+        on where the face is. The two distances are equal only while the feed
+        sits at zero. See :data:`CLEARANCE`.
     ``stated_length``
-        how far the box reaches. Zero ends it at the measurement plane, because
-        everything past that is strip openEMS lays and no probe ever reads.
+        how far the box reaches. Zero ends the box at the measurement plane.
+        Everything past that plane is strip openEMS lays and no probe ever
+        reads.
 
-    Both planes are the conductor *surfaces* facing each other, never the
-    mid-planes of the boxes they were read from: a ground plane drawn with real
-    thickness has its middle inside the metal, and the port would drive across
-    a gap half a conductor too long.
+    Both planes are the conductor surfaces facing each other, and never the
+    mid-planes of the boxes they were read from. A ground plane drawn with real
+    thickness has its middle inside the metal, and a port built to that middle
+    would drive across a gap half a conductor too long.
     """
     width_axis = third_axis(propagation_axis, excitation_axis)
 
@@ -275,12 +305,12 @@ def microstrip(
             "gap to drive across"
         )
 
-    # Which way the field points is a fact about the model, not a setting, so
-    # it is measured here and compared against what the user said. The sign is
-    # not cosmetic: it is the sign of the excitation, and inverting it produces
-    # a perfectly clean-looking solve with the phase reversed. Refusing here
-    # rather than in the adapter means a port that would solve backwards does
-    # not draw either.
+    # The direction the field points follows from the model rather than from a
+    # setting, so it is measured here and compared against what the user stated.
+    # The sign is the sign of the excitation, and inverting it produces a
+    # perfectly clean-looking solve with the phase reversed. The refusal is here
+    # rather than in the adapter, so a port that would solve backwards does not
+    # draw either.
     measured = 1 if ground_plane > trace_plane else -1
     if excitation_direction != measured:
         raise BoxError(
@@ -300,8 +330,8 @@ def microstrip(
     stop[width_axis] = trace_face[1][width_axis]
 
     return PortBox(
-        tuple(start),
-        tuple(stop),
+        corner(start),
+        corner(stop),
         propagation_axis,
         feed=feed_offset,
         measurement=measurement,
@@ -317,8 +347,8 @@ def _line_length(
 ) -> tuple[float, float]:
     """``(box length, measurement plane)``, both from the picked face.
 
-    Shared by every kind that runs a source down a line and reads it back from
-    a probe triplet downstream. Every way those distances can disagree is
+    Every kind that runs a source down a line and reads it back from a probe
+    triplet downstream shares this. Every way those distances can disagree is
     refused here, so a port that would solve wrongly does not draw either.
     """
     if feed_offset < 0:
@@ -355,7 +385,7 @@ def _line_length(
 
 
 def coaxial(
-    annulus,
+    annulus: Box,
     *,
     propagation_axis: int,
     direction: int,
@@ -366,22 +396,22 @@ def coaxial(
 ) -> PortBox:
     """A TEM line between two concentric conductors, driven across the gap.
 
-    The box is the bore's, not the annulus': across the two transverse axes it
-    spans the picked ring's own bounding box, which for a ring centred on the
-    line is the square circumscribing the shield's inner surface. So the box
-    holds the outer radius and the centre, and the inner radius is the one
-    number that has to travel beside it.
+    The box spans the bore rather than the annulus. Across the two transverse
+    axes it spans the picked ring's own bounding box, which for a ring centred
+    on the line is the square circumscribing the shield's inner surface. The box
+    therefore holds the outer radius and the centre, and the inner radius is the
+    one number that has to travel beside it.
 
-    The distances along the line are the microstrip's, and mean the same
-    things - ``feed_offset`` places the source, ``measurement_distance``
-    places the probes downstream of it, ``stated_length`` says how far the box
-    reaches. A coaxial line reads its impedance the same way a microstrip
-    does, by differencing three probes, so the near-field clearance the source
-    needs is the same requirement.
+    The distances along the line are the microstrip's and mean the same things.
+    ``feed_offset`` places the source, ``measurement_distance`` places the probes
+    downstream of it, and ``stated_length`` states how far the box reaches. A
+    coaxial line reads its impedance the same way a microstrip does, by
+    differencing three probes, so the source needs the same near-field
+    clearance.
 
-    Unlike a microstrip there is no excitation axis: the field is radial, so
-    which way it points is a fact about the two radii and not about an axis
-    could be named.
+    A coaxial port has no excitation axis, unlike a microstrip. The field is
+    radial, so its direction follows from the two radii and not from an axis
+    anybody could name.
     """
     length, measurement = _line_length(feed_offset, measurement_distance, stated_length, subject)
 
@@ -390,8 +420,8 @@ def coaxial(
     stop[propagation_axis] = start[propagation_axis] + direction * length
 
     return PortBox(
-        tuple(start),
-        tuple(stop),
+        corner(start),
+        corner(stop),
         propagation_axis,
         feed=feed_offset,
         measurement=measurement,
@@ -400,61 +430,60 @@ def coaxial(
 
 
 def lumped(
-    source,
-    reference,
+    source: Box,
+    reference: Box,
     *,
     excitation_axis: int,
-    outline,
+    outline: Box | None,
     subject: str = "lumped port",
 ) -> PortBox:
     """A resistor across a gap, driven along one axis.
 
     Across the excitation axis the port spans where the two entities actually
-    face each other - their *overlap*, not their union and not either alone. A
-    union is wrong the moment the reference is a ground plane covering the whole
-    footprint: the port becomes a sheet resistor spanning the model, and it
-    solves. Taking the source alone leaves an asymmetry, so picking the ground
-    as the source brings the same fault straight back. An overlap has no
-    preferred end.
+    face each other, which is their overlap. It is not their union, and not
+    either entity alone. A union is wrong the moment the reference is a ground
+    plane covering the whole footprint: the port becomes a sheet resistor
+    spanning the model, and it solves. Taking the source alone leaves an
+    asymmetry, so picking the ground as the source brings the same fault
+    straight back. An overlap has no preferred end.
 
-    Fed from a trace *end face*, the overlap has zero extent across one axis and
-    the box is a plane. That is legitimate and needs no grid line of its own:
+    Fed from a trace end face, the overlap has zero extent across one axis and
+    the box is a plane. That is legitimate and needs no grid line of its own.
     openEMS snaps a lumped element's box to the mesh (``operator.cpp``:1637), so
-    the plane lands on the nearest line either way. Solved on the acceptance
-    line as drawn, a fraction of a cell from the nearest line; half a cell off
-    it; and one cell thick - all agreeing to the digits the lumped gate prints.
+    the plane lands on the nearest line whatever sub-cell offset it was drawn
+    at. The lumped gate holds that invariance.
 
     ``outline`` is the body a curve source was picked off - the trace behind its
-    own end edge, which is how a planar layout offers a cross-section - and
+    own end edge, which is how a planar layout offers a cross-section - and it is
     ``None`` where the source is an area instead. openEMS has no rotated port:
     its lumped element takes a plain box and reads the corners raw, with no
     transform (``operator.cpp``:1601 and :1636), and the current probe is a
     surface with an axis normal. So the end of a trace running off a grid axis
-    arrives as a *bounding box* whose diagonal is the trace end, with half its
-    area past the end of the conductor, driving air above the reference. That is
-    the box being the wrong shape rather than a coarse one, and no cell size
-    reaches it.
+    arrives as a bounding box whose diagonal is the trace end, with half its area
+    past the end of the conductor, driving air above the reference. The box is
+    the wrong shape rather than a coarse one, and no cell size reaches it.
 
-    The port is therefore flattened onto the end of that depth **the body lies
-    behind**, not onto its middle. The middle is where the plane crosses the
-    diagonal, so it leaves half the element off the metal exactly as the box
-    did - and worse once the conductor is rasterised, since it stands the whole
-    port on the staircase, where which side a cell falls is decided by rounding.
-    Taken to the inward end the plane clears the diagonal entirely, and the port
-    lies within the conductor's own outline.
+    The port is therefore flattened onto the end of that depth the body lies
+    behind, and not onto its middle. The middle is where the plane crosses the
+    diagonal, so it leaves half the element off the metal exactly as the box did.
+    It is worse once the conductor is rasterised, since it stands the whole port
+    on the staircase, where rounding decides which side a cell falls. Taken to
+    the inward end, the plane clears the diagonal entirely and the port lies
+    within the conductor's own outline.
 
-    Not everything is bought back. The port sits that depth inside the drawn
-    end. And the conductor reaches the grid inscribed, so a port on its outline
-    is on the edge of what conducts however the plane was chosen - which is a
-    fact about sampling a curve on a lattice, and is not reachable from a
-    bounding box.
+    Flattening does not recover everything. The port sits that depth inside the
+    drawn end. The conductor also reaches the grid rasterised, so a port on its
+    outline is on the edge of what conducts however the plane was chosen.
+    Sampling a curve on a lattice puts that edge on the staircase, and a
+    bounding box carries nothing that says where.
 
     An area source keeps both extents, since a pad driven across its own face
     genuinely spans them. The caller decides which it has, because a bounding
-    box cannot say: a tilted edge's and a small pad's are the same six numbers.
+    box does not separate them: a tilted edge's box and a small pad's box are
+    the same six numbers.
 
-    What snapping does *not* survive is a gap thinner than a cell along the
-    excitation axis: both ends land on one line and openEMS drops the element.
+    Snapping does not survive a gap thinner than a cell along the excitation
+    axis: both ends land on one line and openEMS drops the element.
     ``preflight.ports._check_the_element_survives_snapping`` refuses that.
     """
     transverse = [dim for dim in range(DIMENSIONS) if dim != excitation_axis]
@@ -470,15 +499,13 @@ def lumped(
                 f"{reference[1][dim]:.9g}. A lumped port drives between two "
                 "conductors facing each other"
             )
-        # Against the tolerance and not against zero, then clamped, because
-        # these two numbers come from different shapes. A trace drawn from a
-        # sketch reports its end at -70.00000000000004 where a box reports the
-        # ground it meets at -70.0, and the two orderings are a coin toss: at
-        # one end of a board the overlap comes out inverted by 4e-14 and at the
-        # other it does not. Untouched, that is a port that refuses at one end
-        # of a line and builds at the other, over a distance no drawing can
-        # express. Every fixture in the suite is arithmetically exact and a
-        # kernel's output is not, which is the general form of this.
+        # The comparison is against the tolerance and not against zero, and the
+        # result is then clamped, because these two numbers come from different
+        # shapes. A sketch-derived end and a box-derived ground meeting at one
+        # coordinate are not bit-identical, so which of them compares larger
+        # is arbitrary. Untouched, that is a port that refuses at one end of a
+        # line and builds at the other, over a distance no drawing can express.
+        # A fixture is arithmetically exact and a kernel's output is not.
         start[dim], stop[dim] = low, max(high, low)
 
     start[excitation_axis] = middle(source, excitation_axis)
@@ -491,11 +518,12 @@ def lumped(
             "axis there is none"
         )
 
-    # No propagation axis of its own: a lumped port is a circuit element, not a
-    # transmission line. The adapter uses the axis only to check the port is
-    # clear of the absorber, so the wider transverse extent is taken - which is
-    # also the projection a flattened outline keeps, the two agreeing because
-    # the wider one is the conductor and the narrower is the tilt.
+    # A lumped port is a circuit element rather than a transmission line, so it
+    # has no propagation axis of its own. The adapter uses the axis only to
+    # check the port is clear of the absorber, so the wider transverse extent is
+    # taken. That is also the projection a flattened outline keeps, the two
+    # agreeing because the wider extent is the conductor and the narrower is the
+    # tilt.
     propagation_axis = max(transverse, key=lambda d: stop[d] - start[d])
     if stop[propagation_axis] - start[propagation_axis] <= FLATNESS:
         raise BoxError(
@@ -507,20 +535,20 @@ def lumped(
     if outline is not None:
         across = third_axis(excitation_axis, propagation_axis)
         start[across] = stop[across] = _nearest((start, stop), across, middle(outline, across))
-    # Half the box, because openEMS reads a lumped port at its centre - so which
+    # Half the box, because openEMS reads a lumped port at its centre. Which
     # transverse axis was called the propagation one moves nothing here, the
     # centre being the centre either way. It does decide which extent a
-    # flattened outline keeps, which is why it is the wider one.
+    # flattened outline keeps, and the extent to keep is the wider one.
     return PortBox(
-        tuple(start),
-        tuple(stop),
+        corner(start),
+        corner(stop),
         propagation_axis,
         probe=abs(stop[propagation_axis] - start[propagation_axis]) / 2.0,
     )
 
 
 def rect_waveguide(
-    face,
+    face: Box,
     *,
     propagation_axis: int,
     direction: int,
@@ -531,11 +559,11 @@ def rect_waveguide(
     """A mode launched over a cross-section.
 
     The excitation goes on the near face of this box and the probes on the far
-    one, so the length *is* where the measurement plane sits. Neither shift
+    one, so the length is where the measurement plane sits. Neither shift
     applies, and the envelope refuses one.
     """
     length = length_of(stated_length, fallback, subject)
     start, stop = list(face[0]), list(face[1])
     start[propagation_axis] = middle(face, propagation_axis)
     stop[propagation_axis] = start[propagation_axis] + direction * length
-    return PortBox(tuple(start), tuple(stop), propagation_axis, measurement=length, probe=length)
+    return PortBox(corner(start), corner(stop), propagation_axis, measurement=length, probe=length)

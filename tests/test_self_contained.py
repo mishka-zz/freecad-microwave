@@ -12,6 +12,8 @@ The fix is never a relative path that climbs out. Where the reference carried a
 fact, the fact is written where it was needed; where it carried only provenance,
 it goes. A citation of somebody else's *source* is different and stays - openEMS
 is public, and ``openEMS/FDTD/operator.cpp:517`` resolves for anyone who has it.
+So is a clause of somebody else's *standard*, which is spelled exactly like an
+item's identifier and is told apart by the unit named beside it.
 
 A convention nobody checks is a convention that drifts, so this states the rule
 in a form that fails.
@@ -58,6 +60,16 @@ OUTSIDE = re.compile(
     re.VERBOSE,
 )
 
+#: An appendix of a published standard numbers its subsections the way this
+#: project once numbered its open items, so ``C-5`` is both a clause anyone can
+#: buy and a line of a list only the harness has. What tells them apart is on
+#: the left: a clause is introduced by the unit it is a clause of, and an
+#: identifier stands bare. Adjacency is the whole test - a line that mentions an
+#: appendix elsewhere in it exempts nothing.
+CITED = re.compile(
+    r"(?i:(?:sub)?section|appendix|annex|clause|para\.|table|fig(?:ure|\.))\s+[A-Z]-\d+(?![\w-])"
+)
+
 
 def sources():
     return [path for path in repo.sources(*SUFFIXES) if path != SELF]
@@ -67,7 +79,7 @@ def offences(path: pathlib.Path) -> list[str]:
     """Every line of one file that reaches outside this repository."""
     found = []
     for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
-        if OUTSIDE.search(line):
+        if OUTSIDE.search(CITED.sub(" ", line)):
             found.append(f"{path.name}:{number}: {line.strip()[:80]}")
     return found
 
@@ -84,7 +96,8 @@ def test_the_check_knows_a_citation_from_a_dangling_pointer(tmp_path):
         "# A FreeCAD path like Mod/Plot, and a parameter group Mod/Microwave.\n"
         "# Section 4.2 spelled out in words is prose, not a pointer.\n"
         "# A mode name carries one: TM01.\n"
-        "# A part number is not an item: WR-42, and a coax type RG-58.\n",
+        "# A part number is not an item: WR-42, and a coax type RG-58.\n"
+        "# A clause names its unit: subsection C-7, Appendix C-6, Fig. B-4.\n",
         encoding="utf-8",
     )
     assert offences(kept) == []
@@ -97,7 +110,8 @@ def test_the_check_knows_a_citation_from_a_dangling_pointer(tmp_path):
         "# What M2 wanted, and what M1 was reviewed for.\n"
         "# ``debt.md`` T-6 names it without the directory, and so does status.md.\n"
         "# ui_ux_strategy.md is one of them too.\n"
-        "# D-17, which names a line of a list this repository does not ship.\n",
+        "# D-17, which names a line of a list this repository does not ship.\n"
+        "# An appendix mentioned somewhere on the line exempts nothing: C-7.\n",
         encoding="utf-8",
     )
     # By line, rather than by how many there are: a count says nothing about
@@ -111,4 +125,5 @@ def test_the_check_knows_a_citation_from_a_dangling_pointer(tmp_path):
         "5",
         "6",
         "7",
+        "8",
     ]

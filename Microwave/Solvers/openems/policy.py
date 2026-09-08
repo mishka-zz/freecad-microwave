@@ -3,10 +3,10 @@
 
 """What the solver object says about the run, as the adapter's own settings.
 
-The band, the excitation, the boundaries, how much air to leave around the
-structure, and the mesh policy - everything that describes the *run* rather than
-the device. The device is :mod:`~.geometry`, :mod:`~.materials` and
-:mod:`~.ports`.
+This module reads the band, the excitation, the boundaries, how much air to
+leave around the structure, and the mesh policy: everything that describes the
+run rather than the device. The device is :mod:`~.geometry`, :mod:`~.materials`
+and :mod:`~.ports`.
 
 Lengths arrive in millimetres and frequencies in hertz, which is what the
 envelope holds.
@@ -20,7 +20,6 @@ from typing import Any
 
 from ... import units
 from ...portbox import AXIS_NAMES
-from .mesh import MeshParams
 from .model import (
     DIMENSIONS,
     SPEED_OF_LIGHT,
@@ -31,6 +30,7 @@ from .model import (
     check_timestep_factor,
 )
 from .properties import TranslationError, _label, _model_fault, _value
+from .regions import MeshParams
 from .sizing import fits_inside
 
 #: Document boundary names to openEMS'. ``PML`` takes its depth from
@@ -55,11 +55,11 @@ def _frequency(analysis: Any) -> Frequency:
         return Frequency(start=start, stop=stop, points=int(analysis.NumFrequencyPoints))
 
 
-#: The one excitation this adapter has: ``driver`` calls ``SetGaussExcite`` and
-#: nothing selects between calls. Stated again here rather than imported, because
-#: ``Objects/analysis.GAUSSIAN`` sits behind ``import FreeCAD``; the two are held
-#: together by a test, which is also what would catch a value being offered in
-#: the property editor before there is a call to honour it.
+#: The one excitation this adapter has. ``driver`` builds a single pulse and
+#: nothing selects between shapes. It is stated again here rather than imported,
+#: because ``Objects/analysis.GAUSSIAN`` sits behind ``import FreeCAD``. A test
+#: holds the two together, and that test also catches a value offered in the
+#: property editor before there is a call to honour it.
 GAUSSIAN = "Gaussian"
 
 
@@ -67,10 +67,10 @@ def _waveform(analysis: Any) -> None:
     """Refuse a waveform this adapter cannot produce.
 
     The document object offers one value, so a document built through the GUI
-    cannot fail this. A file can: FreeCAD stores an enumeration's whole list in
-    the document and restores it from there rather than from the class, so a
-    document written with a longer list goes on offering it - and what it
-    offers would otherwise be solved as a Gaussian without a word.
+    cannot fail this check. A file can. FreeCAD stores an enumeration's whole
+    list in the document and restores it from there rather than from the class,
+    so a document written with a longer list goes on offering that list, and
+    what it offers would otherwise be solved as a Gaussian with no message.
     """
     declared = str(analysis.Waveform)
     if declared != GAUSSIAN:
@@ -82,16 +82,17 @@ def _waveform(analysis: Any) -> None:
 
 
 def _smallest_response(analysis: Any) -> float:
-    """The study's reading floor, from decibels to the magnitude in S it is.
+    """The study's reading floor, converted from decibels to a magnitude in S.
 
-    Amplitude and not power, because what it is weighed against is an error in
-    S: twenty decibels a decade, the same decibels the response is plotted in.
+    The conversion is in amplitude rather than power, because the floor is
+    weighed against an error in S: twenty decibels a decade, the same decibels
+    the response is plotted in.
 
-    Zero is full scale and is what a study that has not thought about it says,
-    so the ordinary run keeps the absolute bar. Above zero is refused rather
-    than clamped - a passive device answers no more than one, so it is a typing
-    slip, and a slip that silently became "full scale" would leave the property
-    reading as though it had been honoured.
+    Zero is full scale, and it is what a study that has not considered the
+    question says, so the ordinary run keeps the absolute bar. A value above
+    zero is refused rather than clamped. A passive device answers no more than
+    one, so a positive value is a typing slip, and a slip quietly taken as "full
+    scale" would leave the property reading as though it had been honoured.
     """
     declared = float(analysis.SmallestResponse)
     if not math.isfinite(declared) or declared > 0.0:
@@ -103,7 +104,7 @@ def _smallest_response(analysis: Any) -> float:
     return 10.0 ** (declared / 20.0)
 
 
-def _boundary(solver: Any) -> tuple[str, ...]:
+def _boundary(solver: Any) -> tuple[str, str, str, str, str, str]:
     cells = int(solver.PMLCells)
     words = []
     for axis in ("X", "Y", "Z"):
@@ -126,19 +127,22 @@ def _boundary(solver: Any) -> tuple[str, ...]:
                     "openEMS adapter does not support. Use PML, PEC, PMC or Mur"
                 )
             words.append(word)
-    return tuple(words)
+    # Unpacked because the six are a fixed set, one per face, which the loop
+    # above only implies.
+    x_min, x_max, y_min, y_max, z_min, z_max = words
+    return (x_min, x_max, y_min, y_max, z_min, z_max)
 
 
 def _absorber_cells(boundary: Sequence[str], depth: int) -> tuple[int, int, int]:
     """Absorber depth per axis, for the mesher.
 
-    The mesher lays uniform cells at both ends of any axis that absorbs, because
-    a graded absorber reflects. An axis walled by a conductor gets none - which
-    matters: a waveguide meshed as though it absorbed sideways would grow past
-    its own walls and its cutoff frequency would move.
+    The mesher lays uniform cells at both ends of any axis that absorbs,
+    because a graded absorber reflects. An axis walled by a conductor gets none.
+    That matters: a waveguide meshed as though it absorbed sideways would grow
+    past its own walls, and its cutoff frequency would move.
 
-    An axis absorbing on one face only still gets uniform cells on both. The cost
-    is a few cells of grid in a corner of the model; the alternative is a
+    An axis absorbing on one face only still gets uniform cells on both. The
+    cost is a few cells of grid in a corner of the model. The alternative is a
     per-face parameter the mesher does not have.
     """
     return tuple(  # type: ignore[return-value]
@@ -148,17 +152,17 @@ def _absorber_cells(boundary: Sequence[str], depth: int) -> tuple[int, int, int]
 
 
 def _padding(settings: Any) -> tuple[tuple[Any, Any], ...]:
-    """Per-face domain padding, in the form :func:`~.write.domain` wants.
+    """Per-face domain padding, in the form :func:`~.plan.domain` wants.
 
-    ``Through`` is not "more air". It pulls the domain *in* so the absorber lands
-    on the structure, which is what makes a transmission line infinite. Give a
-    line air at its ends instead and it radiates off an open circuit, and every
-    impedance read from it is contaminated by the reflection - so this is a
-    per-face choice the user has to make, not something to infer.
+    ``Through`` does not add air. It ends the grid on the structure and takes
+    the absorber out of the structure's own extent. A transmission line padded
+    that way is infinite. A line given air at its ends radiates off an
+    open circuit, and the reflection contaminates every impedance read from it.
+    The choice is therefore made per face by the user rather than inferred.
     """
     faces = []
     for axis in AXIS_NAMES:
-        pair = []
+        pair: list[Any] = []
         for name in ("Min", "Max"):
             mode = str(getattr(settings, f"Padding{axis}{name}"))
             if mode == "Through":
@@ -169,8 +173,8 @@ def _padding(settings: Any) -> tuple[tuple[Any, Any], ...]:
                 if count < 0:
                     raise TranslationError(
                         f"{_label(settings)!r}: {buffer} is {count}. Set that "
-                        "face's Padding to Through to pull the domain in; a "
-                        "negative count is not the way to ask for it"
+                        "face's Padding to Through to put the absorber on the "
+                        "structure; a negative count is not the way to ask for it"
                     )
                 pair.append(count)
             else:
@@ -178,20 +182,21 @@ def _padding(settings: Any) -> tuple[tuple[Any, Any], ...]:
                     f"{_label(settings)!r}: Padding{axis}{name} is "
                     f"{mode!r}; expected 'Air' or 'Through'"
                 )
-        faces.append(tuple(pair))
+        faces.append((pair[0], pair[1]))
     return tuple(faces)
 
 
 def _wavelength(materials: Iterable[Material], frequency: Frequency) -> float:
     """Wavelength in millimetres in the slowest material, at the top of the band.
 
-    The top of the band because that is where cells have to be smallest, and the
-    slowest material because a wave slows by sqrt(epsilon * mu) inside it -
-    meshing to the vacuum wavelength under-resolves it by exactly that factor.
+    The top of the band is where cells have to be smallest. The slowest
+    material is the one that matters, because a wave slows by sqrt(epsilon * mu)
+    inside it, and meshing to the vacuum wavelength under-resolves it by that
+    factor.
 
     Permeability belongs in that product. ``mu`` is settable in the GUI and is
     passed to CSXCAD, so leaving it out solves a ferrite as a magnetic material
-    and meshes it as a non-magnetic one - cells too coarse by sqrt(mu_r),
+    and meshes it as a non-magnetic one: cells too coarse by sqrt(mu_r),
     dispersion, and a resonance in the wrong place with no warning.
     """
     slowest = max([material.epsilon * material.mu for material in materials] or [1.0])
@@ -206,17 +211,19 @@ def _mesh_params(
 ) -> MeshParams:
     """Mesh policy in millimetres, from the document's wavelength fractions.
 
-    ``ElementsPerWavelength`` counts elements across the wavelength *in the
-    slowest material in the model* at the top of the band, never a length. A
-    remembered millimetre value silently under-resolves the moment anything raises
-    the permittivity or the frequency.
+    ``ElementsPerWavelength`` counts elements across the wavelength in the
+    slowest material in the model at the top of the band, and never a length. A
+    remembered millimetre value under-resolves the moment anything raises the
+    permittivity or the frequency.
 
-    What matters most is ``EdgeRefinement``, and it is easy to get wrong because
-    the error it causes looks like ordinary discretisation error. At the same
-    cell count, refining the conductor edge by 2 instead of 6 moves the
-    extracted impedance by more than the microstrip gate's tolerance allows. The
-    defaults follow openEMS' own ``MSL_Losses.m``: bulk at lambda/20, edges six
-    times finer.
+    ``EdgeRefinement`` sizes the cell at a conductor edge, and it is the error
+    there that looks like ordinary discretisation error rather than like a
+    conductor meshed wrongly. It is not the whole of what the grid spends on a
+    conductor: :func:`~.metal._edge_size` also sizes the cell from the metal's
+    own width, and takes the finer of the two wherever that second demand is
+    above the grid's floor. So on a narrow trace a coarse refinement is
+    overridden rather than obeyed. The defaults follow openEMS' own
+    ``MSL_Losses.m``: bulk at lambda/20, edges six times finer.
     """
     per_wavelength, refinement = _check_mesh_policy(settings)
     wavelength = _wavelength(materials, frequency)
@@ -231,16 +238,16 @@ def _mesh_params(
         min_lines=int(settings.MinElementsAcross),
         pml_cells=absorber,
         min_cell=floor,
-        # The coarsest cell anywhere: the bulk size in vacuum. Every dielectric
-        # then asks for its own sqrt(epsilon) finer over its own span, and air
-        # - which asks for nothing - gets this. What taking one lambda from
-        # the slowest material in the model instead would cost is on
-        # mesh.Region.size.
+        # The coarsest cell anywhere: the bulk size in vacuum. Every
+        # dielectric then asks for its own sqrt(epsilon) finer over its own
+        # span, and air, which asks for nothing, gets this. What taking one
+        # lambda from the slowest material in the model instead would cost is on
+        # regions.Region.size.
         #
-        # It sizes the air faces of the domain as well as the sizing field -
-        # air is what relaxes to it. A THROUGH face is sized by the material
-        # that will be at the wall instead, because that is what the absorber
-        # gets laid in; see write.domain.
+        # It sizes the air faces of the domain as well as the sizing field, air
+        # being what relaxes to it. A THROUGH face is sized by nothing here: the
+        # domain ends on the drawing, and the absorber comes out of it at the
+        # pitch the mesher lays there.
         cap=_coarsest_cell(settings, frequency),
     )
 
@@ -248,9 +255,9 @@ def _mesh_params(
 def _coarsest_cell(settings: Any, frequency: Frequency) -> float:
     """The largest cell the grid will use anywhere, in mm.
 
-    Read off the vacuum wavelength at the top of the band, so it needs no
-    material and can be asked before the geometry has been read - which is what
-    lets a conductor drawn without one be given a thickness measured against the
+    It is read off the vacuum wavelength at the top of the band, so it needs no
+    material and can be asked before the geometry has been read. A conductor
+    drawn without a thickness can therefore be given one measured against the
     grid that will hold it.
     """
     per_wavelength, _ = _check_mesh_policy(settings)
@@ -260,40 +267,57 @@ def _coarsest_cell(settings: Any, frequency: Frequency) -> float:
 def _skin(settings: Any, frequency: Frequency) -> float:
     """How thick to make a conductor drawn with no thickness at all, in mm.
 
-    A cell has to fit inside the metal or openEMS samples it into islands, and
-    the cell a conductor's own edges are sized at is the metal resolution - so
-    the thickness is the one whose *connection* demand is exactly that: the cell
-    of that size has the thickness for its body diagonal, which is the worst
-    direction a slab can be crossed in and so the one the criterion is stated at.
+    A cell has to fit inside the metal, or openEMS samples it into islands, and
+    the cell a conductor's own edges are sized at is the metal resolution. The
+    thickness is therefore the one whose connection demand is exactly that: the
+    cell of that size has the thickness for its body diagonal, which is the
+    worst direction a slab can be crossed in and so the direction the criterion
+    is stated at.
 
-    Measured in vacuum, where that resolution is at its coarsest. A dielectric in
-    the model only refines it, so this is the thickness that stays resolved
-    whatever else is drawn - and it bounds what the skin can cost: its demand is
-    the vacuum metal resolution, which no model's own metal resolution is coarser
-    than, so a skin is never the finest thing asking.
+    It is measured in vacuum, where that resolution is at its coarsest. A
+    dielectric in the model only refines it, so this thickness stays resolved
+    whatever else is drawn. It also bounds what the skin can cost: its demand is
+    the vacuum metal resolution, which no model's own metal resolution is
+    coarser than, so a skin is never the finest thing asking.
 
-    What it is not is free. A cross-section is read at points across a surface
-    rather than over a span, so a wide skin holds the field down across its whole
-    extent where it would otherwise have relaxed toward the coarsest cell. A
-    conductor drawn thicker than the mesher's reach is read as no feature at all
-    and costs less; that is the price of the thickness being invented here.
+    The skin is not free. A cross-section is read at points across a surface
+    rather than over a span, so a wide skin holds the field down across its
+    whole extent where it would otherwise have relaxed toward the coarsest cell.
+    A conductor drawn thicker than the mesher's reach is read as no feature at
+    all and costs less. That is what supplying the thickness here costs.
     """
     _, refinement = _check_mesh_policy(settings)
     return fits_inside(_coarsest_cell(settings, frequency) / refinement)
 
 
+def _curve_tolerance(settings: Any) -> float:
+    """How far a curved surface may be solved from where it was drawn, in mm.
+
+    Zero asks for nothing, and is what the property carries by default. Leaving
+    the kernel's own band costs time, and the shape's own unevenness decides how
+    much, so it is set per drawing, on the models where a radius decides the
+    answer, rather than as a constant for every model.
+
+    It is read through :func:`~.properties._value` like every other length, so a
+    quantity typed with a unit and a bare float are one number here. The
+    property is absent on a document that predates it, and zero is what such a
+    document was solved at.
+    """
+    return max(0.0, _value(getattr(settings, "CurveTolerance", 0.0)))
+
+
 def _check_mesh_policy(settings: Any) -> tuple[float, float]:
     """Validate the mesh policy once, before anything reads it.
 
-    Called from :func:`contents`, not only from :func:`_mesh_params`, and that
-    placement is the point. ``_Context`` divides by ``ElementsPerWavelength`` to
-    size ports, and it is built *before* mesh parameters exist - so validating
+    It is called from :func:`contents` rather than only from
+    :func:`_mesh_params`. ``_Context`` divides by ``ElementsPerWavelength`` to
+    size ports, and it is built before mesh parameters exist, so validating
     inside ``_mesh_params`` would let a zero through to a ``ZeroDivisionError``
     two functions before the message meant to explain it. Policy checks belong
-    at the one place every route passes through, for the same reason the driver
+    at the one place every route passes through, for the reason the driver
     re-runs pre-flight.
 
-    Returns the two numbers it had to parse anyway.
+    It returns the two numbers it had to parse anyway.
     """
     if not hasattr(settings, "ElementsPerWavelength"):
         raise TranslationError(
@@ -322,11 +346,12 @@ def _check_mesh_policy(settings: Any) -> tuple[float, float]:
 def _termination(solver: Any) -> Termination:
     """When to stop stepping.
 
-    ``EnergyDecay`` at or above zero means "do not stop early", and that is
-    the default. It reads like a disabled feature and it is the only reproducible
-    setting: openEMS re-evaluates its energy criterion inside a branch gated on
-    four seconds of wall clock, so an energy-terminated run stops at a step count
-    that depends on machine load. Pre-flight warns when this is switched on.
+    ``EnergyDecay`` at or above zero means "do not stop early", and that is the
+    default. It reads like a disabled feature, and it is the only reproducible
+    setting. openEMS re-evaluates its energy criterion inside a branch gated on
+    four seconds of wall clock (``openEMS/openems.cpp:1445``), so an
+    energy-terminated run stops at a step count that depends on machine load.
+    Pre-flight warns when this is switched on.
     """
     decay = float(solver.EnergyDecay)
     with _model_fault(_label(solver)):
@@ -339,10 +364,10 @@ def _termination(solver: Any) -> Termination:
 def _threads(solver: Any) -> int:
     """How many threads openEMS may use. Zero means "as many as it likes".
 
-    Read through its own function for the reason :func:`_model_fault` records:
-    it is the one value a user can type that lands in ``Problem``, whose
-    construction is the one place that context manager must not be wrapped
-    around. Checking the property before it gets there costs nothing and catches
+    It is read through its own function for the reason :func:`_model_fault`
+    records. It is the one value a user can type that lands in ``Problem``, and
+    ``Problem``'s construction is the one place that context manager must not
+    wrap. Checking the property before it gets there costs nothing and catches
     only itself.
     """
     threads = int(solver.Threads)
@@ -357,19 +382,20 @@ def _threads(solver: Any) -> int:
 def timestep_factor(solver: Any) -> float:
     """The stability factor, refused here if openEMS would not act on it.
 
-    Read through a function rather than inline because two paths want it and
-    only one of them builds a :class:`Problem`: the mesh preview scales its
-    reported timestep by the factor without ever constructing an envelope, so
-    the envelope's own invariant does not stand between the user and the number
-    on screen. Without this, typing 2 into ``TimestepFactor`` and pressing
-    Update Mesh reports a CFL bound at twice the real one - captioned as the
-    bound, in green - and only Run refuses it. Two paths disagreeing about
-    whether a value is legal, with the permissive one drawing the picture.
+    It is read through a function rather than inline because two paths want it
+    and only one of them builds a :class:`Problem`. The mesh preview scales its
+    reported timestep by the factor without constructing an envelope, so the
+    envelope's own invariant does not stand between the user and the number on
+    screen. Without this check, typing 2 into ``TimestepFactor`` and pressing
+    Update Mesh reports a timestep at twice the vacuum CFL bound, captioned as
+    an estimate of it and in green, and only Run refuses it. The two paths would
+    then disagree about whether a value is legal, with the permissive one
+    drawing the picture.
 
-    A :class:`TranslationError` and not the :class:`EnvelopeError` underneath,
-    through :func:`_model_fault`, which is where that rule is written down.
-    Typing 2 into a property field is not a crash. The bound itself stays in
-    ``model.check_timestep_factor``, stated once.
+    It raises a :class:`TranslationError` rather than the
+    :class:`EnvelopeError` underneath, through :func:`_model_fault`, where that
+    rule is written down. Typing 2 into a property field is not a crash. The
+    bound itself stays in ``model.check_timestep_factor``, stated once.
     """
     with _model_fault(_label(solver)):
         return check_timestep_factor(float(solver.TimestepFactor))

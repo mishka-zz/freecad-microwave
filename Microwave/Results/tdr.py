@@ -1,72 +1,80 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-"""Impedance along a line, from one port's reflection - solver-neutral.
+"""Impedance along a line, from one port's reflection. Solver-neutral.
 
-A step response is the inverse transform of S11 against **one real impedance**,
-so a port reported against its own measured Z(f) - complex and dispersive,
-which is what a microstrip port extracts from the field - is renormalised onto
-a real constant first. That is what a bench does with a de-embedded
-measurement, and it costs nothing: what comes back is the reflection an
-instrument referenced to that number would have read.
+A step response is the inverse transform of S11 against one real impedance. A
+port reported against its own measured Z(f), which is complex and dispersive for
+a microstrip port extracting it from the field, is therefore renormalised onto a
+real constant first. A bench does the same with a de-embedded measurement, and
+it costs nothing: what comes back is the reflection an instrument referenced to
+that number would have read.
 
 The number is the caller's where one is given, and the port's own at band
 centre where none is. :attr:`Trace.reference_measured` says which, because a
-number the port measured is not one the study named - and the section the port
-sits on then reads that measurement back rather than checking it.
+number the port measured differs from one the study named, and the section the
+port sits on then reads that measurement back rather than checking it.
 
 Reads a :class:`~.sparameters.SParameters` and nothing else. No FreeCAD, no Qt,
 and scikit-rf only through :mod:`._skrf`.
 
-What the transform cannot do is beat its own bandwidth: the step count decides
-how finely the trace is *drawn* and buys no ability to *distinguish*.
+The transform cannot beat its own bandwidth. The step count decides how finely
+the trace is drawn and adds no ability to distinguish.
 :class:`~tests.test_tdr.TestBandwidthSetsWhatIsResolved` holds both halves of
 that as properties rather than as a formula, because the separable width
 depends on the window as well as the bandwidth.
+
+The transform also cannot read a section standing behind two discontinuities as
+an impedance, or tell how far the wave went from what the structure kept.
+Neither is guarded here. The chart states both instead.
+``docs/results.md#interpretation-guidelines`` carries the first, and
+``docs/results.md#requirements-for-tdr-transformation`` what the distance axis
+needs.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
 from ..units import SPEED_OF_LIGHT
 from . import _skrf
-from .sparameters import ResultError
+from .sparameters import ResultError, SParameters
 
 #: How many frequency bins below the first measured point may be invented.
 #:
 #: ``extrapolate_to_dc`` fills the band under the first measured point from a
-#: straight line, which is sound while that band holds no feature of the
-#: structure and a fabrication once it holds the structure's first resonance -
-#: and a step response is carried by its low frequencies, so the trace is then
-#: replaced rather than perturbed, smoothly and with nothing out of range.
+#: straight line. That is sound while the band holds no feature of the
+#: structure, and it is a fabrication once the band holds the structure's first
+#: resonance. A step response is carried by its low frequencies, so the trace is
+#: then replaced rather than perturbed, smoothly and with nothing out of range.
 #:
-#: The condition that matters is about the *structure*, whose round-trip delay
-#: can only be read off the very trace in question. This is a deliberately
-#: conservative proxy for it: a short structure tolerates a wider invented band
-#: and is refused anyway.
+#: The condition that matters is about the structure, whose round-trip delay can
+#: only be read off the very trace in question. This limit is a conservative
+#: proxy for it: a short structure tolerates a wider invented band and is
+#: refused anyway.
 INVENTED_BINS = 4
 
-#: The FFT window, and one of the two things that decide what the trace can
+#: The FFT window. It is one of the two things that decide what the trace can
 #: separate.
 #:
-#: It trades the width of a transition against the sidelobes either side, and a
-#: narrow window rings hard enough to carry ``|rho|`` past unity around a strong
-#: reflection - which is what turns samples of a trace into blanks. Fixed rather
-#: than offered, because a chart whose shape depends on an unseen setting is
-#: worse than one shape consistently applied; a keyword, so tests can hold the
-#: trade.
+#: The window trades the width of a transition against the sidelobes either
+#: side. A narrow window rings hard enough to carry ``|rho|`` past unity around
+#: a strong reflection, which turns samples of a trace into blanks. The window
+#: is fixed rather than offered, because a chart whose shape depends on an
+#: unseen setting is worse than one shape consistently applied. It stays a
+#: keyword so that tests can hold the trade.
 WINDOW = "hamming"
 
 #: Length the spectrum is zero-padded to before the inverse transform.
 #:
-#: Padding **interpolates** and adds no information - it separates nothing that
-#: was not already separable, which
+#: Padding interpolates and adds no information. It separates nothing that was
+#: not already separable, which
 #: :class:`~tests.test_tdr.TestBandwidthSetsWhatIsResolved` pins. Unpadded, a
-#: sweep of a hundred points spends single-figure samples on the narrowest
-#: thing its bandwidth can resolve and the trace reads as a chain of corners.
+#: short sweep spends only a few samples on the narrowest thing its bandwidth
+#: can resolve, and the trace reads as a chain of corners.
 SPECTRUM = 2048
 
 
@@ -74,12 +82,12 @@ SPECTRUM = 2048
 class Trace:
     """One port's reflection against time, and the impedance it implies.
 
-    :attr:`time` is **round trip** from the port's reference plane, which is
-    what the transform yields and what an instrument displays. Halving it is
-    :func:`distance`'s job.
+    :attr:`time` is the round trip from the port's reference plane. That is what
+    the transform yields and what an instrument displays. :func:`distance`
+    halves it.
 
-    Samples at ``time < 0`` are kept rather than trimmed: they are the window's
-    non-causal skirt, and a skirt that is not small says the trace was asked
+    Samples at ``time < 0`` are kept rather than trimmed. They are the window's
+    non-causal skirt, and a skirt that is not small means the trace was asked
     for more bandwidth than the sweep holds.
     """
 
@@ -104,10 +112,17 @@ def _ohms(reflection: np.ndarray, reference: float) -> np.ndarray:
     """``Z = Z_ref (1 + rho) / (1 - rho)``, blank where the ratio has no answer.
 
     ``|rho| >= 1`` arises two ways. At an open or a short the impedance is
-    genuinely singular; away from one, the window's overshoot carries ``|rho|``
-    a fraction past unity and the expression returns a large negative
-    impedance, which no passive structure can take. ``nan`` covers both: a plot
+    genuinely singular. Away from one, the window's overshoot carries ``|rho|``
+    a fraction past unity and the expression returns a large negative impedance,
+    which no passive structure can take. ``nan`` covers both cases: a plot
     breaks its line, and nothing downstream inherits an unmeasured number.
+
+    Every reflection is read as though the wave had met nothing on the way, so
+    this inverts the first discontinuity exactly and nothing from the second on.
+    Undoing that is layer peeling, which on a band-limited trace needs a stride
+    and buys the masked section at the unmasked one's expense. A chart drawn
+    from this says how far along itself it is an impedance instead, and
+    ``docs/results.md#interpretation-guidelines`` says why.
     """
     reflection = np.asarray(reflection)
     singular = np.abs(reflection) >= 1.0
@@ -117,7 +132,7 @@ def _ohms(reflection: np.ndarray, reference: float) -> np.ndarray:
     return ohms
 
 
-def _reference_of(result, port: int, chosen: float | None) -> tuple[float, bool]:
+def _reference_of(result: SParameters, port: int, chosen: float | None) -> tuple[float, bool]:
     """The real impedance the trace is measured against, and who chose it.
 
     ``chosen`` wins wherever it is given. Otherwise the port's own reference
@@ -126,12 +141,13 @@ def _reference_of(result, port: int, chosen: float | None) -> tuple[float, bool]
 
     The second value is true only in that last case. A port reported against
     "its own" impedance that turns out to be a number is reported against that
-    number - a lumped port's own impedance is the resistance that was typed -
-    so what the array says decides, not what was declared. It is the judgement
-    :func:`~.sparameters._own_or` already makes to caption the same matrix.
+    number, since a lumped port's own impedance is the resistance that was
+    typed. What the array says decides this, rather than what was declared.
+    :func:`~.sparameters._own_or` already makes the same judgement to caption
+    the same matrix.
 
     An undriven port is refused rather than answered. Its column is ``nan``, so
-    there is nothing to renormalise and nothing to transform, and the fix is to
+    there is nothing to renormalise and nothing to transform. The fix is to
     drive it rather than to change what it is measured against.
     """
     if port in result.unmeasured:
@@ -152,20 +168,21 @@ def _reference_of(result, port: int, chosen: float | None) -> tuple[float, bool]
     return float(column[column.size // 2].real), True
 
 
-def _one_port(result, port: int, reference: float):
+def _one_port(result: SParameters, port: int, reference: float) -> Any:
     """Port ``port``'s reflection against ``reference``, as a one-port ``skrf.Network``.
 
-    Built term by term rather than through :meth:`SParameters.network`, which
-    refuses a matrix with an undriven column. A time-domain solve drives one
-    port per run, so the ordinary two-port study *has* an undriven column and
-    would be refused for a term this transform never reads.
+    This builds the network term by term rather than through
+    :meth:`SParameters.network`, which refuses a matrix with an undriven column.
+    A time-domain solve drives one port per run, so the ordinary two-port study
+    has an undriven column and would be refused for a term this transform never
+    reads.
 
     Moving one port's reference is the whole of the renormalisation, and it can
-    be done on the term alone: every other port stays terminated in whatever it
+    be done on the term alone. Every other port stays terminated in whatever it
     was, so the load this one looks into does not change and no term outside
-    S(p,p) enters the answer. What comes back is therefore this port's
-    reflection and says nothing about the terms left behind - which is all the
-    transform reads.
+    S(p,p) enters the answer. What comes back is this port's reflection, and it
+    says nothing about the terms left behind. The transform reads no more than
+    that.
     """
     frequency = np.asarray(result.frequency, dtype=float)
     term = np.asarray(result.parameter(port, port), dtype=complex)
@@ -191,17 +208,18 @@ def _one_port(result, port: int, reference: float):
 
 #: How far the frequency steps may vary before the sweep is not uniform.
 #:
-#: A transform reads its input as evenly spaced whatever it is, and scikit-rf's
-#: own uniformity test allows five percent before quietly resampling. Neither is
-#: a tolerance a Fourier transform has: this admits the rounding in a
-#: ``linspace`` and nothing else.
+#: A transform reads its input as evenly spaced whatever it is. scikit-rf calls
+#: a sweep linear while it is within ``rtol=0.05`` of a ``linspace``
+#: (``_vendor/skrf/frequency.py:701``), which describes the axis rather than
+#: bounding what may be assumed of it. A Fourier transform has no such
+#: tolerance. This one admits the rounding in a ``linspace`` and nothing else.
 UNIFORM = 1e-6
 
 
-def _check_the_sweep(result, port: int) -> None:
+def _check_the_sweep(result: SParameters, port: int) -> None:
     """Everything the transform needs of the frequency axis, before it is read.
 
-    Both checks are on the **input**, not on what the extrapolation hands back:
+    The checks read the input rather than what the extrapolation hands back.
     ``extrapolate_to_dc`` ends by interpolating onto a ``linspace``, so a
     refusal downstream of it is unreachable by construction.
     """
@@ -242,7 +260,7 @@ def _check_the_sweep(result, port: int) -> None:
 
 
 def step_response(
-    result,
+    result: SParameters,
     port: int,
     *,
     reference: float | None = None,
@@ -252,15 +270,14 @@ def step_response(
     """The reflection at ``port`` against time, and the impedance it implies.
 
     ``reference`` is the impedance to measure the reflection against, in ohms.
-    The port's own serves where none is given - at band centre where it
-    disperses - so a study referenced to nothing in particular still draws.
-    Naming one is what makes two studies comparable, and what puts a trace on
-    the number an instrument would have been calibrated to.
+    The port's own serves where none is given, taken at band centre where it
+    disperses, so a study referenced to nothing in particular still draws.
+    Naming one makes two studies comparable, and puts a trace on the number an
+    instrument would have been calibrated to.
 
-    The sweep is extrapolated to DC before transforming, which is what a
-    reflectometer built on a swept measurement does and why nothing here asks
-    the solver for zero hertz. :data:`INVENTED_BINS` is the bar that costs are
-    held to.
+    The sweep is extrapolated to DC before transforming, as a reflectometer
+    built on a swept measurement does, so nothing here asks the solver for zero
+    hertz. :data:`INVENTED_BINS` is the bar the extrapolation is held to.
     """
     _check_the_sweep(result, port)
     ohms, measured = _reference_of(result, port, reference)
@@ -286,22 +303,22 @@ def step_response(
     )
 
 
-def velocity(result, receiving: int, driving: int, separation: float) -> float:
+def velocity(result: SParameters, receiving: int, driving: int, separation: float) -> float:
     """Propagation velocity in m/s, from the phase of one transmission term.
 
     ``separation`` is the distance between the two ports' reference planes, in
-    metres, and is asked for rather than inferred because a result holds no
-    geometry. The delay divides into the *whole* path between the planes,
-    launches included - the right quantity for putting distance on an axis, and
-    the wrong one for quoting a substrate's effective permittivity.
+    metres. The caller passes it rather than this function inferring it, because
+    a result holds no geometry. The delay divides into the whole path between
+    the planes, launches included. That is the right quantity for putting
+    distance on an axis, and the wrong one for quoting a substrate's effective
+    permittivity.
 
-    Three decisions, each with a plausible alternative that fails:
-    the phase is taken **across the band** rather than as an average of local
-    group delays, the unwrapping is **not centred** on the band's own advance,
-    and a sweep too coarse to unwrap is caught on the resulting **velocity
-    against the speed of light** rather than from the phase, which stays
-    straight and simply takes the wrong slope. Why each, in
-    docs/internals/velocity-from-phase.md.
+    Each of these decisions has a plausible alternative that fails: the phase is
+    taken across the band rather than as an average of local group delays, the
+    unwrapping is not centred on the band's own advance, and a sweep too coarse
+    to unwrap is caught on the resulting velocity against the speed of light
+    rather than from the phase, which stays straight and takes the wrong slope.
+    docs/internals/velocity-from-phase.md says why for each.
     """
     frequency = np.asarray(result.frequency, dtype=float)
     term = np.asarray(result.parameter(receiving, driving), dtype=complex)
@@ -342,7 +359,7 @@ def velocity(result, receiving: int, driving: int, separation: float) -> float:
 def distance(trace: Trace, speed: float) -> np.ndarray:
     """Where along the line each sample of ``trace`` was reflected, in metres.
 
-    Halves the round trip, which is the one step between a transform's output
-    and a length that the units do not show.
+    Halves the round trip. That step stands between a transform's output and a
+    length, and the units do not show it.
     """
     return 0.5 * speed * np.asarray(trace.time, dtype=float)

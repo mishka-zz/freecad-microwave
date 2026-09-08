@@ -6,17 +6,20 @@
 The same structure ``tests/test_acceptance_microstrip.py`` builds by hand - a
 3 mm trace on 1.6 mm FR4, 100 mm long, both ends running out through the
 absorber - but drawn with ``Part`` primitives and marked up with the document
-objects a user would use. Translating it reproduces that grid cell for cell, and
-solving it lands on the same impedance; both come out of the run as ``GATE``
-lines, from ``test_a_document_reproduces_the_acceptance_gate`` and the
-document-route gate beside it. That equivalence is the point: it is what says
-the document layer adds no error of its own.
+objects a user would use. Translating it reproduces that grid cell for cell,
+which ``test_the_drawn_line_and_the_hand_built_one_are_one_grid`` asserts line
+by line. Solving it lands on the same impedance:
+``test_a_document_reproduces_the_acceptance_gate`` prints a ``GATE`` line to
+compare against the hand-built gate's. The two agreeing bound the error the
+document layer adds.
 
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
-    /Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd \\
-        examples/microstrip_50ohm.py
+    freecadcmd examples/microstrip_50ohm.py
+
+``freecadcmd`` ships inside the FreeCAD installation. On macOS it is
+``FreeCAD.app/Contents/Resources/bin/freecadcmd``.
 
 It writes beside itself. Set ``OUT`` to put the document somewhere else.
 """
@@ -159,9 +162,9 @@ def study(doc):
     solver.MaxTimesteps = 14000
 
     settings = document.contents(analysis).settings
-    # The line is meant to be infinite: pull the domain in at both ends so the
-    # absorber lands on the structure. Give it air instead and it radiates off
-    # an open circuit, and every impedance read from it is contaminated.
+    # The line is meant to be infinite: put the absorber on the board at both
+    # ends, so the line runs out through it. Give it air instead and it radiates
+    # off an open circuit, and every impedance read from it is contaminated.
     settings.PaddingXMin = "Through"
     settings.PaddingXMax = "Through"
     return analysis
@@ -193,9 +196,9 @@ def main(out):
 # freecadcmd execs a script under a module name taken from the file stem, not
 # "__main__", so the usual guard alone never fires and the script does nothing.
 if __name__ in ("__main__", "microstrip_50ohm"):
-    # Beside this script, not in the working directory. The default was a bare
-    # relative name, so running the documented command from the repo root wrote
-    # a second copy of the example there. ``__file__`` is defined on this route,
+    # Beside this script, not in the working directory. A bare relative name
+    # writes a second copy wherever the documented command was run from.
+    # ``__file__`` is defined on this route,
     # unlike in InitGui.py - measured under freecadcmd 1.1.1.
     default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "microstrip_50ohm.FCStd")
     main(os.environ.get("OUT", default))

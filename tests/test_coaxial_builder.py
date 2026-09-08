@@ -45,6 +45,12 @@ OUTER = 3.5
 CELL = 1.0
 LINES = np.arange(0.0, 41.0, CELL)
 
+#: A grid graded far harder than a mesher would lay one, for the cases that ask
+#: what an uneven triplet does to the reading. The three lines around 20 are
+#: 1 mm and 2.5 mm apart, so the voltage's span and the current's are as unlike
+#: each other as they can be made here.
+GRADED = np.array([0.0, 4.0, 8.0, 12.0, 16.0, 18.0, 19.0, 20.0, 22.5, 26.0, 30.0, 35.0, 40.0])
+
 
 class Recorder:
     """One probe or excitation, remembering how it was made and what it holds."""
@@ -190,6 +196,17 @@ class TestTheCurrentProbes:
         assert stop[0] - INNER >= 1.0, "half of a 2 mm cell of growth is not cleared"
         assert stop[0] < OUTER
 
+    def test_a_run_given_the_metal_as_drawn_clears_no_growth(self):
+        """The share is the run's rather than the module's, so a port on a run
+        that made no correction does not stand its loop clear of one. It is the
+        same field the conductor was built from - the loop's whole job is to be
+        outside the metal openEMS has, and the two would part otherwise."""
+        coarse = Structure(lines=np.arange(0.0, 41.0, 2.0))
+        csx, port = built(csx=coarse, MeasPlaneShift=20.0, grown_by=0.0)
+        start, stop = [p for p in csx.probes if p.keywords["p_type"] == 1][0].boxes[0]
+
+        assert stop[0] == pytest.approx(INNER + 0.1 * (OUTER - INNER), rel=1e-12, abs=0.0)
+
     def test_a_fine_mesh_leaves_the_loop_where_the_gap_puts_it(self):
         """The growth term must not take over on a mesh where it is negligible,
         or the loop drifts out towards the shield for no reason."""
@@ -319,19 +336,33 @@ class TestReadingTheLineBack:
     IMPEDANCE = 51.83
     BETA = 120.0  # radians per metre
 
-    def _read(self, monkeypatch, port, drawn=(19.0, 20.0, 21.0), unit=1e-3, invert_current=False):
+    def _read(
+        self,
+        monkeypatch,
+        port,
+        drawn=(19.0, 20.0, 21.0),
+        unit=1e-3,
+        invert_current=False,
+        reflection=0.0,
+    ):
         """Fill this port's probes with a travelling wave and let it read them.
 
         ``drawn`` is where the voltage planes sit in *drawing* units; the wave
         is built at the metres those become, which is the conversion the
         extraction has to make for itself.
+
+        ``reflection`` adds a wave coming the other way, of that amplitude
+        against the forward one. It carries the opposite sign of current, which
+        is what makes the pair a line rather than two unrelated fields.
         """
         import Microwave.Solvers.openems.coaxial as module
 
         planes = np.array(drawn) * unit
         loops = planes[:2] + np.diff(planes) / 2.0
-        voltage = np.exp(-1j * self.BETA * planes)
-        current = np.exp(-1j * self.BETA * loops) / self.IMPEDANCE
+        voltage = np.exp(-1j * self.BETA * planes) + reflection * np.exp(1j * self.BETA * planes)
+        current = (
+            np.exp(-1j * self.BETA * loops) - reflection * np.exp(1j * self.BETA * loops)
+        ) / self.IMPEDANCE
         if invert_current:
             current = -current
 
@@ -400,3 +431,132 @@ class TestReadingTheLineBack:
         self._read(monkeypatch, port)
 
         assert abs(port.uf_tot[0]) == pytest.approx(1.0, rel=1e-9, abs=0.0)
+
+    def test_the_impedance_is_blind_to_where_along_the_line_it_is_read(self, monkeypatch):
+        """A travelling wave carries one impedance at every plane, and the
+        extraction has to as well: the exponential is common to the voltage, the
+        current and both derivatives, so it divides out whole. Ten cells along
+        the same uniform grid is the same answer to the last bit.
+
+        What that settles is where the grid's registration *along* the line can
+        reach the reading at all. Not through the plane it is read at - only
+        through the spacings the derivatives are taken over, and by the test
+        below not through those either.
+        """
+        csx, near = built()
+        self._read(monkeypatch, near)
+        csx, far = built(MeasPlaneShift=30.0)
+        self._read(monkeypatch, far, drawn=(29.0, 30.0, 31.0))
+
+        # A port that ignored the shift would read the same planes twice, and
+        # every bar below would hold on a case compared with itself.
+        assert far.measplane_shift != near.measplane_shift
+
+        assert abs(far.Z_ref[0] - near.Z_ref[0]) < 1e-12 * abs(near.Z_ref[0])
+        assert abs(far.beta[0] - near.beta[0]) < 1e-12 * abs(near.beta[0])
+
+    def test_the_impedance_is_blind_to_how_the_triplet_is_spaced(self, monkeypatch):
+        """The two derivatives are taken over different spans - the voltage
+        across the whole triplet, the current between the loops that sit between
+        its planes - so a graded grid discretises them differently and the errors
+        have no reason to match. They cancel exactly anyway, and averaging the
+        two loops is what does it: it puts the current at the same place along
+        the line as the voltage, and the ratio comes out exact whatever the
+        spacings are.
+
+        Asserted against a triplet graded far past anything a mesher would lay,
+        because the point is that no spacing is a special case.
+        """
+        csx, uniform = built()
+        self._read(monkeypatch, uniform)
+
+        csx, graded = built(csx=Structure(lines=GRADED), MeasPlaneShift=20.0)
+        self._read(monkeypatch, graded, drawn=(19.0, 20.0, 22.5))
+
+        assert abs(graded.Z_ref[0] - uniform.Z_ref[0]) < 1e-12 * abs(uniform.Z_ref[0])
+        assert graded.Z_ref[0].real == pytest.approx(self.IMPEDANCE, rel=1e-12, abs=0.0)
+
+    def test_a_standing_wave_is_read_exactly_only_on_an_even_triplet(self, monkeypatch):
+        """The limit on the cancellation above, and the one a real line meets.
+
+        A forward wave and a reflection do not share one exponential, so the two
+        derivatives no longer differ by a common factor. A cross term between
+        them survives in the voltage's and cancels in the current's, weighted by
+        the difference between the two spacings - zero on an even triplet, where
+        a standing wave is therefore read exactly whatever comes back, and not
+        zero on an uneven one, where what it costs is proportional to how much
+        did.
+
+        So the exactness above belongs to a *travelling* wave. A line borrows it
+        only as far as it is matched or its triplet is even, and the gate that
+        reads one asserts both: it holds its match, and the mesher pins a line
+        at the measurement plane where the grading is locally even.
+        """
+        for reflection in (0.0, 0.05, 0.2):
+            csx, port = built()
+            self._read(monkeypatch, port, reflection=reflection)
+
+            assert abs(abs(port.Z_ref[0]) - self.IMPEDANCE) < 1e-12 * self.IMPEDANCE
+
+        cost = []
+        for reflection in (0.05, 0.1):
+            csx, port = built(csx=Structure(lines=GRADED), MeasPlaneShift=20.0)
+            self._read(monkeypatch, port, drawn=(19.0, 20.0, 22.5), reflection=reflection)
+            cost.append(abs(abs(port.Z_ref[0]) / self.IMPEDANCE - 1.0))
+
+        assert cost[0] > 1e-3, "an uneven triplet is supposed to lose the cancellation"
+        assert cost[1] / cost[0] == pytest.approx(2.0, rel=0.05, abs=0.0)
+
+    def test_a_graded_triplet_costs_the_propagation_constant_instead(self, monkeypatch):
+        """What the impedance's cancellation does not extend to.
+
+        ``beta`` is a difference over a finite span, so it carries that span's
+        own discretisation: low by a term in the square of the span, and - where
+        the two spacings differ - turned in the complex plane by half their
+        difference, which reads as a line that gains or loses. Neither is in the
+        physics, this line being lossless and the constant exact.
+
+        Nothing reads ``beta`` here, so this states the limit rather than
+        barring it: a reading taken off it later starts from something measured
+        rather than from the assumption that the impedance's exactness carried
+        across.
+        """
+        csx, uniform = built()
+        self._read(monkeypatch, uniform)
+        csx, graded = built(csx=Structure(lines=GRADED), MeasPlaneShift=20.0)
+        self._read(monkeypatch, graded, drawn=(19.0, 20.0, 22.5))
+
+        assert abs(uniform.beta[0].imag) < 1e-9 * uniform.beta[0].real
+        assert abs(graded.beta[0].imag) > 0.01 * graded.beta[0].real
+        assert graded.beta[0].real < self.BETA
+
+
+class TestWhatTheDriverHandsIt:
+    """The port is built from the envelope like everything else in the run, and
+    the one field that is not on the ``Port`` it is built from is the share the
+    conductors were grown by - which the loop has to clear and so has to be
+    given. Built through the driver rather than by calling the class, that being
+    where the two could part."""
+
+    def _port(self):
+        from Microwave.Solvers.openems.model import Port as EnvelopePort
+
+        return EnvelopePort(
+            number=1,
+            kind="coaxial",
+            start=(-OUTER, -OUTER, 0.0),
+            stop=(OUTER, OUTER, 40.0),
+            propagation_axis=2,
+            inner_radius=INNER,
+            measurement_shift=20.0,
+            label="Port 1",
+        )
+
+    @pytest.mark.parametrize("share", [0.0, 0.5])
+    def test_the_share_the_run_carries_reaches_the_port(self, share):
+        from Microwave.Solvers.openems import driver
+
+        # The engine is never touched on the coaxial branch: the class lays its
+        # own probes into the structure and asks openEMS for nothing.
+        built = driver._add_port(None, Structure(), None, self._port(), 1e-3, share)
+        assert built.grown_by == share

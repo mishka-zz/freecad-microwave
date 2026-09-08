@@ -11,10 +11,14 @@ The document fakes come from ``test_document_translation``: the same microstrip
 the acceptance gate solves, so a grid here is a real grid.
 """
 
+from dataclasses import replace
+
 import pytest
 
 from Microwave.Gui import mesh_preview
+from Microwave.Objects import preview as _preview_objects
 from Microwave.Solvers.openems import document
+from Microwave.Solvers.openems.grid import FixedLine
 
 from .test_document_translation import Obj, mesh_settings, model, policy, solver_of
 from .test_gui_smoke import _FakePart, _FakeVector
@@ -50,7 +54,18 @@ def preview_object(**properties):
         SliceY=0.0,
         SliceZ=0.0,
         Digest="",
+        # A preview that has just been drawn. staleness() reads the badge
+        # before it derives the key, so a stand-in that carried none would
+        # exercise neither branch.
+        Status="Current",
         Cells=0,
+        LinesX=[],
+        LinesY=[],
+        LinesZ=[],
+        AnchorsX=[],
+        AnchorsY=[],
+        AnchorsZ=[],
+        AbsorberCells=[],
     )
     defaults.update(properties)
     return _Preview("EMMeshPreview", "MeshPreview", **defaults)
@@ -107,6 +122,32 @@ class TestStaleness:
         _, study, _ = with_preview(preview_object(Digest=digest))
         solver_of(study).MaxTimesteps = 999_999
         assert mesh_preview.staleness(study) is mesh_preview.CURRENT
+
+    def test_a_badge_already_reading_stale_is_taken_at_its_word(self, monkeypatch):
+        """The badge fires for anything that moved a cell, and the key is what
+        catches what no property edit announces. Deriving the key against a
+        badge already reading stale would translate the document to confirm
+        what is known, and would let the panel print a green line under an
+        amber icon."""
+        doc = model()
+        digest = document.grid_inputs_digest(doc.Objects[0])
+        _, study, _ = with_preview(preview_object(Digest=digest, Status="Out of date"))
+
+        def refuse(analysis):
+            raise AssertionError("the panel derived the key against a stale badge")
+
+        monkeypatch.setattr(mesh_preview._document, "grid_inputs_digest", refuse)
+        assert "has changed" in mesh_preview.staleness(study)
+
+    def test_a_badge_reading_current_is_still_checked(self):
+        """The badge cannot see a port moved into the study or a solid renamed:
+        nothing touches the preview for either. The key can, and this is where
+        it is derived."""
+        doc = model()
+        digest = document.grid_inputs_digest(doc.Objects[0])
+        _, study, _ = with_preview(preview_object(Digest=digest, Status="Current"))
+        policy(study).ElementsPerWavelength = 30.0
+        assert "has changed" in mesh_preview.staleness(study)
 
     def test_a_model_that_stopped_translating_says_so_rather_than_raising(self):
         """It decorates a panel. A broken model has a better message on Check."""
@@ -319,26 +360,127 @@ class TestRedrawIsOneUndoStepToo:
         assert mesh_preview.redraw(preview) is True
         assert doc.transactions == [("Redraw Mesh Preview", "commit")]
 
-    def test_a_model_that_stopped_meshing_opens_none(self, fake_part, monkeypatch):
-        """``redraw`` swallows the failure and returns False; it must not leave
-        an undo entry for a drawing it did not change."""
+    def test_a_preview_with_no_grid_opens_none(self, fake_part):
+        """``redraw`` returns False; it must not leave an undo entry for a
+        drawing it did not change. A preview restored from a document written
+        before the grid was stored beside the picture is the case that reaches
+        this."""
         doc, study, preview = with_preview()
         mesh_preview.refresh(study)
         doc.transactions.clear()
-        monkeypatch.setattr(
-            mesh_preview._document,
-            "mesh",
-            lambda *a, **kw: (_ for _ in ()).throw(document.TranslationError("no")),
-        )
+        preview.LinesX = []
         assert mesh_preview.redraw(preview) is False
         assert doc.transactions == []
 
 
 class TestRefresh:
+    def test_it_stores_the_grid_it_drew(self, fake_part):
+        """Every line of every axis and the absorber depth, so a redraw needs
+        nothing else - and every value a plain float, because a float list
+        handed a numpy array stores copies of its last element."""
+        doc, study, preview = with_preview()
+        plan = mesh_preview._document.mesh(study)
+        mesh_preview.refresh(study)
+
+        for axis, dim in zip("XYZ", range(3)):
+            stored = getattr(preview, f"Lines{axis}")
+            assert [type(value) for value in stored] == [float] * len(stored)
+            assert stored == [float(value) for value in plan.lines[dim]]
+        assert list(preview.AbsorberCells) == list(plan.params.absorber)
+
+    def test_it_stores_the_anchors_and_not_the_preferences(self, fake_part, monkeypatch):
+        """A preference that survived is an ordinary line. The mesher drops one
+        whenever it crowds anything, so drawing it as an anchor would promise a
+        guarantee the mesher has not given - and a stored grid that carried it
+        could not tell the two apart afterwards.
+
+        The pins are substituted rather than drawn, because no document in these
+        fixtures raises a preference and a test that pins none asserts nothing.
+        """
+        doc, study, preview = with_preview()
+        plan = mesh_preview._document.mesh(study)
+        pinned = (
+            plan.lines.fixed[0],
+            plan.lines.fixed[1],
+            (
+                FixedLine(float(plan.lines.z[0]), "domain lower bound", True),
+                FixedLine(float(plan.lines.z[1]), "'Substrate' upper face", False),
+                FixedLine(float(plan.lines.z[-1]), "domain upper bound", True),
+            ),
+        )
+        patched = replace(plan, lines=replace(plan.lines, fixed=pinned))
+        monkeypatch.setattr(mesh_preview._document, "mesh", lambda *a, **kw: patched)
+        mesh_preview.refresh(study)
+
+        assert list(preview.AnchorsZ) == [float(plan.lines.z[0]), float(plan.lines.z[-1])]
+        for axis, pins in zip("XY", pinned):
+            assert sorted(getattr(preview, f"Anchors{axis}")) == sorted(
+                pin.position for pin in pins if pin.required
+            )
+
     def test_it_records_what_the_grid_was_computed_from(self, fake_part):
         doc, study, preview = with_preview()
         mesh_preview.refresh(study)
         assert preview.Digest == document.grid_inputs_digest(study)
+
+    def test_it_reads_the_document_once(self, monkeypatch, fake_part):
+        """The count, where the two tests below are the consequences.
+
+        Two reads are two documents, and refresh stamps three things on the
+        preview: the grid, the key it is checked against, and the list the
+        study compares its membership with. All three come off one reading, so
+        both routes into the document are counted here rather than the one this
+        was opened on.
+        """
+        reads = []
+        translate, members = document._translate, document.contents
+
+        def counted_translate(analysis):
+            reads.append("translate")
+            return translate(analysis)
+
+        def counted_contents(analysis):
+            reads.append("contents")
+            return members(analysis)
+
+        doc, study, preview = with_preview()
+        monkeypatch.setattr(document, "_translate", counted_translate)
+        monkeypatch.setattr(document, "contents", counted_contents)
+        mesh_preview.refresh(study)
+        assert reads == ["translate", "contents"]
+
+    def test_a_document_that_moves_while_it_meshes_is_not_stamped_as_matching(
+        self, monkeypatch, fake_part
+    ):
+        """What the one read is for.
+
+        A recompute finishing, a parametric feature settling, another hand on
+        the model - anything that changes the drawing after the mesher has read
+        it leaves a grid of the old document. Stamping a key taken afterwards
+        puts the new document's key on it, and the panel then reports a picture
+        that matches nothing.
+
+        The change is made from inside the mesher's own call because that is
+        the window, and it is the only place a test can stand in it.
+
+        What is asserted is the stamped key rather than what the panel says.
+        ``staleness`` returns one sentence for a badge already reading stale
+        and for a key that no longer matches, so a test reading that sentence
+        is answered by either and would pass with the key never consulted.
+        """
+        doc, study, preview = with_preview()
+        real = mesh_preview._document.mesh
+        before = document.grid_inputs_digest(study)
+
+        def mesh_then_move(analysis):
+            plan = real(analysis)
+            policy(analysis).ElementsPerWavelength = 30.0
+            return plan
+
+        monkeypatch.setattr(mesh_preview._document, "mesh", mesh_then_move)
+        mesh_preview.refresh(study)
+        assert preview.Digest == before
+        assert preview.Digest != document.grid_inputs_digest(study)
 
     def test_refreshing_makes_the_preview_current(self, fake_part):
         doc, study, preview = with_preview()
@@ -363,30 +505,30 @@ class TestRefresh:
         _, quarter = mesh_preview.refresh(study)
         assert quarter.timestep / full.timestep == pytest.approx(0.25, abs=0.0)
 
-    def test_the_scaled_bound_says_it_was_scaled(self, fake_part):
+    def test_the_scaled_estimate_says_it_was_scaled(self, fake_part):
         """Changing the factor moves this number and *not* the staleness digest,
-        so it can change under a badge that still reads Current. A bound that
+        so it can change under a badge that still reads Current. A figure that
         silently changes identity is worse than one that names its factor."""
         doc, study, preview = with_preview()
         solver_of(study).TimestepFactor = 0.25
         _, report = mesh_preview.refresh(study)
-        assert "vacuum CFL bound x 0.25" in report.summary()
+        assert "vacuum CFL estimate x 0.25" in report.summary()
 
-    def test_an_unscaled_bound_says_nothing_extra(self, fake_part):
+    def test_an_unscaled_estimate_says_nothing_extra(self, fake_part):
         doc, study, preview = with_preview()
         _, report = mesh_preview.refresh(study)
-        assert "vacuum CFL bound;" in report.summary()
+        assert "vacuum CFL estimate;" in report.summary()
 
     @pytest.mark.parametrize("factor", [0.0, -1.0, 2.0])
     def test_a_factor_the_engine_would_ignore_is_refused_rather_than_drawn(self, fake_part, factor):
         """Update Mesh must not accept any float here and print the result.
 
-        Measured before the fix: 0 reported a timestep of 0 s, -1 reported
-        -2.894e-13 s, and 2 reported twice the true CFL bound - each captioned
-        "vacuum CFL bound", in green, from a path that never builds an envelope
-        and so never met the envelope's own limit. Only Run refused them. Two
-        paths disagreeing about whether a value is legal, with the permissive
-        one drawing the picture.
+        Zero and negative factors produce a timestep that is not one, and a
+        factor above 1 reports more than the vacuum CFL bound - each captioned
+        "vacuum CFL estimate", in green, from a path that never builds an envelope
+        and so never meets the envelope's own limit. Only Run refuses them, so
+        without this the two paths disagree about whether a value is legal, with
+        the permissive one drawing the picture.
         """
         doc, study, preview = with_preview()
         solver_of(study).TimestepFactor = factor
@@ -478,28 +620,67 @@ class TestLinking:
 class TestRedraw:
     """Display properties redraw. They never remesh, and never remove a picture."""
 
-    def test_it_redraws_from_the_study_that_owns_it(self, fake_part):
+    def test_a_new_display_mode_draws_the_stored_grid_that_way(self, fake_part):
         doc, study, preview = with_preview()
         mesh_preview.refresh(study)
         preview.Display = "Outline"
         assert mesh_preview.redraw(preview) is True
         assert len(preview.Shape.edges) == 24
 
-    def test_a_preview_in_no_study_is_left_alone(self, fake_part):
-        """Dragged out of its analysis, or never in one. Nothing to redraw
-        from, and inventing a study to use would be a guess."""
-        preview = preview_object()
+    def test_a_preview_in_no_document_is_left_alone(self, fake_part):
+        """A redraw rewrites the picture inside a transaction, and a transaction
+        belongs to a document. The grid is there and drawable, so this reaches
+        the document guard rather than the empty-grid one."""
+        doc, study, preview = with_preview()
+        mesh_preview.refresh(study)
+        assert mesh_preview.redraw(preview) is True
+
         preview.Document = None
         assert mesh_preview.redraw(preview) is False
 
-    def test_a_model_that_stopped_translating_keeps_its_picture(self, fake_part):
-        """Silence, not an exception and not a blank view: the panel says why,
-        and a half-erased preview would be worse than a stale one."""
+    def test_it_neither_meshes_nor_translates(self, fake_part, monkeypatch):
+        """Both the translation and the mesher are set to raise, and the redraw
+        answers anyway.
+
+        A timing assertion would pass on the machine that wrote it and go on
+        passing once a translation crept back behind a faster one.
+        """
+        doc, study, preview = with_preview()
+        mesh_preview.refresh(study)
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("a redraw read the document")
+
+        monkeypatch.setattr(mesh_preview._document, "mesh", refuse)
+        monkeypatch.setattr(mesh_preview._document, "grid_inputs_digest", refuse)
+        preview.Display = "Outline"
+        assert mesh_preview.redraw(preview) is True
+        assert len(preview.Shape.edges) == 24
+
+    def test_it_leaves_the_provenance_where_it_is(self, fake_part):
+        """A redraw cannot change what the drawn grid matches, so it must not
+        restate it. Re-deriving here would stamp the preview with a hash of a
+        different read of the document than the grid it shows."""
+        doc, study, preview = with_preview()
+        mesh_preview.refresh(study)
+        preview.Status = _preview_objects.OUT_OF_DATE
+        digest, cells = preview.Digest, preview.Cells
+
+        preview.Display = "Outline"
+        assert mesh_preview.redraw(preview) is True
+        assert (preview.Digest, preview.Cells) == (digest, cells)
+        assert preview.Status == _preview_objects.OUT_OF_DATE
+
+    def test_a_grid_that_is_not_one_keeps_the_picture(self, fake_part):
+        """An axis of one line draws every box edge on top of itself and every
+        slice along it as a line on itself, which comes out as an empty shape.
+        Blanking a picture is worse than leaving a stale one, so the stored grid
+        has to be refused rather than drawn."""
         doc, study, preview = with_preview()
         mesh_preview.refresh(study)
         drawn = len(preview.Shape.edges)
 
-        policy(study).EdgeRefinement = 0.1
+        preview.LinesX = [preview.LinesX[0]]
         assert mesh_preview.redraw(preview) is False
         assert len(preview.Shape.edges) == drawn
 
@@ -516,9 +697,8 @@ class TestTheStaleMarker:
 
     Not the touched marker: measured on FreeCAD 1.1, an object comes back
     Up-to-date after any recompute whether execute touches itself, does nothing,
-    or does not exist - and the GUI recomputes after every property edit. So the
-    state is recorded on the object and shown through the icon, the way FreeCAD's
-    own CAM dressups do it.
+    or does not exist. So the state is recorded on the object and shown through
+    the icon, the way FreeCAD's own CAM dressups do it.
     """
 
     def test_a_fresh_preview_starts_out_of_date(self, doc):
@@ -534,26 +714,31 @@ class TestTheStaleMarker:
         mesh_preview.refresh(study)
         assert preview.Status == CURRENT
 
-    def test_a_recompute_after_a_real_change_marks_it_out_of_date(self, fake_part):
+    def test_a_recompute_marks_it_out_of_date(self, fake_part):
+        """Whatever reached this object either moved a cell or is geometry
+        nothing of ours can ask. What moves no cell is kept off the graph
+        instead - Objects/staleness.py."""
         from Microwave.Objects.preview import OUT_OF_DATE, EMMeshPreview
 
         _, study, preview = with_preview()
         mesh_preview.refresh(study)
-        policy(study).ElementsPerWavelength = 30.0
         EMMeshPreview.execute(None, preview)
         assert preview.Status == OUT_OF_DATE
 
-    def test_a_recompute_after_a_change_that_moves_no_cell_stays_current(self, fake_part):
-        """The graph recomputes this object for anything it links, but raising
-        MaxTimesteps moves the envelope and not one cell. A badge that cries
-        wolf is a badge people learn to ignore."""
-        from Microwave.Objects.preview import CURRENT, EMMeshPreview
+    def test_a_recompute_asks_the_document_nothing(self, fake_part, monkeypatch):
+        """The whole cost of a recompute here was deriving the staleness key,
+        which translates the document's geometry. A key derived where nobody
+        reads it is a second on the thread the interface is waiting on."""
+        from Microwave.Objects.preview import EMMeshPreview
 
         _, study, preview = with_preview()
         mesh_preview.refresh(study)
-        solver_of(study).MaxTimesteps = 999_999
+
+        def refuse(analysis):
+            raise AssertionError("execute derived the staleness key")
+
+        monkeypatch.setattr(mesh_preview._document, "grid_inputs_digest", refuse)
         EMMeshPreview.execute(None, preview)
-        assert preview.Status == CURRENT
 
     def test_a_preview_that_never_drew_is_out_of_date(self, fake_part):
         from Microwave.Objects.preview import OUT_OF_DATE, EMMeshPreview
@@ -562,31 +747,29 @@ class TestTheStaleMarker:
         EMMeshPreview.execute(None, preview)
         assert preview.Status == OUT_OF_DATE
 
-    def test_a_model_that_stopped_translating_is_out_of_date_not_an_exception(self, fake_part):
-        """execute() runs inside a recompute. Throwing there is not an option."""
-        from Microwave.Objects.preview import OUT_OF_DATE, EMMeshPreview
+    def test_redrawing_leaves_the_verdict_alone_in_both_directions(self, fake_part):
+        """A different view of the same grid cannot change what that grid
+        matches, so the badge reads the same either way round it was.
 
-        _, study, preview = with_preview()
-        mesh_preview.refresh(study)
-        policy(study).EdgeRefinement = 0.1
-        EMMeshPreview.execute(None, preview)
-        assert preview.Status == OUT_OF_DATE
+        Starting from Current alone would pass on a redraw that writes Current,
+        which is what this used to do and what hid the fault: the drawing was
+        being marked as matching a document it had not been checked against.
+        """
+        from Microwave.Objects.preview import CURRENT, OUT_OF_DATE
 
-    def test_redrawing_does_not_make_it_stale(self, fake_part):
-        """A different view of the same grid still matches the document."""
-        from Microwave.Objects.preview import CURRENT
-
-        _, study, preview = with_preview()
-        mesh_preview.refresh(study)
-        preview.Display = "Outline"
-        mesh_preview.redraw(preview)
-        assert preview.Status == CURRENT
+        for before in (CURRENT, OUT_OF_DATE):
+            _, study, preview = with_preview()
+            mesh_preview.refresh(study)
+            preview.Status = before
+            preview.Display = "Outline"
+            assert mesh_preview.redraw(preview) is True
+            assert preview.Status == before
 
     def test_drawing_purges_the_touched_flag(self, fake_part):
         """Assigning the Shape touches the preview. Left touched, the next
         recompute calls execute() - which exists to notice changes - and it
         would mark the drawing stale on the strength of having just been drawn.
-        QA saw the tail of this: "Mesh drawn" in green beside an amber badge."""
+        The visible symptom is "Mesh drawn" in green beside an amber badge."""
         _, study, preview = with_preview()
         mesh_preview.refresh(study)
         assert preview.purged >= 1
@@ -603,3 +786,68 @@ class TestTheStaleMarker:
         from Microwave.Objects.preview import createEMMeshPreview
 
         assert createEMMeshPreview()._editor_modes["Status"] == 1
+
+
+class TestTheReportScoresWhatWasMeasured:
+    """The one wire between a chord's count and anybody being told about it.
+
+    ``document.mesh`` carries what was read off the geometry, and *Update Mesh*
+    hands it to the report; between them the verdict on a triangulated layer has
+    nowhere to come from. Neither end is exercised by meshing a document of
+    boxes, because a box tells the mesher where its faces are and is never
+    measured - so each is asked here directly.
+    """
+
+    def counted(self, thickness=0.05, across=8):
+        """A count demand on a layer thin enough that a box grid misses it."""
+        from Microwave.Solvers.openems.sizing import Feature
+
+        return Feature(
+            thickness=thickness,
+            normal=(0.0, 0.0, thickness),
+            lower=(0.0, 0.0, 0.0),
+            upper=(0.0, 0.0, thickness),
+            across=across,
+            source="'Board' across its thickness on face 0",
+        )
+
+    def test_the_plan_carries_what_was_measured(self, fake_part, monkeypatch):
+        measured = (self.counted(),)
+        monkeypatch.setattr(document, "measured", lambda *args, **kwargs: measured)
+        assert document.mesh(model().Objects[0]).measured == measured
+
+    def test_and_what_could_not_be_measured_reaches_the_report_too(self, fake_part, monkeypatch):
+        """The other wire out of the same tally. A place the drawing declined
+        every station on raises nothing, so the grid carries no trace of it and
+        the panel is told only if the plan's record gets there."""
+        import dataclasses
+
+        from Microwave.Solvers.openems.spend import Refused, Spend
+
+        _, study, _ = with_preview()
+        plain = document.mesh(study)
+        refused = Refused()
+        refused.declined("'Reflector' rim curving")
+        monkeypatch.setattr(
+            mesh_preview._document,
+            "mesh",
+            lambda analysis: dataclasses.replace(plain, spent=Spend(refused=refused)),
+        )
+        _, report = mesh_preview.refresh(study)
+        assert report.unmeasured == (("'Reflector' rim curving", 1),)
+        assert "answered none of its 1 station(s)" in report.summary()
+
+    def test_and_update_mesh_scores_the_grid_against_it(self, fake_part, monkeypatch):
+        import dataclasses
+
+        _, study, _ = with_preview()
+        plain = document.mesh(study)
+        monkeypatch.setattr(
+            mesh_preview._document,
+            "mesh",
+            lambda analysis: dataclasses.replace(plain, measured=(self.counted(),)),
+        )
+        _, report = mesh_preview.refresh(study)
+        assert [chord.asked for chord in report.counted] == [8]
+        assert report.undercounted, "a layer this thin cannot have been given eight cells"
+        assert "were asked for" in report.summary()

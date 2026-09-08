@@ -24,7 +24,14 @@ import pytest
 from Microwave.Solvers.openems.staircase import GROWN_BY
 from tests import convergence
 from tests.analytic import reference
-from tests.staircase_model import capacitance, impedance, recession, uniform
+from tests.staircase_model import (
+    capacitance,
+    impedance,
+    recession,
+    stripline,
+    stripline_grid,
+    uniform,
+)
 
 #: The line, in mm. Its ratio is what sets the answer; the sizes are chosen so
 #: the coarsest grid below still has a conductor several cells across.
@@ -52,17 +59,66 @@ CELLS = (0.22, 0.16, 0.12, 0.09, 0.07, 0.055)
 #: every line and one by spacing the two axes differently.
 GOLDEN = (1 + 5**0.5) / 2
 
+#: Offsets per axis the lattice is averaged over, so that what is read off a
+#: sequence is the cell rather than where the cell fell. Square, since a line has
+#: two transverse axes and they do not move together.
+PHASES = 4
+
+#: How far from one the uncorrected line's order may sit. Tighter than the grown
+#: one below, this error being the several times larger of the two - which is
+#: :data:`SMALLER_BY`'s subject - and so the one the lattice is a smaller share
+#: of.
+UNGROWN_ORDER = 0.35
+
+#: How far from one the grown line's order may sit. Wide, because what the
+#: correction leaves is small enough that the lattice is a large share of it even
+#: averaged. What it has to exclude is the two things that were claimed about
+#: this quantity and are not true of it: a fixed bias that refinement never
+#: reaches, and the second order a boundary would have if the rounding were gone
+#: rather than made smaller.
+GROWN_ORDER = 0.5
+
+#: How much smaller than the rounding it replaces what the correction leaves has
+#: to be. It is the coefficient that the half changes, and this is the claim in
+#: place of the one about the order.
+SMALLER_BY = 2.0
+
 
 def ideal() -> float:
     return reference.coaxial_impedance(INNER, OUTER, 1.0)
 
 
-def error(cell: float, grown: float, offset: float = 0.0, stretch: float = 1.0) -> float:
-    """Fractional error of the staircased line, grown by ``grown`` cells."""
-    x = uniform(cell, SPAN)
+def error(
+    cell: float, grown: float, offset: float = 0.0, stretch: float = 1.0, across: float = 0.0
+) -> float:
+    """Fractional error of the staircased line, grown by ``grown`` cells.
+
+    ``offset`` and ``across`` slide the lattice along one axis and the other, in
+    mm, which is the free variable a single grid per cell size never records.
+    """
+    x = uniform(cell, SPAN, across)
     y = uniform(cell * stretch, SPAN, offset)
     measured = impedance(x, y, INNER + grown * cell, OUTER - grown * cell * stretch, eps_r=1.0)
     return measured / ideal() - 1.0
+
+
+def averaged(cell: float, grown: float) -> float:
+    """The error with where the lattice fell averaged out, on both axes.
+
+    A boundary's place inside its cell moves the answer, and a line through the
+    axis is an extreme of that spread rather than a sample of it - so a sweep
+    read at one offset per cell can draw a flat line through a falling one. It
+    is the whole reason a rate is read off this and not off one grid apiece.
+    """
+    return float(
+        np.mean(
+            [
+                error(cell, grown, offset=down / PHASES * cell, across=step / PHASES * cell)
+                for step in range(PHASES)
+                for down in range(PHASES)
+            ]
+        )
+    )
 
 
 class TestTheModelMeasuresTheRuleItClaimsTo:
@@ -128,10 +184,14 @@ class TestTheModelMeasuresTheRuleItClaimsTo:
         This is the claim the correction exists to answer, and it is the one
         thing here that must be an order rather than a size: a first-order error
         is one refinement cannot afford to remove.
+
+        Off the lattice average, like the corrected line below it. This error is
+        large enough that one offset per cell would answer the same, but a rate
+        read at one offset is not a rate whatever it happens to say.
         """
-        errors = [abs(error(cell, 0.0)) for cell in CELLS]
+        errors = [abs(averaged(cell, 0.0)) for cell in CELLS]
         assert convergence.falls_with_every_refinement(CELLS, errors)
-        assert convergence.order_of(CELLS, errors) == pytest.approx(1.0, abs=0.35)
+        assert convergence.order_of(CELLS, errors) == pytest.approx(1.0, abs=UNGROWN_ORDER)
 
     def test_a_grid_fine_against_the_line_answers_the_closed_form(self):
         """Nothing but the staircase is between the model and the exact answer.
@@ -165,15 +225,28 @@ class TestGrowingTheConductorBeforeItIsSampled:
         """
         assert all(error(cell, GROWN_BY) < 0.0 for cell in CELLS)
 
-    def test_what_the_half_leaves_behind_does_not_refine_away(self):
-        """It is a bias and not a residue, so a finer mesh does not reach it.
+    def test_what_the_half_leaves_behind_is_first_order_too(self):
+        """The growth changes what the term is worth and not the order of it.
 
-        This is what separates a correction of the wrong size from one that is
-        merely imperfect: what a rounding leaves is proportional to the cell and
-        falls with it, and what a wrong coefficient leaves is not.
+        A curved surface goes on meeting the grid at every phase however fine the
+        grid is, so what the correction leaves is still a share of the cell -
+        smaller by a large factor, and falling at the same rate. Both halves are
+        asserted, because the size on its own is what a correction of any wrong
+        coefficient also delivers.
+
+        Read off the lattice average. What is left is small enough that where the
+        grid fell is a large part of it, so a single offset per cell is not a
+        sequence: it jumps about, and reading that as a line that has stopped
+        falling is the mistake averaging exists to prevent.
         """
-        errors = [abs(error(cell, GROWN_BY)) for cell in CELLS]
-        assert not convergence.falls_with_every_refinement(CELLS, errors)
+        grown = [abs(averaged(cell, GROWN_BY)) for cell in CELLS]
+        ungrown = [abs(averaged(cell, 0.0)) for cell in CELLS]
+        assert convergence.order_of(CELLS, grown) == pytest.approx(1.0, abs=GROWN_ORDER)
+        for cell, left, rounding in zip(CELLS, grown, ungrown, strict=True):
+            assert left * SMALLER_BY < rounding, (
+                f"at {cell} mm the correction leaves {100 * left:.3f} % against "
+                f"{100 * rounding:.3f} % for the rounding it replaces"
+            )
 
     def test_one_convex_surface_gives_up_less_than_it_is_handed(self):
         """The bias, measured on a single surface rather than on a pair.
@@ -206,3 +279,48 @@ class TestGrowingTheConductorBeforeItIsSampled:
         centred = abs(error(fine, GROWN_BY))
         broken = abs(error(fine, GROWN_BY, offset=1 / GOLDEN, stretch=GOLDEN / 1.5))
         assert abs(broken - centred) < 0.01
+
+
+class TestAStriplineCrossSection:
+    """The grid the closed form is scored against, held to being the geometry
+    it claims. What it answers is checked in ``test_reference.py``, against the
+    conformal mapping; what is here is the shape the solve is handed."""
+
+    def test_a_wall_inside_the_strip_is_refused(self):
+        """It would otherwise run off the end of an empty list, since the
+        outward grading never takes a step. A box narrower than the conductor
+        in it is a caller's mistake and is named as one."""
+        for wall in (0.4, 0.5):
+            with pytest.raises(ValueError, match="inside a strip"):
+                stripline_grid(1.0, 1.0, 20, wall)
+
+    def test_the_grid_reaches_past_the_wall_it_was_asked_for(self):
+        """The outward grading stops at the first line beyond the wall, and that
+        line is where the shield is put - so what the solve encloses is the box
+        it reports rather than the one it was asked for."""
+        lines, _, reached = stripline_grid(1.0, 1.0, 20, 6.0)
+        assert reached >= 6.0
+        assert lines.max() == pytest.approx(reached, rel=1e-12, abs=0.0)
+
+    def test_the_strip_and_both_planes_land_on_lines(self):
+        """The cross-section is only the drawn one if the sampling rule finds
+        it: an edge between lines is a conductor of another width."""
+        lines, across, _ = stripline_grid(1.0, 1.0, 20, 6.0)
+        for wanted in (-0.5, 0.0, 0.5):
+            assert np.min(np.abs(lines - wanted)) < 1e-12
+        for wanted in (-0.5, 0.0, 0.5):
+            assert np.min(np.abs(across - wanted)) < 1e-12
+
+    def test_the_shield_is_one_conductor(self):
+        """Both planes and both walls, or the solve grounds whichever piece
+        holds the grid's far corner and leaves the rest floating."""
+        metal = stripline(1.0, 1.0, 6.0)
+        for corner in ((6.0, 0.5), (-6.0, -0.5), (0.0, 0.5), (6.0, 0.0)):
+            assert metal(np.array([corner[0]]), np.array([corner[1]]))[0]
+
+    def test_the_strip_has_no_thickness(self):
+        """It is one line of nodes. Given thickness it would be a bar, and the
+        closed form it is scored against is the zero-thickness one."""
+        metal = stripline(1.0, 1.0, 6.0)
+        assert metal(np.array([0.0]), np.array([0.0]))[0]
+        assert not metal(np.array([0.0]), np.array([0.01]))[0]

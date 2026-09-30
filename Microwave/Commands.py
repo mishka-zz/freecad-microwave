@@ -7,8 +7,9 @@ Each command is a ``GetResources`` (icon, label, tooltip), an ``Activated`` and
 an inherited ``IsActive``. The helpers at the top of this file hold what is
 worth knowing about all of them, rather than the classes:
 
-* every creation command joins the active analysis through ``_add``, so a new
-  object lands in one place across the whole workbench;
+* every command that creates one object joins the active analysis through
+  ``_add``, so a new object lands in one place across the whole workbench, and
+  ``_SolverCommand``, which creates several, does the same thing in a loop;
 * every one of them runs inside a transaction, because FreeCAD does not wrap a
   Python command in one and Ctrl-Z would otherwise do nothing;
 * every one of them is disabled with no document open, because FreeCAD leaves a
@@ -27,6 +28,7 @@ import FreeCAD
 from Microwave import Objects
 from Microwave.Gui import notify
 from Microwave.Objects import port_setup
+from Microwave.Objects.kinds import kind_of
 from Microwave.undo import transaction
 from Microwave.ViewProviders import icon as get_icon_path
 
@@ -100,7 +102,8 @@ class EMAnalysisCommand(_Command):
         return {
             "Pixmap": get_icon_path("Analysis.svg"),
             "MenuText": "Create EM Analysis",
-            "ToolTip": "Create a study: a frequency band, a solver and a mesh policy",
+            "ToolTip": "Create a study: a frequency band, an openEMS solver, its Yee "
+            "grid and a mesh policy",
         }
 
     def Activated(self):
@@ -344,7 +347,7 @@ class UpdateMeshCommand(_Command):
         }
 
     def Activated(self):
-        from Microwave.Gui import mesh_preview
+        from Microwave.Gui import openems_mesh_preview
         from Microwave.Solvers.openems import document
 
         doc = FreeCAD.ActiveDocument
@@ -352,7 +355,7 @@ class UpdateMeshCommand(_Command):
         if analysis is None:
             return
         try:
-            _, report = mesh_preview.refresh(analysis)
+            _, report = openems_mesh_preview.refresh(analysis)
         except (document.TranslationError, document.MeshError) as error:
             notify.refused("Update Mesh", str(error))
             return
@@ -361,21 +364,127 @@ class UpdateMeshCommand(_Command):
 
 
 class RunCommand(_Command):
+    """Open the panel for the solver the study is run on.
+
+    The solver selected in the tree, then the study's only one. A study holding
+    one of each backend with neither selected is refused by name rather than
+    guessed at: a run is minutes, and an answer from the backend nobody meant
+    says nothing about it.
+    """
+
     def GetResources(self):
         return {
             "Pixmap": get_icon_path("Run.svg"),
             "MenuText": "Run Simulation",
-            "ToolTip": "Open the simulation control panel",
+            "ToolTip": "Open the panel for the study's solver. Select the solver first "
+            "where the study holds more than one",
         }
 
     def Activated(self):
-        import FreeCADGui
+        from Microwave.Gui.panels import open_run
 
         doc = FreeCAD.ActiveDocument
         analysis = _target_analysis(doc, "Run Simulation")
         if analysis is None:
             return
-        FreeCADGui.ActiveDocument.setEdit(analysis.Name, 0)
+        try:
+            solver = Objects.solver_to_run(analysis, _selected())
+        except Objects.NoSolver as error:
+            notify.refused("Run Simulation", str(error))
+            return
+        open_run("Run Simulation", solver)
+
+
+class _SolverCommand(_Command):
+    """What makes a study runnable on one backend, added to the study.
+
+    A backend needs its solver, its own mesh recipe, and the mesh policy every
+    backend reads. The command adds whichever of those the study lacks, so a
+    study that has the solver and lacks the recipe is repaired by pressing the
+    button rather than by deleting the solver, which would cost the user its
+    absorber, its timesteps and its paths.
+
+    A study holds one solver of each backend and each backend's translation
+    refuses a second, so the command refuses a study already holding all of
+    them - at the moment it is pressed rather than at a Run some time later,
+    naming the solver already there.
+    """
+
+    #: ``(icon, backend, what that backend needs as kind and factory)``. The
+    #: solver leads: it is what the button is named for, what the refusal names,
+    #: and the one object whose arrival alone needs no explaining.
+    backend: tuple
+
+    def GetResources(self):
+        icon, name, _ = self.backend
+        return {
+            "Pixmap": get_icon_path(icon),
+            "MenuText": f"Add {name} Solver",
+            "ToolTip": f"Add a {name} solver to the study, so the study can be run on {name}",
+        }
+
+    def Activated(self):
+        _, name, wanted = self.backend
+        title = f"Add {name} Solver"
+        doc = FreeCAD.ActiveDocument
+        analysis = _target_analysis(doc, title)
+        if analysis is None:
+            return
+
+        (solver_kind, _), *_ = wanted
+        held = {kind_of(member) for member in Objects.members(analysis)}
+        missing = [factory for kind, factory in wanted if kind not in held]
+        missing_kinds = [kind for kind, _ in wanted if kind not in held]
+        if not missing:
+            solver = next(
+                obj for obj in Objects.solvers_in(analysis) if kind_of(obj) == solver_kind
+            )
+            notify.refused(
+                title,
+                f"{analysis.Label!r} already holds {solver.Label!r}, and a study is "
+                f"run on one {name} solver",
+            )
+            return
+
+        with transaction(doc, title):
+            added = [factory(doc) for factory in missing]
+            for obj in added:
+                analysis.addObject(obj)
+        doc.recompute()
+
+        # A backend and its recipe always arrive together, because no command
+        # adds a recipe alone, so a study gaining a second backend is the
+        # ordinary case and shows itself in the tree. What is worth a word is a
+        # study that already had the solver and was missing its companions: the
+        # user pressed a button that says it adds a solver and got something
+        # else.
+        if solver_kind not in missing_kinds:
+            names = ", ".join(repr(obj.Label) for obj in added)
+            notify.noted(title, [f"{title} added {names} to {analysis.Label!r}"])
+
+
+class EMSolverOpenEMSCommand(_SolverCommand):
+    backend = (
+        "SolverOpenEMS.svg",
+        "openEMS",
+        (
+            ("EMSolverOpenEMS", Objects.createEMSolverOpenEMS),
+            ("EMYeeGrid", Objects.createEMYeeGrid),
+            ("EMMeshPolicy", Objects.createEMMeshPolicy),
+        ),
+    )
+
+
+class EMSolverPalaceCommand(_SolverCommand):
+    backend = (
+        "SolverPalace.svg",
+        "Palace",
+        (
+            ("EMSolverPalace", Objects.createEMSolverPalace),
+            ("EMGmshMesh", Objects.createEMGmshMesh),
+            ("EMMeshPolicy", Objects.createEMMeshPolicy),
+        ),
+    )
 
 
 class ExportTouchstoneCommand(_Command):
@@ -448,6 +557,40 @@ class PlotSParametersCommand(_Command):
             show_matrix(load(holder))
         except Exception as error:
             notify.refused("Plot S-parameters", f"cannot plot {_label(holder)}: {error}")
+
+
+class CompareSParametersCommand(_Command):
+    """Draw the study's two S-matrices from two backends against each other.
+
+    Each term is drawn from both, with the magnitude of their difference on the
+    same axis, and the chart says how far apart the two stand at worst. Two
+    results selected are taken as they are, and otherwise the study must hold
+    two.
+    """
+
+    def GetResources(self):
+        return {
+            "Pixmap": get_icon_path("CompareSParameters.svg"),
+            "MenuText": "Compare S-parameters",
+            "ToolTip": "Draw this study's S-parameters from two solvers against each other",
+        }
+
+    def Activated(self):
+        compare_s_parameters(FreeCAD.ActiveDocument, _selected())
+
+
+def compare_s_parameters(document, selection=()):
+    """Compare two results and draw them, or say why they cannot be."""
+    from Microwave.Gui import results as results_glue
+    from Microwave.Gui.plot_s_params import show_comparison
+    from Microwave.Results.compared import Incomparable
+
+    try:
+        show_comparison(results_glue.comparison(document, selection))
+    except (Objects.NoAnalysis, results_glue.NoResult, Incomparable) as error:
+        notify.refused("Compare S-parameters", str(error))
+    except Exception as error:
+        notify.refused("Compare S-parameters", f"cannot compare: {error}")
 
 
 class PlotImpedanceCommand(_Command):
@@ -548,7 +691,7 @@ def export_touchstone(holder, parent=None):
             return
 
     try:
-        written = export.result.write_touchstone(chosen)
+        written = export.result.write_touchstone(chosen, per_point=export.per_point)
     except Exception as error:
         notify.refused("Export Touchstone", f"could not write the file: {error}")
         return
@@ -575,8 +718,11 @@ def _start_directory(doc) -> str:
 #: rather than leaving them for a test to catch.
 COMMANDS = (
     ("Microwave_Analysis", EMAnalysisCommand, "Microwave"),
+    ("Microwave_SolverOpenEMS", EMSolverOpenEMSCommand, "Microwave"),
+    ("Microwave_SolverPalace", EMSolverPalaceCommand, "Microwave"),
     ("Microwave_Run", RunCommand, "Microwave"),
     ("Microwave_PlotSParameters", PlotSParametersCommand, "Microwave Results"),
+    ("Microwave_CompareSParameters", CompareSParametersCommand, "Microwave Results"),
     ("Microwave_PlotImpedance", PlotImpedanceCommand, "Microwave Results"),
     ("Microwave_ExportTouchstone", ExportTouchstoneCommand, "Microwave Results"),
     ("Microwave_MaterialFromCatalog", EMMaterialFromCatalogCommand, "Microwave Materials"),

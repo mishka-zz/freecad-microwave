@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "substrate",
+      "dim": 3,
+      "file": "post_through_a_slab.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "post",
+      "dim": 3,
+      "file": "post_through_a_slab.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "post_through_a_slab.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 249.9999999999999,
+  "outside": 320.0
+}

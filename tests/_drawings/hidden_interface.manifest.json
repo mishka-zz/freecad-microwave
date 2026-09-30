@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "substrate",
+      "dim": 3,
+      "file": "hidden_interface.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "hidden_interface.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "hidden_interface.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 9600.0,
+  "outside": 2800.0
+}

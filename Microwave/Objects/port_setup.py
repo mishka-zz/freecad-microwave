@@ -32,7 +32,7 @@ from typing import Any
 # from ``portbox`` rather than restate it. A restated copy drifts. The import
 # only works in this direction: ``Objects/__init__.py`` imports FreeCAD, so
 # ``portbox`` cannot import from here.
-from .. import picks
+from .. import drawn, picks
 from ..portbox import (  # noqa: F401
     AXIS_NAMES,
     DIMENSIONS,
@@ -216,12 +216,9 @@ def from_shape(obj: Any, sub_element: str = "") -> Box:
     ``sub_element`` empty means the whole shape, which is the spelling
     ``PropertyLinkSub`` uses and the form the ground reference usually takes.
     """
-    shape = getattr(obj, "Shape", None)
-    if shape is None:
+    if picks.placed(obj) is None:
         raise SetupError(f"{getattr(obj, 'Label', obj)!r} has no shape")
-    if sub_element:
-        shape = shape.getElement(sub_element)
-    box = shape.BoundBox
+    box = drawn.bound(picks.element(obj, sub_element))
     return (
         (box.XMin, box.YMin, box.ZMin),
         (box.XMax, box.YMax, box.ZMax),
@@ -294,7 +291,7 @@ def _fill(
     try:
         for name, value in infer(chosen).items():
             setattr(port, name, value)
-    except SetupError as error:
+    except (SetupError, picks.Unplaced) as error:
         notes.append(f"{error}. The axes are left at their defaults")
     return notes
 

@@ -14,7 +14,7 @@ This module asks the mesher. It settles the domain each face is padded to, it
 states what has to be resolved inside that domain, it hands both to
 :mod:`~.mesh`, and it lays the absorber again against the interior that came
 back. Nothing the mesher is built from reaches back up here, and a test in
-``tests/test_adapter_openems.py`` holds that direction.
+``tests/test_openems_adapter.py`` holds that direction.
 
 :func:`grid_from` is what the envelope keeps of the result. :mod:`~.write` puts
 an envelope on disk.
@@ -41,7 +41,15 @@ from .model import (
     Port,
     Solid,
 )
-from .regions import DIMENSIONS, MaterialClass, MeshError, MeshParams, Region, SizingRegion
+from .regions import (
+    DIMENSIONS,
+    MaterialClass,
+    MeshError,
+    MeshParams,
+    Region,
+    SizingRegion,
+    written,
+)
 from .sizing import Feature, fits_inside
 from .spend import Spend
 
@@ -63,7 +71,9 @@ from .spend import Spend
 #: arbitrary one, and handing it back reads as a grid the model was given.
 _ABSORBER_PASSES = 16
 
-#: Per axis, the two faces. A face is a number of cells of air, or ``THROUGH``.
+#: Per axis, the two faces. A face is a length of air in millimetres, or
+#: ``THROUGH``. The document layer states the length and derives its default -
+#: ``Solvers/properties.py::clearance`` - so this module lays what it is given.
 Padding = Sequence[tuple[float | str, float | str]]
 
 
@@ -75,34 +85,6 @@ def _is_through(face: float | str) -> bool:
     send it down the numeric branch without a word.
     """
     return face == THROUGH
-
-
-#: Every face padded by eight cells of air. A reasonable default for a
-#: radiating structure and the wrong one for a transmission line. See
-#: :func:`domain`.
-#:
-#: Eight is calibrated against openEMS' own tutorials. The right-hand column is
-#: this project's arithmetic rather than theirs: at 20 elements per wavelength a
-#: cell here is lambda_0/20, so a stated fraction of lambda_0 converts straight
-#: into cells:
-#:
-#: =========================  =========================  =========
-#: tutorial                   air to the boundary        in cells
-#: =========================  =========================  =========
-#: ``Simple_Patch_Antenna``   70 mm on a 4.997 mm cell   14
-#: ``MSL_Losses``             0.5 lambda_0 at f_stop     10
-#: ``MSL_NotchFilter``        none laterally: the        0
-#:                            substrate meets MUR
-#: =========================  =========================  =========
-#:
-#: A default for an unknown structure belongs between a radiator and a line,
-#: and nearer the line. Giving a line air where ``Through`` was needed costs a
-#: reflection; giving it ``Through`` where air was needed costs a few cells of
-#: domain.
-#:
-#: The same 8 is on ``EMMeshPolicy.AirCells*``, which cannot import this. A test
-#: asserts that the two stay equal.
-DEFAULT_PADDING: Padding = ((8, 8), (8, 8), (8, 8))
 
 
 def structure_bounds(
@@ -143,14 +125,13 @@ def _absorbed_faces(padding: Padding) -> tuple[tuple[bool, bool], ...]:
 def domain(
     solids: Sequence[Solid],
     ports: Sequence[Port],
-    params: MeshParams,
-    padding: Padding = DEFAULT_PADDING,
+    padding: Padding,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """The box the grid spans. Each face is padded outward, or not at all.
 
-    * **A cell count** - leave this much air between the structure and the
-      absorber. The domain grows outward and the absorber is added beyond it,
-      in air. This is what an antenna wants.
+    * **A length in millimetres** - leave this much air between the structure
+      and the absorber. The domain grows outward and the absorber is added
+      beyond it, in air. This is what an antenna wants.
 
     * **``THROUGH``** - the structure continues out through the absorber, so
       the domain ends where the structure does and the absorber is taken out of
@@ -160,16 +141,14 @@ def domain(
       circuit, and the reflection contaminates every impedance extracted from
       it.
 
-    Outward padding is counted in ``params.ceiling``, the bulk size in vacuum.
-    What is being padded is air, and a clearance that has to let a wave in air
-    decay must not shrink as the substrate slows. :data:`DEFAULT_PADDING` says
-    what the count is in.
+    Outward padding is laid as the length it is stated in, so the air a user
+    asks for does not move when the grid is refined or the substrate slows.
 
-    A ``THROUGH`` face needs no count here. How deep the absorber reaches into
+    A ``THROUGH`` face needs no length here. How deep the absorber reaches into
     the structure is the pitch the mesher lays at that wall, which is a property
     of the finished sizing field rather than of anything predictable from the
     material list, so the mesher decides it. See ``mesh._absorber_cell`` and
-    docs/internals/domain-and-absorber.md.
+    docs/internals/openems-domain-and-absorber.md.
     """
     if len(padding) != 3:
         raise EnvelopeError(f"padding needs one entry per axis, got {len(padding)}")
@@ -186,13 +165,13 @@ def domain(
             if _is_through(face):
                 offsets.append(0.0)
             else:
-                cells = float(face)
-                if cells < 0:
+                length = float(face)
+                if length < 0:
                     raise EnvelopeError(
-                        f"padding for {AXIS_NAMES[dim]} is negative ({cells}); "
+                        f"padding for {AXIS_NAMES[dim]} is negative ({length}); "
                         f"use {THROUGH!r} to put the absorber on the structure instead"
                     )
-                offsets.append(cells * params.ceiling)
+                offsets.append(length)
 
         lower.append(lows[dim] - offsets[0])
         upper.append(highs[dim] + offsets[1])
@@ -388,7 +367,7 @@ def plan_mesh(
     ports: Sequence[Port],
     materials: Sequence,
     params: MeshParams,
-    padding: Padding = DEFAULT_PADDING,
+    padding: Padding,
     sizing: Sequence[SizingRegion] = (),
     measured: Sequence[Feature] = (),
     spend: Spend | None = None,
@@ -434,7 +413,7 @@ def plan_mesh(
             if material.kind not in CONDUCTOR_KINDS
         }
 
-    structure = domain(solids, ports, params, padding)
+    structure = domain(solids, ports, padding)
     demands = [*features(solids, sizes), *measured]
     absorbed = _absorbed_faces(padding)
     # Where the drawing asks for a line. The drawing settles it and the loop
@@ -756,7 +735,7 @@ def plan_grid(
     ports: Sequence[Port],
     materials: Sequence,
     params: MeshParams,
-    padding: Padding = DEFAULT_PADDING,
+    padding: Padding,
     sizing: Sequence[SizingRegion] = (),
     measured: Sequence[Feature] = (),
 ) -> MeshGrid:
@@ -787,7 +766,7 @@ def grid_from(
             "dielectric_res": params.dielectric_res,
             "max_ratio": list(params.max_ratio),
             "min_lines": params.min_lines,
-            "pml_cells": list(params.absorber),
+            "pml_cells": written(params.absorber),
             "min_cell": params.floor,
             "cap": params.ceiling,
             "edge_line_inside": params.edge_line_inside,

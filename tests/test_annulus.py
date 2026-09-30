@@ -3,12 +3,12 @@
 
 """Reading two concentric circles off the face a coaxial port is built on.
 
-The fakes here are not FreeCAD stubs, for the reason ``test_document_translation``
-gives about its own: :mod:`Microwave.annulus` imports no FreeCAD, so the contract
-it depends on is small - ``Wires``, each wire's ``Edges``, each edge's ``Curve``
-with a ``Radius`` and a ``Center`` - and these objects implement that and nothing
-else. Anything wider would let the reader start depending on things it has no
-business knowing.
+The fakes here are not FreeCAD stubs, for the reason
+``test_openems_document_translation`` gives about its own:
+:mod:`Microwave.annulus` imports no FreeCAD, so the contract it depends on is
+small - ``Wires``, each wire's ``Edges``, each edge's ``Curve`` with a ``Radius``
+and a ``Center`` - and these objects implement that and nothing else. Anything
+wider would let the reader start depending on things it has no business knowing.
 
 The shapes those fakes stand for were measured under FreeCAD 1.1.1: the flat end
 face of a tube answers two wires of one closed ``Circle`` edge each, sharing a

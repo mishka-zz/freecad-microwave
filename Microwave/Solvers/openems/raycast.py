@@ -672,7 +672,7 @@ def _runs(
     vertices lie on, and the sagitta of a chord is at most half the chord, so the
     longest edge of the triangle bounds the standoff whatever the surface curves
     through. Taking the whole edge rather than half leaves room for a line
-    meeting the facet obliquely. Read off the mesh policy instead the bound has
+    meeting the facet obliquely. Read off the Yee grid instead the bound has
     the fault the wrong way round: where the surface is is not something the grid
     decides, and a threshold that shrinks as the user asks for finer cells stops
     admitting a sample's own boundary exactly when the cells get small, and drops

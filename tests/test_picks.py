@@ -98,7 +98,7 @@ def drawn(*lumps, faces, volume=None):
     which is why the same rule is scored against a real FreeCAD in
     ``tests/launch_probe.py``.
     """
-    from .test_document_translation import Compound, Shape
+    from .test_openems_document_translation import Compound, Shape
 
     body = Compound(*(Shape(*lump) for lump in lumps))
     for name, at in faces.items():
@@ -218,3 +218,90 @@ class TestWhichSideTheBodyIsOn:
 
         bar.common = null
         assert picks.inward((Obj(bar), ["near"]), 0) is None
+
+
+class Root:
+    """The top container of a tree, answering each path with the shape it holds."""
+
+    def __init__(self, label, **held):
+        self.Label = label
+        self._held = held
+        self.asked = []
+
+    def getSubObject(self, path):
+        self.asked.append(path)
+        return self._held[path]
+
+
+class Placed(Obj):
+    """An object standing in containers, as ``Parents`` lists them."""
+
+    def __init__(self, shape, *parents, label="Septum"):
+        super().__init__(shape)
+        self.Label = label
+        self.Parents = list(parents)
+
+
+class TestWhereAShapeIsShown:
+    """An object's ``Shape`` is in the coordinates of the container it stands in,
+    so the shape is asked of the top container along the path down to it."""
+
+    def test_an_object_in_no_container_is_its_own_shape(self):
+        own = Shape()
+        assert picks.placed(Placed(own)) is own
+
+    def test_an_object_in_a_container_is_what_the_top_one_holds_along_the_path(self):
+        shown = Shape()
+        root = Root("Assembly", **{"Inner.Septum.": shown})
+        assert picks.placed(Placed(Shape(), (root, "Inner.Septum."))) is shown
+        assert root.asked == ["Inner.Septum."]
+
+    def test_one_path_listed_twice_is_one_place(self):
+        """A body lists a feature once for each way it claims it."""
+        shown = Shape()
+        root = Root("Body", **{"Pad.": shown})
+        assert picks.placed(Placed(Shape(), (root, "Pad."), (root, "Pad."))) is shown
+
+    def test_two_places_are_refused_naming_both(self):
+        one, other = Root("Assembly", **{"Septum.": Shape()}), Root("Group", **{"Septum.": Shape()})
+        with pytest.raises(
+            picks.Unplaced, match="'Septum' stands in more than one container"
+        ) as said:
+            picks.placed(Placed(Shape(), (one, "Septum."), (other, "Septum.")))
+        assert "Assembly.Septum." in str(said.value) and "Group.Septum." in str(said.value)
+
+    def test_two_roots_sharing_a_label_are_two_places(self):
+        one, other = (
+            Root("Assembly", **{"Septum.": Shape()}),
+            Root("Assembly", **{"Septum.": Shape()}),
+        )
+        with pytest.raises(picks.Unplaced):
+            picks.placed(Placed(Shape(), (one, "Septum."), (other, "Septum.")))
+
+    def test_a_root_in_another_document_is_not_a_place(self):
+        """Another open document linking to the container lists its own root,
+        and that is its drawing rather than this one's."""
+        home, away = object(), object()
+        shown = Shape()
+        here = Root("Assembly", **{"Septum.": shown})
+        there = Root("Assembly", **{"Assembly.Septum.": Shape()})
+        here.Document, there.Document = home, away
+        obj = Placed(Shape(), (there, "Assembly.Septum."), (here, "Septum."))
+        obj.Document = home
+        assert picks.placed(obj) is shown
+
+    def test_an_element_is_taken_off_the_shape_where_it_is_shown(self):
+        face = Element(area=True)
+        root = Root("Assembly", **{"Septum.": Shape(Face1=face)})
+        assert picks.element(Placed(Shape(), (root, "Septum.")), "Face1") is face
+
+    def test_an_element_named_through_a_container_is_refused_naming_it(self):
+        with pytest.raises(picks.Unplaced, match="picked at Inner.Septum.Face1"):
+            picks.element(Placed(Shape()), "Inner.Septum.Face1")
+
+    def test_a_pick_is_read_where_it_is_shown(self):
+        face = Element(area=False)
+        root = Root("Assembly", **{"Septum.": Shape(Edge2=face)})
+        pick = (Placed(Shape(Edge2=Element(area=True)), (root, "Septum.")), ["Edge2"])
+        assert picks.shapes(pick) == [face]
+        assert picks.is_outline(pick)

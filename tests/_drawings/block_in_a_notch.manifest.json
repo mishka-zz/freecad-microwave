@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "substrate",
+      "dim": 3,
+      "file": "block_in_a_notch.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "block",
+      "dim": 3,
+      "file": "block_in_a_notch.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "block_in_a_notch.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 250.0,
+  "outside": 319.99999999999994
+}

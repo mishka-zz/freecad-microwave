@@ -37,7 +37,7 @@ shielding.
 | Solver | Numerical Method | Status | Target Applications |
 |---|---|---|---|
 | **openEMS** | FDTD (Time Domain) | **Supported** | Broadband sweeps, planar circuits, 3D structures |
-| **Palace** | FEM (Frequency Domain) | Planned | High-Q resonators, eigenmode analysis, curved geometry |
+| **Palace** | FEM (Frequency Domain) | **Supported** | Curved geometry on a conforming mesh, waveguide and planar devices through lumped and waveguide ports |
 | **NEC2** | Method of Moments (Wires) | Considered | Wire antennas, thin-wire arrays |
 | **scuff-em** | Surface Integral (MoM) | Considered | Planar conductors with implicit substrates, periodic structures |
 | **FasterCap + FastHenry** | Boundary Element (BEM) | Considered | Quasistatic RLCG extraction for SPICE interconnect models |
@@ -47,26 +47,29 @@ shielding.
 
 | Result Type | Description | Status |
 |---|---|---|
-| **S-parameters** | Full $N \times N$ matrix versus frequency, normalized to fixed $Z_0$ or modal impedance; Touchstone export (`.sNp`) | **Supported** |
+| **S-parameters** | Full $N \times N$ matrix versus frequency, normalized to fixed $Z_0$ or modal impedance; Touchstone export (`.sNp`). On Palace a waveguide port is referenced to its own mode, and a lumped port to its `Resistance` | **Supported** |
 | **Impedance profile (TDR)** | Step response reflection converted to characteristic impedance versus distance ($Z(d)$) or time ($Z(t)$) | **Supported** |
+| **Backend comparison** | One term from each backend's result in dB, with the magnitude of their difference (`Compare S-parameters`) | **Supported** |
 | **Far field** | Antenna gain, directivity, axial ratio, 2D/3D radiation patterns | Planned |
 | **Field maps** | 2D planar and 3D volumetric field distribution exports (VTK format) | Planned |
 | **Eigenmodes** | Resonant frequencies, loaded/unloaded Q-factors, modal patterns | Planned |
 | **Scalar parameters** | Resonance frequency, bandwidth, insertion loss, return loss | Planned |
 
-Every result dataset stores solver provenance: solver and adapter
-versions, input envelope SHA-256 hash, elapsed runtime, and per-port
-residual tail share.
+Every result records the solver that produced it and a digest of the drawing
+it was solved from. An openEMS result also records the solver and adapter
+versions, the input envelope SHA-256 hash, the elapsed runtime and each port's
+residual tail share. A Palace result also records the mesh it was solved on and
+the share of the power each driven port left unaccounted for.
 
 ## Modeling Capabilities
 
 | Feature | Supported | Planned / Limitations |
 |---|---|---|
-| **Ports** | Microstrip, lumped elements (resistors/loads), rectangular waveguide | Differential / mixed-mode ports, coaxial TEM ports |
-| **Materials** | Isotropic dielectrics, lossy dielectrics, PEC, 2D conducting sheets (`ConductingSheet`), TOML catalogs | Dispersive multi-pole models (Debye/Drude/Lorentz), anisotropic substrates |
-| **Boundaries** | Absorbing (PML, Mur), conducting walls (PEC, PMC) | Periodic / Floquet boundary conditions |
-| **Excitation** | Broadband Gaussian pulse on discrete and waveguide ports | Plane-wave incident excitation (RCS) |
-| **Geometry** | 3D CAD solids, 2D planar sheets, curved polyhedra with automatic 0.5-cell offset correction | Offset correction is not applied to curved 2D conductor sheets |
+| **Ports** | Microstrip, lumped elements (resistors/loads), rectangular waveguide; Palace drives the lumped and waveguide ports, a waveguide port in TE10 alone, and an open study through lumped ports only | Differential / mixed-mode ports, coaxial TEM ports |
+| **Materials** | Isotropic dielectrics, lossy dielectrics, PEC, 2D conducting sheets (`ConductingSheet`), TOML catalogs. On Palace a `ConductingSheet` is a sheet only, and a body bound to one is refused | Dispersive multi-pole models (Debye/Drude/Lorentz), anisotropic substrates |
+| **Boundaries** | Each face read off what the mesh policy says lies beyond it. On openEMS, absorbing faces (PML or Mur) and conducting walls (PEC). On Palace, an `Air` face reserves the medium `Clearance` deep and carries a first-order absorbing condition on its outer side, and an `Ends` face is a perfect wall | Periodic / Floquet boundary conditions |
+| **Excitation** | On openEMS, a broadband Gaussian pulse on discrete and waveguide ports. On Palace, a frequency-domain solve at each point, or an adaptive sweep that answers every point from a reduced model built of full solves | Plane-wave incident excitation (RCS) |
+| **Geometry** | 3D CAD solids, 2D planar sheets. On openEMS, curved polyhedra with automatic 0.5-cell offset correction. On Palace, a conforming tetrahedral mesh that follows the drawn surface, with no offset applied | On openEMS, offset correction is not applied to curved 2D conductor sheets |
 | **Parametric Studies** | Single-run simulations | FreeCAD Spreadsheet / VarSet parametric sweeps and optimization |
 
 ## Metrology and Verification
@@ -83,6 +86,10 @@ published experimental measurements:
   roots.
 - Stepped-impedance low-pass filter verified against published physical VNA
   measurements.
+- On Palace: the WR-42 guide's phase constant and port impedance, a septum's
+  attenuation against the half-width guide, a brass wall's loss against its
+  surface resistance, a strip dipole's power balance, and a stripline through
+  lumped ports.
 
 Acceptance gates apply Eça & Hoekstra grid refinement studies to confirm
 numerical convergence. Test tolerances are matched to the known accuracy of
@@ -101,12 +108,12 @@ Detailed guides are available in [`docs/`](docs/README.md):
   surface impedance.
 - [Ports](docs/ports.md): Microstrip, lumped, and rectangular waveguide
   ports.
-- [Meshing](docs/meshing.md): Discretization policies, Yee grids, and
-  refinement.
-- [Running Simulations](docs/running.md): Task panel controls, solver
-  settings, and CLI driver.
-- [Results](docs/results.md): S-parameter plotting, TDR profiles, and
-  Touchstone export.
+- [Meshing](docs/meshing.md): The mesh policy, the Yee grid openEMS is
+  solved on, the tetrahedral mesh Palace is solved on, and refinement.
+- [Running Simulations](docs/running.md): The openEMS and Palace panels,
+  solver settings, the open boundary on Palace, and the openEMS CLI driver.
+- [Results](docs/results.md): S-parameter plotting, TDR profiles, Touchstone
+  export, and comparing two backends.
 - [Metrology](docs/metrology.md): Verification gates, convergence tests,
   and accuracy metrics.
 
@@ -153,6 +160,8 @@ or set the `$MICROWAVE_OPENEMS_PYTHON` environment variable.
 ### 3. Python Dependencies
 The host FreeCAD Python environment requires:
 - `numpy` (geometry processing and Yee meshing)
+- `gmsh` (the Palace backend's tetrahedral mesher, which may instead be
+  installed in any Python the Palace solver's `MesherPython` names)
 - `scipy`, `pandas`, `typing_extensions` (S-parameter processing)
 
 Optional dependency:
@@ -162,13 +171,40 @@ Optional dependency:
 *A compatible version of `scikit-rf` is bundled internally under
 `Microwave/_vendor/`.*
 
+### 4. Palace
+Palace is required only for **Check** and **Run** on a Palace solver.
+**Mesh** needs the Gmsh mesher and no Palace. The workbench needs these, and
+finds each as stated:
+
+- **Palace 0.18.1 or later.** An older release is refused before anything is
+  meshed, and so is a build whose `palace --version` states no release.
+- **The `palace` launcher.** A path in `SolverPath` on the Palace solver is
+  used as given. Left blank, `$MICROWAVE_PALACE` is tried, then `palace` on
+  `PATH`.
+- **`mpirun`, which the `palace` launcher starts its processes through.** A
+  path in `MPILauncher` on the Palace solver is used as given. Left blank,
+  `mpirun` is looked for on `PATH`. On macOS a FreeCAD started from Finder or
+  the Dock is given the system's `PATH` alone.
+- **A Python that can import `gmsh`, which runs the mesher.** A path in
+  `MesherPython` on the Palace solver is tried first. Left blank, the search
+  tries `$MICROWAVE_GMSH_PYTHON`, the Python beside FreeCAD's, then `python3`
+  on `PATH`, and proves each by importing `gmsh`.
+
 ## Quick Start
 
 1. Open [`examples/stub_notch.FCStd`](examples/stub_notch.FCStd).
-2. Double-click the **EM Analysis** container in the tree view to open the
-   task panel.
+2. Double-click the **EM Analysis** container, or the solver inside it, in the
+   tree view to open the task panel.
 3. Click **Run**. The frequency response plot appears when time-stepping
    completes.
+
+The study in `stub_notch.FCStd` holds an openEMS solver. To run a study on
+Palace, select the study and press **Add Palace Solver**. It adds a Palace
+solver and its Gmsh Mesh to the study. Double-click `Palace` in the tree to
+open its panel, and press **Run**. The example documents are set up for
+openEMS, and their settings are not tuned for Palace. Palace refuses a
+microstrip port, so a study driven through microstrip ports does not run on
+it.
 
 ### Example Models
 
@@ -186,17 +222,19 @@ Optional dependency:
   50 Ω microstrip line benchmarked against Hammerstad closed forms.
 - [`examples/stripline_50ohm.FCStd`](examples/stripline_50ohm.FCStd):
   50 Ω symmetric stripline benchmarked against conformal mapping.
+- [`examples/waveguide_wr42.FCStd`](examples/waveguide_wr42.FCStd):
+  WR-42 rectangular waveguide between two waveguide ports.
 
 ### General Simulation Workflow
 
 | Step | Action | Description |
 |---|---|---|
 | 1 | **Draw Geometry** | Construct CAD solids (`Part` workbench) or 2D sketches. |
-| 2 | **Create EM Analysis** | Create study container, solver object, and mesh policy; set frequency range. |
+| 2 | **Create EM Analysis** | Create study container, the openEMS solver object, its Yee grid and the mesh policy; set frequency range. **Add Palace Solver** adds a Palace solver and its Gmsh Mesh. |
 | 3 | **Assign Materials** | Add materials from catalog and bind them to geometry. |
 | 4 | **Add Ports** | Select conductor faces/edges and add Microstrip, Lumped, or Waveguide ports. |
-| 5 | **Update Mesh** | Generate and inspect the Yee discretization grid. |
-| 6 | **Run Simulation** | Execute FDTD solver and inspect extracted S-parameters and TDR profiles. |
+| 5 | **Update Mesh** | On openEMS, generate and inspect the Yee discretization grid. On Palace, press **Mesh** in the Palace panel; the mesh goes into the study as `Mesh (Palace)`. |
+| 6 | **Run Simulation** | Run the solver and inspect extracted S-parameters and TDR profiles. |
 
 ## Running Tests
 
@@ -217,9 +255,12 @@ python3 -m tests.gate_report
 ```
 
 The CI test badge reflects the fast test suite (`not slow`), the linter, the
-type checker, and a clean-environment import check. Acceptance gates require a compiled openEMS
-installation and are not run in standard CI. A passing CI badge verifies
-internal software consistency rather than physical accuracy.
+type checker, and a clean-environment import check. Acceptance gates are not
+run in standard CI. openEMS gates need the openEMS Python bindings. Palace
+gates need Palace, a Python that can import `gmsh`, and `freecadcmd`. A run
+that collected every gate fails where one skipped for want of its engine, and
+names it on an `UNREACHED` line. A passing CI badge verifies internal software
+consistency rather than physical accuracy.
 
 ## Contributing
 

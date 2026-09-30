@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "holder",
+      "dim": 3,
+      "file": "ring_on_a_post.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "ring",
+      "dim": 3,
+      "file": "ring_on_a_post.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "ring_on_a_post.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 221.7367153266045,
+  "outside": 318.5398163397448
+}

@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "speck_against_a_wall.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "speck",
+      "dim": 3,
+      "file": "speck_against_a_wall.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "speck_against_a_wall.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 5999.999999999999,
+  "outside": 2200.0
+}

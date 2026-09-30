@@ -1,0 +1,30 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "parts_overlapping_in_a_box.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "near",
+      "dim": 3,
+      "file": "parts_overlapping_in_a_box.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "far",
+      "dim": 3,
+      "file": "parts_overlapping_in_a_box.2.brep",
+      "priority": 1
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "parts_overlapping_in_a_box.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

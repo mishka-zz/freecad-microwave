@@ -22,7 +22,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from ... import annulus, picks, portbox
+from ... import annulus, drawn, picks, portbox
+from .. import reference_plane
 from .geometry import _bounds, _elements_named, _shape_of, _sub_box
 from .materials import _is_metal
 from .model import DIMENSIONS, Frequency, Material, Port, check_mode
@@ -337,9 +338,11 @@ def _lumped(obj: Any, number: int, ctx: _Context) -> Port:
     subject = f"lumped port {label!r}"
 
     exc_axis, _ = _axis(obj.ExcitationAxis, f"{subject}: ExcitationAxis")
+    _check_one_pick(obj.SourceEntity, "SourceEntity", subject)
+    _check_one_pick(obj.ReferenceEntity, "ReferenceEntity", subject)
     source = _sub_box(obj.SourceEntity, f"{subject}: SourceEntity")
     reference = _sub_box(obj.ReferenceEntity, f"{subject}: ReferenceEntity")
-    body = _bounds(obj.SourceEntity[0].Shape.BoundBox)
+    body = _bounds(drawn.bound(picks.placed(obj.SourceEntity[0])))
 
     for name, picked in (("SourceEntity", source), ("ReferenceEntity", reference)):
         if not picked.is_flat(exc_axis):
@@ -374,12 +377,38 @@ def _lumped(obj: Any, number: int, ctx: _Context) -> Port:
     )
 
 
+def _check_one_pick(link: Any, name: str, subject: str) -> None:
+    """Refuse a lumped port's pick naming more than one face or edge.
+
+    A lumped port here is one box, and a pick is read as the box round all the
+    sub-elements it names. Two ground faces either side of a strip bound a box
+    that spans the whole gap and holds the strip, which is neither of the two
+    elements they describe, and two edges of a trace bound a box neither of
+    them spans.
+    """
+    if not link:
+        return
+    names = [each for each in picks.named(link) if each]
+    if len(names) > 1:
+        raise TranslationError(
+            f"{subject}: {name} names {len(names)} sub-elements, {', '.join(names)}, and "
+            "this solver lays a lumped port as one element across one gap. Select one "
+            "face or edge"
+            + (
+                ", or solve the study on Palace, which lays one element for each face"
+                if name == "ReferenceEntity"
+                else ""
+            )
+        )
+
+
 def _rect_waveguide(obj: Any, number: int, ctx: _Context) -> Port:
     """A rectangular waveguide port: a mode launched over a cross-section.
 
-    It takes no excitation axis and no shifts. The box's length is where the
-    measurement plane sits (:func:`~Microwave.portbox.rect_waveguide`), so the
-    model refuses both rather than accepting numbers it would ignore.
+    It takes no excitation axis and no shifts. The mode is launched on the
+    box's near face and read on its far one, :data:`PROBE_CELLS` in, so the model
+    refuses both shifts rather than accepting numbers it would ignore. Where the
+    S-parameters are referred is the port's ``ReferenceDepth``.
     """
     label = _label(obj)
     subject = f"waveguide port {label!r}"
@@ -413,17 +442,13 @@ def _rect_waveguide(obj: Any, number: int, ctx: _Context) -> Port:
     with _model_fault(_label(obj)):
         check_mode(str(obj.Mode), "Mode")
 
-    # Five cells rather than the guide's length. A box spanning the whole guide
-    # would put the probes at the opposite end. openEMS' own examples and this
-    # project's WR-42 gate both use a box a few cells deep. It is a depth rather
-    # than a reach, so there is no geometry to fall back on.
     box = _box(
         portbox.rect_waveguide,
         face.as_pair(),
         propagation_axis=prop_axis,
         direction=direction,
-        stated_length=_value(obj.Length),
-        fallback=5 * ctx.resolution,
+        stated_length=0.0,
+        fallback=probe_depth(ctx.resolution),
         subject=subject,
     )
 
@@ -433,8 +458,23 @@ def _rect_waveguide(obj: Any, number: int, ctx: _Context) -> Port:
         propagation_axis=prop_axis,
         mode=str(obj.Mode),
         direction_unchecked=not checked,
+        reference_depth=reference_plane.depth(obj),
         **_shared(obj, number, "rect_waveguide", label),
     )
+
+
+#: How many bulk cells into the guide openEMS reads a waveguide port. The box
+#: runs from the face the mode is launched on to the plane the probes read, and
+#: a box spanning the whole guide would put them at the opposite end. openEMS'
+#: own examples read a few cells in. Where the S-parameters are referred is the
+#: port's ``ReferenceDepth``, and the driver moves the wave read here to it.
+PROBE_CELLS = 5
+
+
+def probe_depth(resolution: float) -> float:
+    """How far into the guide openEMS reads a waveguide port, in millimetres,
+    on a grid whose bulk cell is ``resolution``."""
+    return PROBE_CELLS * resolution
 
 
 def _coaxial(obj: Any, number: int, ctx: _Context) -> Port:

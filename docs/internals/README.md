@@ -10,12 +10,13 @@ approximations were chosen over alternatives.
 
 | Page | What it covers |
 |---|---|
-| [Cell allocation across three axes](cell-allocation.md) | Resolving geometric lengths across independently sized Cartesian grid axes |
-| [Deciding where the grid lines go](sizing-field.md) | Grid anchors, sizing field formulation, arclength placement, and symmetry |
-| [Measuring what the grid has to resolve](feature-size.md) | Extracting local feature sizes and gap widths from CAD models |
-| [Conductor width discretization and warning thresholds](conductor-width.md) | Conductor width discretization, edge treatment, and face sizing |
-| [Where the domain ends, and where the absorber goes](domain-and-absorber.md) | Boundary padding, absorbing boundary layer (PML) depth, and domain sizing |
-| [Building one S-matrix out of several runs](s-matrix-from-runs.md) | Assembling multi-port S-parameters from sequential solves and applying symmetry |
+| [Cell allocation across three axes](openems-cell-allocation.md) | openEMS: resolving geometric lengths across independently sized Cartesian grid axes |
+| [Deciding where the grid lines go](openems-sizing-field.md) | openEMS: grid anchors, sizing field formulation, arclength placement, and symmetry |
+| [Measuring what the grid has to resolve](openems-feature-size.md) | openEMS: extracting local feature sizes and gap widths from CAD models |
+| [Conductor width discretization and warning thresholds](openems-conductor-width.md) | openEMS: conductor width discretization, edge treatment, and face sizing |
+| [Where the domain ends, and where the absorber goes](openems-domain-and-absorber.md) | openEMS: boundary padding, absorbing boundary layer (PML) depth, and domain sizing |
+| [The open boundary on Palace](palace-open-boundary.md) | The reserved air, the first-order absorbing condition, and the figures a run states about it |
+| [Building one S-matrix out of several runs](s-matrix-from-runs.md) | openEMS: assembling multi-port S-parameters from sequential solves and applying symmetry |
 | [Extracting phase velocity from transmission phase](velocity-from-phase.md) | Deriving phase velocity and distance axes from broadband phase data |
 
 ## Purpose

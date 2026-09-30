@@ -20,10 +20,10 @@ It does know which axis it is on. A coordinate without an axis names nothing,
 so :class:`_Sources` carries the axis and the provenance beside the positions,
 and a refusal with one in reach spends it.
 
-docs/internals/sizing-field.md works out why the slope is a logarithm rather
-than ``max_ratio - 1``, why the rounding slack must not be absorbed by a bump
-that vanishes at the gap ends, why the integral of the field has a closed form,
-and the two traps in the fold that makes a symmetric grid exact.
+docs/internals/openems-sizing-field.md works out why the slope is a logarithm
+rather than ``max_ratio - 1``, why the rounding slack must not be absorbed by a
+bump that vanishes at the gap ends, why the integral of the field has a closed
+form, and the two traps in the fold that makes a symmetric grid exact.
 """
 
 from __future__ import annotations
@@ -208,9 +208,9 @@ class _SizingField:
 
         The positions offered are a superset of the bends, which is what makes
         that exact. Every knot is offered, and so is every place a ramp can be
-        cut off - docs/internals/sizing-field.md lists them. A position the
-        field does not bend at costs one more piece and changes no answer, the
-        field being linear across it.
+        cut off - docs/internals/openems-sizing-field.md lists them. A
+        position the field does not bend at costs one more piece and changes
+        no answer, the field being linear across it.
         """
         offered = [np.array([lower, upper], dtype=float)]
         if self._knots.size:
@@ -530,12 +530,12 @@ def _segment_lines(
     # and stay within budget. Do not absorb the rounding slack with a correction
     # that vanishes at the ends to keep the seam cells at h(a) and h(b). Such a
     # bump has its own gradient and it adds to the field's, which
-    # docs/internals/sizing-field.md works out. _settle handles seam agreement,
-    # by grading the neighbour rather than by deforming this segment.
-    # The two ends are written back rather than computed. The first target is
-    # no arclength at all and returns the near end exactly; the last is the
-    # whole integral and returns the far end to within its rounding. Both ends
-    # are pinned positions - the far end is the next gap's near end, and a
+    # docs/internals/openems-sizing-field.md works out. _settle handles seam
+    # agreement, by grading the neighbour rather than by deforming this segment.
+    # The two ends are written back rather than computed. The first target is no
+    # arclength at all and returns the near end exactly; the last is the whole
+    # integral and returns the far end to within its rounding. Both ends are
+    # pinned positions - the far end is the next gap's near end, and a
     # zero-thickness conductor is found only where a line equals its position
     # exactly - so neither may rest on that.
     targets = np.linspace(0.0, total, count + 1)

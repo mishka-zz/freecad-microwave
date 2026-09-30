@@ -1,0 +1,30 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "air_filled_by_its_parts.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "substrate",
+      "dim": 3,
+      "file": "air_filled_by_its_parts.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "cover",
+      "dim": 3,
+      "file": "air_filled_by_its_parts.2.brep",
+      "priority": 1
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "air_filled_by_its_parts.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

@@ -47,12 +47,20 @@ SELF = pathlib.Path(__file__).resolve()
 #: line of a list this repository does not have, and the fix is the same one -
 #: say what the item said. A part number keeps its letter, because the boundary
 #: on the left refuses a citation that follows one, as ``WR-42`` does.
+#:
+#: ``kb`` is named on its own and not only as a directory. The record's
+#: identifiers changed shape - they are counted in Crockford's alphabet now, so
+#: ``16N`` is one and ``D-17`` is what one used to be - and a pattern that
+#: catches the new shape would catch ``2D`` and ``5G`` with it. What every
+#: citation of the record has in common is the record's own name, and this tree
+#: has no other use for those two letters.
 OUTSIDE = re.compile(
     r"""
       (?<![\w/])(?:specification|AGENT|CLAUDE|GEMINI)\.md
     | (?<![\w/])(?:debt|status|decisions|ideas|use_cases|ui_ux_strategy)\.md
     | (?<![\w/])(?:engine-quirks|literature)\.md
     | (?<![\w/])(?:plans|notes|archive|references)/
+    | (?<![\w/])kb(?![\w])
     | §\s*\d
     | (?<![\w.])M[0-9](?![\w.])
     | (?<![\w-])[A-Z]-\d+(?![\w-])
@@ -111,7 +119,8 @@ def test_the_check_knows_a_citation_from_a_dangling_pointer(tmp_path):
         "# ``debt.md`` T-6 names it without the directory, and so does status.md.\n"
         "# ui_ux_strategy.md is one of them too.\n"
         "# D-17, which names a line of a list this repository does not ship.\n"
-        "# An appendix mentioned somewhere on the line exempts nothing: C-7.\n",
+        "# An appendix mentioned somewhere on the line exempts nothing: C-7.\n"
+        "# ``kb`` 16N measured it, and kb/known/palace/ is where it lives.\n",
         encoding="utf-8",
     )
     # By line, rather than by how many there are: a count says nothing about
@@ -126,4 +135,5 @@ def test_the_check_knows_a_citation_from_a_dangling_pointer(tmp_path):
         "6",
         "7",
         "8",
+        "9",
     ]

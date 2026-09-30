@@ -1,0 +1,12 @@
+{
+  "pieces": [
+    {
+      "label": "skin",
+      "dim": 2,
+      "file": "sphere_skin.0.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 1256.6370614359175,
+  "outside": 0.0
+}

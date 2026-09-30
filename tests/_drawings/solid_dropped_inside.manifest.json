@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "solid_dropped_inside.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "solid_dropped_inside.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "wire",
+      "dim": 1,
+      "file": "solid_dropped_inside.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

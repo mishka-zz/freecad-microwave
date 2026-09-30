@@ -210,9 +210,11 @@ class TestTheStatusLineIsReadableOnWhateverThemeTheUserHas:
     """
 
     def panel(self):
-        from Microwave.Gui import task_panel
+        from Microwave.Gui import openems_task_panel
 
-        return task_panel.SimulationTaskPanel.__new__(task_panel.SimulationTaskPanel)
+        return openems_task_panel.SimulationTaskPanel.__new__(
+            openems_task_panel.SimulationTaskPanel
+        )
 
     def rendered(self, text, *colour):
         subject = self.panel()
@@ -446,7 +448,7 @@ class TestWhatACommandRefusesArrives:
     def test_a_model_that_will_not_mesh_says_why(self, doc, monkeypatch):
         """Nothing is drawn and nothing changes, so the refusal is all of it."""
         from Microwave import Commands
-        from Microwave.Gui import mesh_preview
+        from Microwave.Gui import openems_mesh_preview
         from Microwave.Solvers.openems import document
 
         target_analysis(doc, monkeypatch)
@@ -455,7 +457,7 @@ class TestWhatACommandRefusesArrives:
         def refuse(_analysis):
             raise document.TranslationError("'Trace' is not axis-aligned")
 
-        monkeypatch.setattr(mesh_preview, "refresh", refuse)
+        monkeypatch.setattr(openems_mesh_preview, "refresh", refuse)
         Commands.UpdateMeshCommand().Activated()
 
         assert shown(boxes) == (boxes.Warning, "Update Mesh", "'Trace' is not axis-aligned")
@@ -531,7 +533,7 @@ class TestTheRunButtonDefaultsSimDirUndoably:
         return SimpleNamespace(solver=solver, analysis=analysis, update_simdir_label=lambda: None)
 
     def _call(self, panel):
-        from Microwave.Gui.task_panel import SimulationTaskPanel
+        from Microwave.Gui.openems_task_panel import SimulationTaskPanel
 
         return SimulationTaskPanel.resolve_directory(panel)
 
@@ -574,12 +576,12 @@ def test_the_task_panel_imports_and_still_reaches_the_adapter():
     time, and it is the difference between a broken workbench being caught here
     or in FreeCAD.
     """
-    from Microwave.Gui import plot_s_params, task_panel
+    from Microwave.Gui import openems_task_panel, plot_s_params
 
     # The stages the panel is built around. Renaming one silently would leave a
     # button wired to nothing.
     for stage in ("translate", "on_check", "on_run", "write_envelopes", "collect_results"):
-        assert hasattr(task_panel.SimulationTaskPanel, stage), stage
+        assert hasattr(openems_task_panel.SimulationTaskPanel, stage), stage
     # What the dialog draws, and what it says it drew. Both are computed outside
     # the Qt class, so a rename reaches the chart as a caught exception drawn
     # into the axes and nothing else.
@@ -601,10 +603,13 @@ def test_the_task_panel_imports_and_still_reaches_the_adapter():
 DOCUMENT_CLASSES = [
     ("EMAnalysis", "Microwave.Objects.analysis"),
     ("EMSolverOpenEMS", "Microwave.Objects.solver"),
+    ("EMSolverPalace", "Microwave.Objects.solver"),
     ("EMMeshPolicy", "Microwave.Objects.mesh"),
     ("EMMaterial", "Microwave.Objects.materials"),
     ("EMMaterialBinding", "Microwave.Objects.materials"),
     ("EMMeshRegion", "Microwave.Objects.mesh"),
+    ("EMYeeGrid", "Microwave.Objects.mesh"),
+    ("EMGmshMesh", "Microwave.Objects.mesh"),
     ("EMMeshPreview", "Microwave.Objects.preview"),
     ("EMPortCoaxial", "Microwave.Objects.ports"),
     ("EMPortLumped", "Microwave.Objects.ports"),
@@ -620,8 +625,11 @@ DOCUMENT_CLASSES = [
 FACTORIES = [
     ("Microwave.Objects.analysis", "createEMAnalysis", "EMAnalysis"),
     ("Microwave.Objects.solver", "createEMSolverOpenEMS", "EMSolverOpenEMS"),
+    ("Microwave.Objects.solver", "createEMSolverPalace", "EMSolverPalace"),
     ("Microwave.Objects.mesh", "createEMMeshPolicy", "EMMeshPolicy"),
     ("Microwave.Objects.mesh", "createEMMeshRegion", "EMMeshRegion"),
+    ("Microwave.Objects.mesh", "createEMYeeGrid", "EMYeeGrid"),
+    ("Microwave.Objects.mesh", "createEMGmshMesh", "EMGmshMesh"),
     ("Microwave.Objects.materials", "createEMMaterial", "EMMaterial"),
     ("Microwave.Objects.materials", "createEMMaterialBinding", "EMMaterialBinding"),
     ("Microwave.Objects.preview", "createEMMeshPreview", "EMMeshPreview"),
@@ -789,7 +797,8 @@ class _Restorable:
 
     It answers ``addProperty`` and ``setEditorMode`` because every real document
     object does, and a restore hook that fills in a property added since the
-    file was written calls them. Guarding against their absence in the code
+    file was written calls them. What each added property was declared as is
+    kept in ``added``. Guarding against their absence in the code
     would be guarding against a document object that does not exist.
     """
 
@@ -799,6 +808,7 @@ class _Restorable:
         self.ViewObject = view_object
 
     def addProperty(self, kind, name, group="", doc=""):
+        self.__dict__.setdefault("added", {})[name] = kind
         setattr(self, name, [])
         return self
 
@@ -1163,7 +1173,7 @@ class TestAPreviewRestoredWithoutItsGridProperties:
         carries a preview."""
         obj, preview_objects = self._restored()
         obj.Proxy.onDocumentRestored(obj)
-        preview_objects.set_grid(obj, ((0.0, 1.0),) * 3, ((), (), ()), (0, 0, 0))
+        preview_objects.set_grid(obj, ((0.0, 1.0),) * 3, ((), (), ()), ((0, 0),) * 3)
         assert preview_objects.stored_grid(obj) is not None
 
     def test_it_draws_nothing_until_it_is_meshed_again(self, doc):
@@ -1223,9 +1233,9 @@ class TestAPreviewRestoredWithoutTheStatusOnItsDisplayProperties:
 class TestADisplayPropertyRedrawsWithoutAButton:
     """``onChanged`` is what makes the display properties live.
 
-    ``Gui/mesh_preview.redraw`` is tested on its own and ``onChanged`` is its
-    only caller - so the function was covered and the call site was not, and the
-    whole method could return immediately with the suite green. The
+    ``Gui/openems_mesh_preview.redraw`` is tested on its own and ``onChanged``
+    is its only caller - so the function was covered and the call site was not,
+    and the whole method could return immediately with the suite green. The
     design claim it carries ("a display property that needs a button press is
     not how FreeCAD behaves anywhere else") would simply stop being true:
     changing ``Display`` or dragging a slice does nothing, the picture is of the
@@ -1246,7 +1256,7 @@ class TestADisplayPropertyRedrawsWithoutAButton:
         obj = preview_objects.createEMMeshPreview()
         # A grid to draw is what the guard reads. A preview with none has
         # nothing to show a different view of.
-        preview_objects.set_grid(obj, ((0.0, 1.0),) * 3, ((), (), ()), (0, 0, 0))
+        preview_objects.set_grid(obj, ((0.0, 1.0),) * 3, ((), (), ()), ((0, 0),) * 3)
         return obj, drawn
 
     def test_a_display_property_redraws(self, doc, monkeypatch):
@@ -1652,6 +1662,37 @@ class TestTheIconSet:
         assert not missing, f"no icon on disk, so FreeCAD draws a generic one: {missing}"
         assert len(set(paths.values())) == len(paths), f"two kinds share a picture: {paths}"
 
+    def test_a_provider_that_names_no_icon_gets_nothing(self):
+        """The empty name is a directory that exists, so asking whether the path
+        is there answers yes and the caller gets the Resources folder. A
+        provider that forgot its icon would then pass every check in this class
+        while FreeCAD drew it a generic pixmap."""
+        from Microwave.ViewProviders import icon
+
+        assert icon("") == ""
+        assert icon("Workbench.svg").endswith("Workbench.svg")
+
+    def test_every_solver_kind_has_its_own_picture(self):
+        """The tree is where a user tells one backend from another, and the
+        solvers are the objects they reach for. Both drawing the same picture
+        hides the distinction in the one place it is visible, and every other
+        test in this class passes while it does: the file is on disk and it is
+        named.
+
+        Counted against the document kinds, so a backend with no provider and a
+        provider with no backend both fail here.
+        """
+        from Microwave.Objects.kinds import solver_kinds
+        from Microwave.ViewProviders import provider_class
+
+        providers = {kind: provider_class(kind) for kind in sorted(solver_kinds())}
+        assert all(providers.values()), f"a solver kind with no provider: {providers}"
+
+        paths = {kind: cls.getIcon(cls) for kind, cls in providers.items()}
+        missing = sorted(kind for kind, path in paths.items() if not path)
+        assert not missing, f"no icon on disk, so FreeCAD draws a generic one: {missing}"
+        assert len(set(paths.values())) == len(paths), f"two backends share a picture: {paths}"
+
     def test_the_stale_badge_follows_the_value_the_document_writes(self):
         """The provider reads the status the document layer declares, not a copy.
 
@@ -1708,8 +1749,11 @@ class TestEveryObjectMayBeShown:
     PROVIDERS = [
         ("analysis", "EMAnalysisViewProvider"),
         ("solver", "EMSolverOpenEMSViewProvider"),
+        ("solver", "EMSolverPalaceViewProvider"),
         ("mesh", "EMMeshPolicyViewProvider"),
         ("mesh", "EMMeshRegionViewProvider"),
+        ("mesh", "EMYeeGridViewProvider"),
+        ("mesh", "EMGmshMeshViewProvider"),
         ("materials", "EMMaterialViewProvider"),
         ("materials", "EMMaterialBindingViewProvider"),
         # Not ports: a port is a Part::FeaturePython now, so FreeCAD supplies
@@ -1720,6 +1764,32 @@ class TestEveryObjectMayBeShown:
         # absent for the same reason.
         ("results", "EMSParametersViewProvider"),
     ]
+
+    @staticmethod
+    def drawn_by_part():
+        """The kinds Part draws, which are the ones left out of the list above.
+
+        Derived rather than typed, so what the pairing below exempts is the
+        stated reason - the object carries a ``Shape`` - and not whoever
+        remembered to write a name down.
+        """
+        from Microwave.Objects.kinds import kinds
+
+        return {kind for kind in kinds() if kind.startswith("EMPort")} | {"EMMeshPreview"}
+
+    def test_the_list_names_every_kind_that_needs_a_mode(self):
+        """The typed list against the derived kinds.
+
+        Two providers were added to the workbench and not to this list, and
+        nothing failed: every test in this class is parametrised over the list,
+        so a kind left out of it is a kind no case runs on. The icon tests two
+        screens above derive their expectations for the same reason.
+        """
+        from Microwave.Objects.kinds import kinds
+
+        listed = {name for _, name in self.PROVIDERS}
+        wanted = {f"{kind}ViewProvider" for kind in kinds() - self.drawn_by_part()}
+        assert listed == wanted
 
     # ``add_display_mode`` imports ``pivy`` at call time and ``conftest`` stubs
     # it for the whole run, so ``attach`` registers its mode here. No view
@@ -1980,6 +2050,32 @@ class TestTheExportCommand:
         assert "Write the other 2?" in asked
         assert (tmp_path / "picked.s2p").is_file()
 
+    def test_a_guide_at_its_own_impedance_is_asked_about_and_written_at_each_point(
+        self, doc, monkeypatch, tmp_path
+    ):
+        """What the user consented to is what reaches the file: each port's
+        reference at each point, which the command has to pass on."""
+        from Microwave.Results.sparameters import SParameters
+
+        base = matrix(frequency=(18e9, 22e9, 26e9))
+        guide = np.column_stack([np.linspace(600.0, 430.0, 3)] * 2)
+        self.study(
+            doc,
+            SParameters(
+                frequency=base.frequency,
+                s=np.full((3, 2, 2), 0.1 + 0.2j),
+                port_numbers=base.port_numbers,
+                reference=guide,
+                measured_impedance=guide.astype(complex),
+                self_referenced=base.port_numbers,
+            ),
+        )
+        subject, boxes, _ = self.command(monkeypatch, tmp_path)
+        subject.Activated()
+
+        assert "may take every port at 50 ohm" in boxes.question.call_args.args[2]
+        assert "! Port Impedance 600" in (tmp_path / "picked.s2p").read_text()
+
     def test_saying_no_writes_nothing(self, doc, monkeypatch, tmp_path):
         self.holed_study(doc)
         subject, _, qt = self.command(monkeypatch, tmp_path, answered=False)
@@ -2097,8 +2193,9 @@ class TestTheRightClickEntry:
 
 
 class TestDoubleClickingTheSolverOutsideAStudy:
-    """It opens the analysis' panel, so a solver dragged out of one has
-    nothing to open and the double-click has to answer."""
+    """It opens its backend's panel over the study it is in, so a solver
+    dragged out of one has nothing to open and the double-click has to
+    answer."""
 
     def test_it_says_where_the_solver_has_to_be(self, monkeypatch):
         from Microwave.Objects import analysis as analysis_module
@@ -2482,7 +2579,7 @@ class TestTheBadgeAfterAMeshIsDrawn:
     def verdict(self, unresolved=0, undercounted=0, oversized=None):
         from types import SimpleNamespace
 
-        from Microwave.Gui.task_panel import mesh_verdict
+        from Microwave.Gui.openems_task_panel import mesh_verdict
 
         return mesh_verdict(
             SimpleNamespace(
@@ -2518,3 +2615,144 @@ class TestTheBadgeAfterAMeshIsDrawn:
         text, colour = self.verdict(oversized="this grid is 9.9 GiB")
         assert colour == "orange"
         assert "very large" in text
+
+
+def two_answers(doc, second=None):
+    """A study holding an openEMS and a Palace matrix of one drawing."""
+    from Microwave.Gui import results as glue
+    from Microwave.Objects import createEMAnalysis
+
+    analysis = createEMAnalysis(doc)
+    s = np.zeros((2, 2, 2), dtype=complex)
+    s[:, 1, 0] = s[:, 0, 1] = 0.9
+    for solver, result in (("openEMS", matrix(s=s)), ("Palace", second or matrix(s=0.8 * s))):
+        result.provenance["solver"] = solver
+        glue.record(analysis, result)
+    return analysis
+
+
+class TestComparingTwoAnswers:
+    """Two backends' matrices of one study, drawn term by term with their
+    difference, from the toolbar and from the result itself."""
+
+    def compared(self, doc):
+        from Microwave.Gui import results as glue
+
+        two_answers(doc)
+        return glue.comparison(doc)
+
+    def test_a_term_is_drawn_from_both_and_as_their_difference(self, doc):
+        from Microwave.Gui.plot_s_params import comparison_chart
+
+        drawn = comparison_chart(self.compared(doc), (2, 1))
+        assert [series.name for series in drawn.series] == [
+            "S21 (openEMS)",
+            "S21 (Palace)",
+            "|S21 (openEMS) - S21 (Palace)|",
+        ]
+        assert drawn.series[2].y == pytest.approx(20 * np.log10([0.18, 0.18]), rel=1e-12)
+
+    def test_the_selector_offers_every_term_and_redraws_the_one_chosen(self, doc):
+        from Microwave.Gui.plot_s_params import comparison_chart
+
+        comparison = self.compared(doc)
+        drawn = comparison_chart(comparison, (1, 1))
+        assert [text for text, _ in drawn.choices] == ["S11", "S12", "S21", "S22"]
+        assert drawn.chosen == (1, 1)
+        assert comparison_chart(comparison, [1, 2]).heading == "S12: openEMS and Palace"
+
+    def test_the_footnote_is_what_the_filing_said_of_that_term(self, doc):
+        from Microwave.Gui.plot_s_params import comparison_chart
+
+        comparison = self.compared(doc)
+        term = next(found for found in comparison.terms if found.name == "S21")
+        assert comparison_chart(comparison, (2, 1)).footnote == comparison.line(term)
+
+    def test_the_footnote_says_which_port_was_turned_and_in_what(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import comparison_chart
+        from Microwave.Results.compared import SIGN_BY_RULE
+
+        s = np.zeros((2, 2, 2), dtype=complex)
+        s[:, 1, 0] = s[:, 0, 1] = -0.9
+        turned = matrix(s=s)
+        turned.provenance[SIGN_BY_RULE] = [2]
+        two_answers(doc, second=turned)
+        footnote = comparison_chart(glue.comparison(doc), (2, 1)).footnote
+        assert footnote.startswith("S21 differs by at most 0 at ")
+        assert footnote.endswith(
+            "port 2 of what Palace solved was turned half a cycle, because "
+            "Palace chose the sign of the mode there by a rule of its own"
+        )
+
+    def test_a_result_filed_without_a_drawing_is_filed_with_the_studys_now(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Objects import createEMAnalysis
+        from Microwave.Objects.results import load
+        from Microwave.Results.compared import DRAWING
+
+        analysis = createEMAnalysis(doc)
+        holder = glue.record(analysis, matrix())
+        assert load(holder).provenance[DRAWING] == glue.drawing(analysis)
+
+    def test_a_damaged_result_beside_is_not_compared_and_says_why(self, doc, monkeypatch):
+        from Microwave.Gui import results as glue
+        from Microwave.Results.sparameters import ResultError
+
+        analysis = two_answers(doc)
+
+        def damaged(_obj):
+            raise ResultError("truncated")
+
+        monkeypatch.setattr(glue, "load", damaged)
+        mine = matrix()
+        mine.provenance["solver"] = "Palace"
+        assert glue.beside(analysis, mine) == ["Not compared with what openEMS solved: truncated"]
+
+    def test_a_study_holding_one_answer_is_refused_saying_what_it_takes(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Objects import createEMAnalysis
+
+        glue.record(createEMAnalysis(doc), matrix())
+        with pytest.raises(
+            glue.NoResult, match="holds one set of S-parameters, and a comparison takes two"
+        ):
+            glue.comparison(doc)
+
+    def test_the_command_refuses_two_answers_of_different_ports_by_name(self, doc, monkeypatch):
+        from Microwave import Commands
+
+        two_answers(doc, second=matrix(port_numbers=(1, 3)))
+        boxes, _ = recording_qt(monkeypatch)
+        Commands.compare_s_parameters(doc)
+        _, title, text = shown(boxes)
+        assert title == "Compare S-parameters"
+        assert "ports 1 and 2" in text and "ports 1 and 3" in text
+
+    def test_the_result_offers_a_comparison_only_beside_a_second(self, doc, monkeypatch):
+        from Microwave.Gui import results as glue
+        from Microwave.ViewProviders.results import EMSParametersViewProvider
+
+        analysis = two_answers(doc)
+        first, _ = glue.results_of(analysis)
+        actions, menu = recording_actions(monkeypatch)
+        vobj = MagicMock()
+        vobj.Object = first
+        EMSParametersViewProvider(MagicMock()).setupContextMenu(vobj, menu)
+        assert "Compare S-parameters" in [action.text for action in actions]
+
+        alone = one_answer(doc, matrix())
+        actions, menu = recording_actions(monkeypatch)
+        vobj.Object = glue.results_of(alone)[0]
+        EMSParametersViewProvider(MagicMock()).setupContextMenu(vobj, menu)
+        assert "Compare S-parameters" not in [action.text for action in actions]
+
+
+def one_answer(doc, result):
+    """A study holding one matrix."""
+    from Microwave.Gui import results as glue
+    from Microwave.Objects import createEMAnalysis
+
+    analysis = createEMAnalysis(doc)
+    glue.record(analysis, result)
+    return analysis

@@ -5,9 +5,9 @@ import FreeCAD
 
 from ._vp_hook import ViewProviderRestored
 
-#: Values of ``EMPort.ReferencedTo``. The first is the default and is what a
-#: "50-ohm system" means: every port's S-parameters reported against one number
-#: the user typed.
+#: Values of ``EMPort.ReferencedTo``. The first is what a "50-ohm system" means:
+#: every port's S-parameters reported against one number the user typed. Which
+#: one a new port gets is its kind's ``REFERENCED_TO``.
 FIXED_IMPEDANCE = "Fixed impedance"
 #: Report this port against the impedance the port itself has - measured from
 #: the field for a microstrip, analytic for a waveguide, the resistance for a
@@ -72,6 +72,9 @@ class EMPortBase(ViewProviderRestored):
     #: so an edit to one marks the drawing stale.
     MOVES_NO_CELL = ("Excitation",)
 
+    #: What a new port of this kind is reported against.
+    REFERENCED_TO = FIXED_IMPEDANCE
+
     def __init__(self, obj):
         obj.addProperty("App::PropertyInteger", "Number", "Port", "Unique port number")
         obj.Number = 0  # 0 means auto-assign
@@ -106,6 +109,10 @@ class EMPortBase(ViewProviderRestored):
             "What this port's S-parameters are reported against",
         )
         obj.ReferencedTo = [FIXED_IMPEDANCE, PORT_IMPEDANCE]
+        obj.ReferencedTo = self.REFERENCED_TO
+        # Called by hand, because ``Proxy`` is not assigned yet and FreeCAD
+        # calls nothing on this object until it is.
+        self.onChanged(obj, "ReferencedTo")
 
         self.declare_what_moves_no_cell(obj)
 
@@ -121,9 +128,10 @@ class EMPortBase(ViewProviderRestored):
 
         ``onChanged`` fires for every property as ``__init__`` creates it, and
         again for each one during restore, so it is filtered on the property
-        name. ``ReferencedTo`` is created before ``Proxy`` is assigned and never
-        reaches here during construction. Restore needs no guard either: the
-        editor mode is a status bit on the property and travels in the file.
+        name. ``ReferencedTo`` is created before ``Proxy`` is assigned, so
+        FreeCAD does not call this for it during construction and ``__init__``
+        calls it by hand. Restore needs no guard: the editor mode is a status
+        bit on the property and travels in the file.
         """
         if prop == "ReferencedTo":
             obj.setEditorMode(
@@ -144,9 +152,16 @@ class EMPortBase(ViewProviderRestored):
         """
         if not hasattr(obj, "Shape"):
             return
+        from .. import picks
         from .port_shape import build
 
-        obj.Shape = build(obj)
+        # The box is worked out where FreeCAD shows the faces it stands on, and
+        # the port is drawn moved by the containers it stands in itself.
+        drawn = build(obj)
+        try:
+            obj.Shape = picks.local(obj, drawn)
+        except picks.Unplaced:
+            obj.Shape = drawn
 
     def __getstate__(self):
         return None
@@ -270,6 +285,13 @@ class EMPortMicrostrip(EMPortBase):
 class EMPortRectWaveguide(EMPortBase):
     """Rectangular waveguide port."""
 
+    #: A guide is measured against its own mode, as a bench's TRL references it
+    #: to the line standard. Its impedance is hundreds of ohms, so a fixed
+    #: fifty reports how far the guide is from fifty ohms rather than what it
+    #: reflects, and magnifies the solve's error by up to the VSWR between the
+    #: two.
+    REFERENCED_TO = PORT_IMPEDANCE
+
     def __init__(self, obj):
         super().__init__(obj)
         obj.addProperty(
@@ -285,22 +307,20 @@ class EMPortRectWaveguide(EMPortBase):
             "Direction of wave propagation",
         )
         obj.PropagationAxis = ["X", "Y", "Z", "-X", "-Y", "-Z"]
-        # AddRectWaveGuidePort puts the excitation on the near face of this box
-        # and the probes on the far one, so this length sets where the
-        # measurement plane sits. It is a reference plane rather than an
-        # invisible depth.
-        #
-        # Zero means five mesh cells, which is what openEMS' own examples and
-        # the WR-42 gate use. It is the one number in the whole port surface
-        # that depends on the mesh, and so the one thing about a port that
-        # cannot be drawn before meshing.
+        # The mode is launched on the picked face on every backend, and this is
+        # where the S-parameters are referred: a plane this far into the guide.
+        # Each backend moves its answer there along the guide by the port's own
+        # propagation constant, so the guide has to be uniform over the depth,
+        # and the translation refuses one that is not. How deep a backend reads
+        # the wave to get there is that backend's own business.
         obj.addProperty(
             "App::PropertyLength",
-            "Length",
+            "ReferenceDepth",
             "Waveguide",
-            "Where the measurement plane sits along the propagation axis (0 = five mesh cells)",
+            "How far into the guide from the picked face the S-parameters are"
+            " referred (0 = the face)",
         )
-        obj.Length = 0.0
+        obj.ReferenceDepth = 0.0
         obj.addProperty(
             "App::PropertyEnumeration",
             "Mode",

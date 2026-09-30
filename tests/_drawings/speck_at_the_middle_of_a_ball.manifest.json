@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "speck_at_the_middle_of_a_ball.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "speck",
+      "dim": 3,
+      "file": "speck_at_the_middle_of_a_ball.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "speck_at_the_middle_of_a_ball.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 4188.790204786392,
+  "outside": 1256.6370614365178
+}

@@ -27,7 +27,7 @@ from .finding import _ON_THE_GRID, REFUSE, SUBSTITUTE, WARN, Finding
 #: it the optimistic bound: nowhere on the grid is better than this.
 #:
 #: An envelope carries a grid meshed for one band and a frequency stop in
-#: another, and nothing else compares the two. Or a mesh policy is coarse
+#: another, and nothing else compares the two. Or a Yee grid is coarse
 #: enough: ``ElementsPerWavelength`` is refused at or below
 #: zero and bounded nowhere else, so a model whose features all ask for cells
 #: coarser than this floor is meshed and then judged by it. What keeps an
@@ -53,7 +53,7 @@ def _check_cells_per_wavelength(problem: Problem) -> list[Finding]:
     """The grid against the shortest wavelength it has to carry.
 
     An envelope meshed for one band and solved over another looks exactly like
-    a working model, and nothing else compares the two. A mesh policy coarse
+    a working model, and nothing else compares the two. A Yee grid coarse
     enough reaches the same floor from the other side, on a model whose
     features ask for nothing finer than it.
     """
@@ -112,8 +112,8 @@ def _check_the_grid_is_a_size_somebody_meant(problem: Problem) -> list[Finding]:
             WARN,
             "grid",
             f"{where}. That is a long run rather than a wrong one - but if it "
-            "was not meant, MaxGrowthRatio, PMLCells and FeedOffset are what "
-            "move it fastest",
+            "was not meant, MaxGrowthRatio on the Yee grid, PMLCells and "
+            "FeedOffset are what move it fastest",
         )
     ]
 

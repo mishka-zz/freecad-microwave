@@ -3,12 +3,12 @@
 
 """Build ``microstrip_50ohm.FCStd``: the acceptance gate, as a real document.
 
-The same structure ``tests/test_acceptance_microstrip.py`` builds by hand - a
-3 mm trace on 1.6 mm FR4, 100 mm long, both ends running out through the
-absorber - but drawn with ``Part`` primitives and marked up with the document
-objects a user would use. Translating it reproduces that grid cell for cell,
-which ``test_the_drawn_line_and_the_hand_built_one_are_one_grid`` asserts line
-by line. Solving it lands on the same impedance:
+The same structure ``tests/test_acceptance_openems_microstrip.py`` builds by
+hand - a 3 mm trace on 1.6 mm FR4, 100 mm long, both ends running out through
+the absorber - but drawn with ``Part`` primitives and marked up with the
+document objects a user would use. Translating it reproduces that grid cell
+for cell, which ``test_the_drawn_line_and_the_hand_built_one_are_one_grid``
+asserts line by line. Solving it lands on the same impedance:
 ``test_a_document_reproduces_the_acceptance_gate`` prints a ``GATE`` line to
 compare against the hand-built gate's. The two agreeing bound the error the
 document layer adds.

@@ -1,0 +1,18 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "below_the_element.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "below_the_element.1.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 1e-12,
+  "outside": 6.000000000000001e-08
+}

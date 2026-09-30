@@ -1,0 +1,30 @@
+{
+  "pieces": [
+    {
+      "label": "substrate",
+      "dim": 3,
+      "file": "crossing_port.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "crossing_port.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "crossing_port.2.brep",
+      "priority": 0
+    },
+    {
+      "label": "port",
+      "dim": 2,
+      "file": "crossing_port.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 25600.0,
+  "outside": 5760.0
+}

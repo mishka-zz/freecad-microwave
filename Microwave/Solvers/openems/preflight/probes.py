@@ -18,10 +18,11 @@ A round port's clearance is its own circumference, because a coaxial line's
 first mode that is not TEM is cut off below about that and decays over a length
 of that order. A shielded line meshed as a strip between planes behaves the same
 way, over the shield's width divided by pi
-(``tests/test_acceptance_stripline.py``, ``GATE stripline clearance``). So does
-an open microstrip, which is what the uniform-gap check below mostly runs on: a
-ladder of measurement planes read off one run gives the distance there as the
-cross-section's too (``tests/test_acceptance_microstrip.py``, ``GATE microstrip
+(``tests/test_acceptance_openems_stripline.py``, ``GATE stripline clearance``).
+So does an open microstrip, which is what the uniform-gap check below mostly
+runs on: a ladder of measurement planes read off one run gives the distance
+there as the cross-section's too
+(``tests/test_acceptance_openems_microstrip.py``, ``GATE microstrip
 clearance``), even though such a line radiates and carries a surface wave its
 ground plane never cuts off.
 
@@ -94,8 +95,9 @@ def _check_probes_clear_of_the_feed(problem: Problem) -> list[Finding]:
     judges, a ladder of measurement planes read off one run gives the same answer
     from the other side: moving the band barely shifts the contamination at a
     given distance, while changing the cross-section shifts it a great deal. The
-    gates are ``tests/test_acceptance_stripline.py`` and
-    ``tests/test_acceptance_microstrip.py``, on their ``clearance`` lines.
+    gates are ``tests/test_acceptance_openems_stripline.py`` and
+    ``tests/test_acceptance_openems_microstrip.py``, on their ``clearance``
+    lines.
 
     That contradicts the shape of this threshold and offers no length to put in
     its place. On the open ladder the contamination and the distance the reading

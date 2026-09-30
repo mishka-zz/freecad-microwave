@@ -38,7 +38,7 @@ The measurements, and what each becomes:
 Why a witness pair misses a cylinder's diameter, why a fillet's curvature is not
 a thickness, where a join's demands and a thickness demand cross, and why the
 join's demand is about a plane rather than a pair of directions, are in
-docs/internals/feature-size.md.
+docs/internals/openems-feature-size.md.
 
 The kernel answers each of those directly except the thickness. A gap is a
 witness-pair query, and walking it outward is more of the same query; a
@@ -81,6 +81,7 @@ from typing import Any
 
 import numpy as np
 
+from ... import drawn
 from ...portbox import KERNEL_TOLERANCE, corner
 from .raycast import Surface, chords_at, prepared
 from .sizing import DIMENSIONS, Feature, fits_inside
@@ -228,7 +229,7 @@ MOST_CROSSINGS = 1 << 19
 #: many :func:`bends_through` lays along an edge. The count is fixed rather than
 #: spaced in millimetres like :data:`MAX_SAMPLES`. Its caller triangulates
 #: before any grid exists, and a count read off a cell size would make the
-#: triangulation follow the mesh policy that is decided from it.
+#: triangulation follow the Yee grid that is decided from it.
 #:
 #: It is a bound rather than a convergence. The sharpest radius is a minimum
 #: over the samples, so it only falls as samples are added, and on a surface
@@ -286,13 +287,13 @@ WINDING_PROBE = 10.0 * CONTAINMENT_TOLERANCE
 #:
 #: A station that strikes nothing marches its whole reach, so it costs
 #: :data:`SEPARATION_REACH` divided by this, rounded up. Both are shares of the
-#: same cell, so that division has neither the drawing nor the mesh policy in
+#: same cell, so that division has neither the drawing nor the Yee grid in
 #: it. A station pays a winding probe on top of the march, and a body with no
 #: inside is walked both ways and pays the march twice instead.
 #:
 #: That cost lands on a sample whose neighbour is out of reach, and on one whose
-#: face points away from it. Both ask for nothing. ``tests/test_lfs.py`` holds
-#: the bound.
+#: face points away from it. Both ask for nothing. ``tests/test_openems_lfs.py``
+#: holds the bound.
 MARCH_STEP = 0.1
 
 #: How closely the gap's near wall is then placed inside that bracket, as a
@@ -326,19 +327,19 @@ class Body:
     """One drawn object, as this module needs it.
 
     :param label: What to call it in a message.
-    :param shape: The FreeCAD shape. What is asked of it is ``BoundBox``,
-        ``Faces``, ``Edges``, ``Solids``, ``distToShape`` and ``isInside``; of a
-        face, ``Area``, ``ParameterRange``, ``Surface``, ``Wires``, ``Edges``,
-        ``curveOnSurface``, ``valueAt``, ``normalAt``, ``curvatureAt`` and
-        ``isPartOfDomain``; of a surface, ``isPlanar`` and ``parameter``; of an
-        edge, ``tangentAt``, ``FirstParameter``, ``LastParameter`` and
-        ``hashCode``; of a wire, ``OrderedEdges``; and of a parameter curve,
-        ``discretize``. Everything else is addition and scaling on the
-        points the shape hands back, so a stand-in needs no kernel. A gap is
-        walked by arithmetic on a point rather than by making a line to
-        intersect with, so the kernel stays out of that. The one thing built
-        here is a face's own surface over its own parameter rectangle, which is
-        what says whether the face covers it.
+    :param shape: The FreeCAD shape. What is asked of it is its bound through
+        :func:`Microwave.drawn.bound`, ``Faces``, ``Edges``, ``Solids``,
+        ``distToShape`` and ``isInside``; of a face, ``Area``, ``ParameterRange``,
+        ``Surface``, ``Wires``, ``Edges``, ``curveOnSurface``, ``valueAt``,
+        ``normalAt``, ``curvatureAt`` and ``isPartOfDomain``; of a surface,
+        ``isPlanar`` and ``parameter``; of an edge, ``tangentAt``,
+        ``FirstParameter``, ``LastParameter`` and ``hashCode``; of a wire,
+        ``OrderedEdges``; and of a parameter curve, ``discretize``. Everything
+        else is addition and scaling on the points the shape hands back, so a
+        stand-in needs no kernel. A gap is walked by arithmetic on a point
+        rather than by making a line to intersect with, so the kernel stays out
+        of that. The one thing built here is a face's own surface over its own
+        parameter rectangle, which is what says whether the face covers it.
     :param vertices: The points of the triangulation this body reaches the
         engine as.
     :param faces: Its triangles, as three numbers into ``vertices``. A body
@@ -491,6 +492,7 @@ def _separations(
     by :func:`_gap_run`.
     """
     reach = SEPARATION_REACH * cap
+    boxes = [drawn.bound(body.shape) for body in bodies]
     for first in range(len(bodies)):
         for second in range(first + 1, len(bodies)):
             one, other = bodies[first], bodies[second]
@@ -499,7 +501,7 @@ def _separations(
             # between them.
             if not (one.measured or other.measured):
                 continue
-            if _boxes_further_apart_than(one.shape, other.shape, reach):
+            if _boxes_further_apart_than(boxes[first], boxes[second], reach):
                 continue
             distance, pairs, _ = one.shape.distToShape(other.shape)
             distance = float(distance)
@@ -592,8 +594,9 @@ def _gap_run(
     targets = list(getattr(against.shape, "Solids", ()) or ())
     own = list(getattr(sampled.shape, "Solids", ()) or ())
     march = MARCH_STEP * cap
+    beyond = drawn.bound(against.shape)
     for face in _faces(sampled.shape):
-        if _boxes_further_apart_than(face, against.shape, reach):
+        if _boxes_further_apart_than(drawn.bound(face), beyond, reach):
             continue
         stations, spaced = _sampling(face, distance)
         for u, v in stations:
@@ -688,7 +691,7 @@ def _across_gap(
 
 
 def _diagonal(shape: Any) -> float:
-    box = shape.BoundBox
+    box = drawn.bound(shape)
     return math.dist(
         (float(box.XMin), float(box.YMin), float(box.ZMin)),
         (float(box.XMax), float(box.YMax), float(box.ZMax)),
@@ -773,7 +776,7 @@ def _rims(
     samples a wall. The connection criterion is not among the claims here, and
     that is the difference between this and :func:`_curvatures`. Both criteria,
     and what a hole's rim asks, are in
-    docs/internals/feature-size.md#a-rim-is-not-a-cross-section.
+    docs/internals/openems-feature-size.md#a-rim-is-not-a-cross-section.
 
     A curve answers its curvature as a magnitude, where a face answers two
     signed principal ones. Measured on FreeCAD 1.1.1: reversing a circle and
@@ -836,7 +839,7 @@ def _thicknesses(
     demand in :func:`_curvatures`, and at the cost of what a tapering tip does
     to the timestep. Why a cross-section may not be floored when fidelity may,
     and what that costs, are in
-    docs/internals/feature-size.md#floors-and-which-demands-may-be-given-up.
+    docs/internals/openems-feature-size.md#floors-and-which-demands-may-be-given-up.
     """
     reach = fits_inside(cap)
     # Where the run begins is not read, unlike in :func:`_element_counts`. A
@@ -874,7 +877,7 @@ def _element_counts(
     will ask for, which is the one exception to the rule :func:`_spacing`
     states. The demand covers the chord rather than sitting at its end the way a
     cross-section does. Why each, and what the reach costs a void or a taper,
-    are in docs/internals/feature-size.md#sampled-coarsely-on-purpose.
+    are in docs/internals/openems-feature-size.md#sampled-coarsely-on-purpose.
     """
     for number, point, step, chord, begins in _chords(
         body, across * cap, _Stations(body, cap), spend
@@ -1207,7 +1210,7 @@ def _curves(face: Any) -> bool:
     :func:`_curvatures` asks for :data:`SURFACE_FIDELITY` of twice that, which
     is beyond ``reach`` - and so dropped - unless ``L`` is under a few microns
     on a millimetre-sized cell. Nothing the mesher acts on moves, which is what
-    ``tests/test_corpus_geometry.py::TestEveryShapeGetsAnHonestVerdict::test_the_skip_costs_the_mesher_no_demand``
+    ``tests/test_openems_corpus_geometry.py::TestEveryShapeGetsAnHonestVerdict::test_the_skip_costs_the_mesher_no_demand``
     holds it to over the corpus.
 
     Asked once a face, because the answer is a property of the surface and not
@@ -1876,13 +1879,13 @@ def _steps(
     return max(2, min(MAX_SAMPLES, int(length / spacing + COUNT_SLACK) + 1)), length
 
 
-def _boxes_further_apart_than(one: Any, other: Any, reach: float) -> bool:
-    """Whether two shapes' bounding boxes are certainly more than ``reach`` apart.
+def _boxes_further_apart_than(first: Any, second: Any, reach: float) -> bool:
+    """Whether two shapes are certainly more than ``reach`` apart, given the box
+    :func:`Microwave.drawn.bound` takes round each.
 
     The comparison is a lower bound on the true distance, so it can only decline
     to cull. It never culls a pair that mattered.
     """
-    first, second = one.BoundBox, other.BoundBox
     gap = 0.0
     for low, high in (("XMin", "XMax"), ("YMin", "YMax"), ("ZMin", "ZMax")):
         along = max(

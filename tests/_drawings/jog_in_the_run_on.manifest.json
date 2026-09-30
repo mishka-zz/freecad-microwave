@@ -1,0 +1,23 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "jog_in_the_run_on.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "port1",
+      "dim": 2,
+      "file": "jog_in_the_run_on.1.brep",
+      "priority": 0,
+      "inward": [
+        1.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "measure": 14000.0,
+  "outside": 4660.0
+}

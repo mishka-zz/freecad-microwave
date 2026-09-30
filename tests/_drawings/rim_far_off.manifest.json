@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "skin",
+      "dim": 2,
+      "file": "rim_far_off.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "rim",
+      "dim": 1,
+      "file": "rim_far_off.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "far",
+      "dim": 2,
+      "file": "rim_far_off.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6.00000005,
+  "outside": 0.0
+}

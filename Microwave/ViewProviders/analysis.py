@@ -18,25 +18,30 @@ class EMAnalysisViewProvider(HasDisplayMode):
     ICON = "Analysis.svg"
 
     def doubleClicked(self, vobj):
-        import FreeCADGui
+        """Open the panel for the study's only solver, or say which to open.
 
-        FreeCADGui.ActiveDocument.setEdit(vobj.Object.Name, 0)
+        The selection is not asked: the click that begins a double-click has
+        already made the study the selection. A study holding a solver of each
+        backend says nothing about which a double-click meant, so it is refused
+        naming them.
+        """
+        from ..Gui.notify import refused
+        from ..Gui.panels import open_run
+        from ..Objects.analysis import NoSolver, solver_to_run
+
+        try:
+            solver = solver_to_run(vobj.Object)
+        except NoSolver as error:
+            refused("Run Simulation", str(error))
+            return True
+        open_run("Run Simulation", solver)
         return True
 
     def setEdit(self, vobj, mode):
-        import FreeCADGui
+        """Refused. A run's panel is held on the solver it runs.
 
-        from ..Gui.task_panel import SimulationTaskPanel
-
-        self.panel = SimulationTaskPanel(vobj.Object)
-        FreeCADGui.Control.showDialog(self.panel)
-        return True
-
-    def unsetEdit(self, vobj, mode):
-        import FreeCADGui
-
-        if hasattr(self, "panel"):
-            self.panel.shutdown()
-            del self.panel
-        FreeCADGui.Control.closeDialog()
-        return True
+        The study holds a solver of each backend it is answered by, and a panel
+        opened on the study would have to guess which. FreeCAD reads ``False``
+        as the edit refused, and opens nothing.
+        """
+        return False

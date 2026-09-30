@@ -35,11 +35,11 @@ _BOUNDARY_WORDS = frozenset({"PEC", "PMC", "MUR"})
 #: is refused outright while meshing, before this could describe it. This check
 #: speaks for the range between them.
 #:
-#: The share does not move in step with the mesh policy across that range. The
+#: The share does not move in step with the Yee grid across that range. The
 #: block is the finest cell the sizing field asks for near the wall, and the
 #: band that is read over reaches in proportionally to the cell, so coarsening
 #: widens the band, and a feature the wider band swallows collapses the block
-#: rather than deepening it. The share therefore tracks the mesh policy over the
+#: rather than deepening it. The share therefore tracks the Yee grid over the
 #: range as a whole rather than step by step. Read this as a warning about the
 #: grid in hand rather than as a threshold to tune against.
 _INTERIOR_SHARE_LIMIT = 0.5
@@ -131,8 +131,8 @@ def _check_the_absorber_leaves_a_model(problem: Problem) -> list[Finding]:
             if gap > 0
         ]
         per_end = (
-            f" The absorber is {_absorber_cells(grid, dim)} cells deep and "
-            f"covers {' and '.join(taken)} of a {drawn:.4g} mm model."
+            f" The absorber is {' and '.join(str(n) for n in _absorber_cells(grid, dim) if n)} "
+            f"cells deep and covers {' and '.join(taken)} of a {drawn:.4g} mm model."
             if taken
             else ""
         )
@@ -142,22 +142,25 @@ def _check_the_absorber_leaves_a_model(problem: Problem) -> list[Finding]:
                 f"{AXIS_NAMES[dim]} domain",
                 f"the absorber leaves {share:.0%} of the structure outside it."
                 f"{per_end} Everything measured has to fit in that. Draw "
-                f"more structure, raise ElementsPerWavelength, or lower "
-                f"PMLCells - note that *coarsening* the mesh deepens the "
+                f"more structure, raise ElementsPerWavelength on the Yee grid, or "
+                f"lower PMLCells - note that *coarsening* the mesh deepens the "
                 f"absorber rather than leaving more room",
             )
         )
     return findings
 
 
-def _absorber_cells(grid: MeshGrid, dim: int) -> int:
-    """How many cells of absorber this axis declares at each end, or zero.
+def _absorber_cells(grid: MeshGrid, dim: int) -> tuple[int, int]:
+    """How many cells of absorber this axis declares at its lower and its upper
+    face, zero at a face with none.
 
-    ``pml_cells`` is per axis. A closed structure absorbs on some axes and is
-    walled by a conductor on the others.
+    ``pml_cells`` holds one count for an axis whose faces agree and a pair for
+    one whose faces differ: a closed structure absorbs on some faces and is
+    walled by a conductor on the others, and a one-port guide absorbs at the
+    port and is walled at its far end.
 
     This answers what the axis declares rather than what it can hold. An axis
-    with too few cells to carry two blocks and something between them is
+    with too few cells to carry its blocks and something between them is
     refused by :func:`_check_the_absorber_fits_the_axis` and reported by
     :func:`_absorber_covers_the_axis`. Answering zero here would instead say
     the axis absorbs nowhere, which silences every check that measures against
@@ -170,21 +173,23 @@ def _absorber_cells(grid: MeshGrid, dim: int) -> int:
     cells = grid.params.get("pml_cells")
     if isinstance(cells, (list, tuple)):
         cells = cells[dim] if len(cells) > dim else 0
-    if not cells or int(cells) < 0:
-        return 0
-    return int(cells)
+    ends = list(cells) if isinstance(cells, (list, tuple)) else [cells, cells]
+    if len(ends) != 2:
+        return 0, 0
+    low, high = (max(int(end), 0) if end else 0 for end in ends)
+    return low, high
 
 
 def _absorber_covers_the_axis(grid: MeshGrid, dim: int) -> bool:
-    """Whether the two blocks leave no cell between them.
+    """Whether the blocks leave no cell between them.
 
     Asked before the interior, because such an axis has none to ask about. Every
     cell absorbs, so a point anywhere on the axis is in the attenuating region.
     That covers the line the blocks meet on, which carries an absorbing cell on
     each side of it and would otherwise read as an interior of no width.
     """
-    cells = _absorber_cells(grid, dim)
-    return bool(cells) and len(grid[dim]) - 1 <= 2 * cells
+    low, high = _absorber_cells(grid, dim)
+    return bool(low or high) and len(grid[dim]) - 1 <= low + high
 
 
 def _absorber_bounds(grid: MeshGrid, dim: int) -> tuple[float, float] | None:
@@ -195,11 +200,11 @@ def _absorber_bounds(grid: MeshGrid, dim: int) -> tuple[float, float] | None:
     :func:`_absorber_covers_the_axis` is what tells those apart, and a caller
     that has to describe the axis asks it first.
     """
-    cells = _absorber_cells(grid, dim)
-    if not cells or _absorber_covers_the_axis(grid, dim):
+    low, high = _absorber_cells(grid, dim)
+    if not (low or high) or _absorber_covers_the_axis(grid, dim):
         return None
     lines = grid[dim]
-    return float(lines[cells]), float(lines[-1 - cells])
+    return float(lines[low]), float(lines[-1 - high])
 
 
 def _absorber_depth(grid: MeshGrid, dim: int) -> tuple[float, float]:
@@ -221,18 +226,16 @@ def _absorber_depth(grid: MeshGrid, dim: int) -> tuple[float, float]:
     whole axis - and :func:`_absorber_covers_the_axis` is what a caller asks
     instead.
     """
-    cells = _absorber_cells(grid, dim)
-    if not cells:
-        return 0.0, 0.0
+    low, high = _absorber_cells(grid, dim)
     lines = grid[dim]
     return (
-        float(lines[cells]) - float(lines[0]),
-        float(lines[-1]) - float(lines[-1 - cells]),
+        float(lines[low]) - float(lines[0]),
+        float(lines[-1]) - float(lines[-1 - high]),
     )
 
 
 def _check_the_absorber_fits_the_axis(problem: Problem) -> list[Finding]:
-    """An axis has to hold two blocks of absorber and something between them.
+    """An axis has to hold its blocks of absorber and something between them.
 
     :func:`~..absorber._validate_absorber` refuses this while meshing, on the
     same comparison, so no grid the mesher laid reaches here. An envelope that
@@ -242,18 +245,19 @@ def _check_the_absorber_fits_the_axis(problem: Problem) -> list[Finding]:
     """
     findings = []
     for dim in range(DIMENSIONS):
-        cells = _absorber_cells(problem.grid, dim)
+        low, high = _absorber_cells(problem.grid, dim)
         lines = len(problem.grid[dim])
-        if not cells or lines >= 2 * cells + 2:
+        if not (low or high) or lines >= low + high + 2:
             continue
         findings.append(
             Finding(
                 REFUSE,
                 f"{AXIS_NAMES[dim]} domain",
-                f"the axis has {lines} lines and declares {cells} absorber cells "
-                f"at each end, which needs {2 * cells + 2}. The two blocks "
-                f"overlap, so every cell on this axis absorbs and nothing on it "
-                f"is being solved. Lower PMLCells, or mesh this axis more finely",
+                f"the axis has {lines} lines and declares {low} absorber cells at "
+                f"its lower face and {high} at its upper, which needs "
+                f"{low + high + 2}. The blocks overlap, so every cell on this axis "
+                f"absorbs and nothing on it is being solved. Lower PMLCells, or "
+                f"mesh this axis more finely",
             )
         )
     return findings
@@ -318,8 +322,9 @@ def _check_a_mur_wall_carries_no_excitation(problem: Problem) -> list[Finding]:
                     "source may sit on the wall itself. openEMS then holds "
                     "that wall shut until the drive is over, and this "
                     "adapter's drive lasts the whole run - the wall would "
-                    "reflect for the entire solve rather than absorb. Put PML "
-                    f"on {face}, or move the port clear of it",
+                    "reflect for the entire solve rather than absorb. Set "
+                    "Absorber to PML on the openEMS solver, or move the port "
+                    "clear of the face",
                 )
             )
     return findings
@@ -344,9 +349,12 @@ def _check_absorber_agrees(problem: Problem, index: int, face: str, asked: int) 
     case rather than an exempt one: every clearance check here then has no
     absorber to measure against and says nothing at all, while openEMS
     attenuates the field at that wall in the cells it was told to use.
+
+    The translation states both from ``PMLCells``, so an envelope it wrote
+    agrees. What reaches this is an envelope that arrived some other way.
     """
     dim = index // 2
-    reserved = _absorber_cells(problem.grid, dim)
+    reserved = _absorber_cells(problem.grid, dim)[index % 2]
     if reserved == asked:
         return []
 
@@ -364,8 +372,9 @@ def _check_absorber_agrees(problem: Problem, index: int, face: str, asked: int) 
             WARN,
             f"boundary {face}",
             f"it asks for {asked} cells of PML and the mesh set aside "
-            f"{reserved} on {axis}. openEMS absorbs in the {asked} it was told "
-            f"to, so {consequence}. Set PMLCells and the boundary from one "
-            "number",
+            f"{reserved} at that face of {axis}. openEMS absorbs in the {asked} it "
+            f"was told to, so {consequence}. The translation states both from "
+            "PMLCells, so this envelope was not written by it: write it again "
+            "from the document",
         )
     ]

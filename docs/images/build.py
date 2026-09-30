@@ -312,9 +312,9 @@ def figure_port(doc, port):
 
 
 def mesh(analysis, display, **properties):
-    from Microwave.Gui import mesh_preview
+    from Microwave.Gui import openems_mesh_preview
 
-    preview, report = mesh_preview.refresh(analysis)
+    preview, report = openems_mesh_preview.refresh(analysis)
     preview.Display = display
     for name, value in properties.items():
         setattr(preview, name, value)
@@ -334,7 +334,7 @@ def figure_padding(doc, analysis):
     the board changes size between the pictures, and the eye reads that as the
     board having moved rather than the domain.
     """
-    settings = next(obj for obj in analysis.Group if obj.Label == "Mesh Policy")
+    settings = next(obj for obj in analysis.Group if type(obj.Proxy).__name__ == "EMMeshPolicy")
     height = None
 
     for name, mode in (("domain-air.png", "Air"), ("domain-through.png", "Through")):

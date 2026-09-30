@@ -4,6 +4,44 @@ What changed, and what it means if you are using this. Measured figures are not
 written down here - they go stale wherever nothing re-runs them. Every build
 prints its own with `python3 -m tests.gate_report`.
 
+## Unreleased
+
+### Palace, a second backend
+
+**A study can be solved on Palace**, a frequency-domain finite-element solver,
+beside openEMS. **Add Palace Solver** adds a Palace solver and its Gmsh mesh
+settings to a study. The drawing, the materials, the ports and the band are
+marked up once and read by both backends. Each backend keeps its own result,
+labelled with its name, and **Compare S-parameters** draws both against each
+other.
+
+**The mesh is tetrahedral.** Gmsh meshes the drawing. The mesh a run solves on
+is put in the study as `Mesh (Palace)`, FreeCAD's own FEM mesh object, and is
+marked out of date when the study changes under it.
+
+**What Palace drives.** Lumped ports and rectangular waveguide ports in TE10;
+metal drawn as a `PEC` sheet or body; a `ConductingSheet` as the surface
+impedance of its metal; lossy dielectrics. An open study reserves air round the
+structure and absorbs on its outer side. A band of many points is swept
+adaptively, and the reduced model is checked against full solves. What the
+adapter cannot express - a microstrip port, a waveguide port in an open study,
+a body bound to a `ConductingSheet` - is refused by name before any process
+starts.
+
+**Palace 0.18.1 or later is required**, with `mpirun` and a Python that can
+import `gmsh`. The README says where each is found. The host floors are
+unchanged: FreeCAD 1.0 or newer, on Python 3.11 or newer.
+
+**On openEMS**, a rectangular waveguide port reads its waves at the scales and
+with the mode the grid carries, and states the error of a column read alone.
+Two materials drawn over one space, and a dielectric the averaging never reads,
+are refused.
+
+**New gates on Palace**: the WR-42 guide's phase constant and port impedance, a
+septum's attenuation against the half-width guide, a brass wall's loss against
+its surface resistance, a strip dipole's power balance, and a stripline through
+lumped ports. A run of the gates fails where one skipped for want of its engine.
+
 ## Release 0.0.2 - 2026-09-08
 
 ### Answers move, and the evidence gets sharper

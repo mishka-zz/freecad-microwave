@@ -58,5 +58,5 @@ def test_the_changelog_names_this_version():
 
 # That reading the version through `capabilities` costs no import is covered
 # where every such rule is: the clean-interpreter sweep in
-# test_adapter_openems, which globs the adapter directory and so already
+# test_openems_adapter, which globs the adapter directory and so already
 # imports this module with FreeCAD and openEMS forbidden.

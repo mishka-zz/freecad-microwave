@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 #: The catalog format this workbench understands. A file declaring a higher
@@ -31,6 +32,15 @@ SCHEMA = 1
 #: one, so offering it in a catalog would be a silent no-op. Dispersion is data
 #: about a dielectric, held in :class:`DispersionPoint` below.
 KINDS = ("dielectric", "pec", "conducting_sheet")
+
+#: The same kinds as the document object's enumeration spells them. One set has
+#: two spellings: the enumeration is what a FreeCAD user sees in a dropdown, and
+#: the other is what a file holds.
+DOCUMENT_TYPES = {
+    "dielectric": "Dielectric",
+    "pec": "PEC",
+    "conducting_sheet": "ConductingSheet",
+}
 
 #: Lower case, digits, and separators. A slug rather than free text, because the
 #: id ends up inside a saved document: ``rogers:ro4350b`` has to survive a
@@ -113,21 +123,30 @@ class MaterialEntry:
     # a set or a dict key needs the same care. The suite cannot see such a
     # failure, because Qt is a MagicMock there.
 
-    def at(self, frequency: float) -> MaterialEntry:
-        """This entry with the dispersion row nearest ``frequency`` applied.
+    @property
+    def rows(self) -> tuple[DispersionPoint, ...]:
+        """The table, with the headline values as a row of it where they are
+        quoted at a frequency the table does not hold.
 
-        Never interpolates. A row is a laboratory measurement, and a point
-        between two rows is invented. This layer exists to keep an invented
-        permittivity from looking measured. Returns ``self`` when there is no
-        table to choose from.
-
-        A frequency exactly between two rows takes the lower one, because
-        ``min`` keeps the first of equal keys and rows are sorted ascending. The
-        choice is arbitrary, and it is fixed and written down here.
+        A value quoted at a frequency is a measurement there, as much as a row
+        is, so a band nearer the headline's frequency than any row's solves at
+        the headline. A headline quoted at no frequency is not a row, and an
+        entry with no table has no rows.
         """
-        if not self.dispersion or frequency <= 0:
+        stated = {point.frequency for point in self.dispersion}
+        if not self.dispersion or self.measured_at <= 0 or self.measured_at in stated:
+            return self.dispersion
+        headline = DispersionPoint(self.measured_at, self.epsilon_r, self.loss_tangent)
+        return tuple(sorted((*self.dispersion, headline), key=lambda point: point.frequency))
+
+    def at(self, frequency: float) -> MaterialEntry:
+        """This entry with the row :func:`nearest` ``frequency`` applied and
+        its :attr:`rows` kept as its table, or ``self`` when there is no row to
+        choose."""
+        rows = self.rows
+        row = nearest(rows, frequency)
+        if row is None:
             return self
-        row = min(self.dispersion, key=lambda point: abs(point.frequency - frequency))
         from dataclasses import replace
 
         return replace(
@@ -135,6 +154,7 @@ class MaterialEntry:
             epsilon_r=row.epsilon_r,
             loss_tangent=row.loss_tangent,
             measured_at=row.frequency,
+            dispersion=rows,
         )
 
     def rgb(self) -> tuple[float, float, float]:
@@ -149,20 +169,60 @@ class MaterialEntry:
         Stored on a material at import, as a record of what the catalog stated.
         A description, a datasheet reference and every other presentation field
         are left out, so rewording one in a later catalog release does not move
-        the fingerprint.
+        the fingerprint. The :attr:`rows` are in it, so a table changed after the
+        pick reads as an edit.
         """
-        payload = "|".join(
-            f"{value:.12g}"
-            for value in (
-                self.epsilon_r,
-                self.mu_r,
-                self.loss_tangent,
-                self.conductivity,
-                self.thickness,
-                self.measured_at,
-            )
+        return fingerprint(
+            self.kind,
+            self.epsilon_r,
+            self.mu_r,
+            self.loss_tangent,
+            self.conductivity,
+            self.thickness,
+            self.measured_at,
+            self.rows,
         )
-        return hashlib.sha256(f"{self.kind}|{payload}".encode()).hexdigest()[:16]
+
+
+def nearest(rows: Sequence[DispersionPoint], frequency: float) -> DispersionPoint | None:
+    """The row measured nearest ``frequency``, or ``None`` where there are no
+    rows or no frequency to choose by.
+
+    Never interpolates. A row is a laboratory measurement, and a point between
+    two rows is invented. This layer exists to keep an invented permittivity
+    from looking measured.
+
+    A frequency exactly between two rows takes the lower one, because ``min``
+    keeps the first of equal keys and rows are sorted ascending. The choice is
+    arbitrary, and it is fixed and written down here.
+    """
+    if not rows or frequency <= 0:
+        return None
+    return min(rows, key=lambda point: abs(point.frequency - frequency))
+
+
+def fingerprint(
+    kind: str,
+    epsilon_r: float,
+    mu_r: float,
+    loss_tangent: float,
+    conductivity: float,
+    thickness: float,
+    measured_at: float,
+    rows: Sequence[DispersionPoint] = (),
+) -> str:
+    """:meth:`MaterialEntry.digest` of these values and rows.
+
+    Each value is rounded to sixteen decimal places first. A saved document
+    holds a number in that form and hands back exactly the value so rounded, so
+    a value that went through a file fingerprints as it did before it went in.
+    Twelve significant figures of that are kept.
+    """
+    values = [epsilon_r, mu_r, loss_tangent, conductivity, thickness, measured_at]
+    for row in rows:
+        values += [row.frequency, row.epsilon_r, row.loss_tangent]
+    payload = "|".join(f"{round(value, 16):.12g}" for value in values)
+    return hashlib.sha256(f"{kind}|{payload}".encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)

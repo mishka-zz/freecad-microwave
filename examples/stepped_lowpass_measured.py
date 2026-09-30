@@ -25,8 +25,9 @@ sibling exists to show.
 
 This one is drawn from a table, and its reference is an instrument. Nothing
 about the synthesis is on trial, which is what makes it a measurement of the
-solver rather than of the design equations. ``tests/test_acceptance_lowpass.py``
-is where that comparison is made and where the tolerances are argued.
+solver rather than of the design equations.
+``tests/test_acceptance_openems_lowpass.py`` is where that comparison is
+made and where the tolerances are argued.
 
 The drawn lengths are not the synthesis's lengths
 --------------------------------------------------

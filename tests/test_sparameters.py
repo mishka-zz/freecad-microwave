@@ -9,12 +9,17 @@ numbers that look entirely plausible.
 """
 
 import re
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from Microwave.Results.sparameters import (
+    IMPEDANCE_STATED,
+    MAGNIFICATION_TOLERANCE,
+    MAGNIFIED,
     MIRROR,
+    SENT_BACK,
     ResultError,
     SParameters,
     describe_reference,
@@ -41,13 +46,25 @@ class Run:
         #: returns a full-length array of zeros, which is the case worth being
         #: able to build here.
         self.incident = np.ones_like(self.frequency, dtype=complex)
+        #: A port's waves where they are not what ``volts`` implies: every
+        #: other port sending back nothing, and each reflecting its ratio of
+        #: the incident wave.
+        self.waves = {}
 
     @property
     def ports(self):
         return dict.fromkeys(self._z)
 
     def port(self, number):
-        return type("P", (), {"z0": self._z[number], "incident": self.incident})()
+        if number in self.waves:
+            incident, reflected = self.waves[number]
+        else:
+            driven = number == self.excited_port
+            incident = self.incident if driven else np.zeros_like(self.incident)
+            reflected = self.s(number, self.excited_port) * self.incident
+        return type(
+            "P", (), {"z0": self._z[number], "incident": incident, "reflected": reflected}
+        )()
 
     def s(self, receiving, driving):
         return np.asarray(self._volts[(receiving, driving)], dtype=complex)
@@ -106,6 +123,112 @@ def three_port_run(frequency=(1e9, 2e9)):
     z = {n: 50.0 * ones for n in (1, 2, 3)}
     volts = {(n, 1): 0.1 * n * ones for n in (1, 2, 3)}
     return [Run(frequency, 1, z, volts)]
+
+
+def terminated(s, loads, frequency=(1e9, 2e9)):
+    """The two runs of a two-port whose undriven port sends back part of what
+    reaches it.
+
+    ``s`` is the network with both ports at one real impedance, and ``loads[n]``
+    the reflection port *n*'s termination presents when it is not driven. Each
+    run's waves solve ``b = S a`` with a unit wave into the driven port and
+    ``a_k = loads[k] b_k`` at the other, which is what a solve returns from a
+    port whatever lies behind its plane sends back.
+    """
+    frequency = np.asarray(frequency, dtype=float)
+    ones = np.ones_like(frequency, dtype=complex)
+    s = np.asarray(s, dtype=complex)
+    runs = []
+    for driven in (0, 1):
+        other = 1 - driven
+        load = loads[other + 1]
+        back = s[other, driven] / (1 - s[other, other] * load)
+        a = np.zeros(2, dtype=complex)
+        a[driven], a[other] = 1.0, load * back
+        b = s @ a
+        volts = {(n + 1, driven + 1): b[n] * ones for n in (0, 1)}
+        run = Run(frequency, driven + 1, {1: 50.0 * ones, 2: 50.0 * ones}, volts)
+        run.waves = {n + 1: (a[n] * ones, b[n] * ones) for n in (0, 1)}
+        runs.append(run)
+    return runs
+
+
+def terminated_ports(s, loads, impedances, driven, frequency=(1e9, 2e9)):
+    """The runs driving each port in ``driven`` of a network whose other ports
+    send back part of what reaches them.
+
+    ``s`` is the network in power waves at ``impedances``, and ``loads[n]`` the
+    reflection port *n*'s termination presents when it is not driven. Each
+    run's waves solve ``b = S a`` with a unit wave into the driven port and
+    ``a_k = loads[k] b_k`` at every other, handed over as voltage waves.
+    """
+    frequency = np.asarray(frequency, dtype=float)
+    ones = np.ones_like(frequency, dtype=complex)
+    s = np.asarray(s, dtype=complex)
+    count = s.shape[0]
+    z = {n + 1: impedances[n] * ones for n in range(count)}
+    runs = []
+    for number in driven:
+        gamma = np.diag([0.0 if n + 1 == number else loads.get(n + 1, 0.0) for n in range(count)])
+        b = np.linalg.solve(np.eye(count) - s @ gamma, s[:, number - 1])
+        a = gamma @ b
+        a[number - 1] = 1.0
+        volts = {(n + 1, number): b[n] / a[number - 1] * ones for n in range(count)}
+        run = Run(frequency, number, z, volts)
+        root = np.sqrt(np.asarray(impedances, dtype=float))
+        run.waves = {n + 1: (a[n] * root[n] * ones, b[n] * root[n] * ones) for n in range(count)}
+        runs.append(run)
+    return runs
+
+
+def _as_power_waves(s, impedances, reference):
+    """``s``, power waves at ``impedances``, renormalised to a real reference
+    per port.
+
+    With ``a = (V + Z I) / (2 sqrt Z)`` at each port, the waves at the new
+    reference are ``a' = K (a - G b)`` and ``b' = K (b - G a)``, ``G`` being the
+    reflection of the new reference against the old and
+    ``K = (Z + Z') / (2 sqrt(Z Z'))``.
+    """
+    z = np.asarray(impedances, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    g = np.diag((reference - z) / (reference + z))
+    k = np.diag((reference + z) / (2 * np.sqrt(z * reference)))
+    count = s.shape[0]
+    return k @ (s - g) @ np.linalg.inv(np.eye(count) - g @ s) @ np.linalg.inv(k)
+
+
+def measured_apart(z_matrix, loads, z_by_run, frequency=(1e9, 2e9)):
+    """The two runs of a two-port whose ports measure their own impedance
+    anew in each run, as a microstrip port does.
+
+    ``z_matrix`` is the network, ``loads[n]`` the resistance port *n* is
+    terminated in when it is not driven, and ``z_by_run[j][n]`` the impedance
+    port *n* reports in the run driving port *j*. Each run drives a unit current
+    into its port; every port's voltage and current follow from the network,
+    and each run splits them into waves at the impedance it reports, as openEMS
+    does.
+    """
+    frequency = np.asarray(frequency, dtype=float)
+    ones = np.ones_like(frequency, dtype=complex)
+    z_matrix = np.asarray(z_matrix, dtype=complex)
+    runs = []
+    for driven in (0, 1):
+        other = 1 - driven
+        current = np.zeros(2, dtype=complex)
+        current[driven] = 1.0
+        current[other] = -z_matrix[other, driven] / (z_matrix[other, other] + loads[other + 1])
+        voltage = z_matrix @ current
+        z = {n + 1: z_by_run[driven + 1][n + 1] * ones for n in (0, 1)}
+        waves = {}
+        for n in (0, 1):
+            incident = 0.5 * (voltage[n] + current[n] * z[n + 1])
+            waves[n + 1] = (incident, voltage[n] * ones - incident)
+        volts = {(n + 1, driven + 1): waves[n + 1][1] / waves[driven + 1][0] for n in (0, 1)}
+        run = Run(frequency, driven + 1, z, volts)
+        run.waves = waves
+        runs.append(run)
+    return runs
 
 
 class TestTheWaveConventionIsCorrected:
@@ -269,10 +392,9 @@ class TestAPortReferencedToItself:
 
     def test_a_mirror_derives_its_column_in_the_one_basis_the_declaration_gives(self):
         """Two ports of a declared mirror are one port, so they have one
-        impedance - and the copy S22 = S11 is only exact if the answer is
-        reported in the basis the copy was taken in. Referencing each port to
-        its own *measurement* instead would move the two diagonal terms by
-        different amounts and undo it.
+        impedance - and S22 = S11 holds only in a basis where the two are one.
+        Referencing each port to its own *measurement* instead would move the
+        two diagonal terms by different amounts and undo it.
         """
         runs = series_resistor(50.0, 50.4, 20.0)
         derived = SParameters.from_runs(runs[:1], reference=None, symmetry=MIRROR)
@@ -282,7 +404,7 @@ class TestAPortReferencedToItself:
 
 
 class TestAOnePathMeasurement:
-    """Driving one port of a two-port: S11 and S21, exactly, and nothing faked.
+    """Driving one port of a two-port: S11 and S21, and nothing faked.
 
     The overwhelmingly common study, and the same thing a one-path VNA gives
     you - a LiteVNA has one source and two receivers, so S12 and S22 are not
@@ -293,6 +415,10 @@ class TestAOnePathMeasurement:
     own reference impedance"**, so leaving port 2 where it was measured is not
     a number left unconverted - it is part of what S11 *is*. Moving port 2 to
     50 ohm asks a different physical question and needs S22 to answer.
+
+    The stub terminates port 2 in its own impedance, so it sends back nothing
+    and the column is S exactly. A solved port sends back part of what reaches
+    it, which :class:`TestAPortThatSendsBackPartOfWhatReachesIt` covers.
     """
 
     Z01, Z02, R = 30.0, 75.0, 20.0
@@ -408,6 +534,754 @@ class TestAOnePathMeasurement:
             self.one_path().write_touchstone(tmp_path / "partial")
 
         assert list(tmp_path.iterdir()) == []
+
+
+class TestAPortThatSendsBackPartOfWhatReachesIt:
+    """A solved port is terminated by whatever lies behind its plane, and sends
+    some of what reaches it back into the device.
+
+    A run measures ``b = S a`` at every port at once, so where every column is
+    known the matrix is ``B A^-1`` and the terminations drop out. A column read
+    alone is the device with the other ports terminated as the run left them.
+    Held against a closed form: a network and a load per port, solved for the
+    waves each run would record.
+    """
+
+    #: Reciprocal and not its own mirror, so no identity makes a wrong matrix
+    #: right by accident.
+    S = [[0.2 + 0.1j, 0.9j], [0.9j, -0.1]]
+    LOADS = {1: 0.05, 2: -0.3 + 0.1j}
+
+    def test_every_port_driven_gives_the_network_whatever_terminates_it(self):
+        result = SParameters.from_runs(terminated(self.S, self.LOADS), reference=50.0)
+        np.testing.assert_allclose(result.s[0], self.S, rtol=0, atol=1e-12)
+
+    def test_one_port_driven_gives_the_column_as_the_run_terminated_it(self):
+        """The undriven port's wave enters the column through S12, and a
+        column read alone cannot take it out."""
+        runs = terminated(self.S, self.LOADS)
+        a2 = runs[0].waves[2][0][0]
+        result = SParameters.from_runs(runs[:1], reference=50.0)
+
+        s = np.asarray(self.S)
+        np.testing.assert_allclose(result.s[0][:, 0], s[:, 0] + s[:, 1] * a2, rtol=0, atol=1e-12)
+        assert np.max(np.abs(result.s[0][:, 0] - s[:, 0])) > 1e-2
+
+    def test_a_mirror_counts_the_run_it_stands_for(self):
+        """One run and its mirror are two measurements of one network, so the
+        derived matrix is the network and the measured column moves to it."""
+        symmetric = [[0.2 + 0.1j, 0.9j], [0.9j, 0.2 + 0.1j]]
+        runs = terminated(symmetric, {1: 0.3, 2: 0.3})
+        derived = SParameters.from_runs(runs[:1], reference=50.0, symmetry=MIRROR)
+        plain = SParameters.from_runs(runs[:1], reference=50.0)
+
+        np.testing.assert_allclose(derived.s[0], symmetric, rtol=0, atol=1e-12)
+        assert abs(plain.s[0, 0, 0] - symmetric[0][0]) > 1e-2
+
+    def test_a_port_sending_back_much_of_what_reaches_it_is_still_counted(self):
+        """Open at both ends, each undriven port sends back most of the wave,
+        and the two runs still separate."""
+        result = SParameters.from_runs(terminated(self.S, {1: 1.0, 2: 1.0}), reference=50.0)
+        np.testing.assert_allclose(result.s[0], self.S, rtol=0, atol=1e-12)
+
+    def test_runs_in_proportion_are_refused(self):
+        """Under a mirror, a port sending back as much as was driven into the
+        other makes the solved run and the one it stands for the same
+        measurement."""
+        runs = terminated(self.S, self.LOADS)
+        driven, reflected = runs[0].waves[1]
+        runs[0].waves[2] = (driven.copy(), reflected)
+
+        with pytest.raises(ResultError, match="in proportion at 2 of 2 frequency points"):
+            SParameters.from_runs(runs[:1], reference=50.0, symmetry=MIRROR)
+
+    def test_each_run_is_split_again_at_the_impedance_the_matrix_is_normalised_to(self):
+        """A port that measures its impedance anew in each run hands over its
+        waves on two bases, and ``B A^-1`` is a scattering matrix only on one."""
+        z_matrix = [[60.0, 20.0], [20.0, 45.0]]
+        runs = measured_apart(
+            z_matrix,
+            loads={1: 30.0, 2: 80.0},
+            z_by_run={1: {1: 48.0, 2: 55.0}, 2: {1: 52.0, 2: 57.0}},
+        )
+        result = SParameters.from_runs(runs, reference=50.0)
+
+        z = np.asarray(z_matrix)
+        exact = (z - 50.0 * np.eye(2)) @ np.linalg.inv(z + 50.0 * np.eye(2))
+        np.testing.assert_allclose(result.s[0], exact, rtol=0, atol=1e-12)
+
+    def test_a_run_already_at_the_impedance_asked_for_is_left_bit_for_bit(self):
+        """Its waves are not split again, whatever dividing the impedance by
+        itself does to the last bit."""
+        size = 201
+        z = np.linspace(400.0, 600.0, size) + 0j
+        assert np.any(z / z != 1)
+        ones = np.ones(size)
+        run = Run(
+            np.linspace(1e9, 2e9, size),
+            1,
+            {1: z, 2: z},
+            {(1, 1): (0.1 + 0.2j) * ones, (2, 1): 0.9j * ones},
+        )
+
+        result = SParameters.from_runs([run], reference=None)
+
+        np.testing.assert_array_equal(result.parameter(1, 1), run.s(1, 1))
+        np.testing.assert_array_equal(result.parameter(2, 1), run.s(2, 1))
+
+    def test_runs_a_bit_apart_whose_ratio_is_one_leave_an_unread_wave_alone(self):
+        """Two runs give port 3 impedances one bit apart, which numpy divides to
+        exactly one, and port 3's incident wave was not read at one point."""
+        z = np.array([475.0 + 0j])
+        apart = z.copy()
+        mean = z
+        while mean[0] == z[0] or (mean / z)[0] != 1:
+            apart = np.nextafter(apart.real, np.inf) + 0j
+            mean = (z + apart) / 2
+        runs = terminated_ports(
+            np.full((3, 3), 0.3), {3: 0.1}, (50.0, 50.0, z[0].real), driven=(1, 2)
+        )
+        runs[1]._z[3] = np.full(2, apart[0])
+        incident, reflected = runs[0].waves[3]
+        runs[0].waves[3] = (np.array([np.nan, incident[1]]), reflected)
+
+        result = SParameters.from_runs(runs, reference=None)
+
+        assert np.all(np.isfinite(result.parameter(3, 1)))
+
+    def test_a_driven_wave_of_nothing_at_one_point_is_refused_by_name(self):
+        runs = terminated(self.S, self.LOADS)
+        incident, reflected = runs[0].waves[1]
+        runs[0].waves[1] = (np.array([incident[0], 0.0]), reflected)
+
+        with pytest.raises(ResultError, match="S11 is not a number at 1 of 2"):
+            SParameters.from_runs(runs[:1], reference=50.0)
+
+    def test_a_point_already_discarded_is_not_counted(self):
+        """A point the runs disagree about is blanked whatever its waves say,
+        so runs in proportion there do not refuse the rest of the band. Asked
+        of the assembly directly, because a disagreement of impedance splits
+        the waves again at that point and no stub keeps them in proportion
+        through it."""
+        from Microwave.Results.sparameters import _volts
+
+        s = np.asarray(self.S)
+        incident = np.array([[[1.0, 0.3], [0.2, 1.0]], [[1.0, 1.0], [1.0, 1.0]]], dtype=complex)
+        reflected = s @ incident
+
+        volts = _volts(incident, reflected, (1, 2), [1, 2], (), blanked=(1,))
+
+        np.testing.assert_allclose(volts[0], s, rtol=0, atol=1e-12)
+        with pytest.raises(ResultError, match="in proportion at 1 of 2"):
+            _volts(incident, reflected, (1, 2), [1, 2], (), blanked=())
+
+    def test_runs_close_to_proportion_are_still_counted(self):
+        """Ill-conditioned is not inseparable: a mirror whose undriven port
+        sends back nearly all of what reaches it still gives the network."""
+        symmetric = np.array([[0.2 + 0.1j, 0.9j], [0.9j, 0.2 + 0.1j]])
+        nearly = 0.999
+        load = nearly / (symmetric[0, 1] + symmetric[1, 1] * nearly)
+        runs = terminated(symmetric, {1: load, 2: load})
+
+        derived = SParameters.from_runs(runs[:1], reference=50.0, symmetry=MIRROR)
+
+        np.testing.assert_allclose(derived.s[0], symmetric, rtol=0, atol=1e-9)
+
+    def test_an_undriven_port_with_no_wave_is_refused_where_it_is_counted(self):
+        runs = terminated(self.S, self.LOADS)
+        incident, reflected = runs[0].waves[2]
+        runs[0].waves[2] = (np.array([np.nan, incident[1]]), reflected)
+
+        with pytest.raises(ResultError, match="S21 is not a number at 1 of 2"):
+            SParameters.from_runs(runs, reference=50.0)
+        assert np.all(np.isfinite(SParameters.from_runs(runs[:1], reference=50.0).s[:, :, 0]))
+
+
+class TestWhatAColumnReadAloneCarries:
+    """A column read alone records how much its undriven ports sent back, and
+    says so past a bar the caller sets."""
+
+    S = TestAPortThatSendsBackPartOfWhatReachesIt.S
+    LOADS = TestAPortThatSendsBackPartOfWhatReachesIt.LOADS
+
+    def one_path(self):
+        return SParameters.from_runs(terminated(self.S, self.LOADS)[:1], reference=50.0)
+
+    def test_the_share_is_the_undriven_ports_wave_over_the_driven_one(self):
+        runs = terminated(self.S, self.LOADS, frequency=(1e9, 2e9, 3e9))
+        a1, a2 = runs[0].waves[1][0], runs[0].waves[2][0]
+        runs[0].waves[2] = (a2 * np.array([1.0, 1.5, 1.2]), runs[0].waves[2][1])
+
+        record = SParameters.from_runs(runs[:1], reference=50.0).provenance[SENT_BACK]
+
+        assert record == {
+            "1": {"bound": pytest.approx(1.5 * abs(a2[0] / a1[0])), "port": 2, "frequency": 2e9}
+        }
+
+    def test_the_share_is_of_power_between_ports_of_different_impedance(self):
+        """A 100 ohm port's wave carries a quarter of the power per volt a
+        25 ohm port's does."""
+        runs = measured_apart(
+            [[60.0, 20.0], [20.0, 45.0]],
+            loads={1: 30.0, 2: 80.0},
+            z_by_run={1: {1: 25.0, 2: 100.0}, 2: {1: 25.0, 2: 100.0}},
+        )
+        a1, a2 = runs[0].waves[1][0], runs[0].waves[2][0]
+
+        record = SParameters.from_runs(runs[:1], reference=None).provenance[SENT_BACK]
+
+        expected = abs(a2[0]) / np.sqrt(100.0) / (abs(a1[0]) / np.sqrt(25.0))
+        assert record["1"]["bound"] == pytest.approx(expected, rel=1e-12, abs=0.0)
+
+    def test_two_ports_sending_back_add_as_power(self):
+        runs = terminated_ports(
+            np.full((3, 3), 0.3), {2: 0.1, 3: 0.1}, (50.0, 50.0, 50.0), driven=(1,)
+        )
+        a = [runs[0].waves[n][0][0] for n in (1, 2, 3)]
+
+        record = SParameters.from_runs(runs, reference=None).provenance[SENT_BACK]
+
+        expected = np.sqrt(abs(a[1]) ** 2 + abs(a[2]) ** 2) / abs(a[0])
+        assert record["1"]["bound"] == pytest.approx(expected, rel=1e-12, abs=0.0)
+
+    def test_a_point_already_discarded_is_left_out(self):
+        """Two runs of a three-port disagree about port 3 at one point, where
+        port 2 sent back most of what was driven."""
+        runs = terminated_ports(
+            np.full((3, 3), 0.3), {2: 0.1, 3: 0.1}, (50.0, 50.0, 50.0), driven=(1, 3)
+        )
+        runs[1]._z[3] = np.array([50.0, 70.0], dtype=complex)
+        incident, reflected = runs[0].waves[2]
+        runs[0].waves[2] = (np.array([incident[0], 5.0]), reflected)
+
+        result = SParameters.from_runs(runs, reference=None)
+
+        assert result.discarded == (1,)
+        assert result.provenance[SENT_BACK]["1"]["frequency"] == 1e9
+
+    def test_at_another_reference_the_bound_follows_the_renormalisation(self):
+        """Reported at 50 ohm, a column's error grows and spreads into the other
+        driven column, which the share at the ports' own impedances misses."""
+        rng = np.random.default_rng(2)
+        unitary, _ = np.linalg.qr(rng.normal(size=(3, 3)) + 1j * rng.normal(size=(3, 3)))
+        s = 0.9 * unitary @ unitary.T
+        impedances = (500.0, 100.0, 500.0)
+        loads = {1: 0.05, 2: -0.05, 3: 0.05j}
+        runs = terminated_ports(s, loads, impedances, driven=(1, 3))
+
+        reported = SParameters.from_runs(runs, reference=50.0)
+        own = SParameters.from_runs(runs, reference=None).provenance[SENT_BACK]
+        # The port nobody drove stays at its own impedance.
+        truth = _as_power_waves(s, impedances, (50.0, impedances[1], 50.0))
+
+        for column in ("1", "3"):
+            index = int(column) - 1
+            error = float(np.max(np.abs(reported.s[0][:, index] - truth[:, index])))
+            assert error <= reported.provenance[SENT_BACK][column]["bound"]
+        assert any(
+            np.max(np.abs(reported.s[0][:, int(c) - 1] - truth[:, int(c) - 1])) > own[c]["bound"]
+            for c in ("1", "3")
+        )
+
+    def test_a_wave_nobody_read_leaves_its_port_out(self):
+        runs = terminated(self.S, self.LOADS)
+        incident, reflected = runs[0].waves[2]
+        runs[0].waves[2] = (np.array([np.nan, incident[1]]), reflected)
+
+        record = SParameters.from_runs(runs[:1], reference=50.0).provenance[SENT_BACK]
+
+        assert record["1"]["bound"] == pytest.approx(abs(incident[1]), rel=1e-12, abs=0.0)
+
+    def test_a_matrix_every_column_of_which_is_known_records_nothing(self):
+        runs = terminated(self.S, self.LOADS)
+        both = SParameters.from_runs(runs, reference=50.0)
+        mirror = SParameters.from_runs(runs[:1], reference=50.0, symmetry=MIRROR)
+
+        assert SENT_BACK not in both.provenance and SENT_BACK not in mirror.provenance
+        assert both.sent_back(0.0) is None and mirror.sent_back(0.0) is None
+
+    def test_past_the_bar_it_names_the_port_the_column_and_the_ways_out(self):
+        result = self.one_path()
+        share = result.provenance[SENT_BACK]["1"]["bound"]
+
+        said = result.sent_back(share * 0.99)
+
+        assert said.startswith("A term of column 1 can be off S by up to about")
+        assert "at 1 GHz, against a bar of" in said and "port 2 most" in said
+        assert "Drive port 2 as well" in said and "declare the mirror" in said
+        assert result.sent_back(share) is None
+
+    def test_a_three_port_is_told_to_drive_every_port_left(self):
+        (run,) = three_port_run()
+        run.waves = {3: (0.2 * run.incident, run.s(3, 1) * run.incident)}
+        result = SParameters.from_runs([run], reference=50.0)
+
+        said = result.sent_back(0.1)
+
+        assert (
+            "column 1 can be off S by up to about 0.2 (-14.0 dB)" in said and "port 3 most" in said
+        )
+        assert "Drive ports 2 and 3 as well" in said
+        assert "mirror" not in said
+
+
+def _analytic_reach(s, impedances, reference):
+    """``|d S'_ic / d S_:j|`` of :func:`_as_power_waves`, in closed form.
+
+    ``S' = K (S - G) M K^-1`` with ``M = (I - G S)^-1``, so
+    ``dS' = K P dS M K^-1`` with ``P = I + (S - G) M G``, and the norm over a
+    column of ``dS`` is ``|K_ii| |P_i,:| |M_jc| / |K_cc|``.
+    """
+    z = np.asarray(impedances, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    count = s.shape[0]
+    g = np.diag((reference - z) / (reference + z))
+    k = (reference + z) / (2 * np.sqrt(z * reference))
+    m = np.linalg.inv(np.eye(count) - g @ s)
+    p = np.eye(count) + (s - g) @ m @ g
+    rows = np.abs(k) * np.linalg.norm(p, axis=1)
+    return rows[:, None, None] * np.abs(m).T[None, :, :] / np.abs(k)[None, :, None]
+
+
+class TestHowFarARenormalisationCarriesAColumnsError:
+    """What the bound of a column read alone is made of, against closed forms."""
+
+    IMPEDANCES = (500.0, 100.0, 500.0)
+    #: The port nobody drove stays at its own impedance.
+    WANTED = (50.0, 100.0, 50.0)
+
+    def network(self):
+        rng = np.random.default_rng(2)
+        unitary, _ = np.linalg.qr(rng.normal(size=(3, 3)) + 1j * rng.normal(size=(3, 3)))
+        return 0.9 * unitary @ unitary.T
+
+    def derivative(self, s):
+        from Microwave.Results.sparameters import _derivative
+
+        return _derivative(
+            np.array([1e9]),
+            s[None],
+            np.array(self.IMPEDANCES, dtype=complex)[None],
+            np.array(self.WANTED, dtype=complex)[None],
+            [0, 2],
+        )
+
+    def test_the_reach_is_the_derivative_of_the_renormalisation(self):
+        from Microwave.Results.sparameters import _reach
+
+        s = self.network()
+        reach = _reach(self.derivative(s))[0]
+
+        expected = _analytic_reach(s, self.IMPEDANCES, self.WANTED)
+        for column in (0, 2):
+            np.testing.assert_allclose(
+                reach[:, :, column], expected[:, :, column], rtol=1e-4, atol=0.0
+            )
+
+    def test_a_column_is_bounded_by_every_run_that_reaches_it(self):
+        """Run 1's undriven ports send back far more than run 3's, so column 3
+        of the matrix reported is bounded mostly by run 1's share, and names
+        the port that sent back most there - port 2, where run 3's own loudest
+        is port 1."""
+        from Microwave.Results.sparameters import _reach, _sent_back
+
+        s = self.network()
+        root = np.sqrt(np.array(self.IMPEDANCES))
+        incident = np.zeros((1, 3, 3), dtype=complex)
+        incident[0, :, 0] = np.array([1.0, 0.2, 0.05]) * root
+        incident[0, :, 2] = np.array([0.02, 0.01, 1.0]) * root
+        shares = np.array([np.hypot(0.2, 0.05), 0.0, np.hypot(0.02, 0.01)])
+
+        record = _sent_back(
+            incident,
+            _reach(self.derivative(s)),
+            np.array(self.IMPEDANCES, dtype=complex)[None],
+            (1, 2, 3),
+            [1, 3],
+            np.array([1e9]),
+            blank=(),
+        )
+
+        reach = _analytic_reach(s, self.IMPEDANCES, self.WANTED)
+        bound = np.max(reach[:, 2, :] @ shares)
+        assert record["3"]["bound"] == pytest.approx(bound, rel=1e-4, abs=0.0)
+        assert record["3"]["port"] == 2
+
+
+def _vswr(reference, impedance):
+    reflection = abs((reference - impedance) / (reference + impedance))
+    return (1 + reflection) / (1 - reflection)
+
+
+class TestHowFarARenormalisationMagnifiesTheSolvesError:
+    """A matrix reported against anything but its ports' own impedance records
+    how far that can magnify an error in the solve, and says so past the
+    tolerance. Held against the closed form ``S' = K (S - G) M K^-1``."""
+
+    GUIDE = 475.0
+
+    def line(self, phase, impedances=(GUIDE, GUIDE), driven=(1, 2)):
+        """The runs of a matched lossless line between ports at ``impedances``."""
+        through = np.exp(-1j * phase)
+        return terminated_ports([[0, through], [through, 0]], {}, impedances, driven)
+
+    @pytest.mark.parametrize("phase", [0.3, 1.2, 2.0, np.pi - 0.2, np.pi - 0.05])
+    def test_a_matched_line_is_magnified_as_its_closed_form_says(self, phase):
+        """``(1 - g^2) / min |1 -+ g t|^2`` for ``S = t [[0, 1], [1, 0]]``,
+        which reaches the VSWR as the line's phase reaches half a turn."""
+        g = (50.0 - self.GUIDE) / (50.0 + self.GUIDE)
+        through = np.exp(-1j * phase)
+        expected = (1 - g**2) / min(abs(1 - g * through), abs(1 + g * through)) ** 2
+
+        record = SParameters.from_runs(self.line(phase), reference=50.0).provenance[MAGNIFIED]
+
+        assert record["factor"] == pytest.approx(expected, rel=1e-5, abs=0.0)
+        assert record["factor"] < _vswr(50.0, self.GUIDE)
+
+    def test_the_factor_is_the_norm_of_the_renormalisations_derivative(self):
+        """Over passive networks between real impedances.
+
+        ``S' = K (S - G) M K^-1`` has the derivative ``H -> A H B`` with
+        ``A = (I - G^2)^(1/2) (I - S G)^-1`` and ``B = (I - G S)^-1 (I - G^2)^(1/2)``,
+        whose norm is ``|A| |B|``. For a contraction each of those is at most
+        the square root of the largest VSWR. An error in the solve along a
+        random direction comes out no larger than the factor times itself.
+        """
+        rng = np.random.default_rng(7)
+        for count in (2, 3):
+            for _ in range(20):
+                raw = rng.normal(size=(count, count)) + 1j * rng.normal(size=(count, count))
+                s = (raw + raw.T) / 2
+                s *= rng.uniform(0.3, 1.0) / np.linalg.norm(s, 2)
+                impedances = rng.uniform(20.0, 1000.0, count)
+                wanted = rng.uniform(20.0, 1000.0, count)
+                runs = terminated_ports(s, {}, impedances, tuple(range(1, count + 1)))
+
+                factor = SParameters.from_runs(runs, reference=list(wanted)).provenance[MAGNIFIED][
+                    "factor"
+                ]
+
+                g = np.diag((wanted - impedances) / (wanted + impedances))
+                root = np.sqrt(np.eye(count) - g @ g)
+                a = root @ np.linalg.inv(np.eye(count) - s @ g)
+                b = np.linalg.inv(np.eye(count) - g @ s) @ root
+                expected = np.linalg.norm(a, 2) * np.linalg.norm(b, 2)
+                assert factor == pytest.approx(expected, rel=1e-4, abs=0.0)
+                assert factor <= max(map(_vswr, wanted, impedances)) * (1 + 1e-6)
+
+                error = 1e-7 * (rng.normal(size=s.shape) + 1j * rng.normal(size=s.shape))
+                carried = _as_power_waves(s + error, impedances, wanted) - _as_power_waves(
+                    s, impedances, wanted
+                )
+                assert np.linalg.norm(carried) <= factor * np.linalg.norm(error) * (1 + 1e-3)
+
+    def test_at_the_ports_own_impedance_nothing_is_recorded(self):
+        own = SParameters.from_runs(self.line(1.0), reference=None)
+        one_path = SParameters.from_runs(self.line(1.0)[:1], reference=None)
+        lumped = SParameters.from_runs(self.line(1.0, impedances=(50.0, 50.0)), reference=50.0)
+
+        for result in (own, one_path, lumped):
+            assert MAGNIFIED not in result.provenance
+            assert result.magnified() is None
+
+    def test_a_mirror_is_magnified_as_the_two_port_it_stands_for(self):
+        runs = self.line(np.pi - 0.05)
+
+        mirror = SParameters.from_runs(runs[:1], reference=50.0, symmetry=MIRROR)
+        both = SParameters.from_runs(runs, reference=50.0)
+
+        assert mirror.provenance[MAGNIFIED]["factor"] == pytest.approx(
+            both.provenance[MAGNIFIED]["factor"], rel=1e-6, abs=0.0
+        )
+
+    def test_every_port_past_the_tolerance_is_named_with_its_own_impedance(self):
+        s = np.array([[0.1, 0.6, 0.3j], [0.6, 0.0, 0.5], [0.3j, 0.5, -0.2]])
+        runs = terminated_ports(s, {}, (self.GUIDE, 400.0, 200.0), driven=(1, 2, 3))
+
+        one = SParameters.from_runs(runs, reference=50.0).magnified()
+        each = SParameters.from_runs(runs, reference=[50.0, 50.0, 25.0]).magnified()
+
+        assert one.startswith(
+            "Ports 1, 2 and 3 are reported against 50 ohm and their own impedances are "
+            "475 ohm, 400 ohm and 200 ohm at 1 GHz"
+        )
+        assert each.startswith(
+            "Ports 1, 2 and 3 are reported against 50 ohm, 50 ohm and 25 ohm and their own "
+            "impedances are 475 ohm, 400 ohm and 200 ohm at 1 GHz"
+        )
+
+    def test_each_port_moved_is_recorded_with_what_it_was_moved_to(self):
+        """Port 2 of this three-port is already at 50 ohm, so nothing moved it."""
+        s = np.array([[0.1, 0.6, 0.3j], [0.6, 0.0, 0.5], [0.3j, 0.5, -0.2]])
+        runs = terminated_ports(s, {}, (self.GUIDE, 50.0, 200.0), driven=(1, 2, 3))
+
+        ports = SParameters.from_runs(runs, reference=50.0).provenance[MAGNIFIED]["ports"]
+
+        assert ports == {
+            "1": {
+                "reference": [50.0, 0.0],
+                "own": [self.GUIDE, 0.0],
+                "vswr": pytest.approx(self.GUIDE / 50.0),
+            },
+            "3": {"reference": [50.0, 0.0], "own": [200.0, 0.0], "vswr": pytest.approx(4.0)},
+        }
+
+    @pytest.mark.parametrize("own", [GUIDE, 100.0])
+    def test_a_column_read_alone_carries_only_its_driven_port_moving(self, own):
+        """The undriven port stays at its own impedance, so only port 1 moved,
+        and an error ``(h1, h2)`` in column 1 of a matched line comes out as
+        ``((1 - g^2) h1, sqrt(1 - g^2) (t g h1 + h2))``. Its norm squared is
+        ``(1 - |g|) (1 + |g|)^2``, largest at a third, where it is 32/27."""
+        g = abs((50.0 - own) / (50.0 + own))
+        runs = self.line(np.pi - 0.05, impedances=(own, own))
+
+        record = SParameters.from_runs(runs[:1], reference=50.0).provenance[MAGNIFIED]
+
+        assert list(record["ports"]) == ["1"]
+        assert record["factor"] ** 2 == pytest.approx((1 - g) * (1 + g) ** 2, rel=1e-5, abs=0.0)
+
+    def test_a_point_already_discarded_is_left_out(self):
+        """The runs disagree about port 2 at 2 GHz, where the impedance they
+        measured would magnify more than at 1 GHz."""
+        runs = self.line(np.pi - 0.05)
+        runs[1]._z[2] = np.array([self.GUIDE, 700.0], dtype=complex)
+
+        result = SParameters.from_runs(runs, reference=50.0)
+
+        assert result.discarded == (1,)
+        assert result.provenance[MAGNIFIED]["frequency"] == 1e9
+
+    def test_past_the_tolerance_it_names_the_ports_and_the_way_out(self):
+        result = SParameters.from_runs(self.line(np.pi - 0.05), reference=50.0)
+
+        said = result.magnified()
+
+        assert said.startswith(
+            "Ports 1 and 2 are reported against 50 ohm and their own impedance is 475 ohm "
+            "at 1 GHz, so renormalising there can magnify an error in the solve by up to "
+        )
+        assert said.endswith(
+            "Reference them to their own impedance, where the error is not magnified"
+        )
+
+    def line_over(self, phases, impedance=GUIDE):
+        """Both runs of a matched line whose phase is ``phases`` at 1, 2, 3 GHz
+        and so on, between ports of one impedance."""
+        through = np.exp(-1j * np.asarray(phases))
+        frequency = 1e9 * np.arange(1, through.size + 1)
+        z = {n: np.full(through.size, impedance, dtype=complex) for n in (1, 2)}
+        return [
+            Run(
+                frequency, driven, z, {(driven, driven): 0 * through, (3 - driven, driven): through}
+            )
+            for driven in (1, 2)
+        ]
+
+    def test_the_record_is_where_the_factor_is_largest(self):
+        """The line lines up with ``G`` at the middle point alone."""
+        phases = [0.3, np.pi - 0.05, 1.2]
+
+        record = SParameters.from_runs(self.line_over(phases), reference=50.0).provenance[MAGNIFIED]
+
+        g = (50.0 - self.GUIDE) / (50.0 + self.GUIDE)
+        through = np.exp(-1j * phases[1])
+        middle = (1 - g**2) / min(abs(1 - g * through), abs(1 + g * through)) ** 2
+        assert record["frequency"] == 2e9
+        assert record["factor"] == pytest.approx(middle, rel=1e-5, abs=0.0)
+
+    def test_a_complex_own_impedance_is_named_by_its_own_value(self):
+        """30 - 30j ohm is 42 ohm in magnitude and a VSWR of 2.5 against
+        50 ohm, which is what names it."""
+        own = 30.0 - 30.0j
+
+        result = SParameters.from_runs(self.line_over([5 * np.pi / 12], own), reference=50.0)
+
+        assert result.provenance[MAGNIFIED]["ports"]["1"]["vswr"] == pytest.approx(_vswr(50.0, own))
+        assert result.magnified().startswith(
+            "Ports 1 and 2 are reported against 50 ohm and their own impedance is 30 - 30j ohm"
+        )
+
+    def test_within_the_tolerance_it_says_nothing(self):
+        """A 60 ohm line at 50 ohm is a VSWR of 1.2."""
+        result = SParameters.from_runs(self.line(np.pi, impedances=(60.0, 60.0)), reference=50.0)
+
+        assert result.provenance[MAGNIFIED]["factor"] < MAGNIFICATION_TOLERANCE
+        assert result.magnified() is None
+
+    def test_a_port_within_the_tolerance_is_not_named(self):
+        runs = self.line(np.pi - 0.05, impedances=(self.GUIDE, 60.0))
+
+        said = SParameters.from_runs(runs, reference=50.0).magnified()
+
+        assert said.startswith(
+            "Port 1 is reported against 50 ohm and its own impedance is 475 ohm at 1 GHz"
+        )
+        assert "Reference it to its own impedance" in said
+
+    @pytest.mark.parametrize(
+        ("factor", "written"), [(14.47, "15"), (2.0307, "2.1"), (25845.0, "26000")]
+    )
+    def test_its_figures_are_written_without_an_exponent_and_the_bound_rounded_up(
+        self, factor, written
+    ):
+        """A guide near cutoff is past a thousand ohm, and a bound rounded down
+        to the tolerance would read as not passing it."""
+        result = SParameters.from_runs(self.line(1.0), reference=50.0)
+        result.provenance[MAGNIFIED] = {
+            "factor": factor,
+            "frequency": 1e9,
+            "ports": {"1": {"reference": [50.0, 0.0], "own": [1463.7, 0.0], "vswr": 29.3}},
+        }
+
+        said = result.magnified()
+
+        assert "its own impedance is 1460 ohm" in said and f"by up to {written} times." in said
+
+    def test_a_point_where_no_port_moved_is_left_out(self):
+        """Port 2 is at 50 ohm at the middle point, where an active matrix makes
+        ``I - S`` singular and a finite step reads scikit-rf's way round it."""
+        frequency = np.array([1e9, 2e9, 3e9])
+        z = np.array([self.GUIDE, 50.0, self.GUIDE], dtype=complex)
+        s11 = np.array([0.0, 1.0 + 1e3, 0.0], dtype=complex)
+        s21 = np.array([0.5, -1e3, 0.5], dtype=complex)
+        impedances = {1: z, 2: z}
+        runs = [
+            Run(frequency, 1, impedances, {(1, 1): s11, (2, 1): s21}),
+            Run(frequency, 2, impedances, {(1, 2): s21, (2, 2): s11}),
+        ]
+
+        result = SParameters.from_runs(runs, reference=50.0)
+
+        assert result.provenance[MAGNIFIED]["frequency"] != 2e9
+        assert result.provenance[MAGNIFIED]["ports"]
+        result.magnified()
+
+    def test_where_no_port_passes_alone_the_one_furthest_out_is_named(self):
+        result = SParameters.from_runs(self.line(1.0), reference=50.0)
+        result.provenance[MAGNIFIED] = {
+            "factor": 2.5,
+            "frequency": 1e9,
+            "ports": {
+                "1": {"reference": [50.0, 0.0], "own": [90.0, 0.0], "vswr": 1.8},
+                "2": {"reference": [50.0, 0.0], "own": [95.0, 0.0], "vswr": 1.9},
+            },
+        }
+
+        assert result.magnified().startswith(
+            "Port 2 is reported against 50 ohm and its own impedance is 95 ohm"
+        )
+
+
+def by_hand(s, driven=None, derived=(), port_numbers=None):
+    """A matrix handed over whole, as a backend with no runs to count hands one."""
+    s = np.asarray(s, dtype=complex)
+    points, count = s.shape[0], s.shape[1]
+    return SParameters(
+        frequency=np.linspace(1e9, 3e9, points),
+        s=s,
+        port_numbers=port_numbers or tuple(range(1, count + 1)),
+        reference=np.full((points, count), 50.0),
+        measured_impedance=np.full((points, count), 50.0 + 0j),
+        driven=driven,
+        derived=derived,
+    )
+
+
+def _departure_and_floor(said):
+    """The two figures a departure is said with."""
+    figures = re.findall(r"by up to ([0-9.e-]+) \(|off by ([0-9.e-]+) \(", said)
+    return float(figures[0][0]), float(figures[1][1])
+
+
+class TestAMatrixSaysHowFarItDepartsFromReciprocity:
+    """Every material a model holds is reciprocal, so where two terms of a
+    matrix every column of which was measured differ, at least one is off by
+    half the departure. Held against ``S = (Z - R)(Z + R)^-1`` of a reading
+    whose ``Z`` is not symmetric."""
+
+    READ = np.array([[60.0, 25.0], [31.0, 70.0]])
+
+    def test_a_reading_that_is_not_reciprocal_departs_by_its_closed_form(self):
+        reference = 50.0 * np.eye(2)
+        s = (self.READ - reference) @ np.linalg.inv(self.READ + reference)
+        departure = abs(s[1, 0] - s[0, 1])
+
+        result = SParameters.from_runs(from_z_matrix(self.READ, [50.0, 50.0]), reference=50.0)
+
+        assert result.nonreciprocal(departure * (1 - 1e-9))
+        assert result.nonreciprocal(departure * (1 + 1e-9)) is None
+
+    @pytest.mark.parametrize("reference", [None, 50.0, 1000.0])
+    def test_runs_splitting_at_impedances_that_disagree_leave_a_reciprocal_device_so(
+        self, reference
+    ):
+        """Each run splits its waves at the impedance it measured, as a
+        microstrip port does, and the runs disagree. The matrix counted from
+        them is the ``Z`` of what the ports read, which no impedance enters."""
+        z_by_run = {1: {1: 48.0 + 1.0j, 2: 53.0 - 2.0j}, 2: {1: 51.0 + 0.0j, 2: 47.0 + 3.0j}}
+        runs = measured_apart([[60.0, 28.0], [28.0, 70.0]], {1: 45.0, 2: 55.0}, z_by_run)
+
+        assert SParameters.from_runs(runs, reference=reference).nonreciprocal(1e-12) is None
+
+    def test_the_worst_pair_is_named_where_it_is_worst(self):
+        s = np.zeros((3, 3, 3), dtype=complex)
+        s[0, 1, 0] = 0.05
+        s[1, 2, 0] = 0.2
+        s[2, 2, 0] = 0.1
+
+        said = by_hand(s).nonreciprocal(0.01)
+
+        assert said.startswith("S31 and S13 differ by up to 0.2 (-14.0 dB) at 2 GHz")
+
+    def test_at_least_one_of_the_two_is_off_by_half_the_departure(self):
+        s = np.zeros((1, 2, 2), dtype=complex)
+        s[0, 1, 0], s[0, 0, 1] = 0.4 + 0.1j, 0.35 - 0.023j
+
+        departure, floor = _departure_and_floor(by_hand(s).nonreciprocal(0.01))
+
+        # Three figures, so each is within half a unit of the third.
+        assert departure == pytest.approx(abs(0.05 + 0.123j), rel=5e-3)
+        assert floor == pytest.approx(departure / 2, rel=5e-3)
+
+    def test_a_matrix_with_a_column_a_mirror_derived_says_nothing(self):
+        s = np.zeros((2, 2, 2), dtype=complex)
+        s[:, 1, 0] = 0.5
+
+        assert by_hand(s, driven=(1,), derived=(2,)).nonreciprocal(0.01) is None
+
+    def test_a_matrix_not_every_column_of_which_was_driven_says_nothing(self):
+        """A reciprocal three-port read right, driven at two of its ports. Each
+        column carries what the port left undriven sent back, which is not a
+        departure of the device and which the matrix says otherwise."""
+        s = np.array([[0.1, 0.5, 0.3], [0.5, 0.2, 0.4], [0.3, 0.4, 0.1]])
+        runs = terminated_ports(s, {1: 0.2, 2: 0.3, 3: 0.5}, (50.0, 50.0, 50.0), (1, 2))
+        result = SParameters.from_runs(runs, reference=50.0)
+
+        assert abs(result.s[0, 1, 0] - result.s[0, 0, 1]) > 1e-3
+        assert result.nonreciprocal(0.0) is None
+        assert result.sent_back(1e-6)
+
+    def test_a_point_holding_no_number_is_left_out(self):
+        s = np.zeros((3, 2, 2), dtype=complex)
+        s[0] = np.nan
+        s[2, 1, 0] = 0.03
+
+        assert "at 3 GHz" in by_hand(s).nonreciprocal(0.01)
+
+    def test_a_matrix_holding_no_number_says_nothing(self):
+        """A matrix handed over whole can hold no number, and the check then
+        has no pair to compare."""
+        s = np.full((3, 2, 2), np.nan + 1j * np.nan)
+
+        assert by_hand(s).nonreciprocal(0.0) is None
+
+    def test_a_port_numbered_past_nine_is_named_apart(self):
+        s = np.zeros((1, 2, 2), dtype=complex)
+        s[0, 1, 0] = 0.1
+
+        said = by_hand(s, port_numbers=(1, 12)).nonreciprocal(0.01)
+
+        assert said.startswith("S12,1 and S1,12 differ")
 
 
 class TestMirrorSymmetry:
@@ -560,15 +1434,15 @@ class TestMirrorSymmetry:
 class TestThePreconditionTheMirrorRestsOn:
     """S22 = S11 needs both ports at one reference, so one is *made*.
 
-    The precondition is real and cannot be handled by assumption: the
-    copy was made in the measured basis and renormalisation afterwards moved
-    the two diagonal terms by different amounts, undoing it. A lumped port's
-    Z_ref is the number the user typed, so two of them agree exactly and the
-    acceptance gates - which use lumped ports - read a mismatch of 0.0 and
+    The precondition is real and cannot be handled by assumption: in the
+    measured basis the two ports are two references, and renormalisation
+    afterwards moves the two diagonal terms by different amounts. A lumped
+    port's Z_ref is the number the user typed, so two of them agree exactly and
+    the acceptance gates - which use lumped ports - read a mismatch of 0.0 and
     could never see it. A **microstrip** port measures
     ``sqrt(Et*dEt / (Ht*dHt))`` from its own fields, so the two ends of a
-    genuinely symmetric line come back different, and the derived column
-    inherited that difference.
+    genuinely symmetric line come back different, and a derived column taken in
+    the measured basis would inherit that difference.
 
     Two ports of a true mirror have the same Z0. A gap between them is two noisy
     estimates of one quantity, never a real asymmetry - so the gap is evidence
@@ -592,12 +1466,11 @@ class TestThePreconditionTheMirrorRestsOn:
     def test_the_derived_matrix_is_the_closed_form_whatever_the_ports_report(self, z_b):
         """The one assertion that separates every candidate fix.
 
-        Deriving in the measured basis gave 0.2460 at z_b = 44 and 0.4831 at
-        z_b = 60 against an exact 0.1667. Overwriting the undriven port's
-        measured impedance with the driven one fixes S22 by putting the error
-        into S11 instead. Renormalising both ports before deriving needs the
-        column nobody measured. Only making the common basis out of the
-        undriven port's own impedance is exact.
+        Copying S11 into S22 in the measured basis is not exact, and neither is
+        overwriting one port's measured impedance with the other's. Splitting
+        both ports' waves at one impedance and counting the solved run with its
+        mirror is, whichever impedance is chosen, because the two runs are then
+        two measurements of one network.
         """
         s = self.one_path(40.0, z_b).s[0]
         assert s[0, 0] == pytest.approx(self.EXACT_S11, abs=1e-6)
@@ -606,14 +1479,15 @@ class TestThePreconditionTheMirrorRestsOn:
         assert s[0, 1] == pytest.approx(self.EXACT_S21, abs=1e-6)
 
     def test_the_measured_column_is_not_moved_to_prop_up_the_derived_one(self):
-        """A derivation may never corrupt a measurement. Both matrices are at
-        50 ohm, so the driven column must be the same in each."""
+        """With nothing sent back, the solved column is already the network's,
+        and the derivation leaves it there. Both matrices are at 50 ohm, so the
+        driven column must be the same in each."""
         both = SParameters.from_runs(series_resistor(40.0, 60.0, self.R), reference=50.0)
         derived = self.one_path(40.0, 60.0)
         assert derived.s[:, 0, 0] == pytest.approx(both.s[:, 0, 0], abs=1e-6)
         assert derived.s[:, 1, 0] == pytest.approx(both.s[:, 1, 0], abs=1e-6)
 
-    def test_the_copy_survives_into_a_reflection_null(self):
+    def test_the_mirror_holds_into_a_reflection_null(self):
         """The user's own complaint, as an assertion.
 
         A max-|S| metric cannot see this - which is why SYMMETRY_TOLERANCE
@@ -839,32 +1713,32 @@ class TestWhatItCarries:
             SParameters.from_runs(runs)
 
     def test_a_non_finite_impedance_is_named(self):
-        """A waveguide port below cutoff. Without this the failure is a
-        LinAlgError from inside scikit-rf that names nothing."""
+        """Without this the failure is a LinAlgError from inside scikit-rf that
+        names nothing."""
         runs = series_resistor(50.0, 50.0, 10.0)
         for run in runs:
             run._z = {1: run._z[1] * np.nan, 2: run._z[2]}
-        with pytest.raises(ResultError, match="port 1 reports a non-finite"):
+        with pytest.raises(ResultError, match="port 1 reports a non-finite .* at 2 of 2 frequency"):
             SParameters.from_runs(runs)
 
-    def test_it_names_the_run_that_produced_it_and_both_causes(self):
-        """An ``MSLPort`` reads ``nan`` at every point in
-        a run a *lumped* port excites, and is finite in the run it drives
-        itself. Both causes are properties of the excitation, so naming only
-        the measured port sends the reader to the wrong object - and this one
-        is invisible from that port entirely. Advice about
-        waveguide cutoff alone, in documents holding no waveguide."""
+    def test_it_names_the_run_and_the_points_and_no_cause(self):
+        """What leaves a port without an impedance can be the run's excitation,
+        so the run is named beside the port. The openEMS driver refuses each
+        cause it knows before a results file exists, so no cause is guessed at
+        here: a guess once advised waveguide cutoff in documents holding no
+        waveguide."""
         runs = series_resistor(50.0, 50.0, 10.0)
         by_excitation = {int(run.excited_port): run for run in runs}
         bad = by_excitation[2]
-        bad._z = {1: bad._z[1] * np.nan, 2: bad._z[2]}
+        bad._z = {1: bad._z[1] * np.array([1.0, np.nan]), 2: bad._z[2]}
 
         with pytest.raises(ResultError) as raised:
             SParameters.from_runs(runs)
 
         said = str(raised.value)
-        assert "run driven by port 2" in said
-        assert "cutoff" in said and "lumped port excites" in said
+        assert "port 1 reports a non-finite reference impedance at 1 of 2 frequency" in said
+        assert "(at 2 GHz) in the run driven by port 2" in said
+        assert "cutoff" not in said and "lumped" not in said
 
     def test_a_run_that_excited_nothing_is_refused_by_its_cause(self):
         """A lumped port whose box lies outside the grid. openEMS clips such a
@@ -937,6 +1811,27 @@ class TestWhatItCarries:
             1: {"1": 1e-4, "2": 0.0},
             2: {"1": 1e-4, "2": 0.2},
         }
+
+    def test_each_run_keeps_what_its_ports_read_besides_their_mode(self):
+        """Weighed against the power that run drove in, so it belongs to the run
+        as the tails do, and a port warned of in one column is not lost to the
+        other's quiet record."""
+        runs = series_resistor(50.0, 50.0, 10.0)
+        for index, run in enumerate(runs):
+            run.provenance = dict(run.provenance, near_field={"share": 0.002 * index})
+
+        result = SParameters.from_runs(runs)
+        assert result.provenance["near_field"] == {1: {"share": 0.0}, 2: {"share": 0.002}}
+
+    def test_each_run_keeps_how_much_power_its_ports_account_for(self):
+        """Weighed against the power that run drove in, and of opposite sign in
+        two columns where one port misreads, so a run's is never the matrix's."""
+        runs = series_resistor(50.0, 50.0, 10.0)
+        for index, run in enumerate(runs):
+            run.provenance = dict(run.provenance, power_balance={"share": 0.002 * index})
+
+        result = SParameters.from_runs(runs)
+        assert result.provenance["power_balance"] == {1: {"share": 0.0}, 2: {"share": 0.002}}
 
     def test_what_the_tails_were_judged_against_stays_one_number(self):
         """The other direction from the two above, and the one nothing else
@@ -1032,7 +1927,7 @@ class TestDescribingTheReference:
         )
 
     def test_every_shape_reads_as_english_after_the_words_referenced_to(self):
-        """The one sentence the chart, the ``Reference`` property and both
+        """The one sentence the chart, the ``Reference`` property and the
         Touchstone refusals share. A bracketed list or a bare verb phrase reads
         as a debug print in every one of them.
         """
@@ -1069,19 +1964,20 @@ class TestDescribingTheReference:
         assert result.reference_description() == "50 ohm"
 
     def test_a_derived_mirror_asked_for_nothing_is_recorded_and_reads_as_its_number(self):
-        """Both ports sit at the pair's one common impedance, which is neither
-        port's own measurement - so only ``from_runs`` can record what it did,
-        and it does. What the reader is shown is still the number, because there
-        is one and it is what every term on the chart is against: the same
-        impedance that ``one_reference`` would let Touchstone put in its option
-        line, where a phrase about whose impedance it is has nowhere to go.
+        """Both ports sit at the pair's one common impedance, the mean of the
+        two measurements and neither port's own - so only ``from_runs`` can
+        record what it did, and it does. What the reader is shown is still the
+        number, because there is one and it is what every term on the chart is
+        against: the same impedance that ``one_reference`` would let Touchstone
+        put in its option line, where a phrase about whose impedance it is has
+        nowhere to go.
         """
         runs = series_resistor(50.0, 50.4, 20.0)[:1]
         result = SParameters.from_runs(runs, reference=None, symmetry=MIRROR)
 
         assert result.self_referenced == (1, 2)
         assert result.one_reference
-        assert result.reference_description() == "50.4 ohm"
+        assert result.reference_description() == "50.2 ohm"
 
 
 class TestTheStubStillMatchesTheRealThing:
@@ -1102,11 +1998,13 @@ class TestTheStubStillMatchesTheRealThing:
             assert hasattr(read.Results, name) or name in read.Results.__dataclass_fields__, (
                 f"read.Results has no {name!r}; the stub in this file has drifted"
             )
-        for name in ("port", "s"):
-            assert callable(getattr(read.Results, name, None)), (
-                f"read.Results.{name}() is gone; the stub in this file has drifted"
+        assert callable(getattr(read.Results, "port", None)), (
+            "read.Results.port() is gone; the stub in this file has drifted"
+        )
+        for name in ("z0", "incident", "reflected"):
+            assert name in read.PortResult.__dataclass_fields__, (
+                f"read.PortResult has no {name!r}; the stub in this file has drifted"
             )
-        assert "z0" in read.PortResult.__dataclass_fields__
 
 
 class TestTouchstone:
@@ -1122,7 +2020,8 @@ class TestTouchstone:
         assert np.allclose(again.z0.real, 50.0)
 
     def test_a_reference_the_format_cannot_hold_is_refused_here(self, tmp_path):
-        """One real number for every port at every frequency, or no file.
+        """One real number for every port at every frequency, or no file unless
+        the reference at each point is asked for.
 
         Unguarded, each way of missing it arrives as scikit-rf's own sentence
         out of a vendored library, after the save dialog, naming nothing about
@@ -1136,14 +2035,167 @@ class TestTouchstone:
                 result.write_touchstone(tmp_path / "device")
             assert not (tmp_path / "device.s2p").exists()
 
-    def test_a_mirror_whose_ports_end_up_at_different_references_is_refused(self, tmp_path):
-        """The header would claim S22 is a copy of S11, and it would be off.
+    @staticmethod
+    def at_each_point(ports=2, title="", stated=None):
+        """A matrix whose ports sit at a real reference that moves with
+        frequency and differs between them, as guides at their own impedance
+        do, with every term distinct."""
+        frequency = np.linspace(18e9, 26e9, 5)
+        index = np.indices((frequency.size, ports, ports))
+        s = (0.1 * index[0] + 0.03 * index[1] + 0.01 * index[2]) + 1j * (
+            0.2 - 0.02 * index[0] + 0.05 * index[1]
+        )
+        reference = np.stack(
+            [np.linspace(600.0, 430.0, frequency.size) + 7.0 * n for n in range(ports)], axis=1
+        ).astype(complex)
+        provenance = {"title": title} if title else {}
+        if stated:
+            provenance[IMPEDANCE_STATED] = stated
+        return SParameters(
+            frequency=frequency,
+            s=s.astype(complex),
+            port_numbers=tuple(range(1, ports + 1)),
+            reference=reference,
+            measured_impedance=reference.copy(),
+            self_referenced=tuple(range(1, ports + 1)),
+            provenance=provenance,
+        )
 
-        A mirror declares the two ports identical, so asking for one against a
-        number and the other against itself asks for the copy to be taken in one
-        basis and reported in another - the final renormalisation then moves
-        the two diagonal terms by different amounts. ``Gui/symmetry`` warns
-        before the solve; the file cannot be written either way, because two
+    @pytest.mark.parametrize("ports", [2, 3, 4])
+    def test_a_reference_at_each_point_round_trips_through_a_file(self, tmp_path, ports):
+        """What is written is what a reader of the per-point form takes back,
+        past the header, beyond two ports where a row runs over several lines,
+        and under a title a reader would otherwise dispatch on."""
+        from Microwave.Results import _skrf
+
+        for title in ("", "Port impedance study", "Gamma sweep"):
+            result = self.at_each_point(
+                ports, title, stated={"1": "the wave impedance of its mode"}
+            )
+            written = result.write_touchstone(tmp_path / f"guide{ports}", per_point=True)
+            again = _skrf.module().Network(str(written))
+
+            assert np.array_equal(again.s, result.s)
+            assert np.array_equal(again.z0, result.reference)
+            assert again.s_def == "power"
+
+    def test_a_reference_at_each_point_says_where_it_is_and_what_else_reads_it(self, tmp_path):
+        result = self.at_each_point(stated={"2": "the wave impedance of its mode, k Z0 / beta"})
+        text = result.write_touchstone(tmp_path / "guide", per_point=True).read_text()
+        header = " ".join(line[16:].strip() for line in text.splitlines() if line.startswith("!  "))
+
+        assert "which scikit-rf reads as 50 ohm and another reader may refuse" in header
+        assert "At port 2 it is the wave impedance of its mode, k Z0 / beta." in header
+        assert "renormalising them is not" in header
+        # Nothing the workbench wrote starts a line with a word the reader
+        # dispatches on, whatever the wrapping.
+        ours = text.split("# ")[0].lower().splitlines()
+        assert not [line for line in ours if line.startswith(("! port", "! gamma"))]
+
+    def test_only_a_port_at_its_own_mode_says_which_impedance(self, tmp_path):
+        """A guide port at a number the user typed states that number, and
+        naming the guide's impedance for it would contradict the data."""
+        result = replace(
+            self.at_each_point(stated={"1": "A-IMPEDANCE", "2": "B-IMPEDANCE"}),
+            self_referenced=(2,),
+        )
+        text = result.write_touchstone(tmp_path / "guide", per_point=True).read_text()
+
+        assert "B-IMPEDANCE" in text and "A-IMPEDANCE" not in text
+
+    def test_no_port_at_its_own_mode_says_nothing_about_renormalising(self, tmp_path):
+        result = replace(self.at_each_point(stated={"1": "A-IMPEDANCE"}), self_referenced=())
+        text = result.write_touchstone(tmp_path / "guide", per_point=True).read_text()
+
+        assert "A-IMPEDANCE" not in text and "renormalising" not in text
+
+    def test_the_runs_decide_together_which_impedance_a_port_states(self):
+        """The reference is taken over every run, so a port one run read again
+        and another did not is at a mean of two definitions, and the matrix
+        names neither."""
+        runs = series_resistor(30.0, 75.0, 20.0)
+        runs[0].provenance[IMPEDANCE_STATED] = {"1": "READ", "2": "SAME"}
+        runs[1].provenance[IMPEDANCE_STATED] = {"1": "RAW", "2": "SAME"}
+
+        assembled = SParameters.from_runs(runs, reference=None)
+
+        assert assembled.provenance[IMPEDANCE_STATED] == {"2": "SAME"}
+
+    def test_no_line_of_the_reference_starts_with_a_word_the_reader_acts_on(
+        self, tmp_path, monkeypatch
+    ):
+        """Whatever the wrapping hands it: every line after the first sits under
+        the label, and the reader matches a keyword only at a line's start."""
+        from Microwave.Results import _skrf
+
+        keywords = [
+            "port impedance 1 2",
+            "gamma 3 4",
+            "modal data exported",
+            "terminal data exported",
+        ]
+        monkeypatch.setattr(SParameters, "_reference_lines", lambda self: ["first", *keywords])
+        result = self.at_each_point()
+        written = result.write_touchstone(tmp_path / "guide", per_point=True)
+        again = _skrf.module().Network(str(written))
+
+        assert np.array_equal(again.z0, result.reference)
+        assert [line for line in written.read_text().splitlines() if line.endswith(keywords[0])]
+
+    def test_a_title_naming_a_wave_definition_does_not_change_the_one_read_back(self, tmp_path):
+        """The reader takes the definition from any comment that names one, so
+        the file's own must be the only one."""
+        from Microwave.Results import _skrf
+
+        for definition in ("traveling", "pseudo"):
+            result = self.at_each_point(title=f"S-parameter uses the {definition} definition")
+            written = result.write_touchstone(tmp_path / "t", per_point=True)
+            assert _skrf.module().Network(str(written)).s_def == "power"
+
+    def test_a_reference_no_port_can_have_is_refused(self, tmp_path):
+        for value in (0.0, -50.0):
+            result = replace(self.at_each_point(), reference=np.full((5, 2), value, dtype=complex))
+            result = replace(result, reference=result.reference + np.arange(5)[:, None])
+            with pytest.raises(ResultError, match="as a real impedance"):
+                result.write_touchstone(tmp_path / "guide", per_point=True)
+
+    def test_one_reference_stays_on_the_option_line_when_each_point_is_asked_for(self, tmp_path):
+        """The per-point form could hold it too, and would only lose readers."""
+        result = SParameters.from_runs(series_resistor(30.0, 75.0, 20.0), reference=50.0)
+        text = result.write_touchstone(tmp_path / "device", per_point=True).read_text()
+
+        assert "# HZ S RI R 50" in text.upper()
+        assert "! Port Impedance" not in text
+
+    def test_a_reference_at_each_point_is_written_only_when_asked_for(self, tmp_path):
+        result = self.at_each_point()
+        # The refusal names the way to ask, and what asking costs.
+        with pytest.raises(ResultError, match=r"per_point=True .* reads with no reference"):
+            result.write_touchstone(tmp_path / "guide")
+        assert not (tmp_path / "guide.s2p").exists()
+
+    def test_a_complex_or_missing_reference_is_refused_even_at_each_point(self, tmp_path):
+        """The wave definitions differ at a complex reference, and scikit-rf
+        reads the per-point form as the one it takes HFSS to use. A missing one
+        has nothing to state, and an infinite one is no impedance a port has."""
+        complex_ = SParameters.from_runs(series_resistor(30.0, 75.0, 20.0), reference=50.0)
+        infinite = np.array(complex_.reference)
+        infinite[:, 0] = np.inf
+        for reference in (
+            np.full_like(complex_.reference, 50.0 - 3.0j),
+            np.full_like(complex_.reference, np.nan),
+            infinite,
+        ):
+            result = replace(complex_, reference=reference)
+            with pytest.raises(ResultError, match="as a real impedance"):
+                result.write_touchstone(tmp_path / "device", per_point=True)
+            assert not (tmp_path / "device.s2p").exists()
+
+    def test_a_mirror_whose_ports_end_up_at_different_references_is_refused(self, tmp_path):
+        """A mirror declares the two ports identical, so asking for one against
+        a number and the other against itself reports two identical ports at two
+        references. ``Gui/symmetry`` warns before the solve; the file's option
+        line cannot state them, because it states one reference and two
         references are two references.
         """
         result = SParameters.from_runs(
@@ -1509,7 +2561,7 @@ class TestASolveThatReturnedNoFieldAtAll:
             self.blank().network()
 
     def test_usable_does_not_hand_back_the_same_dead_end(self):
-        """``_kept`` was fixed to ask the array; ``usable`` was left guarding on
+        """``kept`` was fixed to ask the array; ``usable`` was left guarding on
         ``discarded``, so it returned ``self`` for a solve with nothing
         discarded - and the refusal that sent the user here said "call
         usable() for the points that do"."""
@@ -1532,7 +2584,7 @@ class TestASolveThatReturnedNoFieldAtAll:
             "s",
             np.where(np.arange(2)[None, None, :] == 0, 0.1 + 0.2j, np.nan) * np.ones((3, 2, 2)),
         )
-        assert result._kept.all()
+        assert result.kept.all()
 
 
 class TestWhatABandWithAHoleRefuses:
@@ -1626,6 +2678,260 @@ class TestWhatABandWithAHoleRefuses:
         symmetry, and the declaration is about the structure, not the band."""
         result = SParameters.from_runs(one_bad_point(index=1))
         assert result.mirror_disagreement() < 1e-6
+
+
+GUIDE_BAND = (1e9, 2e9, 3e9, 4e9, 5e9)
+
+#: The cutoff of the guide :func:`below_cutoff` describes, between the second
+#: point of :data:`GUIDE_BAND` and the third.
+GUIDE_CUTOFF = 2.5e9
+
+
+def below_cutoff(frequency=GUIDE_BAND, cutoff=GUIDE_CUTOFF, length=0.01):
+    """The two runs of a straight guide whose band starts below its mode's
+    cutoff, each port stating ``k Z0 / beta`` as openEMS does.
+
+    Below cutoff ``beta`` is imaginary, so each port's impedance has no real
+    part and the port carries no power; the waves there are the evanescent
+    field's, finite and normalisable by nothing. Above it the guide is matched,
+    and its transmission is ``exp(-j beta L)``.
+    """
+    frequency = np.asarray(frequency, dtype=float)
+    k = 2 * np.pi * frequency / 299792458.0
+    kc = 2 * np.pi * cutoff / 299792458.0
+    beta = np.sqrt(k**2 - kc**2 + 0j)
+    z = k * 376.730313668 / beta
+    through = np.exp(-1j * beta * length)
+    nothing = np.zeros_like(through)
+    z_ref = {1: z, 2: z}
+    return [
+        Run(frequency, 1, z_ref, {(1, 1): nothing, (2, 1): through}),
+        Run(frequency, 2, z_ref, {(1, 2): through, (2, 2): nothing}),
+    ]
+
+
+def _powered_points(frequency=GUIDE_BAND, cutoff=GUIDE_CUTOFF):
+    return tuple(f for f in frequency if f > cutoff)
+
+
+class TestAPortThatCarriesNoPower:
+    """A waveguide study whose band starts below its mode's cutoff.
+
+    Pre-flight warns and the run goes ahead, since the points above cutoff are
+    sound. The points below it cannot be normalised: every term is 0/0. They
+    come back blank and named, the rest is assembled as though they had never
+    been asked for, and every message about them says a port carried no power
+    rather than that the runs disagreed or the solve returned no field.
+    """
+
+    def test_the_premise_each_port_states_an_impedance_with_no_real_part(self):
+        """If this ever fails the tests below prove nothing."""
+        z = below_cutoff()[0].port(1).z0
+        assert np.all(z[:2].real == 0.0) and np.all(z[:2].imag != 0.0)
+        assert np.all(z[2:].real > 0.0)
+
+    @pytest.mark.parametrize(
+        "reference, driven, symmetry",
+        [
+            (None, (1, 2), None),
+            (50.0, (1, 2), None),
+            ([None, 50.0], (1, 2), None),
+            (50.0, (1,), None),
+            (None, (1,), MIRROR),
+            (50.0, (1,), MIRROR),
+        ],
+    )
+    def test_it_assembles_at_any_reference(self, reference, driven, symmetry):
+        """At a fixed reference scikit-rf renormalises through Z-parameters,
+        whose inverse refused the whole band over one point of 0/0."""
+        runs = [run for run in below_cutoff() if run.excited_port in driven]
+        result = SParameters.from_runs(runs, reference=reference, symmetry=symmetry)
+        assert result.unpowered == (0, 1)
+        assert result.discarded == ()
+        known = [result.index_of(n) for n in sorted(result.known)]
+        assert np.all(np.isnan(result.s[:2]))
+        assert np.all(np.isfinite(result.s[2:][:, :, known]))
+
+    @pytest.mark.parametrize("reference", [None, 50.0])
+    def test_the_rest_equals_a_sweep_that_never_had_them(self, reference):
+        """Exactly, since renormalisation is per point and the points left out
+        are left out of it rather than handed to it."""
+        spoiled = SParameters.from_runs(below_cutoff(), reference=reference).usable()
+        clean = SParameters.from_runs(
+            below_cutoff(frequency=_powered_points()), reference=reference
+        )
+        assert np.array_equal(spoiled.frequency, clean.frequency)
+        assert np.array_equal(spoiled.s, clean.s)
+
+    def test_a_point_with_a_real_part_is_not_one(self):
+        """The boundary: a guide just above cutoff states a large impedance,
+        and it carries power."""
+        result = SParameters.from_runs(below_cutoff(cutoff=0.999e9))
+        assert result.unpowered == ()
+        assert result.kept.all()
+
+    def test_a_port_that_states_no_impedance_is_not_one(self):
+        """Palace states none for a port it read no voltage at, and ``nan``
+        stands in for it. A number that is not there says nothing about power."""
+        full = SParameters.from_runs(series_resistor(50.0, 50.0, 10.0))
+        result = replace(full, measured_impedance=np.full_like(full.measured_impedance, np.nan))
+        assert result.unpowered == ()
+        assert result.kept.all()
+
+    def test_the_refusal_says_the_ports_carry_no_power(self):
+        """Not "the solve returned no field, check the port planes": the port
+        planes are sound, and that sends the user to the wrong object."""
+        with pytest.raises(ResultError) as raised:
+            SParameters.from_runs(below_cutoff()).network()
+        said = str(raised.value)
+        assert "Ports 1 and 2 carry no power there" in said
+        assert "below its mode's cutoff" in said
+        assert "grid lines" not in said and "disagreed" not in said
+
+    def test_it_names_where_a_band_would_start_above_cutoff(self):
+        """The first point carrying power, not the last carrying none: the
+        cutoff lies between the two, and a band started just past the second
+        can still start below it."""
+        with pytest.raises(ResultError, match="Start the band at 3 GHz or above"):
+            SParameters.from_runs(below_cutoff()).network()
+
+    def test_one_port_is_named_alone(self):
+        runs = below_cutoff()
+        powered = np.asarray(runs[0].port(1).z0).real.max() * np.ones(len(GUIDE_BAND))
+        for run in runs:
+            run._z = {1: run._z[1], 2: powered + 0j}
+        with pytest.raises(ResultError, match="Port 1 carries no power there: its impedance"):
+            SParameters.from_runs(runs).network()
+
+    def test_each_cause_says_which_points_are_its_own(self):
+        """One point the runs disagree about, beside two that carry no power."""
+        runs = below_cutoff()
+        scale = np.ones(len(GUIDE_BAND), dtype=complex)
+        scale[3] = 2.0
+        runs[0]._z = {1: runs[0]._z[1] * scale, 2: runs[0]._z[2]}
+        result = SParameters.from_runs(runs)
+        assert result.discarded == (3,) and result.unpowered == (0, 1)
+        power, disagreement = result.blank_causes()
+        assert "carry no power at 2 of them (lowest 1 GHz, highest 2 GHz)" in power
+        assert "disagreed about port impedance at 1 of them (at 4 GHz)" in disagreement
+
+    def test_a_band_below_cutoff_throughout_is_refused(self):
+        with pytest.raises(ResultError) as raised:
+            SParameters.from_runs(below_cutoff(cutoff=6e9))
+        said = str(raised.value)
+        assert "no frequency point of this sweep can be normalised" in said
+        assert "carry no power at 5 of the 5" in said
+        # Where the cutoff lies above the band is not known from it, so the
+        # top of the band is not offered as a start that clears it.
+        assert "Start the band above" not in said
+        assert "above the cutoff of each port's mode, which lies above 5 GHz" in said
+
+    def test_ports_cut_off_at_different_frequencies_are_named_each_with_its_own(self):
+        """A junction whose arms are built a little differently: port 2 carries
+        power from the second point, port 1 from the third."""
+        runs = below_cutoff()
+        powered = below_cutoff(cutoff=1.5e9)[0].port(1).z0
+        for run in runs:
+            run._z = {1: run._z[1], 2: powered}
+        (cause,) = SParameters.from_runs(runs).blank_causes()
+        assert cause.startswith(
+            "At each of them a port carries no power: port 1 at 2 (lowest 1 GHz, highest "
+            "2 GHz); port 2 at 1 (at 1 GHz)"
+        )
+        assert "Start the band at 3 GHz or above" in cause
+
+    def test_and_beside_another_cause_each_still_says_where(self):
+        """The sentence then starts with where its points are, units intact."""
+        runs = below_cutoff()
+        powered = below_cutoff(cutoff=1.5e9)[0].port(1).z0
+        scale = np.ones(len(GUIDE_BAND), dtype=complex)
+        scale[3] = 2.0
+        for run in runs:
+            run._z = {1: run._z[1], 2: powered}
+        runs[0]._z = {1: runs[0]._z[1] * scale, 2: runs[0]._z[2]}
+        power, _ = SParameters.from_runs(runs).blank_causes()
+        assert power.startswith(
+            "At 2 of them (lowest 1 GHz, highest 2 GHz) a port carries no power: port 1"
+        )
+
+    def test_what_a_column_read_alone_carries_is_taken_over_the_rest(self):
+        """The bound divides by the power the driven port carries, which is
+        none below cutoff. Port 2 sends back a tenth of what reaches it, so
+        there is a bound to take."""
+        run = below_cutoff()[0]
+        through = run.s(2, 1)
+        back = 0.1 * through
+        run.waves = {1: (np.ones_like(through), through * back), 2: (back, through)}
+        result = SParameters.from_runs([run], reference=50.0)
+        for record in result.provenance[SENT_BACK].values():
+            assert np.isfinite(record["bound"])
+            assert record["frequency"] > GUIDE_CUTOFF
+        magnified = result.provenance[MAGNIFIED]
+        assert np.isfinite(magnified["factor"]) and magnified["frequency"] > GUIDE_CUTOFF
+
+    def test_the_file_says_why_the_points_are_missing(self, tmp_path):
+        text = SParameters.from_runs(below_cutoff(), reference=50.0).usable()
+        text = text.write_touchstone(tmp_path / "guide").read_text()
+        assert "2 FREQUENCY POINT(S) ARE MISSING (lowest 1 GHz, highest 2 GHz)" in text
+        assert "Ports 1 and 2 carry no power there" in text
+        assert "disagreed" not in text
+
+    def test_no_line_of_it_is_read_as_an_extension(self, tmp_path):
+        """A sentence starting "Ports 1 and 2" at the head of a comment is the
+        word a Touchstone reader takes for a port impedance line."""
+        from Microwave.Results import _skrf
+
+        path = (
+            SParameters.from_runs(below_cutoff(), reference=50.0)
+            .usable()
+            .write_touchstone(tmp_path / "guide")
+        )
+        read = _skrf.module().Network(str(path))
+        assert np.all(read.z0 == 50.0)
+        assert read.f.size == len(_powered_points())
+        # scikit-rf hands a line starting "! Port" to its port-name parser and
+        # keeps it out of the comments it reads.
+        assert "carry no power there" in read.comments
+
+    def test_a_point_that_carries_no_power_need_not_be_separable(self):
+        """Below cutoff the guide behind a port's plane carries nothing into
+        the absorber either, so the port sends back all of what reaches it and
+        the runs' incident waves are in proportion. Asked to be separable
+        there, the assembly refused the whole band over points it blanks."""
+        runs = below_cutoff()
+        cut = np.array([1.0, 1.0, 0.0, 0.0, 0.0], dtype=complex)
+        for run, other in zip(runs, (2, 1), strict=True):
+            driven = run.excited_port
+            ones = np.ones(len(GUIDE_BAND), dtype=complex)
+            run.waves = {
+                driven: (ones, run.s(driven, driven)),
+                other: (cut, run.s(other, driven)),
+            }
+        result = SParameters.from_runs(runs)
+        assert result.unpowered == (0, 1)
+
+    def test_one_port_without_power_blanks_a_mirror_whose_impedance_has_some(self):
+        """A declared mirror normalises both ports at their mean impedance,
+        which has a real part where one of the two has none. The point is
+        still one where a port carries no power."""
+        runs = below_cutoff()[:1]
+        z = np.asarray(runs[0]._z[1]).copy()
+        z[0] = 400.0 - 300j
+        z[1] = 0.0 - 200j
+        runs[0]._z = {1: runs[0]._z[1], 2: z}
+        result = SParameters.from_runs(runs, reference=50.0, symmetry=MIRROR)
+        assert result.unpowered == (0, 1)
+        assert np.all(np.isnan(result.s[:2]))
+
+    def test_a_mirror_with_no_point_to_compare_says_why(self):
+        full = SParameters.from_runs(below_cutoff())
+        dead = replace(
+            full,
+            s=np.full_like(full.s, np.nan),
+            measured_impedance=np.full_like(full.measured_impedance, -300j),
+        )
+        with pytest.raises(ResultError, match="nothing to compare. Ports 1 and 2 carry no power"):
+            dead.mirror_disagreement()
 
 
 class TestWhereTheFileActuallyLands:

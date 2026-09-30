@@ -1,0 +1,31 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "sheet_on_a_post_face.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "post",
+      "dim": 3,
+      "file": "sheet_on_a_post_face.1.brep",
+      "priority": 1,
+      "leaves": true
+    },
+    {
+      "label": "sheet",
+      "dim": 2,
+      "file": "sheet_on_a_post_face.2.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "sheet_on_a_post_face.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 5808.0,
+  "outside": 2408.0
+}

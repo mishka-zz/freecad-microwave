@@ -1,0 +1,38 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "two_posts_across_a_sheet.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "left",
+      "dim": 3,
+      "file": "two_posts_across_a_sheet.1.brep",
+      "priority": 1,
+      "leaves": true
+    },
+    {
+      "label": "right",
+      "dim": 3,
+      "file": "two_posts_across_a_sheet.2.brep",
+      "priority": 1,
+      "leaves": true
+    },
+    {
+      "label": "sheet",
+      "dim": 2,
+      "file": "two_posts_across_a_sheet.3.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "two_posts_across_a_sheet.4.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 5808.0,
+  "outside": 2408.0
+}

@@ -30,6 +30,9 @@ class EMSParametersViewProvider(HasDisplayMode):
         The menu carries one impedance entry per port that can produce a trace,
         and one entry anyway when no port can, so the user can press it and be
         told why. ``Results/tdr.py`` writes those refusals for exactly this.
+
+        The comparison is offered where the study holds a second result to
+        compare this one with, which is decided without reading either.
         """
         self._acting_on = vobj.Object
         self._add(menu, "Plot S-parameters", self.plot_matrix)
@@ -39,6 +42,8 @@ class EMSParametersViewProvider(HasDisplayMode):
                 f"Plot impedance along the line (port {number})",
                 self._impedance_of(number),
             )
+        if self._comparable():
+            self._add(menu, "Compare S-parameters", self.compare)
         self._add(menu, "Export Touchstone...", self.export_touchstone)
 
     def _add(self, menu, text, slot):
@@ -48,6 +53,17 @@ class EMSParametersViewProvider(HasDisplayMode):
         action = QtGui.QAction(text, menu)
         action.triggered.connect(slot)
         menu.addAction(action)
+
+    def _comparable(self):
+        """Whether the study holding this result holds one other to compare it with."""
+        try:
+            from ..Gui.results import results_of
+            from ..Objects.analysis import analysis_of
+
+            analysis = analysis_of(self._acting_on)
+            return analysis is not None and len(results_of(analysis)) == 2
+        except Exception:
+            return False
 
     def _impedance_ports(self):
         """Port numbers to offer an impedance chart for. Never empty.
@@ -109,6 +125,17 @@ class EMSParametersViewProvider(HasDisplayMode):
 
             refused("Plot impedance", f"cannot plot port {number}: {error}")
 
+    def compare(self, *_):
+        """This result against the other backend's in its study."""
+        try:
+            from ..Commands import compare_s_parameters
+
+            compare_s_parameters(self._acting_on.Document, [self._acting_on])
+        except Exception as error:
+            from ..Gui.notify import refused
+
+            refused("Compare S-parameters", f"cannot compare: {error}")
+
     def export_touchstone(self, *_):
         """Write the object this menu was raised on.
 
@@ -126,8 +153,8 @@ class EMSParametersViewProvider(HasDisplayMode):
     def doubleClicked(self, vobj):
         """Plot the stored matrix.
 
-        This does not open the analysis panel, which is what double-clicking the
-        solver does. A result is a thing to look at, and the numbers are already
+        This does not open a run panel, which is what double-clicking a solver
+        does. A result is a thing to look at, and the numbers are already
         in the document. Opening the panel would put a Run button in front of a
         user who asked to see an answer they already have.
         """

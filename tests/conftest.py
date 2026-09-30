@@ -15,6 +15,7 @@ Qt and pivy are stubbed for the same reason and a simpler one: they ship inside
 FreeCAD and cannot be installed here.
 """
 
+import functools
 import os
 import re
 import sys
@@ -110,12 +111,18 @@ class DocumentObjectStub:
         super().__setattr__("_colors", set())
         super().__setattr__("_enums", {})
         super().__setattr__("_editor_modes", {})
+        #: The tooltip each property was created with, which the property editor
+        #: shows and ``getDocumentationOfProperty`` hands back.
+        super().__setattr__("_documentation", {})
         #: What ``setPropertyStatus`` was told, per property. Recorded rather
         #: than acted on: whether a status suppresses FreeCAD's touch is
         #: FreeCAD's decision, and a stub that modelled it would be the thing
         #: asserting itself. ``tests/test_preview_recompute.py`` counts that
         #: under a real one.
         super().__setattr__("_property_status", {})
+        #: The type and group each added property was declared with.
+        super().__setattr__("_types", {})
+        super().__setattr__("_groups", {})
         super().__setattr__("TypeId", type)
         super().__setattr__("Type", type)
         super().__setattr__("Name", name)
@@ -138,8 +145,16 @@ class DocumentObjectStub:
             super().__setattr__("Placement", MagicMock())
             super().__setattr__("Shape", MagicMock())
 
+        # FreeCAD's mesh object carries its mesh as a property of its own type.
+        if type.startswith("Fem::FemMeshObject"):
+            self.PropertiesList.append("FemMesh")
+            self._props["FemMesh"] = None
+
     def addProperty(self, ptype, pname, pgroup="", pdoc=""):
         self.PropertiesList.append(pname)
+        self._documentation[pname] = pdoc
+        self._types[pname] = ptype
+        self._groups[pname] = pgroup
         if "PropertyEnumeration" in ptype:
             self._enums[pname] = []
             self._props[pname] = None
@@ -180,6 +195,22 @@ class DocumentObjectStub:
         if name not in self._props and name not in self._enums:
             raise AttributeError(f"Property container has no property '{name}'")
         self._property_status.setdefault(name, []).append(status)
+
+    def getPropertyStatus(self, name):
+        """What ``setPropertyStatus`` was told, and, for a property added to the
+        object, the status FreeCAD 1.1.1 reports every added property carrying,
+        21, as it does beside the names."""
+        added = [21] if name in self._types else []
+        return [*self._property_status.get(name, ()), *added]
+
+    def getTypeIdOfProperty(self, name):
+        return self._types.get(name, "")
+
+    def getGroupOfProperty(self, name):
+        return self._groups.get(name, "")
+
+    def getDocumentationOfProperty(self, name):
+        return self._documentation[name]
 
     def setEditorMode(self, name, mode):
         # Read-only/hidden flags are display state, but a property hidden
@@ -255,6 +286,22 @@ class DocumentObjectStub:
                 "this too: a property must be added before it can be set"
             )
 
+    def removeProperty(self, name):
+        """As FreeCAD's: the property goes, with its value and what it was
+        declared as."""
+        self.PropertiesList.remove(name)
+        for held in (
+            self._props,
+            self._enums,
+            self._types,
+            self._groups,
+            self._documentation,
+            self._property_status,
+        ):
+            held.pop(name, None)
+        self._colors.discard(name)
+        return True
+
     def purgeTouched(self):
         super().__setattr__("_touched", False)
 
@@ -282,6 +329,8 @@ class DocumentStub:
     #: which is the state a fresh one is actually in.
     Name = "Unnamed"
     FileName = ""
+    #: A real document's, and false until somebody freezes recomputes.
+    RecomputesFrozen = False
 
     def __init__(self):
         self.reset()
@@ -293,6 +342,7 @@ class DocumentStub:
         # later file asserts the unsaved default.
         self.__dict__.pop("Name", None)
         self.__dict__.pop("FileName", None)
+        self.__dict__.pop("RecomputesFrozen", None)
         #: ``(label, outcome)`` per transaction, in order. A real document has
         #: these three and code that groups an edit into one undo step calls
         #: them; a stub without them turns "did this open a transaction?" into
@@ -331,7 +381,14 @@ class DocumentStub:
         return self._objects.get(name)
 
     def removeObject(self, name):
-        del self._objects[name]
+        # A real document takes the object out of any group holding it as well,
+        # measured on 1.1.1 - and a stub that left it there would hand a lookup
+        # through the study an object the document no longer has.
+        gone = self._objects.pop(name)
+        for obj in self._objects.values():
+            held = getattr(obj, "Group", None)
+            if held is not None and any(member is gone for member in held):
+                obj.Group = [member for member in held if member is not gone]
 
     @property
     def Objects(self):
@@ -396,6 +453,15 @@ class FreeCADStub:
     def getUserAppDataDir(self):
         return self.USER_APP_DATA_DIR
 
+    def newDocument(self, name="Unnamed", label=None, hidden=False, temp=False):
+        """A document of its own, which the active one does not see."""
+        made = DocumentStub()
+        made.Name = name
+        return made
+
+    def closeDocument(self, name):
+        pass
+
     def ParamGet(self, group):
         return self.ParameterGrp()
 
@@ -448,10 +514,11 @@ sys.modules["PySide.QtWidgets"] = _qt.QtWidgets
 #: is still a study.
 #:
 #: Both halves are load-bearing, these being names rather than objects: a
-#: sequence of *drawings* costs nothing at all, and ``test_coax_fixture`` reads
-#: the same refinement off the envelopes with no solver anywhere in it. What
-#: separates the two is :func:`interpreter`, which is how anything here reaches
-#: openEMS and so is in the closure of everything that solves.
+#: sequence of *drawings* costs nothing at all, and
+#: ``test_openems_coax_fixture`` reads the same refinement off the envelopes
+#: with no solver anywhere in it. What separates the two is
+#: :func:`interpreter`, which is how anything here reaches openEMS and so is in
+#: the closure of everything that solves.
 #:
 #: This is one reason to be held back and not the only one, which is why the
 #: marker names the tier rather than the reason. What it cannot see is a test
@@ -515,10 +582,12 @@ def pytest_collection_modifyitems(config, items):
 #: the assertion: the sphere's poles turned, the line along the other axis, the
 #: pillbox short, its probe doubled, its caps handed over on the grid line, the
 #: guide on its other axis, the two-port's second excitation. Then one apiece for
-#: the gates driven from a document in ``test_document_translation``.
+#: the gates driven from a document in ``test_openems_document_translation``.
 #:
 #: A count of solves rather than a time, a time belonging to whichever machine
-#: measured it.
+#: measured it. Palace solves are not counted: the census wraps openEMS' own run
+#: and nothing on the other backend passes through it. What a Palace gate could
+#: not reach is held by :data:`UNREACHED` instead.
 #:
 #: **Held from both sides.** Over it, and something that solves a sequence has
 #: got into the tier. Under it on a run that collected every gate, and a gate has
@@ -526,7 +595,36 @@ def pytest_collection_modifyitems(config, items):
 #: which is the fault this whole tier is about, one level down. Either way the
 #: run's exit status is the signal: pytest's own summary counts assertions and
 #: none of these failed.
-PRE_COMMIT_SOLVES = 19
+PRE_COMMIT_SOLVES = 25
+
+#: Every engine a test of this run could not reach, one reason for each, filled
+#: by :func:`unreachable`. A gate that skipped for want of its engine reads as a
+#: skip among many, and a Palace gate reaches its engine inside a FreeCAD
+#: subprocess the census cannot see. So a run that collected every gate is held
+#: to reaching all of them by this record, whichever backend each one solves on.
+UNREACHED: list[str] = []
+
+
+def unreachable(reason: str, *, module_level: bool = False):
+    """Skip because this machine cannot reach an engine, and record it.
+
+    The one way a test says that its engine, its mesher or the CAD kernel is
+    missing. A skip for any other reason - a specimen with nothing to measure, a
+    case that does not apply - is an ordinary skip and is not recorded.
+    """
+    UNREACHED.append(reason)
+    pytest.skip(reason, allow_module_level=module_level)
+
+
+def needed(module: str, reason: str, *, module_level: bool = False):
+    """Import ``module``, or skip as :func:`unreachable` does. What
+    ``pytest.importorskip`` does, with the skip recorded."""
+    import importlib
+
+    try:
+        return importlib.import_module(module)
+    except ImportError:
+        unreachable(reason, module_level=module_level)
 
 
 #: Where a growth stops being linear and starts being quadratic, as a power of
@@ -581,10 +679,18 @@ def pytest_collection_finish(session):
     gates = {path.name for path in Path(__file__).resolve().parent.glob("test_acceptance_*.py")}
     session.config.studied = any(item.get_closest_marker("release") for item in session.items)
     session.config.whole_tier = gates <= {item.path.name for item in session.items}
+    session.config.unreached = UNREACHED
 
 
 def _off_budget(config) -> str:
     """What is wrong with the number of solves a pre-commit run made, or nothing."""
+    unreached = sorted(set(getattr(config, "unreached", ())))
+    if unreached and getattr(config, "whole_tier", False):
+        return (
+            "a run that collected every gate skipped what this machine could not "
+            "reach, so it is not the run it reads as. Make each reachable, or "
+            "deselect the gates that need it: " + "; ".join(unreached)
+        )
     solved = getattr(config, "solve_census", ())
     if getattr(config, "studied", True) or not solved:
         return ""
@@ -612,9 +718,10 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     tiering is argued from and a remembered one would be the wrong one.
     """
     solved = getattr(config, "solve_census", ())
-    if not solved:
-        return
-    terminalreporter.write_line(f"SOLVES {len(solved)} openEMS runs")
+    if solved:
+        terminalreporter.write_line(f"SOLVES {len(solved)} openEMS runs")
+    for reason in sorted(set(getattr(config, "unreached", ()))):
+        terminalreporter.write_line(f"UNREACHED {reason}")
     wrong = _off_budget(config)
     if wrong:
         terminalreporter.write_sep("=", "SOLVES", red=True, bold=True)
@@ -643,7 +750,7 @@ def interpreter(census):
     try:
         return run.find_interpreter()
     except run.EngineNotFound as error:
-        pytest.skip(str(error))
+        unreachable(str(error))
 
 
 @pytest.fixture(autouse=True)
@@ -652,9 +759,116 @@ def reset_document():
     yield
 
 
+@pytest.fixture(autouse=True)
+def uniform_asked(monkeypatch):
+    """What each translation asked of a waveguide port's guide, as a list of
+    ``(port, axis, direction, reach, why)``, in place of the answer.
+
+    Whether a guide is uniform over a depth is asked of the CAD kernel, and no
+    kernel runs in this interpreter. The kernel's answer is driven under a real
+    FreeCAD by ``tests/openems_palace_faces_probe.py``; here a test reads what
+    was asked.
+    """
+    from Microwave.Solvers import reference_plane
+
+    asked = []
+
+    def record(port, faces, axis, direction, reach, referred, bound, outside, why, remedy):
+        asked.append((port, axis, direction, reach, why))
+
+    monkeypatch.setattr(reference_plane, "check_uniform", record)
+    return asked
+
+
+@pytest.fixture(autouse=True)
+def bound_of_a_stub(monkeypatch):
+    """Every bound the translation takes, answered by the shape's ``BoundBox``.
+
+    A stub is a world of boxes. It carries no mesh and no surface the kernel
+    bounds loosely, so ``BoundBox`` is what :func:`Microwave.drawn.bound` and
+    :func:`Microwave.drawn.reached` would answer of it. A box meets a plane at
+    its extreme with a face lying in it, so :func:`Microwave.drawn.touching`
+    finds nothing. The real ones are driven under a real FreeCAD by
+    ``tests/openems_corpus_probe.py`` and ``tests/palace_curved_ends_probe.py``.
+    """
+    from Microwave import drawn
+
+    monkeypatch.setattr(drawn, "bound", lambda shape: shape.BoundBox)
+    monkeypatch.setattr(drawn, "reached", lambda shape: shape.BoundBox)
+    monkeypatch.setattr(drawn, "touching", lambda shape, dim, sign, at: None)
+
+
+@pytest.fixture(autouse=True)
+def rooms_asked(monkeypatch):
+    """What each translation asked the CAD kernel about the room its drawing
+    leaves in the box round it, as a list of ``(lower, upper, held, sheets)``.
+    The answer is that there is none.
+
+    No kernel runs in this interpreter. The kernel's answer is driven under a
+    real FreeCAD by ``tests/openems_palace_faces_probe.py``; here a test reads
+    what was asked, or sets ``answer`` to rooms of its own.
+    """
+    from Microwave import drawn
+
+    asked = []
+
+    def record(lower, upper, held, sheets):
+        asked.append((lower, upper, held, sheets))
+        return list(record.answer)
+
+    record.answer = []
+    monkeypatch.setattr(drawn, "rooms", record)
+    return record, asked
+
+
 @pytest.fixture
 def doc():
     return stub.ActiveDocument
+
+
+# ---------------------------------------------------------------------------
+# Holding a stand-in to the class it stands for
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def declared_by(module, name):
+    """Every property the real document class ``name`` adds, as a frozenset.
+
+    ``module`` is the dotted path under ``Microwave.Objects`` the class lives
+    in. The class is built on the stubs above, which is what makes this
+    answerable with no CAD kernel: ``addProperty`` records exactly what it was
+    given, so the set is what a real object of that class carries.
+
+    Cached, because it is asked once per fixture call and the answer is fixed at
+    import time.
+    """
+    import importlib
+
+    made = stub.ActiveDocument.addObject("App::FeaturePython", f"declared{name}")
+    getattr(importlib.import_module(f"Microwave.Objects.{module}"), name)(made)
+    declared = frozenset(made.PropertiesList)
+    stub.ActiveDocument.removeObject(made.Name)
+    return declared
+
+
+def only_declared(module, name, properties):
+    """Refuse a stand-in keyword the real class does not declare.
+
+    A stand-in is an attribute bag: it sets whatever it is handed, so a fixture
+    goes on carrying a property that has moved to another class and nothing says
+    a word. What that costs is not a red test - it is a *green* one, describing
+    a document nobody can build, and the run underneath it reading the real
+    object's default instead. A property moved between two document classes
+    reached a solve that way.
+
+    What it costs to hold: a fixture can no longer name a property before the
+    class declares one, so a test written against a property being added has to
+    add it to the class first. That is the direction to fail in.
+    """
+    stray = sorted(set(properties) - declared_by(module, name))
+    assert not stray, f"{name} declares no {stray}, so a stand-in carrying them stands for nothing"
+    return properties
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +883,7 @@ FREECAD_CANDIDATES = (
     "/usr/local/bin/freecadcmd",
 )
 
-CORPUS_PROBE = os.path.join(os.path.dirname(__file__), "corpus_probe.py")
+CORPUS_PROBE = os.path.join(os.path.dirname(__file__), "openems_corpus_probe.py")
 
 
 def _freecadcmd():
@@ -684,7 +898,7 @@ def _freecadcmd():
     return None
 
 
-def probe_manifest(script, out, variable, key="cases"):
+def probe_manifest(script, out, variable, key="cases", environment=None):
     """Run a drawing probe under a real FreeCAD, and hand back what it named.
 
     :param script: The probe, which draws everything it is for and writes a
@@ -695,6 +909,8 @@ def probe_manifest(script, out, variable, key="cases"):
     :param key: Which list in the manifest to return, or ``None`` for the whole
         of it, where one run answers two questions and a second would only pay
         for the same documents twice.
+    :param environment: Further variables the probe reads, by name, where one
+        probe draws different cases for different callers.
 
     A gate needs a real CAD kernel to make its geometry and a real solver to
     solve it, and no interpreter has both - so the drawing happens here, in a
@@ -710,13 +926,13 @@ def probe_manifest(script, out, variable, key="cases"):
 
     binary = _freecadcmd()
     if binary is None:
-        pytest.skip("no freecadcmd on this machine, so the CAD kernel is unreachable")
+        unreachable("no freecadcmd on this machine, so the CAD kernel is unreachable")
 
     result = subprocess.run(
         [binary, script],
         capture_output=True,
         text=True,
-        env={**os.environ, variable: str(out)},
+        env={**os.environ, **(environment or {}), variable: str(out)},
         cwd=os.path.dirname(os.path.dirname(script)),
     )
     manifest = out / "manifest.json"
@@ -726,6 +942,9 @@ def probe_manifest(script, out, variable, key="cases"):
             f"stdout:\n{result.stdout[-4000:]}\n\nstderr:\n{result.stderr[-4000:]}"
         )
     read = json.loads(manifest.read_text())
+    if read.get("missing"):
+        # The caller skips on it; recorded here, where every probe passes.
+        UNREACHED.append(str(read["missing"]))
     return read if key is None else read[key]
 
 
@@ -761,5 +980,5 @@ def corpus_record(artifacts, name):
     )
     record = artifacts[name]
     if record["status"] == "unavailable":
-        pytest.skip(f"{name} needs something this machine has not got: {record['reason']}")
+        unreachable(f"{name} needs something this machine has not got: {record['reason']}")
     return record

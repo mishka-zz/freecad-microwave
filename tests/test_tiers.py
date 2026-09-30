@@ -107,10 +107,11 @@ def test_every_gate_still_has_something_in_the_pre_commit_tier():
 class _Session:
     """What :func:`tests.conftest._off_budget` reads off a finished run."""
 
-    def __init__(self, solved, studied=False, whole_tier=True):
+    def __init__(self, solved, studied=False, whole_tier=True, unreached=()):
         self.solve_census = ["envelope"] * solved
         self.studied = studied
         self.whole_tier = whole_tier
+        self.unreached = list(unreached)
 
 
 def test_the_budget_is_silent_about_a_run_that_solved_what_it_is_composed_of():
@@ -137,3 +138,51 @@ def test_the_budget_says_nothing_about_a_slice_of_the_tier():
 def test_the_budget_says_nothing_about_a_run_that_did_the_studies():
     """The release run solves far more than the tier, and is not over budget."""
     assert not conftest._off_budget(_Session(10 * conftest.PRE_COMMIT_SOLVES, studied=True))
+
+
+def test_a_run_of_every_gate_refuses_one_it_could_not_reach():
+    """A gate that skipped for want of its engine is one skip among many, and a
+    Palace gate solves inside a subprocess the census never sees - so a run whose
+    count of openEMS solves is exactly right can still have reached no Palace at
+    all. Each thing missing is named, once."""
+    missing = "no Palace on this machine"
+    wrong = conftest._off_budget(_Session(conftest.PRE_COMMIT_SOLVES, unreached=[missing, missing]))
+    assert wrong.count(missing) == 1
+
+
+def test_a_release_run_is_held_to_what_it_reached_as_well():
+    """The studies are no excuse for a gate that skipped."""
+    assert conftest._off_budget(_Session(0, studied=True, unreached=["no Palace"]))
+
+
+def test_a_slice_of_the_tier_may_skip_what_it_cannot_reach():
+    """One file run on a machine without its engine is a skip and nothing more."""
+    assert not conftest._off_budget(_Session(1, whole_tier=False, unreached=["no Palace"]))
+
+
+def test_every_engine_a_probe_could_not_reach_is_recorded(tmp_path, monkeypatch):
+    """The Palace gates skip on the manifest their probe writes, so the record
+    is taken where every probe's manifest is read."""
+    script = tmp_path / "tests" / "probe.py"
+    script.parent.mkdir()
+    script.write_text("")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "manifest.json").write_text('{"missing": "no Palace", "cases": []}')
+    monkeypatch.setattr(conftest, "_freecadcmd", lambda: "true")
+    monkeypatch.setattr(conftest, "UNREACHED", [])
+    conftest.probe_manifest(str(script), tmp_path / "out", "OUT")
+    assert conftest.UNREACHED == ["no Palace"]
+
+
+def test_nothing_skips_for_want_of_a_module_without_saying_so():
+    """``pytest.importorskip`` skips without recording, so a run of every gate
+    would read as clean on a machine missing the module. ``conftest.needed``
+    is the recorded spelling."""
+    here = Path(__file__).resolve().parent
+    bare = [
+        f"{path.name}:{number}"
+        for path in sorted(here.glob("*.py"))
+        for number, line in enumerate(path.read_text().splitlines(), 1)
+        if "importorskip(" in line and "``" not in line and path.name != Path(__file__).name
+    ]
+    assert not bare, f"skips nothing records: {bare}"

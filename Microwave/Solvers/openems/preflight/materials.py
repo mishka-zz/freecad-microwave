@@ -24,8 +24,8 @@ import math
 import numpy as np
 
 from ....units import VACUUM_PERMEABILITY
-from ..capabilities import Capabilities
-from ..model import Problem, Solid
+from ...capabilities import Capabilities
+from ..model import AXIS_NAMES, Problem, Solid
 from .finding import _ON_THE_GRID, REFUSE, SUBSTITUTE, WARN, Finding, hz
 
 
@@ -41,13 +41,17 @@ def _check_materials(problem: Problem, caps: Capabilities) -> list[Finding]:
                     f"this adapter handles {sorted(caps.materials)}",
                 )
             )
+        # openEMS builds a sheet of no thickness as a perfect conductor
+        # (``openEMS/FDTD/extensions/operator_ext_conductingsheet.cpp:123-128``),
+        # so its conductivity would reach nothing.
         if material.kind == "conducting_sheet" and material.thickness <= 0:
             findings.append(
                 Finding(
-                    WARN,
+                    REFUSE,
                     material.name,
-                    "a conducting sheet with zero thickness has no surface "
-                    "impedance, so it will behave as a perfect conductor",
+                    "a conducting sheet of zero thickness is built as a perfect "
+                    "conductor, so its conductivity reaches nothing. Give it the "
+                    "metal's thickness, or make it a PEC",
                 )
             )
     return findings
@@ -68,9 +72,9 @@ def _check_the_loss_was_measured_in_this_band(problem: Problem) -> list[Finding]
     centre = problem.frequency.center
     findings = []
     for material in problem.materials:
-        # Tested on the term rather than on the kind. The two agree, since
-        # ``Material`` refuses a kappa on any kind the engine would not be
-        # handed it for, and the term is what carries the approximation.
+        # Tested on the term rather than on the kind. A lossy dielectric can
+        # carry a conductivity of its own and no kappa, and this question is
+        # about the kappa a loss tangent became.
         if material.kappa <= 0:
             continue
         if material.measured_at <= 0:
@@ -186,7 +190,9 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
 
     Two solids of one material are a drawing to tidy up rather than a fault:
     the same conductor drawn twice is one conductor, and the run is right. So
-    this warns, and names the two objects the engine's line does not.
+    this warns, and names the two objects the engine's line does not. One
+    material means one set of values the engine is handed, as
+    :meth:`~..model.Material.given` states it, whatever each is called.
 
     Two solids of different materials are a wrong structure, so this refuses.
     One space cannot be made of two materials, and the engine resolves the
@@ -198,6 +204,7 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
     copper, and the run completes and reports numbers for it. Binding geometry
     twice is one selection away, so this names the pair.
     """
+    given = {material.name: material.given() for material in problem.materials}
     findings = []
     seen: list[Solid] = []
     for solid in problem.solids:
@@ -207,7 +214,12 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
             continue
         subject = solid.label or solid.material
         occupies = f"occupies the same space as {first.label or first.material!r}"
-        if first.material == solid.material:
+        if given.get(first.material) == given.get(solid.material):
+            made = (
+                f"which is also {solid.material!r}"
+                if first.material == solid.material
+                else f"which is {first.material!r}, the same material under another name"
+            )
             findings.append(
                 Finding(
                     WARN,
@@ -216,7 +228,7 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
                     # into one line naming every object that said them, so
                     # "both" would be false the moment a third solid shares the
                     # space.
-                    f"{occupies}, which is also {solid.material!r}. openEMS "
+                    f"{occupies}, {made}. openEMS "
                     "discretises one box in a shared space and drops the rest "
                     "with an 'Unused primitive' warning that names only the "
                     "material, so this says which objects it meant. Delete the "
@@ -253,7 +265,7 @@ def _check_a_thickness_was_invented(problem: Problem) -> list[Finding]:
 
     This is reported even where the drawing meant a surface. The thickness
     follows the cell the metal is meshed at, so it moves with the band and the
-    mesh policy, and the document carries that length nowhere a reader could
+    Yee grid, and the document carries that length nowhere a reader could
     look.
 
     A conducting sheet is left out. Its length is not free, being what carries
@@ -376,6 +388,59 @@ def _check_sheet_thickness(problem: Problem) -> list[Finding]:
                     "model does not apply. openEMS will not refuse this - it "
                     "clamps its fit and returns a plausible-looking wrong "
                     "answer. Model it as a solid, or check the units",
+                )
+            )
+    return findings
+
+
+def _boundary_lines(word: str) -> int:
+    """How many grid lines in from a face of the domain openEMS gives its boundary.
+
+    Zero behind a perfect wall, one behind Mur, and the depth of a PML
+    (``openEMS/openems.cpp:389-400``).
+    """
+    if word.startswith("PML_") and word[4:].isdigit():
+        return int(word[4:])
+    return 1 if word == "MUR" else 0
+
+
+def _check_a_sheet_standing_in_the_boundary(problem: Problem) -> list[Finding]:
+    """A conducting sheet lying in a plane openEMS solves as a perfect conductor.
+
+    openEMS turns the conducting-sheet model off at every grid position the
+    boundary holds - the first and last line of the domain behind a perfect
+    wall, one line more behind Mur, the whole depth of a PML - and builds a
+    perfect conductor there with nothing said
+    (``openEMS/FDTD/extensions/operator_ext_conductingsheet.cpp:74-77,108-114``).
+    A sheet whose plane is one of those lines is lossless metal wherever it was
+    drawn, and the run returns a matrix with its loss missing. A sheet that only
+    runs into the boundary, as a trace runs into an absorber, loses its loss
+    where nothing is measured, and is passed.
+    """
+    kinds = {material.name: material.kind for material in problem.materials}
+    findings = []
+    for solid in problem.solids:
+        if kinds.get(solid.material) != "conducting_sheet":
+            continue
+        for dim in range(3):
+            if solid.lower[dim] != solid.upper[dim]:
+                continue
+            lines = problem.grid[dim]
+            index = int(np.argmin(np.abs(lines - solid.lower[dim])))
+            low = _boundary_lines(problem.boundary[2 * dim])
+            high = _boundary_lines(problem.boundary[2 * dim + 1])
+            if low < index < len(lines) - high - 1:
+                continue
+            side = "min" if index <= low else "max"
+            findings.append(
+                Finding(
+                    REFUSE,
+                    solid.label or solid.material,
+                    f"its {solid.material!r} sheet lies in the {AXIS_NAMES[dim]}{side} "
+                    "boundary of the domain, where openEMS solves a conducting sheet as a "
+                    "perfect conductor and says nothing, so its conductivity reaches "
+                    "nothing. Leave air between the sheet and that side of the domain, or "
+                    "bind it to a PEC",
                 )
             )
     return findings

@@ -333,8 +333,8 @@ class MeshReport:
         return (
             f"this grid is {used / 1024**3:,.1f} GiB of operator and field, "
             "which is a long run rather than a wrong one - but if it was not "
-            "meant, MaxGrowthRatio, PMLCells and FeedOffset are what move it "
-            "fastest"
+            "meant, MaxGrowthRatio on the Yee grid, PMLCells and FeedOffset are "
+            "what move it fastest"
         )
 
     @property
@@ -540,16 +540,16 @@ def mesh_report(
 Axis = Sequence[float] | npt.NDArray[np.floating[Any]]
 
 
-def extents(axes: Sequence[Axis], absorber: Sequence[int]) -> tuple[Extent, Extent]:
+def extents(axes: Sequence[Axis], absorber: Sequence[tuple[int, int]]) -> tuple[Extent, Extent]:
     """The interior, and the whole box that got lines.
 
     They differ by the absorber, and which of the two the drawing sits inside
-    depends on how the face was padded. A face padded with air cells grows the
+    depends on how the face was padded. A face padded with air grows the
     domain outward, so the drawing is inside the interior. A face the structure
     runs out through has the absorber taken off the inside, so the drawing is
-    the outer box. ``docs/internals/domain-and-absorber.md`` says which is
-    which. The count read here is one per axis, and it is taken off both ends
-    of that axis.
+    the outer box. ``docs/internals/openems-domain-and-absorber.md`` says which
+    is which. The count read here is one per face, and each is taken off its
+    own end of the axis.
 
     Reporting only the outer box would overstate the modelled region by the
     absorber at both ends of each axis. Reporting only the interior would hide
@@ -567,12 +567,12 @@ def extents(axes: Sequence[Axis], absorber: Sequence[int]) -> tuple[Extent, Exte
     domain_lower, domain_upper, outer_lower, outer_upper = [], [], [], []
     for dim in range(DIMENSIONS):
         axis = axes[dim]
-        cells = int(absorber[dim])
+        low, high = (int(cells) for cells in absorber[dim])
         outer_lower.append(float(axis[0]))
         outer_upper.append(float(axis[-1]))
-        inside = cells > 0 and len(axis) >= 2 * cells + 2
-        domain_lower.append(float(axis[cells]) if inside else float(axis[0]))
-        domain_upper.append(float(axis[-1 - cells]) if inside else float(axis[-1]))
+        inside = len(axis) >= low + high + 2
+        domain_lower.append(float(axis[low]) if inside else float(axis[0]))
+        domain_upper.append(float(axis[-1 - high]) if inside else float(axis[-1]))
 
     return (
         Extent(corner(domain_lower), corner(domain_upper)),

@@ -21,10 +21,17 @@ requires-python = ">=3.11"
 # test_declared_dependencies.py asserts the two agree, so the declaration cannot
 # drift away from the environment the suite actually passes in.
 #
-# Only numpy is imported by this code. scikit-rf is absent because a copy is
-# vendored - and the other three are here because that copy imports them, which
-# is the whole point: vendoring pins the version and does nothing about presence.
-dependencies = ["numpy", "scipy", "pandas", "typing_extensions"]
+# numpy and gmsh are the two this code imports. scikit-rf is absent because a
+# copy is vendored - and the other three are here because that copy imports
+# them, which is the whole point: vendoring pins the version and does nothing
+# about presence.
+#
+# gmsh is declared rather than vendored because FreeCAD's own Addon Manager
+# names it on the list of packages it will install, which scikit-rf is not on.
+# What that route cannot do is pin it: the Addon Manager keeps the name and
+# discards any version bound, so this declaration states what is needed and
+# nothing about which release.
+dependencies = ["numpy", "gmsh", "scipy", "pandas", "typing_extensions"]
 
 [project.optional-dependencies]
 # The tools, and the two of them whose output is a gate carry the version CI
@@ -115,24 +122,32 @@ warn_redundant_casts = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 
-# Not resolvable where the checker runs. FreeCAD, its Gui, its bundled PySide
-# and its `Plot` window are the application; the engine's bindings mean
+# Not resolvable where the checker runs. FreeCAD, its Gui, its FEM module, its
+# bundled PySide and its `Plot` window are the application; the engine's bindings mean
 # building openEMS; and scikit-rf is reached through `_vendor`, which is
 # excluded above. What this buys is that a name from one of them is `Any`
 # rather than an error - the import is not the thing being checked, the code
 # around it is. The list is what is actually unresolvable, and no more:
 # matplotlib is absent because this tree never imports it, reaching it only
 # through FreeCAD's own plot window.
+#
+# `gmsh` is the one here for a different reason, and it is the reason to keep
+# reading this list rather than adding to it: it ships neither stubs nor a
+# `py.typed` marker, so mypy refuses to analyse it even where it is installed,
+# and the checker's job does not install it. The effect is the same - its names
+# are `Any` - and what would change it is upstream shipping the marker.
 [[tool.mypy.overrides]]
 module = [
     "FreeCAD",
     "FreeCADGui",
+    "Fem",
     "Part",
     "Plot",
     "pivy.*",
     "PySide.*",
     "openEMS.*",
     "CSXCAD.*",
+    "gmsh",
     "skrf.*",
 ]
 ignore_missing_imports = true

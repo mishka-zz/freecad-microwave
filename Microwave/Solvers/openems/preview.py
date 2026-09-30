@@ -90,13 +90,13 @@ class DrawnGrid:
         The preferences that survived are ordinary lines here: a preference is
         dropped whenever it crowds anything, so drawing it would claim a
         guarantee the mesher has not given.
-    :param absorber: Absorber cells at each end of each axis. Zero where the
-        axis has none.
+    :param absorber: Absorber cells at the lower and the upper face of each
+        axis. Zero where the face has none.
     """
 
     axes: tuple[Sequence[float], Sequence[float], Sequence[float]]
     anchors: tuple[Sequence[float], Sequence[float], Sequence[float]]
-    absorber: tuple[int, int, int]
+    absorber: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
 
     def __post_init__(self) -> None:
         for name in ("axes", "anchors", "absorber"):

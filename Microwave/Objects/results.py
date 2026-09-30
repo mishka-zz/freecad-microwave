@@ -34,6 +34,7 @@ import json
 import FreeCAD
 import numpy as np
 
+from ..Results import modelled
 from ..Results.sparameters import ResultError, SParameters
 from ._vp_hook import ViewProviderRestored
 
@@ -67,6 +68,7 @@ SUMMARY = (
     "FrequencyStart",
     "FrequencyStop",
     "Reference",
+    "Modelled",
     "Provenance",
 )
 
@@ -74,10 +76,10 @@ SUMMARY = (
 class EMSParameters(ViewProviderRestored):
     """One N×N S-matrix against frequency, referenced to a stated impedance.
 
-    Solver-neutral. openEMS produced this one, and nothing about the object
-    records that. A NEC2 or Palace adapter assembling the same
-    :class:`~..Results.sparameters.SParameters` stores it through the same
-    :func:`store`, and every consumer above works unchanged.
+    Solver-neutral. Every backend assembles the same
+    :class:`~..Results.sparameters.SParameters` and stores it through the same
+    :func:`store`, and every consumer above works unchanged. Which backend it
+    was is in ``Provenance``, written by the run, and :func:`backend` reads it.
     """
 
     def __init__(self, obj):
@@ -186,6 +188,15 @@ class EMSParameters(ViewProviderRestored):
             "Result",
             "The impedance the matrix is referenced to",
         )
+        # Two backends solving one document solve two models of its loss, and
+        # the matrix cannot show which. The words are read off the run's own
+        # record rather than off the materials, which may have changed since.
+        obj.addProperty(
+            "App::PropertyStringList",
+            "Modelled",
+            "Result",
+            "How the solver modelled each lossy material, and an outside open to free space",
+        )
         obj.addProperty(
             "App::PropertyString",
             "Provenance",
@@ -215,6 +226,20 @@ class EMSParameters(ViewProviderRestored):
         return None
 
 
+#: The provenance key naming the mesh a matrix was solved on, where the backend
+#: shows its mesh in the study. See ``Objects/fem_mesh.py``'s ``IDENTITY``.
+SOLVED_ON = "mesh"
+
+#: What a result's label gains while the study shows a mesh other than the one
+#: it was solved on, a mesh nobody recorded it against, or none.
+APART = " - not solved on the mesh shown"
+
+
+def label(solver, apart=False):
+    """What a result ``solver`` filled is called in the tree."""
+    return f"S-Parameters ({solver})" + (APART if apart else "")
+
+
 def createEMSParameters(doc=None):
     """An empty result object. :func:`store` fills it in."""
     doc = doc or FreeCAD.ActiveDocument
@@ -226,6 +251,27 @@ def createEMSParameters(doc=None):
 
     inject_view_provider(obj, "EMSParameters")
     return obj
+
+
+def backend(obj) -> str:
+    """Which backend filled ``obj``, as its run's provenance names it, or ``""``.
+
+    A study keeps one result per backend, so that a drawing answered by two of
+    them keeps both answers. The name is read off what the run recorded rather
+    than carried beside it: the adapter that ran wrote it, it is saved with the
+    matrix, and it cannot disagree with the numbers it came with. An object
+    whose provenance is missing or unreadable names no backend.
+    """
+    return str(provenance(obj).get("solver") or "")
+
+
+def provenance(obj) -> dict:
+    """What the run that filled ``obj`` recorded, or nothing where it is unreadable."""
+    try:
+        said = json.loads(obj.Provenance) if obj.Provenance else {}
+    except ValueError:
+        return {}
+    return said if isinstance(said, dict) else {}
 
 
 def store(obj, result: SParameters):
@@ -240,7 +286,19 @@ def store(obj, result: SParameters):
     right, so a frequency axis reopens as a flat line at the top of the band and
     looks like a physics result. The stub in ``tests/conftest.py`` stores
     whatever it is handed, so nothing short of a real document catches it.
+
+    An object restored from a document saved before one of its properties
+    existed comes back without it, since FreeCAD does not reconcile a restored
+    object against its class. That is refused by name before anything is
+    written, so the matrix the object held stays whole.
     """
+    for name in (*BULK, *SUMMARY):
+        if not hasattr(obj, name):
+            raise ResultError(
+                f"{getattr(obj, 'Label', '?')!r} has no {name}: it was saved by an earlier "
+                "build, and restoring one does not add what has been added since. Delete "
+                "it, or export it to Touchstone first to keep it, and run again"
+            )
     frequency = np.asarray(result.frequency, dtype=float)
     scattering = np.asarray(result.s, dtype=complex)
     reference = np.asarray(result.reference, dtype=complex)
@@ -265,6 +323,9 @@ def store(obj, result: SParameters):
     obj.FrequencyStart = float(frequency[0]) if frequency.size else 0.0
     obj.FrequencyStop = float(frequency[-1]) if frequency.size else 0.0
     obj.Reference = result.reference_description()
+    # From the record in hand rather than from the JSON above, which drops
+    # everything where it cannot be written.
+    obj.Modelled = modelled.said(result.provenance.get("modelled") or ())
     return obj
 
 
@@ -291,7 +352,12 @@ def _provenance_json(provenance: dict) -> str:
     try:
         return json.dumps(safe, sort_keys=True, default=str, skipkeys=True)
     except (TypeError, ValueError):
-        return json.dumps({"unserialisable": repr(provenance)})
+        # The backend's name survives, being what the result is filed under: a
+        # result that lost it would be passed over by the next run of the same
+        # backend, which would file another beside it.
+        return json.dumps(
+            {"unserialisable": repr(provenance), "solver": str(provenance.get("solver") or "")}
+        )
 
 
 def load(obj) -> SParameters:

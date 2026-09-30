@@ -23,13 +23,14 @@ def _check_reproducibility(problem: Problem) -> list[Finding]:
         Finding(
             WARN,
             "termination",
-            f"energy termination is enabled (end_criteria="
-            f"{problem.termination.end_criteria:g}), so this run is not "
-            "reproducible: openEMS only re-evaluates that criterion on a "
-            "four-second wall-clock timer, so it stops at a step count that "
-            "depends on machine load. Repeat the run and the numbers move. "
-            "Set end_criteria to 0 for anything that has to agree with "
-            "itself twice",
+            f"energy termination is enabled (openEMS stops at a share of "
+            f"{problem.termination.end_criteria:g} of the peak), so this run is not "
+            "reproducible: openEMS tests that criterion only on a four-second "
+            "wall-clock timer (openEMS/openems.cpp:1445), so a run shorter than "
+            "that takes every step, and a longer one stops at the first test "
+            "after the energy has fallen, at a step count that depends on machine "
+            "load. Repeat the run and the numbers move. Set the solver's "
+            "EnergyDecay to 0 for anything that has to agree with itself twice",
         )
     ]
 
@@ -57,7 +58,7 @@ def _check_timestep_factor(problem: Problem) -> list[Finding]:
             "timestep",
             f"the timestep is scaled by {factor:g}, so {steps:,} steps cover "
             f"{factor:g} times the simulated time they otherwise would. Raise "
-            f"max_timesteps to about {round(steps / factor):,} to keep the same "
+            f"MaxTimesteps to about {round(steps / factor):,} to keep the same "
             "window, or the run may be cut off before the energy has decayed",
         )
     ]
@@ -99,7 +100,7 @@ def _check_the_excitation_fits_the_run(problem: Problem) -> list[Finding]:
     detail = (
         f"the excitation is {needed:,.0f} timesteps long at this bandwidth "
         f"({problem.frequency.half_bandwidth / 1e9:.4g} GHz either side of "
-        f"centre) and this grid, and max_timesteps is {steps:,}"
+        f"centre) and this grid, and MaxTimesteps is {steps:,}"
     )
     if steps < needed:
         return [
@@ -109,7 +110,7 @@ def _check_the_excitation_fits_the_run(problem: Problem) -> list[Finding]:
                 f"{detail}. The run would stop "
                 f"{steps / needed:.0%} of the way through the pulse, which "
                 f"peaks at half, and still return a full S-matrix. Raise "
-                f"max_timesteps to at least "
+                f"MaxTimesteps to at least "
                 f"{_PULSE_LENGTHS_WANTED * needed:,.0f}, or widen the band",
             )
         ]

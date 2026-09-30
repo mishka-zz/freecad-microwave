@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "block",
+      "dim": 3,
+      "file": "slab_in_a_slot.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "slab",
+      "dim": 3,
+      "file": "slab_in_a_slot.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "slab_in_a_slot.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 5999.996,
+  "outside": 3499.99995
+}

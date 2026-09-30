@@ -1,0 +1,32 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "two_posts_overlapping.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "left",
+      "dim": 3,
+      "file": "two_posts_overlapping.1.brep",
+      "priority": 1,
+      "leaves": true
+    },
+    {
+      "label": "right",
+      "dim": 3,
+      "file": "two_posts_overlapping.2.brep",
+      "priority": 1,
+      "leaves": true
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "two_posts_overlapping.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 5783.999999999999,
+  "outside": 2428.0
+}

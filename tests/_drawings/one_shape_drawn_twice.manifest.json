@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "one",
+      "dim": 3,
+      "file": "one_shape_drawn_twice.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "two",
+      "dim": 3,
+      "file": "one_shape_drawn_twice.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "one_shape_drawn_twice.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

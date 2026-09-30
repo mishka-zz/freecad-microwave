@@ -23,7 +23,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ..capabilities import Capabilities, capabilities
+from ...capabilities import Capabilities
+from ..capabilities import capabilities
 from ..model import Problem
 from . import absorber, grid, materials, ports, precision, probes, solve
 
@@ -74,6 +75,7 @@ def check(problem: Problem, caps: Capabilities | None = None) -> list[Finding]:
     findings += materials._check_a_thickness_was_invented(problem)
     findings += materials._check_a_conducting_sheet_spans_a_surface(problem)
     findings += materials._check_sheet_thickness(problem)
+    findings += materials._check_a_sheet_standing_in_the_boundary(problem)
     findings += ports._check_lumped_excitation_beside_a_measured_line(problem)
     findings += ports._check_the_launch_direction_was_read(problem)
     findings += materials._check_sheet_fits_the_surface_impedance_model(problem)

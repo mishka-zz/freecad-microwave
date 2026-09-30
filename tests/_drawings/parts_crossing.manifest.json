@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "one",
+      "dim": 3,
+      "file": "parts_crossing.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "two",
+      "dim": 3,
+      "file": "parts_crossing.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "parts_crossing.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 7500.0,
+  "outside": 2799.9999999999995
+}

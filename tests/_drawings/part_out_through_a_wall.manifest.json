@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "part_out_through_a_wall.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "part",
+      "dim": 3,
+      "file": "part_out_through_a_wall.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "part_out_through_a_wall.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6095.999999999999,
+  "outside": 2280.0
+}

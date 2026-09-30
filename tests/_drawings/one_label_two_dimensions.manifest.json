@@ -1,0 +1,18 @@
+{
+  "pieces": [
+    {
+      "label": "region",
+      "dim": 3,
+      "file": "one_label_two_dimensions.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "region",
+      "dim": 2,
+      "file": "one_label_two_dimensions.1.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

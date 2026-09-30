@@ -242,6 +242,19 @@ measured_at = 1.0e10
         entry = parse(FR4).get("fr4")
         assert entry.at(5e9) is entry
 
+    def test_a_table_beside_a_headline_quoted_at_no_frequency_is_refused(self):
+        """A study solves at the row nearest its band, and a headline with no
+        frequency is a value nobody can place among the rows."""
+        message = refusal(
+            '[[material]]\nid = "x"\nkind = "dielectric"\nepsilon_r = 4.0\n'
+            "[[material.dispersion]]\nfrequency = 1.0e10\nepsilon_r = 3.66\nloss_tangent = 0.0\n"
+        )
+        assert "measured_at" in message
+
+    def test_a_headline_disagreeing_with_the_row_at_its_frequency_is_refused(self):
+        message = refusal(self.TABLE.replace("epsilon_r = 3.48\nloss", "epsilon_r = 3.55\nloss", 1))
+        assert "1e+10 Hz" in message
+
     def test_rows_out_of_order_are_refused(self):
         message = refusal(
             '[[material]]\nid = "x"\nkind = "dielectric"\nepsilon_r = 3.0\n'

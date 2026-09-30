@@ -256,7 +256,7 @@ def _validate_total_size(lines: MeshLines) -> None:
         f"the grid is {cells:,} cells ({shape} lines), which openEMS counts as "
         f"{cells * BYTES_PER_CELL / 1024**3:,.1f} GiB of operator and field, "
         f"against a ceiling of {MAX_GRID_BYTES / 1024**3:g} GiB. No single axis "
-        "is out of bounds - it is the product that ran away, and pml_cells "
+        "is out of bounds - it is the product that ran away, and PMLCells "
         "reaches it fastest because it is applied to every axis after "
         "everything else"
     )

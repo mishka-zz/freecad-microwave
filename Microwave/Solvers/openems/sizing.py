@@ -46,7 +46,7 @@ Against a thickness ``t`` with unit normal ``m``:
 Each is one inequality in three unknowns, so each needs an objective; these
 minimise a weighted line count. The working, the objective rejected for being
 discontinuous in a face's tilt, and why a count cannot be delivered as a sum
-of per-axis rates, are in docs/internals/cell-allocation.md.
+of per-axis rates, are in docs/internals/openems-cell-allocation.md.
 """
 
 from __future__ import annotations
@@ -276,7 +276,7 @@ def edge(thickness: float, tangent: Sequence[float]) -> tuple[float, float, floa
     worst of it is tight. The profile is a judgement. The scale is not: the
     scale makes any profile feasible, and this profile prices within a few
     percent of the cheapest over the line-count objective. The working is in
-    docs/internals/cell-allocation.md.
+    docs/internals/openems-cell-allocation.md.
 
     An axis the tangent runs along comes back ``inf``: cells packed along an
     edge resolve nothing, and every direction the criterion holds is square to

@@ -1,0 +1,34 @@
+{
+  "pieces": [
+    {
+      "label": "dielectric",
+      "dim": 3,
+      "file": "coax_run_on.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "port1",
+      "dim": 2,
+      "file": "coax_run_on.1.brep",
+      "priority": 0,
+      "inward": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "label": "port2",
+      "dim": 2,
+      "file": "coax_run_on.2.brep",
+      "priority": 0,
+      "inward": [
+        0.0,
+        0.0,
+        -1.0
+      ]
+    }
+  ],
+  "measure": 942.4777960769381,
+  "outside": 1005.3096491487338
+}

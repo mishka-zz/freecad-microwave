@@ -55,8 +55,9 @@ instead:
   positions alone - ``CheckSymmetry``,
   ``CSXCAD/python/CSXCAD/SmoothMeshLines.py:168``.
 
-docs/internals/sizing-field.md works all of this out, and
-:mod:`~.sizing_field` is where the code it describes lives.
+docs/internals/openems-sizing-field.md works all of this
+out, and :mod:`~.sizing_field` is where the code it
+describes lives.
 """
 
 from __future__ import annotations
@@ -366,8 +367,8 @@ def absorber_pitches(
     out: list[tuple[float | None, float | None]] = []
     for dim in range(DIMENSIONS):
         cells = params.absorber[dim]
-        faces = (absorbed[dim][0], absorbed[dim][1])
-        if not cells or not any(faces):
+        faces = (absorbed[dim][0] and cells[0] > 0, absorbed[dim][1] and cells[1] > 0)
+        if not any(faces):
             out.append((None, None))
             continue
         mandatory, preferred = _fixed_positions(
@@ -391,8 +392,12 @@ def absorber_pitches(
         )
         out.append(
             (
-                _absorber_cell(field, lower[dim], 1.0, cells, params.floor) if faces[0] else None,
-                _absorber_cell(field, upper[dim], -1.0, cells, params.floor) if faces[1] else None,
+                _absorber_cell(field, lower[dim], 1.0, cells[0], params.floor)
+                if faces[0]
+                else None,
+                _absorber_cell(field, upper[dim], -1.0, cells[1], params.floor)
+                if faces[1]
+                else None,
             )
         )
     return tuple(out)
@@ -519,7 +524,7 @@ def _check_sizing_region(
             "resolution off whatever else lies level with it. To let a "
             "particular object go, set that region's Mode to Coarsen, which "
             "names the object instead; to coarsen the whole model, lower "
-            "ElementsPerWavelength"
+            "ElementsPerWavelength on the Yee grid"
         )
     if region.size < params.floor:
         raise MeshError(

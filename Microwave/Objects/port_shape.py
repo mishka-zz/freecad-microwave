@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from .. import annulus, picks, portbox
+from .. import annulus, drawn, picks, portbox
 from ..portbox import Box, PortBox
 from .kinds import kind_of
 
@@ -40,15 +40,13 @@ def _axis(name: Any) -> tuple[int, int] | None:
 
 
 def _box_of(obj: Any, sub_element: str = "") -> Box | None:
-    shape = getattr(obj, "Shape", None)
+    try:
+        shape = picks.element(obj, sub_element)
+    except Exception:
+        return None
     if shape is None:
         return None
-    if sub_element:
-        try:
-            shape = shape.getElement(sub_element)
-        except Exception:
-            return None
-    bound = shape.BoundBox
+    bound = drawn.bound(shape)
     return ((bound.XMin, bound.YMin, bound.ZMin), (bound.XMax, bound.YMax, bound.ZMax))
 
 
@@ -65,20 +63,17 @@ def _element(link: Any) -> Any:
     """The shape a ``PropertyLinkSub`` names, for what a box does not carry."""
     if not link or link[0] is None:
         return None
-    shape = getattr(link[0], "Shape", None)
     names = [name for name in (link[1] or []) if name]
-    if shape is None or not names:
-        return shape
-    return shape.getElement(names[0])
+    return picks.element(link[0], names[0] if names else "")
 
 
 def port_box(obj: Any) -> PortBox | None:
     """The :class:`~Microwave.portbox.PortBox` for this port, or ``None``.
 
     ``None`` whenever the port is not yet configured enough to have one, and for
-    a waveguide port with ``Length`` unset, because that default is five mesh
-    cells and there is no mesh here. That length is the one thing about a port
-    that cannot be drawn before meshing.
+    a waveguide port referred to its own face, which has no depth to draw. A
+    waveguide port with a ``ReferenceDepth`` is drawn from the face it is
+    launched on to the plane it is referred to.
     """
     kind = kind_of(obj)
     try:
@@ -95,6 +90,28 @@ def port_box(obj: Any) -> PortBox | None:
         # why, loudly, when the user runs it. The drawing layer does not.
         return None
     return None
+
+
+def reference_box(obj: Any) -> PortBox | None:
+    """The box a port's S-parameters are read against, or ``None``.
+
+    :func:`port_box` for every kind, and for a waveguide port referred to its
+    own face, which draws nothing, a box of no depth standing on that face: its
+    reference plane is the face.
+    """
+    box = port_box(obj)
+    if box is not None or kind_of(obj) != "EMPortRectWaveguide":
+        return box
+    try:
+        propagation = _axis(obj.PropagationAxis)
+        _, face = _linked(obj.CrossSection)
+        if not propagation or face is None:
+            return None
+        start, stop = list(face[0]), list(face[1])
+        start[propagation[0]] = stop[propagation[0]] = portbox.middle(face, propagation[0])
+        return PortBox(portbox.corner(start), portbox.corner(stop), propagation[0])
+    except (portbox.BoxError, AttributeError, IndexError, TypeError):
+        return None
 
 
 def _length(quantity: Any) -> float:
@@ -133,8 +150,52 @@ def _lumped(obj: Any) -> PortBox | None:
         source,
         reference,
         excitation_axis=excitation[0],
-        outline=body if picks.is_outline(obj.SourceEntity) else None,
+        outline=body if _outline(obj.SourceEntity) else None,
     )
+
+
+def _further_references(obj: Any) -> list[PortBox]:
+    """A lumped port's box to each face its reference names past the first.
+
+    A reference naming several faces is a port with an element to each on
+    Palace, and the other backend refuses it by name. The port is drawn as
+    Palace lays it, so what was picked is seen whole.
+    """
+    if kind_of(obj) != "EMPortLumped":
+        return []
+    try:
+        link = obj.ReferenceEntity
+        excitation = _axis(obj.ExcitationAxis)
+        body, source = _linked(obj.SourceEntity)
+        names = [name for name in (link[1] or []) if name] if link and link[0] is not None else []
+        if not excitation or source is None or len(names) < 2:
+            return []
+        boxes = []
+        for name in names[1:]:
+            reference = _box_of(link[0], name)
+            if reference is None:
+                continue
+            boxes.append(
+                portbox.lumped(
+                    source,
+                    reference,
+                    excitation_axis=excitation[0],
+                    outline=body if _outline(obj.SourceEntity) else None,
+                )
+            )
+        return boxes
+    except (portbox.BoxError, AttributeError, IndexError, TypeError):
+        return []
+
+
+def _outline(link: Any) -> bool:
+    """:func:`Microwave.picks.is_outline`, or no outline where the pick cannot
+    be placed. A port is drawn from what it can read, and the adapter refuses
+    the pick by name when it is run."""
+    try:
+        return picks.is_outline(link)
+    except picks.Unplaced:
+        return False
 
 
 def _coaxial(obj: Any) -> PortBox | None:
@@ -155,7 +216,7 @@ def _coaxial(obj: Any) -> PortBox | None:
 def _waveguide(obj: Any) -> PortBox | None:
     propagation = _axis(obj.PropagationAxis)
     _, face = _linked(obj.CrossSection)
-    stated = _length(obj.Length)
+    stated = _length(obj.ReferenceDepth)
     if not propagation or face is None or stated <= 0:
         return None
     return portbox.rect_waveguide(
@@ -200,6 +261,8 @@ def build(obj: Any) -> Any:
     # tools would give the wrong length. Being measurable matters more. The body
     # is translucent, so an interior plane shows through it anyway.
     pieces = [_body(box, ring, lower, upper)]
+    for further in _further_references(obj):
+        pieces.append(_body(further, None, *further.corners()))
     for distance in (box.feed, box.measurement):
         if distance <= 0:
             continue
@@ -263,28 +326,9 @@ def _marker(
 
     position = box.plane_at(distance)
     if ring is None:
-        return _plane(position, box.propagation_axis, lower, upper)
+        return drawn.rectangle(position, box.propagation_axis, lower, upper)
     base, along = _axis_frame(box, ring, position)
     try:
         return Part.Face(Part.Wire(Part.makeCircle(ring.outer, base, along)))
     except Exception:  # pragma: no cover - a degenerate ring has no disc
-        return None
-
-
-def _plane(position: float, axis: int, lower: Sequence[float], upper: Sequence[float]) -> Any:
-    """A flat rectangle across the box at ``position`` along ``axis``."""
-    import FreeCAD
-    import Part
-
-    corners: list[Any] = []
-    transverse = [dim for dim in range(3) if dim != axis]
-    for first, second in ((0, 0), (1, 0), (1, 1), (0, 1)):
-        point = [0.0, 0.0, 0.0]
-        point[axis] = position
-        point[transverse[0]] = (lower, upper)[first][transverse[0]]
-        point[transverse[1]] = (lower, upper)[second][transverse[1]]
-        corners.append(FreeCAD.Vector(*point))
-    try:
-        return Part.Face(Part.makePolygon(corners + [corners[0]]))
-    except Exception:  # pragma: no cover - a degenerate box has no plane
         return None

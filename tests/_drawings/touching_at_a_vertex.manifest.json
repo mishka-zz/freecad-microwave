@@ -1,0 +1,18 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "touching_at_a_vertex.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "touching_at_a_vertex.1.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 1999.9999999999995,
+  "outside": 1199.9999999999998
+}

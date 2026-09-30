@@ -1,0 +1,18 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "curving_pass_fails.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "curving_pass_fails.1.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 3553.0575843921683,
+  "outside": 2368.705056261446
+}

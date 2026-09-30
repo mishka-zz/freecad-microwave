@@ -32,8 +32,10 @@ class EMMeshPreview(ViewProviderRestored):
     ``Objects/staleness.py`` is what keeps an edit that moves no cell from
     reaching it. ``Digest`` is the other half: the preview records a hash of
     what the grid it shows was computed from, and the panel re-derives that
-    whenever it opens, which catches what no property edit announces. What the
-    hash covers is the mesher's inputs rather than the envelope, so raising
+    whenever it opens, which catches what no property edit announces. A change
+    no recompute has reached yet writes neither, and the panel asks FreeCAD's
+    touched state for that - ``Gui/openems_mesh_preview.py::staleness``. What
+    the hash covers is the mesher's inputs rather than the envelope, so raising
     ``MaxTimesteps`` moves neither.
     """
 
@@ -66,8 +68,7 @@ class EMMeshPreview(ViewProviderRestored):
         # reason they exist: FEM's own mesh objects carry the same thing (a
         # Shape link plus three link lists) and no execute(), so a recompute
         # clears the marker without remeshing. The marker is a hint, and the
-        # panel's staleness line, which re-derives the grid digest, is the
-        # answer.
+        # panel's staleness line is the answer.
         #
         # There is no link back to the study. The preview is a member of the
         # analysis group, and group membership is itself a dependency edge
@@ -266,7 +267,7 @@ def _add_grid_properties(obj):
                 "App::PropertyIntegerList",
                 name,
                 "Grid",
-                "Absorber cells at each end of each axis",
+                "Absorber cells at the lower and the upper face of each axis",
             )
         else:
             obj.addProperty(
@@ -294,7 +295,7 @@ def set_grid(obj, axes, anchors, absorber):
         setattr(obj, f"Lines{axis}", [float(value) for value in values])
     for axis, values in zip("XYZ", anchors):
         setattr(obj, f"Anchors{axis}", [float(value) for value in values])
-    obj.AbsorberCells = [int(cells) for cells in absorber]
+    obj.AbsorberCells = [int(cells) for ends in absorber for cells in ends]
     return obj
 
 
@@ -313,10 +314,11 @@ def stored_grid(obj):
             return None
         axes.append(tuple(float(value) for value in lines))
         anchors.append(tuple(float(value) for value in getattr(obj, f"Anchors{axis}", ()) or ()))
-    absorber = list(getattr(obj, "AbsorberCells", ()) or ())
-    if len(absorber) != len(axes):
+    absorber = [int(cells) for cells in getattr(obj, "AbsorberCells", ()) or ()]
+    if len(absorber) != 2 * len(axes):
         return None
-    return tuple(axes), tuple(anchors), tuple(int(cells) for cells in absorber)
+    faces = tuple((absorber[2 * dim], absorber[2 * dim + 1]) for dim in range(len(axes)))
+    return tuple(axes), tuple(anchors), faces
 
 
 def set_segments(obj, segments):
@@ -345,7 +347,15 @@ def set_segments(obj, segments):
             continue
         edges.append(Part.LineSegment(FreeCAD.Vector(*start), FreeCAD.Vector(*end)).toShape())
 
-    obj.Shape = Part.Compound(edges) if edges else Part.Shape()
+    from .. import picks
+
+    # The lines are where the solver puts them, which is where FreeCAD shows the
+    # drawing, and the preview is drawn moved by the containers it stands in.
+    drawn = Part.Compound(edges) if edges else Part.Shape()
+    try:
+        obj.Shape = picks.local(obj, drawn)
+    except picks.Unplaced:
+        obj.Shape = drawn
     return obj
 
 

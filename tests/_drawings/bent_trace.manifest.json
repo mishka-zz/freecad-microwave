@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "substrate",
+      "dim": 3,
+      "file": "bent_trace.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "bent_trace.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "bent_trace.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 5999.264999999999,
+  "outside": 2243.54
+}

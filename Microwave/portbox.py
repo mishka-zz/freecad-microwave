@@ -80,8 +80,9 @@ SPEED_OF_LIGHT = units.SPEED_OF_LIGHT * units.MM_PER_M
 #: over pi. A plane standing more wavelengths clear at the top of a band
 #: therefore reads further out rather than nearer. An open line behaves the same
 #: way, although it radiates and carries a surface wave nothing cuts off. The
-#: gates are ``tests/test_acceptance_stripline.py`` and
-#: ``tests/test_acceptance_microstrip.py``, on their ``clearance`` lines.
+#: gates are ``tests/test_acceptance_openems_stripline.py`` and
+#: ``tests/test_acceptance_openems_microstrip.py``, on their ``clearance``
+#: lines.
 #:
 #: The figure stays a fraction because no cross-section is available at the
 #: moment it is needed. A port is created before there is a strip, a substrate
@@ -92,8 +93,8 @@ SPEED_OF_LIGHT = units.SPEED_OF_LIGHT * units.MM_PER_M
 #: no symptom.
 #:
 #: The figure is good to about one significant figure.
-#: ``tests/test_acceptance_stripline.py`` solves a ladder of clearances and
-#: measures what each buys.
+#: ``tests/test_acceptance_openems_stripline.py`` solves a ladder of
+#: clearances and measures what each buys.
 CLEARANCE = 0.1
 
 
@@ -123,12 +124,14 @@ class PortBox:
     propagation_axis: int
     feed: float = 0.0
     measurement: float = 0.0
-    #: Distance from ``start`` along the propagation axis to where openEMS reads
-    #: this port's numbers, in millimetres. The port kind decides which plane
-    #: that is, and nothing else does, so each constructor below sets it. It is
-    #: separate from :attr:`measurement`. A microstrip, a coaxial line and a
-    #: waveguide set both to the same distance; a lumped port sets only this
-    #: one, having no measurement plane.
+    #: Distance from ``start`` along the propagation axis to the plane this
+    #: port's numbers are referred to, in millimetres: where openEMS reads them
+    #: for a microstrip, a coaxial line and a lumped port, and the reference
+    #: plane for a waveguide, whose reading the adapter moves there. The port
+    #: kind decides which plane that is, and nothing else does, so each
+    #: constructor below sets it. It is separate from :attr:`measurement`. A
+    #: microstrip, a coaxial line and a waveguide set both to the same distance;
+    #: a lumped port sets only this one, having no measurement plane.
     #:
     #: It is named for the probes rather than for the reference plane the user
     #: knows it as, because ``reference`` already names an entity in
@@ -556,11 +559,12 @@ def rect_waveguide(
     fallback: float,
     subject: str = "waveguide port",
 ) -> PortBox:
-    """A mode launched over a cross-section.
+    """A mode launched over a cross-section, and a plane ``length`` into the guide.
 
-    The excitation goes on the near face of this box and the probes on the far
-    one, so the length is where the measurement plane sits. Neither shift
-    applies, and the envelope refuses one.
+    The mode is launched on the near face of this box. The openEMS adapter
+    builds its port as this box, whose far face is where openEMS reads the wave;
+    the drawing of a port shows the plane its S-parameters are referred to.
+    Neither shift applies, and the envelope refuses one.
     """
     length = length_of(stated_length, fallback, subject)
     start, stop = list(face[0]), list(face[1])

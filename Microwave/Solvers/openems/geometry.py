@@ -25,10 +25,11 @@ Refused here, by name:
 * a solid wound inside out, which describes everything except the space it
   appears to occupy and so is not bounded;
 * a dielectric surface that encloses no volume and lies flat on none of the
-  three axes. A layer with no thickness is laid at an elevation, and a curved or
-  a tilted one has no elevation. Its thickness is most of what the layer does,
-  so nothing here may supply one. A conductor drawn that way is given a
-  thickness instead: the field inside metal is zero either way;
+  three axes. Its thickness is most of what the layer does, so nothing here may
+  supply one. A flat one is refused by the translation instead, since openEMS
+  reads a plane only where it happens to lie on a reading point. A conductor
+  drawn that way is given a thickness: the field inside metal is zero either
+  way;
 * a shape whose own triangulation comes back open, or comes back having lost
   enough of the drawing to be a different object.
 """
@@ -36,14 +37,16 @@ Refused here, by name:
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence, Set
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from ... import picks, portbox
+from ... import drawn, picks, portbox
+from .. import mesh_regions
+from ..mesh_regions import COARSEN
 from .lfs import Curvature, bends_through, curvature
 from .model import DIMENSIONS
-from .properties import AXIS_NAMES, TranslationError, _label, _value
+from .properties import AXIS_NAMES, TranslationError, _label
 from .rectilinear import Rect, RectilinearError, rectangles
 from .regions import SizingRegion
 from .surface import covered_area, enclosed_volume, surface_fault
@@ -352,21 +355,44 @@ def _union(boxes: Sequence[Box]) -> Box:
     )
 
 
-def solid_boxes(obj: Any, skin: float | None = None, held_to: float = 0.0) -> list[Piece]:
+def solid_boxes(
+    obj: Any, skin: float | None = None, held_to: float = 0.0, shape: Any = None
+) -> list[Piece]:
     """The boxes a whole document object occupies, labelled.
 
     :param skin: How thick to make a conductor drawn as a surface, in mm, or
-        ``None`` to refuse one. Only a conductor gets this: a dielectric's
-        thickness is a property of the device and nothing here may invent it.
+        ``None`` for a dielectric. Only a conductor gets this: a dielectric's
+        thickness is a property of the device and nothing here may invent it,
+        and a dielectric drawn as a closed surface fills the volume inside it.
     :param held_to: How far a curved surface may be solved from where it was
         drawn, in mm, or zero to ask for nothing. See :func:`_within`.
+    :param shape: the shape to take in place of the object's own: the body a
+        slip grows. See :func:`~Microwave.drawn.joined`.
     """
-    shape = getattr(obj, "Shape", None)
+    shape = picks.placed(obj) if shape is None else shape
     if shape is None:
         raise TranslationError(
             f"{_label(obj)!r} has no shape, so there is nothing to mesh. "
             "Material bindings must reference solid geometry"
         )
+    if skin is None:
+        # A dielectric drawn as a closed surface fills the volume inside it, and
+        # taken as that solid it is cut into the boxes a solid is cut into.
+        try:
+            filled = drawn.filling(shape)
+        except drawn.Unmeasured as failed:
+            raise TranslationError(
+                f"{_label(obj)!r} is drawn as closed surfaces, and the CAD kernel could "
+                f"not make a solid of them: {failed}. Check it with Part's Check geometry"
+            ) from None
+        if filled is not None and filled is not shape and drawn.loose(shape):
+            raise TranslationError(
+                f"{_label(obj)!r} holds closed surfaces and faces that bound no volume, so "
+                "it is part volume and part surface. Which of the two a face is meant to "
+                "be cannot be read from the drawing. Bind them separately, or leave the "
+                "faces out"
+            )
+        shape = shape if filled is None else filled
     return _boxes_of(shape, _label(obj), skin, held_to)
 
 
@@ -437,7 +463,7 @@ def _boxes_of(
                 for piece in _boxes_of(surface, f"{label}#{number}", skin, held_to)
             ]
 
-    box = _bounds(shape.BoundBox)
+    box = _bounds(drawn.bound(shape))
     extents = box.extents
     flat = [dim for dim in range(DIMENSIONS) if box.is_flat(dim)]
 
@@ -1016,9 +1042,9 @@ def _thickened(shape: Any, label: str, skin: float) -> Any:
             f"{MOST_OF_A_SKIN:.0%} of the {width:.4g} mm it measures across. What "
             "would be solved is a bar rather than the sheet that was drawn. That "
             "thickness follows the cell the metal is meshed at, so either raise "
-            "ElementsPerWavelength or EdgeRefinement until a cell is small "
-            "against this shape, or draw the conductor as a solid whose thickness "
-            "you chose"
+            "ElementsPerWavelength or EdgeRefinement on the Yee grid until a cell "
+            "is small against this shape, or draw the conductor as a solid whose "
+            "thickness you chose"
         )
 
     args = (skin, portbox.KERNEL_TOLERANCE)
@@ -1062,9 +1088,9 @@ def _thickened(shape: Any, label: str, skin: float) -> Any:
             "allowed, which is that thickness measured against the radius this "
             "shape turns through. What would be solved is a block rather than the "
             "sheet that was drawn. The thickness follows the cell the metal is "
-            "meshed at, so either raise ElementsPerWavelength or EdgeRefinement "
-            "until a cell is small against this shape, or draw the conductor as a "
-            "solid whose thickness you chose"
+            "meshed at, so either raise ElementsPerWavelength or EdgeRefinement on the "
+            "Yee grid until a cell is small against this shape, or draw the "
+            "conductor as a solid whose thickness you chose"
         )
     return solid
 
@@ -1072,7 +1098,7 @@ def _thickened(shape: Any, label: str, skin: float) -> Any:
 def _extent_of(vertices: Sequence[Vertex]) -> Box:
     """The triangulation's own bounds, which are what the adapter will emit.
 
-    These are not the shape's ``BoundBox``. That bounds the exact surface, and
+    These are not :func:`Microwave.drawn.bound`. That bounds the exact surface, and
     so lies marginally outside a triangulation that chords across every curve.
     The domain and the block the absorber is laid in are measured against what
     is sent.
@@ -1177,10 +1203,12 @@ def _cut_into(label: str, boxes: Sequence[Box], shape: Any) -> list[Piece]:
     """``boxes`` as pieces of ``shape``, numbered where there is more than one.
 
     Every rectangle carries the shape it was cut from, which is the whole of
-    what they tile. Nothing is lost by that. Each of them is a box, so the grid
-    pins its own faces, and lines bound any clearance between them on both
-    sides. A measurement has to find a clearance only where the grid cannot pin
-    the shape.
+    what they tile, and a length is measured off that shape. The same region
+    drawn as the boxes themselves is measured off each box, so the two drawings
+    raise different demands. Each of them is a box, so the grid pins its own
+    faces, and lines bound any clearance between them on both sides. A
+    measurement has to find a clearance only where the grid cannot pin the
+    shape.
     """
     labels = (
         [label] if len(boxes) == 1 else [f"{label}#{number}" for number in range(1, len(boxes) + 1)]
@@ -1203,7 +1231,7 @@ def _flat_axis(face: Any) -> int | None:
     thirty degrees in the plane keeps the two caps square and loses the four
     sides.
     """
-    at = _bounds(face.BoundBox)
+    at = _bounds(drawn.bound(face))
     thin = [dim for dim in range(DIMENSIONS) if at.is_flat(dim)]
     return thin[0] if len(thin) == 1 else None
 
@@ -1217,7 +1245,7 @@ def _planes(square: Sequence[tuple[int, Any]], axis: int) -> list[tuple[float, l
     nothing between them.
     """
     found = sorted(
-        (_bounds(face.BoundBox).lower[axis], number)
+        (_bounds(drawn.bound(face)).lower[axis], number)
         for number, (flat, face) in enumerate(square)
         if flat == axis
     )
@@ -1411,10 +1439,7 @@ def _cut_up(shape: Any, label: str, box: Box, flat: int, area: float) -> list[Pi
 
 def _shape_of(obj: Any, sub: str) -> Any:
     """The shape a binding names - the whole solid, or one sub-element of it."""
-    shape = getattr(obj, "Shape", None)
-    if shape is None or not sub:
-        return shape
-    return shape.getElement(sub)
+    return picks.element(obj, sub or "")
 
 
 def _elements_named(reference: Any) -> list[str]:
@@ -1423,7 +1448,10 @@ def _elements_named(reference: Any) -> list[str]:
 
 
 def _reference_boxes(
-    reference: Any, skin: float | None = None, held_to: float = 0.0
+    reference: Any,
+    skin: float | None = None,
+    held_to: float = 0.0,
+    grown: Mapping[str, Any] | None = None,
 ) -> tuple[Any, list[Piece]]:
     """Every region one binding reference names.
 
@@ -1436,6 +1464,9 @@ def _reference_boxes(
     One region per named element rather than their union, because the union of
     two faces on different planes is a box that is neither of them.
 
+    ``grown`` holds, by object name, the body a slip grows in place of a whole
+    object's own shape.
+
     Which element a region came from is not returned beside it. Each
     :class:`Piece` carries the geometry it is, and one element yields as many
     pieces as it needs, so a name paired by position would land on whichever
@@ -1446,197 +1477,32 @@ def _reference_boxes(
     names = [name for name in names if name]
 
     if not names:
-        return obj, solid_boxes(obj, skin, held_to)
+        return obj, solid_boxes(obj, skin, held_to, (grown or {}).get(obj.Name))
 
-    shape = getattr(obj, "Shape", None)
-    if shape is None:
+    if picks.placed(obj) is None:
         raise TranslationError(f"{_label(obj)!r} has no shape, so there is nothing to mesh")
     regions = []
     for name in names:
         label = f"{_label(obj)}:{name}"
-        regions.extend(_boxes_of(shape.getElement(name), label, skin, held_to))
+        regions.extend(_boxes_of(picks.element(obj, name), label, skin, held_to))
     return obj, regions
-
-
-def _refinement_boxes(reference: Any, region: str) -> list[tuple[str, Box]]:
-    """Every box one ``EMMeshRegion`` reference names, as ``(label, box)``.
-
-    These are bounding boxes. They are not proved to be boxes the way
-    :func:`solid_boxes` proves a material region is one. Refining around a
-    cylinder or a fillet is a reasonable thing to want, and the rectilinear
-    answer to it is the box it sits in. That is a surprise worth naming rather
-    than a refusal, so the property tooltip says "bounding box" and this does
-    not complain.
-
-    One box per named element rather than their union, for the reason
-    :func:`_reference_boxes` gives: the union of two faces on different planes
-    is a box that is neither of them.
-    """
-    obj = reference[0] if isinstance(reference, tuple) else reference
-    names = [name for name in _elements_named(reference) if name]
-
-    shape = getattr(obj, "Shape", None)
-    if shape is None:
-        raise TranslationError(
-            f"{region!r} references {_label(obj)!r}, which has no shape, so "
-            "there is nothing to refine around"
-        )
-    if not names:
-        return [(_label(obj), _bounds(shape.BoundBox))]
-    return [(f"{_label(obj)}:{name}", _bounds(shape.getElement(name).BoundBox)) for name in names]
-
-
-#: What a mesh region's ``Mode`` may say. ``Objects.EMMeshRegion`` offers the
-#: same words; the document layer cannot import it to ask.
-REFINE, COARSEN = "Refine", "Coarsen"
-
-
-def _mode(obj: Any) -> str:
-    """Which way a mesh region points, for a document that may predate the ask.
-
-    A word that is not one of the two is refused rather than defaulted. FreeCAD
-    stores an enumeration's whole list in the document and restores it from
-    there rather than from the class, so a file can go on offering a word this
-    adapter has no behaviour for. The reading it would fall back to silently is
-    the one that leaves the region doing the opposite.
-    """
-    mode = str(getattr(obj, "Mode", REFINE) or REFINE)
-    if mode not in (REFINE, COARSEN):
-        raise TranslationError(
-            f"{_label(obj)!r}: Mode is {mode!r}. A mesh region either makes the "
-            f"elements around its geometry finer ({REFINE}) or lets them go "
-            f"coarser ({COARSEN})"
-        )
-    return mode
-
-
-def _across_of(obj: Any) -> int:
-    """How many elements a mesh region wants across itself."""
-    across = int(obj.MinElementsAcross)
-    if across < 0:
-        raise TranslationError(
-            f"{_label(obj)!r}: MinElementsAcross is {across}; it must be 0 "
-            "to inherit the global count, or a positive number"
-        )
-    return across
-
-
-def _size_of(obj: Any) -> float:
-    """The element size a mesh region asks for, whichever way it points."""
-    size = _value(obj.ElementSize)
-    if size <= 0:
-        raise TranslationError(
-            f"{_label(obj)!r} has no element size set, so it asks for "
-            "nothing. Set ElementSize, or uncheck Enabled"
-        )
-    return size
-
-
-def _targets(obj: Any, verb: str) -> list[Any]:
-    """What a mesh region is aimed at, refused when it is aimed at nothing."""
-    references = list(getattr(obj, "References", ()) or ())
-    if not references:
-        raise TranslationError(
-            f"{_label(obj)!r} {verb} nothing. Select the geometry it applies to, or delete it"
-        )
-    return references
-
-
-def _subject(obj: Any, element: str) -> tuple[str, str]:
-    """What a coarsening and a material binding have to agree on to be the same.
-
-    The key uses ``Name`` rather than the label. FreeCAD keeps the name unique
-    within a document and leaves the label unique only by convention, so two
-    objects a user has given one label are still two things to relax separately.
-
-    The sub-element belongs in the key. A conductor is routinely a face of the
-    board it sits on, so the object alone does not identify what was drawn.
-    Relaxing by object would let a coarsened substrate take the ground plane
-    down with it, and this feature is built not to reach that far.
-    """
-    return (getattr(obj, "Name", "") or _label(obj), element)
-
-
-@dataclass(frozen=True)
-class _Relaxation:
-    """The size some geometry settles for, and who asked."""
-
-    size: float
-    asked_by: str
-
-
-def _relaxations(refinements: Sequence[Any]) -> dict[tuple[str, str], _Relaxation]:
-    """Which drawn geometry stops driving the grid, and the size it settles for.
-
-    A coarsening names geometry, and that is why it is carried this way rather
-    than as a box like a refinement. The grid is separable, so a box spends
-    itself on a slab through the model on each axis. A refinement that
-    overshoots hands out cells nobody asked for, and a coarsening that
-    overshoots would take them off whatever else lies level with the box,
-    anywhere in the model.
-
-    It is keyed by :func:`_subject`, so it reaches what a material binding would
-    have had to name to be the same thing.
-
-    Two coarsenings over one subject leave it at the finer of the two, the same
-    way round as two refinements: the grid ends up as fine as the finest thing
-    asked for, whichever direction asked.
-    """
-    out: dict[tuple[str, str], _Relaxation] = {}
-
-    for obj in refinements:
-        if not bool(getattr(obj, "Enabled", True)) or _mode(obj) != COARSEN:
-            continue
-
-        size = _size_of(obj)
-        across = _across_of(obj)
-        if across:
-            raise TranslationError(
-                f"{_label(obj)!r} is set to {COARSEN} and asks for {across} "
-                "elements across. A count is a demand for resolution, so it "
-                "would be honoured while the coarsening beside it was not. Set "
-                f"MinElementsAcross to 0, or set Mode to {REFINE}"
-            )
-
-        for reference in _targets(obj, "coarsens"):
-            target = reference[0] if isinstance(reference, tuple) else reference
-            for element in _elements_named(reference):
-                key = _subject(target, element)
-                if key not in out or size < out[key].size:
-                    out[key] = _Relaxation(size, _label(obj))
-
-    return out
-
-
-def _check_relaxations_were_used(
-    relaxed: Mapping[tuple[str, str], _Relaxation], used: Set[tuple[str, str]]
-) -> None:
-    """Refuse a coarsening aimed at geometry the mesher never sizes.
-
-    Only a material binding gives geometry a size the grid works from, so a
-    coarsening aimed anywhere else changes nothing at all. It is refused rather
-    than passed over. The region is a typed request, and one that is quietly
-    dropped leaves the property editor showing a size that was never applied.
-    This check refuses that instead.
-    """
-    for (name, element), relaxation in relaxed.items():
-        if (name, element) in used:
-            continue
-        drawn = f"{name}:{element}" if element else name
-        raise TranslationError(
-            f"{relaxation.asked_by!r} coarsens {drawn!r}, which no material "
-            "binding names. Only geometry a material has been bound to has an "
-            "element size to settle for, so this asks for nothing. Bind a "
-            "material to it, or aim the region at geometry that has one"
-        )
 
 
 def _sizing_regions(refinements: Sequence[Any]) -> tuple[SizingRegion, ...]:
     """``EMMeshRegion`` objects as the mesher's local refinement input.
 
     This returns refinements only. A region set to coarsen is attached to the
-    geometry it names instead - see :func:`_relaxations` - and contributes no
-    box.
+    geometry it names instead - see
+    :func:`~Microwave.Solvers.mesh_regions.relaxations` - and contributes no box.
+
+    Each thing a region names is refined as its bounding box. It is not proved
+    to be a box the way :func:`solid_boxes` proves a material region is one.
+    Refining around a cylinder or a fillet is a reasonable thing to want, and
+    the rectilinear answer to it is the box it sits in. That is a surprise worth
+    naming rather than a refusal, so the property tooltip says "bounding box"
+    and this does not complain. One box per named element rather than their
+    union, for the reason :func:`_reference_boxes` gives: the union of two faces
+    on different planes is a box that is neither of them.
 
     Nothing here compares the requested size against the global one. That check
     needs :class:`MeshParams`, and it lives in the mesher, where every route -
@@ -1646,23 +1512,21 @@ def _sizing_regions(refinements: Sequence[Any]) -> tuple[SizingRegion, ...]:
     out: list[SizingRegion] = []
 
     for obj in refinements:
-        if not bool(getattr(obj, "Enabled", True)) or _mode(obj) == COARSEN:
+        if not bool(getattr(obj, "Enabled", True)) or mesh_regions.mode(obj) == COARSEN:
             continue
 
-        size = _size_of(obj)
-        across = _across_of(obj)
-
-        for reference in _targets(obj, "refines"):
-            for label, box in _refinement_boxes(reference, _label(obj)):
-                out.append(
-                    SizingRegion(
-                        lower=box.lower,
-                        upper=box.upper,
-                        size=size,
-                        min_lines=across,
-                        label=f"{_label(obj)} on {label}",
-                    )
+        region = mesh_regions.read(obj)
+        for named in region.named:
+            box = _bounds(drawn.bound(named.shape))
+            out.append(
+                SizingRegion(
+                    lower=box.lower,
+                    upper=box.upper,
+                    size=region.size,
+                    min_lines=region.across,
+                    label=f"{region.label} on {named.name}",
                 )
+            )
 
     return tuple(out)
 
@@ -1680,8 +1544,7 @@ def _sub_box(link: Any, subject: str) -> Box:
     obj, sub = link
     names = [sub] if isinstance(sub, str) else list(sub or ())
     names = [name for name in names if name]
-    shape = obj.Shape
 
     if not names:
-        return _bounds(shape.BoundBox)
-    return _union([_bounds(shape.getElement(name).BoundBox) for name in names])
+        return _bounds(drawn.bound(picks.placed(obj)))
+    return _union([_bounds(drawn.bound(picks.element(obj, name))) for name in names])

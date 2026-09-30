@@ -36,15 +36,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import FreeCAD  # noqa: E402
 
-from Microwave.Gui import mesh_preview  # noqa: E402
+from Microwave.Gui import fem_mesh, openems_mesh_preview  # noqa: E402
 from Microwave.Objects import mesh, results  # noqa: E402
 from Microwave.Objects import preview as preview_objects  # noqa: E402
+from Microwave.Objects.analysis import find_preview  # noqa: E402
 from Microwave.Objects.preview import DISPLAY_PROPERTIES  # noqa: E402
 from Microwave.Solvers.openems import document  # noqa: E402
 
 #: Filled by the counted wrapper below, and reset before each case.
 ASKS = [0]
 EXECUTES = [0]
+
+
+def _a_mesh_arrives(analysis):
+    import Fem
+
+    fem_mesh.put(analysis, "Palace", Fem.FemMesh())
 
 
 def _instrument():
@@ -95,9 +102,16 @@ def _a_bound_solid(analysis):
 
 
 def _edit_then_nudge(preview, found):
-    """Move the mesh policy, then move a slice before anything recomputes."""
-    found.settings.ElementsPerWavelength = float(found.settings.ElementsPerWavelength) + 5.0
+    """Move the Yee grid, then move a slice before anything recomputes."""
+    found.recipe.ElementsPerWavelength = float(found.recipe.ElementsPerWavelength) + 5.0
     _nudge(preview, "SliceY")
+
+
+def _fixed(obj, name):
+    """Whether ``name`` is an enumeration offering one value."""
+    if obj.getTypeIdOfProperty(name) != "App::PropertyEnumeration":
+        return False
+    return len(obj.getEnumerationsOfProperty(name)) == 1
 
 
 def _bump(obj, name):
@@ -130,19 +144,77 @@ def _nudge(preview, name):
         setattr(preview, name, float(getattr(preview, name)) + 0.5)
 
 
-def _counted(path):
-    doc = FreeCAD.openDocument(path)
+def _reopened(doc, out):
+    """``doc`` saved into ``out``, closed, and opened again."""
+    copy = os.path.join(out, os.path.basename(doc.FileName))
+    doc.saveAs(copy)
+    FreeCAD.closeDocument(doc.Name)
+    return FreeCAD.openDocument(copy)
+
+
+def _verdicts(doc, out):
+    """What the panel says where no full recompute has written the badge.
+
+    Returns the document, which is a different one once it has been saved and
+    opened again, and the verdicts by case. Each case that changes something
+    ends with a full recompute and the badge put back, so the cases after it
+    start from a drawing that matches.
+    """
     analysis = _analysis(doc)
-    if analysis is None:
+    preview, _ = openems_mesh_preview.refresh(analysis)
+    verdicts = {"just drawn": openems_mesh_preview.staleness(analysis)}
+
+    doc = _reopened(doc, out)
+    analysis = _analysis(doc)
+    verdicts["saved and opened again"] = openems_mesh_preview.staleness(analysis)
+
+    solid = _a_bound_solid(analysis)
+    if solid is None:
+        return doc, verdicts
+    preview = find_preview(analysis)
+
+    solid.touch()
+    verdicts["a bound solid touched"] = openems_mesh_preview.staleness(analysis)
+    doc.recompute([solid])
+    verdicts["a bound solid recomputed alone"] = openems_mesh_preview.staleness(analysis)
+    doc.recompute()
+    openems_mesh_preview._mark_current(preview)
+
+    solid.touch()
+    doc.recompute([solid, *document.contents(analysis).bindings])
+    _nudge(preview, "SliceX")
+    verdicts["a bound solid recomputed alone, then a slice nudged"] = (
+        openems_mesh_preview.staleness(analysis)
+    )
+    doc.recompute()
+    verdicts["that, then recomputed"] = str(preview.Status)
+    openems_mesh_preview._mark_current(preview)
+
+    solid.touch()
+    doc = _reopened(doc, out)
+    analysis = _analysis(doc)
+    verdicts["a bound solid touched, saved and opened again"] = openems_mesh_preview.staleness(
+        analysis
+    )
+    doc.recompute()
+    openems_mesh_preview._mark_current(find_preview(analysis))
+    return doc, verdicts
+
+
+def _counted(path, out):
+    doc = FreeCAD.openDocument(path)
+    if _analysis(doc) is None:
         FreeCAD.closeDocument(doc.Name)
         return None
 
-    preview, _ = mesh_preview.refresh(analysis)
+    doc, verdicts = _verdicts(doc, out)
+    analysis = _analysis(doc)
+    preview = find_preview(analysis)
     doc.recompute()
     found = document.contents(analysis)
     solid = _a_bound_solid(analysis)
 
-    cases = {}
+    cases = {"verdicts": verdicts}
     # The display properties first, while the badge still reads Current: a case
     # that asks nothing can only be told from one that asks and finds nothing
     # by the count, and the badge is what says the drawing still matches.
@@ -151,8 +223,9 @@ def _counted(path):
 
     # Then everything else a class declares moves no cell, on the same footing:
     # the declaration is what has to keep these off the graph.
+    # An enumeration offering one value has no other setting to move to.
     for name in sorted(type(found.solver.Proxy).MOVES_NO_CELL):
-        if hasattr(found.solver, name):
+        if hasattr(found.solver, name) and not _fixed(found.solver, name):
             cases[name] = _case(doc, preview, partial(_bump, found.solver, name))
     if found.ports:
         cases["Excitation"] = _case(doc, preview, partial(_bump, found.ports[0], "Excitation"))
@@ -168,6 +241,18 @@ def _counted(path):
     # fire than the one the comparison puts out.
     cases["a result arriving"] = _case(
         doc, preview, partial(analysis.addObject, results.createEMSParameters(doc))
+    )
+    # Another backend's mesh, which a Mesh or a Run on it puts in the study. It
+    # is FreeCAD's own object rather than one of this workbench's, so the
+    # comparison leaves it out along with everything else the workbench does
+    # not own.
+    cases["a mesh arriving"] = _case(doc, preview, partial(_a_mesh_arrives, analysis))
+    # And the other backend's mesh recipe, which Add Palace Solver puts in the
+    # study. It is this workbench's own object and a member of the study, so
+    # what keeps it out of the comparison is its row on NOT_MESHED_FROM rather
+    # than anything the sweep above covers.
+    cases["another pipeline's recipe arriving"] = _case(
+        doc, preview, partial(analysis.addObject, mesh.createEMGmshMesh(doc))
     )
     # A material is reached through the binding that names it, wherever the
     # tree keeps it, so tidying one into the study moves no cell. Counting it
@@ -194,13 +279,26 @@ def _counted(path):
     cases["the frequency band"] = _case(doc, preview, partial(_bump, analysis, "FrequencyStop"))
     if solid is not None:
         cases["a bound solid touched"] = _case(doc, preview, solid.touch)
+    cases["the Yee grid"] = _case(
+        doc,
+        preview,
+        lambda: setattr(
+            found.recipe,
+            "ElementsPerWavelength",
+            float(found.recipe.ElementsPerWavelength) + 5.0,
+        ),
+    )
+    # And the policy beside it, which is a different link. With only the grid
+    # edited, dropping the policy from what Gui/openems_mesh_preview.py::_link
+    # records would leave this sweep green while a count across a substrate
+    # moved the grid and nothing said so.
     cases["the mesh policy"] = _case(
         doc,
         preview,
         lambda: setattr(
             found.settings,
-            "ElementsPerWavelength",
-            float(found.settings.ElementsPerWavelength) + 5.0,
+            "MinElementsAcross",
+            int(found.settings.MinElementsAcross) + 2,
         ),
     )
     if solid is not None and hasattr(solid, "Length"):
@@ -220,7 +318,7 @@ def _counted(path):
     # housekeeping, and both members() and contents() follow it.
     subgroup = doc.addObject("App::DocumentObjectGroup", "Refinements")
     analysis.addObject(subgroup)
-    mesh_preview._mark_current(preview)
+    openems_mesh_preview._mark_current(preview)
     cases["a region arriving in a subgroup"] = _case(
         doc, preview, partial(subgroup.addObject, mesh.createEMMeshRegion(doc))
     )
@@ -231,7 +329,8 @@ def _counted(path):
 
 #: Property types the sweep has no perturbation for. A link is not moved
 #: because moving one rewrites what the study owns, which is a different
-#: subject - see the membership note in ``Gui/mesh_preview.py::_link``.
+#: subject - see the membership note in
+#: ``Gui/openems_mesh_preview.py::_link``.
 UNSWEPT = ("Link", "XLink", "Expression")
 
 
@@ -284,7 +383,7 @@ def _declared(path):
         FreeCAD.closeDocument(doc.Name)
         return None
 
-    preview, _ = mesh_preview.refresh(analysis)
+    preview, _ = openems_mesh_preview.refresh(analysis)
     found = document.contents(analysis)
     owned = [
         ("study", analysis),
@@ -339,7 +438,7 @@ def main():
     counted = {}
     declared = {}
     for path in sorted(glob.glob(os.path.join(here, "examples", "*.FCStd"))):
-        cases = _counted(path)
+        cases = _counted(path, out)
         if cases is not None:
             counted[os.path.basename(path)] = cases
         swept = _declared(path)

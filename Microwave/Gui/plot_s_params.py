@@ -8,19 +8,20 @@ tested without a display and :mod:`.charts` is handed a finished value to
 render.
 
 This module must import with neither matplotlib nor Qt present.
-``Gui/task_panel.py`` takes :func:`show_matrix` at module scope, so an import
-that raises here takes the whole task panel with it, and double-clicking the
-analysis then does nothing at all. Everything the workbench does apart from
-drawing - modelling, meshing, pre-flight, solving, Touchstone export - needs
-neither library, so their absence costs the chart and nothing else.
-The refusal belongs at the call, which every caller already reports, and
-:mod:`.charts` raises it.
+``Gui/openems_task_panel.py`` takes :func:`show_matrix` at module scope, so
+an import that raises here takes the whole task panel with it, and
+double-clicking the analysis then does nothing at all. Everything the
+workbench does apart from drawing - modelling, meshing, pre-flight, solving,
+Touchstone export - needs neither library, so their absence costs the chart
+and nothing else. The refusal belongs at the call, which every caller already
+reports, and :mod:`.charts` raises it.
 """
 
 from typing import NamedTuple
 
 import numpy as np
 
+from ..Results import modelled
 from . import charts
 
 #: Floor for the log, in magnitude. A perfectly matched bin would otherwise
@@ -76,6 +77,12 @@ def matrix_db(result):
     return frequency, traces
 
 
+#: Longest basis this chart puts under itself, in characters. The footnote is
+#: one wrapped text at ``x-small``, and the heading reserves one line for it;
+#: wrapping past two lines reaches into the top of the axes.
+LONGEST_BASIS = 240
+
+
 class ChartText(NamedTuple):
     """The chart's own text. The fields are named rather than a plain pair,
     because two strings of the same type are one transposition away from a
@@ -103,9 +110,16 @@ def chart_text(result) -> ChartText:
     """
     study = str(result.provenance.get("title") or "")
     reference = result.reference_description()
-    return ChartText(
-        f"{study} S-parameters".strip(), f"Referenced to {reference}" if reference else ""
-    )
+    basis = [f"Referenced to {reference}"] if reference else []
+    # How the loss was modelled is the second half of the basis. Two backends
+    # give two charts of one drawing that differ by it, and nothing on the axes
+    # says so.
+    loss = modelled.brief(result.provenance.get("modelled") or ())
+    if loss:
+        basis.append(f"Loss: {loss}")
+        if len(". ".join(basis)) > LONGEST_BASIS:
+            basis[-1] = "Loss: as the result's Modelled property states for each material"
+    return ChartText(f"{study} S-parameters".strip(), ". ".join(basis))
 
 
 def chart(result):
@@ -139,3 +153,57 @@ def show_matrix(result):
     call rather than at import.
     """
     return charts.render(chart(result), f"S-parameters ({result.ports}-port)")
+
+
+def comparison_chart(comparison, term):
+    """One term of two matrices, each in dB, and the magnitude of their
+    difference on the same axis.
+
+    :param comparison: a :class:`~..Results.compared.Comparison`.
+    :param term: ``(receiving, driving)``, by port number.
+    """
+    first_by, second_by = comparison.by
+    chosen = next(
+        found for found in comparison.terms if (found.receiving, found.driving) == tuple(term)
+    )
+    row = comparison.port_numbers.index(chosen.receiving)
+    column = comparison.port_numbers.index(chosen.driving)
+    frequency = np.asarray(comparison.frequency, dtype=float) / 1e9
+    return charts.Chart(
+        series=(
+            charts.Series(
+                frequency, db(comparison.first[:, row, column]), f"{chosen.name} ({first_by})"
+            ),
+            charts.Series(
+                frequency, db(comparison.second[:, row, column]), f"{chosen.name} ({second_by})"
+            ),
+            charts.Series(
+                frequency,
+                db(comparison.difference(chosen.receiving, chosen.driving)),
+                f"|{chosen.name} ({first_by}) - {chosen.name} ({second_by})|",
+            ),
+        ),
+        x_label="Frequency (GHz)",
+        y_label="Magnitude (dB)",
+        x_unit="GHz",
+        y_unit="dB",
+        heading=f"{chosen.name}: {first_by} and {second_by}",
+        footnote=". ".join([comparison.line(chosen), *comparison.notes()]),
+        choices=tuple((found.name, (found.receiving, found.driving)) for found in comparison.terms),
+        choice_label="Term",
+        chosen=(chosen.receiving, chosen.driving),
+    )
+
+
+def show_comparison(comparison):
+    """Draw two matrices term by term, with a selector for the term. Returns
+    the window.
+
+    Raises :class:`~.charts.ChartUnavailable` when there is nothing to draw into.
+    """
+    first = comparison.terms[0]
+    return charts.render(
+        comparison_chart(comparison, (first.receiving, first.driving)),
+        "S-parameters compared",
+        rebuild=lambda term: comparison_chart(comparison, term),
+    )

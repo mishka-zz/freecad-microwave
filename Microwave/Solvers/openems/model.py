@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from ... import units
 from .staircase import GROWN_BY, PINNED_CLEARANCE, grown
@@ -51,7 +52,12 @@ from .surface import sheet_fault, surface_fault
 #: ``results.json`` agree with each other, ``Results.matches()`` would still deny
 #: that the results came from the envelope. This adapter therefore refuses an
 #: unknown version by name.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+
+#: The priority the medium is laid at: one box over the whole grid, below every
+#: solid, so a cell takes the medium wherever no solid covers it and a solid
+#: wherever one does. openEMS gives a cell to the highest priority covering it.
+MEDIUM_PRIORITY = -1
 
 AXIS_NAMES = ("x", "y", "z")
 
@@ -144,6 +150,11 @@ PORT_KINDS = frozenset({"microstrip", "lumped", "rect_waveguide", "coaxial"})
 #: pre-flight checks, so :class:`Material` refuses them rather than leaving them
 #: set. See ``Material.__post_init__``.
 CONDUCTOR_KINDS = frozenset({"pec", "conducting_sheet"})
+
+#: Material kinds that turn power into heat. ``driver._add_material`` hands a
+#: ``lossy_dielectric`` and a ``conducting_sheet`` a conductivity, and every
+#: other kind none.
+LOSSY_KINDS = frozenset({"lossy_dielectric", "conducting_sheet"})
 
 #: Port kinds that integrate a voltage across a gap. Each has to be told which
 #: way to integrate. A waveguide port excites a mode over its whole
@@ -317,8 +328,14 @@ class Material:
     """A material property, in openEMS' terms.
 
     :param kind: ``dielectric`` (lossless), ``lossy_dielectric`` (adds
-        ``kappa``), ``pec`` (a perfect conductor), or ``conducting_sheet``
-        (a zero-thickness conductor with a surface-impedance loss model).
+        ``kappa`` and ``conductivity``), ``pec`` (a perfect conductor), or
+        ``conducting_sheet`` (a zero-thickness conductor with a
+        surface-impedance loss model).
+    :param kappa: For ``lossy_dielectric`` only, in S/m: the conductivity a loss
+        tangent became at one frequency.
+    :param conductivity: In S/m. A ``conducting_sheet``'s, and a
+        ``lossy_dielectric``'s own, held fixed across the band. The engine is
+        handed a lossy dielectric's two conductivities as one.
     :param thickness: For ``conducting_sheet`` only, in the same length unit as
         everything else here. It is a loss parameter and feeds the surface
         impedance. The sheet stays geometrically flat, so this never enters the
@@ -326,8 +343,8 @@ class Material:
         it at the boundary.
     :param measured_at: The frequency, in Hz, at which the loss that ``kappa``
         was built from was quoted; zero when nothing recorded it. The solver
-        never sees this field, because openEMS is handed ``kappa`` and nothing
-        else. It travels anyway: ``kappa`` is fixed for the whole run, so it
+        never sees this field, because openEMS is handed a conductivity and
+        nothing else. It travels anyway: ``kappa`` is fixed for the whole run, so it
         stands for that loss at one frequency only. Only this field can say whether
         that frequency lies in this band, and pre-flight asks on every route,
         including the one that is handed an envelope.
@@ -404,11 +421,44 @@ class Material:
                 "the engine and the run would come back lossless. Make it a "
                 "lossy_dielectric, or leave kappa at 0"
             )
+        # And the same again for a conductivity, which ``driver._add_material``
+        # passes for a conducting sheet and a lossy dielectric and drops for
+        # every other kind. A lossy dielectric's two are handed over as their
+        # sum, which has to be a number as well.
+        if self.conductivity > 0 and self.kind not in ("conducting_sheet", "lossy_dielectric"):
+            raise EnvelopeError(
+                f"{subject}: a {self.kind} carries a conductivity of {self.conductivity:g} "
+                "S/m. openEMS is handed one for a conducting_sheet and a lossy_dielectric "
+                "and for nothing else, so this one would be dropped on the way to the "
+                "engine. Make it one of those, or leave the conductivity at 0"
+            )
+        if not math.isfinite(self.kappa + self.conductivity):
+            raise EnvelopeError(
+                f"{subject}: kappa {self.kappa:g} and conductivity {self.conductivity:g} "
+                "S/m add to more than a double holds"
+            )
         if self.kind == "conducting_sheet" and self.conductivity <= 0:
             raise EnvelopeError(
                 f"material {self.name!r}: a conducting sheet needs a positive "
                 "conductivity; use kind 'pec' for a lossless conductor"
             )
+
+    def given(self) -> tuple[str | float, ...]:
+        """What the engine is handed for this material, apart from its name.
+
+        This follows ``driver._add_material``. A perfect conductor is handed
+        nothing. A conducting sheet is handed its conductivity and thickness. A
+        dielectric is handed its permittivity, its permeability and one
+        conductivity, the sum of the two this carries. A lossless one is handed
+        no conductivity, which CSXCAD takes as zero
+        (``CSXCAD/src/CSPropMaterial.cpp``, ``CSPropMaterial::Init``), so the
+        two dielectric kinds are one kind here.
+        """
+        if self.kind == "pec":
+            return (self.kind,)
+        if self.kind == "conducting_sheet":
+            return (self.kind, self.conductivity, self.thickness)
+        return ("dielectric", self.epsilon, self.mu, self.kappa + self.conductivity)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -660,6 +710,11 @@ class Port:
     #: to pre-flight. It is False for an envelope written by hand, because there
     #: is no drawing to disagree with.
     direction_unchecked: bool = False
+    #: How far into the guide from ``start`` the S-parameters are referred, in
+    #: length units. A waveguide port only, and refused on every other kind.
+    #: openEMS reads the wave at the box's far face, and the driver moves what it
+    #: read to this plane along the guide by the mode's propagation constant.
+    reference_depth: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "start", _point(self.start, f"port {self.number}"))
@@ -757,7 +812,14 @@ class Port:
         transverse axis therefore describes no guide at all.
         """
         if self.kind != "rect_waveguide":
+            if self.reference_depth:
+                raise EnvelopeError(
+                    f"port {self.number}: a {self.kind} port is referred where it "
+                    f"measures, so reference_depth {self.reference_depth:g} describes "
+                    "nothing; leave it unset"
+                )
             return
+        _finite(self.reference_depth, f"port {self.number}: reference_depth", low=0.0)
         for name, value in (
             ("feed_shift", self.feed_shift),
             ("measurement_shift", self.measurement_shift),
@@ -865,6 +927,13 @@ class Port:
     @property
     def name(self) -> str:
         return self.label or f"port {self.number}"
+
+    def probe_plane(self, lines: npt.ArrayLike) -> float:
+        """Where openEMS reads a waveguide port, on a grid whose lines along the
+        propagation axis are ``lines``: the line nearest the box's far face,
+        which is where the engine lays a probe box flat across the axis."""
+        along = np.asarray(lines, dtype=float)
+        return float(along[np.argmin(np.abs(along - self.stop[self.propagation_axis]))])
 
     @property
     def length(self) -> float:
@@ -1151,6 +1220,11 @@ class Port:
         # envelope this adapter produces and say nothing on most of them.
         if self.direction_unchecked:
             data["direction_unchecked"] = True
+        # On every waveguide port, zero included. What a waveguide port's
+        # S-parameters are referred to is part of what its envelope means, so the
+        # digest has to move where that plane does.
+        if self.kind == "rect_waveguide":
+            data["reference_depth"] = self.reference_depth
         return data
 
     @classmethod
@@ -1173,6 +1247,7 @@ class Port:
             priority=int(data.get("priority", 10)),
             label=data.get("label", ""),
             direction_unchecked=bool(data.get("direction_unchecked", False)),
+            reference_depth=float(data.get("reference_depth", 0.0)),
         )
 
 
@@ -1373,8 +1448,11 @@ def check_mode(mode: str, subject: str) -> str:
     return mode
 
 
-def check_timestep_factor(value: float) -> float:
+def check_timestep_factor(value: float, subject: str = "timestep_factor") -> float:
     """Return ``value`` if openEMS would act on it, and raise otherwise.
+
+    ``subject`` is the name the message gives the value: the envelope's field by
+    default, and the property where the document layer asks.
 
     The bound is stated here rather than at each of the two call sites, which
     are the envelope's own invariant and the document layer reading a property
@@ -1397,7 +1475,7 @@ def check_timestep_factor(value: float) -> float:
     """
     if not 0.0 < value <= 1.0:
         raise EnvelopeError(
-            f"timestep_factor must be above 0 and at most 1, got {value:g}. "
+            f"{subject} must be above 0 and at most 1, got {value:g}. "
             "openEMS scales its own timestep by it, and ignores anything else"
         )
     return value
@@ -1471,6 +1549,11 @@ class Problem:
         so a clearance reaching it zeroes an edge belonging outside the metal
         and stands the wall a cell inside the drawing, which is the same fault
         with its sign turned round.
+
+    :param medium: The name of the material filling every cell no solid covers,
+        the absorber included, or empty for the vacuum openEMS fills them with
+        unasked. It is one of ``materials`` and a dielectric, and the driver lays
+        it as one box over the grid at :data:`MEDIUM_PRIORITY`.
     """
 
     frequency: Frequency
@@ -1487,6 +1570,7 @@ class Problem:
     grown_by: float = GROWN_BY
     pinned_clearance: float = PINNED_CLEARANCE
     title: str = ""
+    medium: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "materials", tuple(self.materials))
@@ -1525,6 +1609,20 @@ class Problem:
                 raise EnvelopeError(
                     f"solid {solid.name!r} references material "
                     f"{solid.material!r}, which is not defined"
+                )
+        if self.medium:
+            filling = next((one for one in self.materials if one.name == self.medium), None)
+            if filling is None:
+                raise EnvelopeError(f"the medium {self.medium!r} is not a defined material")
+            if filling.kind in CONDUCTOR_KINDS:
+                raise EnvelopeError(
+                    f"the medium {self.medium!r} is a {filling.kind}, and a medium is a dielectric"
+                )
+            below = [solid.name for solid in self.solids if solid.priority <= MEDIUM_PRIORITY]
+            if below:
+                raise EnvelopeError(
+                    f"solid {below[0]!r} stands at priority {MEDIUM_PRIORITY} or below, where "
+                    "the medium would cover it"
                 )
         for port in self.ports:
             if port.metal and port.metal not in known:
@@ -1588,9 +1686,11 @@ class Problem:
         The offset is returned because the structure the engine is handed is
         not the one the user drew, and the XML beside it is in these
         coordinates. A reader of that file has to be told the offset, and
-        anything read back off the engine by position would have to subtract it.
-        Nothing this adapter reads back is a position, and an S-matrix is not
-        one, so the offset is provenance rather than a correction to apply.
+        anything that asks the engine about a position asks in these
+        coordinates. The adapter asks where a waveguide port's walls are, and
+        asks the moved problem. Nothing it reports is a position, and an
+        S-matrix is not one, so the offset is provenance rather than a
+        correction to apply.
 
         The translation is applied where the envelope is turned into a structure
         and nowhere earlier, so the mesh preview, a pre-flight message and the
@@ -1625,6 +1725,7 @@ class Problem:
             "solids": [s.to_dict() for s in self.solids],
             "ports": [p.to_dict() for p in self.ports],
             "grid": self.grid.to_dict(),
+            "medium": self.medium,
         }
 
     @classmethod
@@ -1650,6 +1751,7 @@ class Problem:
             grown_by=float(data.get("grown_by", GROWN_BY)),
             pinned_clearance=float(data.get("pinned_clearance", PINNED_CLEARANCE)),
             title=data.get("title", ""),
+            medium=str(data.get("medium", "")),
         )
 
     def to_json(self) -> str:

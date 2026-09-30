@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "small_and_far_apart.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "small_and_far_apart.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "small_and_far_apart.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.001,
+  "outside": 2200.0599999999904
+}

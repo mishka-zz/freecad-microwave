@@ -58,12 +58,11 @@ def mirror_warnings(problem):
 def _port_warnings(first, second):
     """Check that the two ports are each other's mirror.
 
-    Mirror completion copies S11 into S22 in the basis the solver measured in,
-    and that is valid
-    only if the two ports share a reference impedance. Mirrored ports do share
-    one, because they are the same cross-section. A 25 ohm lumped port facing a
-    100 ohm one is not a mirror however symmetric the structure between them
-    is.
+    Mirror completion takes the run nobody solved to be the solved one with the
+    two ports exchanged, and that is valid only if the two are the same port,
+    sharing a reference impedance. Mirrored ports do share one, because they are
+    the same cross-section. A 25 ohm lumped port facing a 100 ohm one is not a
+    mirror however symmetric the structure between them is.
     """
     found = []
     if first.kind != second.kind:
@@ -79,26 +78,25 @@ def _port_warnings(first, second):
         found.append(
             f"Port {first.number} is {one:g} ohm and port {second.number} is "
             f"{two:g} ohm. Mirrored ports have the same reference impedance, and "
-            "the derived S22 is a copy of S11 in the basis those impedances "
-            "define."
+            "the derived column is the solved run with the two ports exchanged, "
+            "which holds only for ports that are the same."
         )
 
     # The two ports must also be referenced the same way. One fixed and one
-    # against its own impedance leaves the completed matrix with a different
-    # reference at each port, and the copy cannot survive that. The final
-    # renormalisation then moves the two diagonal terms by different amounts,
-    # and the copied term is the one that ends up wrong.
+    # against its own impedance reports the completed matrix at a different
+    # reference at each port, which is a matrix of some other pair of ports
+    # than the two the declaration says are the same.
     stated = [port.reference_impedance is not None for port in (first, second)]
     if stated[0] != stated[1]:
         fixed, own = (first, second) if stated[0] else (second, first)
         found.append(
             f"Port {fixed.number} is referenced to a fixed impedance and port "
             f"{own.number} to its own. Mirrored ports are the same port, so they "
-            "are referenced the same way; S22 would be a copy of S11 taken in one "
-            "basis and reported in another."
+            "are referenced the same way; the matrix would be reported at a "
+            "different reference at each, and S22 would not read as S11."
         )
 
-    for name in ("feed_shift", "measurement_shift"):
+    for name in ("feed_shift", "measurement_shift", "reference_depth"):
         one, two = getattr(first, name, None), getattr(second, name, None)
         if one is not None and two is not None and not _close(one, two):
             found.append(

@@ -1,0 +1,30 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "specks_touching_under_two_labels.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "one",
+      "dim": 3,
+      "file": "specks_touching_under_two_labels.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "two",
+      "dim": 3,
+      "file": "specks_touching_under_two_labels.2.brep",
+      "priority": 2
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "specks_touching_under_two_labels.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

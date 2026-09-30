@@ -701,3 +701,44 @@ class TestACylinderIsAskedOnlyForModesItHas:
                 reference.circular_cavity_frequency(**bad)
         with pytest.raises(ValueError, match="eps_r"):
             reference.circular_cavity_frequency(10.0e-3, 10.0e-3, eps_r=0.0)
+
+
+class TestWhatTheWallsOfAGuideTakeOffTE10:
+    """``wall_attenuation`` is summed face by face, and the textbook states the
+    four walls summed. The two are different arithmetic for one quantity."""
+
+    WR42 = (10.7e-3, 4.3e-3)
+    BRASS = 1.57e7
+    BAND = np.array([20e9, 23e9, 26e9])
+
+    def test_the_four_walls_are_pozars_closed_form(self):
+        """Pozar, *Microwave Engineering*, eq. 3.96:
+        ``Rs / (a^3 b beta k eta) * (2 b pi^2 + a^3 k^2)``."""
+        a, b = self.WR42
+        k = 2 * np.pi * self.BAND / reference.SPEED_OF_LIGHT
+        beta = np.real(reference.phase_constant(self.BAND, a, b))
+        eta = reference.Z_FREE_SPACE
+        rs = np.sqrt(k * eta / (2 * self.BRASS))
+        pozar = rs / (a**3 * b * beta * k * eta) * (2 * b * np.pi**2 + a**3 * k**2)
+        got = reference.wall_attenuation(self.BAND, a, b, self.BRASS)
+        np.testing.assert_allclose(got, pozar, rtol=1e-12, atol=0.0)
+
+    def test_it_is_the_sum_of_what_each_face_takes(self):
+        a, b = self.WR42
+        one = reference.wall_attenuation(self.BAND, a, b, self.BRASS, broad=1, narrow=0)
+        other = reference.wall_attenuation(self.BAND, a, b, self.BRASS, broad=0, narrow=1)
+        whole = reference.wall_attenuation(self.BAND, a, b, self.BRASS)
+        np.testing.assert_allclose(whole, 2 * one + 2 * other, rtol=1e-12, atol=0.0)
+
+    def test_it_falls_as_the_root_of_the_conductivity(self):
+        """The surface resistance goes as one over the root of it."""
+        a, b = self.WR42
+        worse = reference.wall_attenuation(self.BAND, a, b, self.BRASS / 4)
+        np.testing.assert_allclose(
+            worse, 2 * reference.wall_attenuation(self.BAND, a, b, self.BRASS), rtol=1e-12
+        )
+
+    def test_it_is_not_stated_below_cutoff(self):
+        a, b = self.WR42
+        with pytest.raises(ValueError, match="above cutoff"):
+            reference.wall_attenuation(np.array([10e9]), a, b, self.BRASS)

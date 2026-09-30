@@ -1,0 +1,25 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "skin_across_the_box.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "skin",
+      "dim": 2,
+      "file": "skin_across_the_box.1.brep",
+      "priority": 0,
+      "divides": true
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "skin_across_the_box.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

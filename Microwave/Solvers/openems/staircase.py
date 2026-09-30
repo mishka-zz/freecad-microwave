@@ -12,9 +12,9 @@ on the primary grid lines across the edge and midway along it
 
 The effect on a curved surface is measured rather than argued from the
 sampling. It arrives inside where it was drawn, by a share of the cell that
-``tests/test_fidelity.py`` reads off a cylinder and a sphere. The error is
-one-sided, so it does not average out over the surface, and it is proportional
-to the cell, so refining does not remove it.
+``tests/test_openems_fidelity.py`` reads off a cylinder and a sphere. The
+error is one-sided, so it does not average out over the surface, and it is
+proportional to the cell, so refining does not remove it.
 
 The correction is to grow a conductor by half the cell it will be sampled on,
 which puts the last line still inside it on the drawn surface. It grows on the
@@ -36,8 +36,8 @@ These boundaries are left alone:
 - A **sheet's rim**. It is point-sampled and does come back cut in, by an amount
   nothing has measured. A flat conductor's charge sits at its outline where the
   grid is least accurate, so a capacitance cannot separate what the rim gave up
-  from what the discretisation gained. ``tests/test_fidelity.py`` shows the two
-  are the same size on a plate the grid holds exactly.
+  from what the discretisation gained. ``tests/test_openems_fidelity.py`` shows
+  the two are the same size on a plate the grid holds exactly.
 
 The half is established by the size of the error it leaves rather than by the
 rate that error falls at. The correction does not change the rate: a
@@ -46,18 +46,18 @@ grid is, so what is left stays proportional to the cell. The correction changes
 the coefficient, by a large factor. A correction of the wrong size leaves a share
 of the cell several times larger while still looking better than none.
 
-``tests/test_staircase_model.py`` holds both halves with no solver in it. It
-solves the same rule as electrostatics on a coaxial cross-section, averaged over
-where the lattice falls, since what is left is small enough that a single grid
-per cell size is scatter rather than a sequence.
-``tests/test_acceptance_cavity.py`` holds the size against a real solve, on every
-mesh it runs, and at the meshes ``tests/cavity.py`` lists as *as drawn* it solves
-the same cavity with the share set to zero. How far the engine's own reading
-stands from the drawing is therefore measured on Maxwell rather than read off the
-source above.
+``tests/test_openems_staircase_model.py`` holds both halves with no solver in it.
+It solves the same rule as electrostatics on a coaxial cross-section, averaged
+over where the lattice falls, since what is left is small enough that a single
+grid per cell size is scatter rather than a sequence.
+``tests/test_acceptance_openems_cavity.py`` holds the size against a real solve,
+on every mesh it runs, and at the meshes ``tests/openems_cavity.py`` lists as *as
+drawn* it solves the same cavity with the share set to zero. How far the engine's
+own reading stands from the drawing is therefore measured on Maxwell rather than
+read off the source above.
 
 A sphere cannot establish where the rule stops, having no flat face to leave
-alone. A cylinder can, and ``tests/pillbox.py`` draws one.
+alone. A cylinder can, and ``tests/openems_pillbox.py`` draws one.
 """
 
 from __future__ import annotations
@@ -110,9 +110,9 @@ GROWN_BY = 0.5
 #: The share is bounded at both ends and set well inside them. The lower bound is
 #: how far into a face containment stays unsure, which is a property of the
 #: triangulation rather than a fixed tolerance;
-#: ``tests/test_pinned_clearance.py`` measures it against the engine and holds
-#: the clearance above it. The upper bound is half a cell, where the field edge
-#: normal to the face is sampled on the void side of it
+#: ``tests/test_openems_pinned_clearance.py`` measures it against the engine and
+#: holds the clearance above it. The upper bound is half a cell, where the field
+#: edge normal to the face is sampled on the void side of it
 #: (``Operator::GetYeeCoords``, ``openEMS/FDTD/operator.cpp:183-186``, which puts
 #: a component on the dual line of its own axis). A displacement reaching that
 #: zeroes an edge belonging outside the metal and stands the wall a cell inside
@@ -212,8 +212,8 @@ NEARLY_SQUARE = math.sqrt(2.0 * PLANAR)
 #: claims to be. Held, it pins a grid line at the chord, and an anchor is refused
 #: outright when another lands within the cell floor of it, so a rod drawn
 #: against a wall would stop meshing. Such a strip is about as wide as the facets
-#: it abuts, and ``tests/test_corpus_staircase.py`` measures the ground between
-#: that and a face over every drawing the corpus makes.
+#: it abuts, and ``tests/test_openems_corpus_staircase.py`` measures the ground
+#: between that and a face over every drawing the corpus makes.
 #:
 #: Nothing forces an upper bound, so the threshold is set well clear rather than
 #: close. A rejected run is grown like the curve it lies in, which costs accuracy

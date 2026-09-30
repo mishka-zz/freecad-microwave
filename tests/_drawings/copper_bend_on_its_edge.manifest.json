@@ -1,0 +1,30 @@
+{
+  "pieces": [
+    {
+      "label": "substrate",
+      "dim": 3,
+      "file": "copper_bend_on_its_edge.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "copper_bend_on_its_edge.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "copper",
+      "dim": 3,
+      "file": "copper_bend_on_its_edge.2.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "copper_bend_on_its_edge.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

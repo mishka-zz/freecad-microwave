@@ -52,7 +52,7 @@ class MicrowaveWorkbench(Workbench):
         # Imported for its side effect. It registers the preview redraw hook, so
         # changing a display property acts immediately even if the simulation
         # panel has never been opened. It imports no Qt.
-        from Microwave.Gui import mesh_preview  # noqa: F401
+        from Microwave.Gui import openems_mesh_preview  # noqa: F401
 
         # One toolbar per group rather than one toolbar of dropdowns. The
         # commands are few enough to fit, and the user can move or hide each of
@@ -119,8 +119,9 @@ def _install_document_support():
     This module runs at GUI startup for every installed addon, so it must stay
     cheap. It registers a hook and an observer, imports no Qt, and leaves the
     per-provider modules to be imported inside ``inject_vp``. The observer fills
-    gaps only on objects this workbench defines a proxy class for, so it does
-    nothing for every other document in the session.
+    gaps only on objects this workbench defines a proxy class for, and marks a
+    mesh this workbench put in a study, so it does nothing for every other
+    document in the session.
     """
     try:
         from Microwave import Objects, ViewProviders

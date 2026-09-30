@@ -4,11 +4,11 @@ FreeCAD geometry can be created using primitives, the Sketcher, boolean
 operations, or imported DXF profiles. The workbench extracts the resulting
 shape for simulation.
 
-> This page describes geometry handling for the openEMS FDTD solver.
-> OpenEMS uses a rectilinear Yee grid. While curved and rotated geometry is
-> supported, the discretization follows rectilinear grid constraints.
-> Solvers based on the Method of Moments (NEC2) or FEM (Palace) use their
-> own mesh representations and do not share these constraints.
+> Sections that name openEMS describe the rectilinear Yee grid it is solved
+> on. While curved and rotated geometry is supported there, the
+> discretization follows rectilinear grid constraints. On Palace the
+> tetrahedral mesh follows the drawn surface, and the constraints are those of
+> [Geometry on Palace](#geometry-on-palace).
 
 ## Placement and orientation
 
@@ -28,6 +28,20 @@ accordingly.
 Absolute coordinates and origin position are arbitrary. The mesher
 constructs the simulation domain around the bounding box of the assigned
 geometry.
+
+Shapes inside containers - an `App::Part`, a `PartDesign::Body`, an
+`App::LinkGroup`, a link inside one of them - are read where FreeCAD shows
+them, with the placement of every container above them applied. The port boxes
+and the mesh preview are drawn there too, wherever the study itself stands.
+
+A link, or a link array, shows a copy of what it links to. A binding on the
+original reads the original where it stands; bind the link to read the copy.
+
+These are refused by name:
+- An object two containers hold. Nothing in the drawing says which place is
+  meant. Keep it in one.
+- A face or edge picked through the container that holds it, such as
+  `Part.Box.Face1`. Pick it on the object that owns it.
 
 ### Recommended geometry types
 
@@ -94,14 +108,14 @@ Summary of supported geometry:
 | Flat sheet | Planar layouts, ground planes, thin patches | Low |
 | Metal shell | Zero-thickness conductor surfaces (reflectors, horns) | Moderate |
 
-## A conductor drawn as a surface is given a thickness
+## A conductor drawn as a surface is given a thickness on openEMS
 
 When a conductor is modeled as an open surface or zero-thickness shell (such
 as a horn antenna or reflector), the adapter automatically offsets the
 surface into a solid volume. This applies exclusively to conductors, since
 the electric field inside a conductor is zero.
 
-The offset thickness is derived from the mesh policy and the top of the band:
+The offset thickness is derived from the Yee grid and the top of the band:
 it is sized from the coarsest cell the grid will use anywhere, computed in
 vacuum, so it never becomes the finest feature limiting the FDTD timestep.
 The applied thickness is reported by the Check command and during simulation
@@ -112,7 +126,20 @@ missing faces, it will be treated as an open shell and assigned this
 artificial thickness. Inspect geometry warnings to ensure closed solids are
 properly closed in CAD.
 
-## Rejected geometry configurations
+On Palace a sheet bound to `PEC` carries the perfect conductor where it is
+drawn, and is given no thickness. A sheet bound to a `ConductingSheet` carries
+its metal's surface impedance on each of its faces.
+
+## A dielectric drawn as a closed surface is the volume inside it
+
+A dielectric bound to a closed surface - a shell, or a mesh brought in from STL
+and made into a shape - fills the volume the surface bounds, on both backends,
+and is meshed as that solid would be. A hollow part arrives as one closed
+surface round the outside and one round each cavity. A surface standing inside
+another bounds a cavity, and the cavity holds no dielectric. A surface standing
+inside that cavity bounds dielectric again.
+
+## Rejected geometry configurations on openEMS
 
 The adapter validates geometry prior to simulation and explicitly rejects
 shapes that cannot be represented in openEMS:
@@ -120,15 +147,17 @@ shapes that cannot be represented in openEMS:
 | Rejected condition | Description | Corrective action |
 |---|---|---|
 | Flat in two axes | A 1D line or 0D point enclosing no area | Assign width/thickness |
-| Mixed volume and surface | A single object containing both solid volumes and loose faces | Separate into distinct objects or knit into a closed solid |
+| Mixed volume and surface | A single object containing both volumes - solids or closed surfaces - and loose faces | Separate into distinct objects or knit into a closed solid |
 | Inverted normal (inside out) | A solid whose surface normals point inward | Reverse face normals |
 | Self-pinching surface | Two lobes of a single volume touching at a single vertex | Merge lobes or split into separate solids |
-| Tilted or curved dielectric sheet | A zero-thickness dielectric that is not flat on one of the three axes | Model dielectric as a solid with explicit thickness |
+| Dielectric surface | A dielectric bound to a face, or to a shape that encloses no volume | Model the dielectric as a solid with explicit thickness |
 | Surface that will not close | A solid whose surface is open, wound against itself, or pinched, so no polyhedron can be built from it | Run `Part > Check geometry` and repair faces |
 | Degenerate triangulation | Triangulated volume deviates excessively from CAD solid | Repair self-intersections or simplify CAD faces |
 
-Dielectric sheets must be planar or modeled as solids with explicit
-thickness. Unlike conductors, dielectrics cannot be assigned an artificial
+A dielectric is modelled as a solid with explicit thickness. openEMS reads a
+cell's material only at its middle and a quarter of the way in from each of its
+lines, so a dielectric surface would be read only where it happened to lie on
+one of those. Unlike conductors, dielectrics cannot be assigned an artificial
 thickness automatically.
 
 The adapter automatically translates the whole problem - geometry, ports and
@@ -140,6 +169,9 @@ These checks prevent openEMS from running simulations on corrupted geometry
 that would otherwise produce plausible-looking but invalid results.
 
 ## Where a curved conductor ends up
+
+This section describes openEMS. On Palace the mesh follows the drawn surface,
+and no offset is applied.
 
 OpenEMS determines electrical conductivity at grid edges by point-sampling
 material at discrete sample points (`Operator::CalcPEC_Range`). On curved
@@ -191,7 +223,9 @@ To avoid this computational overhead:
 For thick conductors where vertical sidewall capacitance is critical,
 model the conductor as a 3D solid (`Part::Box`) and assign `PEC` material.
 OpenEMS applies surface impedance loss only to 2D planar elements; solid
-conductor volumes are treated as lossless PEC.
+conductor volumes are treated as lossless PEC. On Palace a body bound to a
+`ConductingSheet` is refused, and a body bound to `PEC` leaves the region, with
+its faces carrying the conductor.
 
 Port attachment depends on the chosen model:
 - Solid trace: Select the end cross-section face.
@@ -213,19 +247,77 @@ extensions are sufficient, increase their dimensions and re-run the
 simulation; if S-parameters do not change, the margins are adequate.
 
 Air buffers between the physical device and absorbing boundaries are added
-automatically by the mesh policy. Do not model air volumes explicitly.
+automatically, by the policy's `Padding` and `Clearance`, and filled with its
+`Medium`. Do not model air volumes explicitly.
 
 ## Overlaps
 
-Pre-flight checks verify that coincident solids do not assign conflicting
-materials to the same space:
-- Two coincident solids with the same material generate a warning.
-- Two coincident solids with different materials generate an error, as
-  openEMS cannot resolve conflicting material properties in the same grid
-  cell.
+One space is made of one material. Where two dielectric bodies of different
+bindings share a volume, the translation refuses the drawing before anything is
+solved. Draw a part standing in a board with the board cut round it
+(`Part > Boolean > Cut`), so that no two bodies share a volume. The message says
+which body stands inside which, and which to cut out of which.
+
+Metal is the exception. A metal body fills the space it is drawn in, above
+every dielectric, so a via or a post drawn through an uncut board is taken on
+both backends.
+
+Only an overlap thicker than about one nanometre counts, and a thick part of
+it counts however thin the rest is. Bodies that share a face, such as the
+layers of a stackup or a part set flush into a pocket, are taken, and so are
+faces drawn to meet that stand less than a nanometre apart. Curved faces drawn
+to meet can be refused all the same, because the kernel's booleans answer
+unreliably where such faces nearly touch. Cut one body out of the other
+(`Part > Boolean > Cut`) so the two share their faces exactly.
+
+On openEMS:
+- Materials are compared by what the engine is given. Two materials with the
+  same values under different names are one material, and may overlap.
+- A metal body standing inside a dielectric is taken at a priority above it.
+- Two metal bodies of different values over one space are refused, and the
+  message says which to cut.
+- Two boxes of one material in exactly the same place draw a warning. Delete
+  the spare.
+
+On Palace:
+- Any two dielectric bindings drawn over one space are refused, whatever their
+  materials.
+- Bodies of perfect conductor under different bindings that meet are taken as
+  one metal, such as a via through a block or a pad on a via barrel. Bodies
+  meet where they touch, share a volume or stand no more than a nanometre apart,
+  directly or through other such bodies. The mesh holds them under the label of
+  the binding that comes first in the analysis. `Check` and the run state
+  which bindings are joined, and every message about that metal names that
+  label.
+- The mesher refuses a piece two dielectric regions were both drawn over. Such
+  a piece can be a skin under a nanometre thick that the translation takes, so
+  draw faces that meet to meet exactly.
+- A metal body standing inside a dielectric is taken: the metal leaves the
+  region, and its faces carry the condition.
+
+## Geometry on Palace
+
+Palace refuses these by name:
+
+- A region in more than one piece. Bodies meant to meet have to share a face.
+- A part of the region no port stands on, such as the inside of a skin of
+  metal drawn as a surface.
+- A metal sheet reaching outside the region.
+- A body bound to a `ConductingSheet`.
+- A binding of metal holding both bodies and sheets, and an object bound whole
+  by two bindings.
+- A body that an `Ends` or a `Through` side touches only where the body curves
+  away from it.
+- An open study drawn flat along an axis with neither face across that axis
+  set to `Air`.
+
+[Running a study](running.md#execution-model) states each rule, what the
+refusal names, and what to change.
 
 ## Sanity
 
 Small slivers or micro-edges generated by CAD boolean operations can force
-the mesher to generate extremely small Yee cells, severely reducing the FDTD
-timestep. Clean CAD geometry and remove micro-features before meshing.
+the mesher to generate extremely small elements. On openEMS these are Yee
+cells, which severely reduce the FDTD timestep. On Palace they are tetrahedra,
+or a Gmsh failure the run names. Clean CAD geometry and remove micro-features
+before meshing.

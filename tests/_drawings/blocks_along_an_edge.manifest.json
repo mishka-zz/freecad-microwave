@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "one",
+      "dim": 3,
+      "file": "blocks_along_an_edge.0.brep",
+      "priority": 1
+    },
+    {
+      "label": "two",
+      "dim": 3,
+      "file": "blocks_along_an_edge.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "blocks_along_an_edge.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 1999.999999999,
+  "outside": 1199.9995999998
+}

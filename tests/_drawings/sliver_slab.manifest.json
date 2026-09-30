@@ -1,0 +1,18 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "sliver_slab.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "sliver_slab.1.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 0.3,
+  "outside": 600.0799999999998
+}

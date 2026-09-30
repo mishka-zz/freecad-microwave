@@ -1,0 +1,25 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "post_through_the_wall.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "post",
+      "dim": 3,
+      "file": "post_through_the_wall.1.brep",
+      "priority": 1,
+      "leaves": true
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "post_through_the_wall.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 5904.0,
+  "outside": 2280.0
+}

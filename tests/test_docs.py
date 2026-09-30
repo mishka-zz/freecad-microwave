@@ -11,8 +11,8 @@ a freshly created one.
 What it can check is what the cell claims. A default written as a number, a
 word from an enumeration or a boolean is compared; a cell saying where the
 value comes from - ``inferred``, ``from the band`` - claims no figure and is
-passed over. A stale *number* is therefore caught, which is the drift that
-happens.
+passed over. A stale number and a stale choice are therefore caught, which is
+the drift that happens.
 
 ``<axis>`` and ``<side>`` in a property name stand for the six faces, and each
 one is checked.
@@ -27,14 +27,19 @@ import pytest
 
 import Microwave
 from Microwave.Objects.analysis import createEMAnalysis
-from Microwave.Objects.mesh import createEMMeshPolicy, createEMMeshRegion
+from Microwave.Objects.mesh import (
+    createEMGmshMesh,
+    createEMMeshPolicy,
+    createEMMeshRegion,
+    createEMYeeGrid,
+)
 from Microwave.Objects.ports import (
     createEMPortCoaxial,
     createEMPortLumped,
     createEMPortMicrostrip,
     createEMPortRectWaveguide,
 )
-from Microwave.Objects.solver import createEMSolverOpenEMS
+from Microwave.Objects.solver import createEMSolverOpenEMS, createEMSolverPalace
 
 DOCS = pathlib.Path(Microwave.__file__).resolve().parent.parent / "docs"
 
@@ -42,8 +47,11 @@ DOCS = pathlib.Path(Microwave.__file__).resolve().parent.parent / "docs"
 FACTORIES = {
     "EMAnalysis": createEMAnalysis,
     "EMSolverOpenEMS": createEMSolverOpenEMS,
+    "EMSolverPalace": createEMSolverPalace,
     "EMMeshPolicy": createEMMeshPolicy,
     "EMMeshRegion": createEMMeshRegion,
+    "EMYeeGrid": createEMYeeGrid,
+    "EMGmshMesh": createEMGmshMesh,
     "EMPortMicrostrip": lambda doc: createEMPortMicrostrip(doc=doc),
     "EMPortLumped": lambda doc: createEMPortLumped(doc=doc),
     "EMPortRectWaveguide": lambda doc: createEMPortRectWaveguide(doc=doc),
@@ -99,19 +107,31 @@ def _expand(name):
     ]
 
 
-def _stale(stated, value):
+def _stale(stated, value, choices=()):
     """Whether this cell states a default the object does not have.
 
     A cell that agrees - as a word or as a number - holds. A *number* that
-    disagrees has gone stale. Anything else is prose about where the value
-    comes from, ``inferred`` or ``assigned``, and claims no figure to check.
+    disagrees has gone stale, and so has one of the property's own
+    ``choices``. Anything else is prose about where the value comes from,
+    ``inferred`` or ``assigned``, and claims nothing to check.
     """
     if stated.lower() == str(value).lower():
         return False
+    if stated.lower() in (choice.lower() for choice in choices):
+        return True
     try:
         return float(stated) != float(value)
     except (TypeError, ValueError):
         return False
+
+
+def _states_wrongly(created, name, stated):
+    """Whether the cell ``stated`` is a default ``created.<name>`` does not have."""
+    try:
+        choices = created.getEnumerationsOfProperty(name) or ()
+    except AttributeError:
+        choices = ()
+    return _stale(stated, getattr(created, name), choices)
 
 
 @pytest.mark.parametrize(
@@ -124,10 +144,36 @@ def test_the_manual_states_the_default_the_object_has(page, obj, prop, stated, d
     created = FACTORIES[obj](doc)
     for name in _expand(prop):
         assert hasattr(created, name), f"{page}: {obj} has no property {name!r}"
-        value = getattr(created, name)
-        assert not _stale(stated, value), (
-            f"{page}: {obj}.{name} defaults to {value!r}, not {stated!r}"
+        assert not _states_wrongly(created, name, stated), (
+            f"{page}: {obj}.{name} defaults to {getattr(created, name)!r}, not {stated!r}"
         )
+
+
+class TestWhatACellClaims:
+    """Every cell the manual holds today agrees, so the check over the pages
+    says nothing about whether a disagreeing one would be caught. These hold a
+    cell of each kind against a port whose value each test sets itself, so
+    none of them moves with a default."""
+
+    def test_another_of_the_propertys_own_choices_is_stale(self, doc):
+        port = createEMPortRectWaveguide(doc=doc)
+        port.ReferencedTo = "Port impedance"
+        assert _states_wrongly(port, "ReferencedTo", "Fixed impedance")
+        assert _states_wrongly(port, "ReferencedTo", "fixed impedance")
+
+    def test_the_value_among_them_holds(self, doc):
+        port = createEMPortRectWaveguide(doc=doc)
+        port.ReferencedTo = "Fixed impedance"
+        assert not _states_wrongly(port, "ReferencedTo", "Fixed impedance")
+
+    def test_prose_about_where_the_value_comes_from_claims_nothing(self, doc):
+        port = createEMPortRectWaveguide(doc=doc)
+        assert not _states_wrongly(port, "PropagationAxis", "inferred")
+
+    def test_another_number_is_stale(self, doc):
+        port = createEMPortRectWaveguide(doc=doc)
+        port.ReferenceImpedance = 50.0
+        assert _states_wrongly(port, "ReferenceImpedance", "75.0")
 
 
 def test_every_page_the_index_offers_is_there():

@@ -100,12 +100,20 @@ def work(solid: Solid, count: int) -> int:
 
 
 def contains(
-    solid: Solid, points: npt.ArrayLike, vertices: Sequence[Sequence[float]] | None = None
+    solid: Solid,
+    points: npt.ArrayLike,
+    vertices: Sequence[Sequence[float]] | None = None,
+    boundary: bool = True,
 ) -> np.ndarray:
     """Which of ``points`` the solid holds. ``points`` is ``(N, 3)``.
 
     The boundary counts as inside. A face flush against another solid then lies
     in both of them rather than falling between the two.
+
+    :param boundary: whether a point on a triangulated volume's surface counts.
+        A caller asking what the engine certainly holds leaves it out, since the
+        engine's own answer there follows its rounding. A box and a sheet always
+        count their boundary.
 
     :param vertices: The triangulation's points to read in place of the solid's
         own, for a caller asking about the surface that reaches the engine
@@ -119,7 +127,9 @@ def contains(
     if solid.is_sheet:
         return _in_outline(solid, points)
     if solid.is_mesh:
-        return _in_surface(solid, points, solid.vertices if vertices is None else vertices)
+        return _in_surface(
+            solid, points, solid.vertices if vertices is None else vertices, boundary
+        )
     return _in_box(solid, points)
 
 
@@ -173,9 +183,12 @@ def _side(start: np.ndarray, end: np.ndarray, points: np.ndarray) -> np.ndarray:
 
 
 def _in_surface(
-    solid: Solid, points: np.ndarray, vertices: Sequence[Sequence[float]] | None
+    solid: Solid,
+    points: np.ndarray,
+    vertices: Sequence[Sequence[float]] | None,
+    boundary: bool = True,
 ) -> np.ndarray:
-    """Enclosed by the boundary, or on it.
+    """Enclosed by the boundary, or on it where ``boundary`` is set.
 
     A point the surface encloses sees one full turn of solid angle, and a point
     outside sees none. Away from the surface the two are a whole turn apart, so
@@ -193,7 +206,8 @@ def _in_surface(
         here = points[start : start + step]
         offsets = tuple(corners[None, :, index, :] - here[:, None, :] for index in range(_CORNERS))
         enclosed = np.abs(_solid_angle(*offsets)) > 2.0 * math.pi
-        held[start : start + step] = enclosed | _on_the_surface(*offsets)
+        on = _on_the_surface(*offsets)
+        held[start : start + step] = enclosed | on if boundary else enclosed & ~on
     return held
 
 

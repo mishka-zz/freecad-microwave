@@ -81,11 +81,11 @@ IDENTITY = "an identity - there is no reference"
 #: A limit carries a band of its own, and it is not the one computed for the
 #: finest grid: those are different quantities about different numbers, and
 #: which of them is the wider is a property of the sequence rather than a rule.
-#: Neither gate here scores a limit *against* that band. The cavity bounds its
-#: leftover and prints the band beside it, saying on its own line why the two
-#: are not folded together; the stripline holds two limits to each other and
-#: bounds their disagreement by a band computed for that difference, one grid
-#: dropped from both sequences at once.
+#: An extrapolated gate here does not score a limit *against* that band. The
+#: cavity bounds its leftover and prints the band beside it, saying on its own
+#: line why the two are not folded together; the stripline holds two limits to
+#: each other and bounds their disagreement by a band computed for that
+#: difference, one grid dropped from both sequences at once.
 #: Whether it can is a property of the drawing rather than of the procedure - a
 #: boundary the grid samples answers to where the grid fell as well as to how big
 #: its cells are - so each file says which of the two it asserts. That says more
@@ -225,7 +225,7 @@ class Gate:
 #: cannot outlive the file it describes.
 GATES = (
     Gate(
-        name="waveguide",
+        name="openems_waveguide",
         reference="exact - a rectangular guide's phase constant from its own dimensions",
         activity=VERIFICATION,
         criterion=DECLARED,
@@ -236,7 +236,88 @@ GATES = (
         ),
     ),
     Gate(
-        name="cavity",
+        name="palace_waveguide",
+        reference="exact - the same guide's phase constant, answered by the other backend",
+        activity=VERIFICATION,
+        criterion=DECLARED,
+        isolates=(
+            "the second backend answering the closed form the first one is scored "
+            "against, on one guide - so what agrees is the document rather than "
+            "either engine; a conforming tetrahedral mesh, where the wall is where "
+            "it was drawn instead of on the nearest grid line; a port standing on "
+            "the guide's own end face, which the other backend refuses by name; a "
+            "region numbered above its ports in one drawing and below them in the "
+            "other, which an older Palace refuses to read a port beside; and "
+            "the whole route from a marked-up document to a matrix in one call, "
+            "which every stage of that adapter answers into and nothing else runs"
+        ),
+    ),
+    Gate(
+        name="palace_septum",
+        reference="exact - the attenuation of a half-width guide below its cutoff",
+        activity=VERIFICATION,
+        criterion=DECLARED,
+        isolates=(
+            "metal drawn inside the region the field is in, as a sheet the region "
+            "runs round on both sides - which is how every board draws its metal - "
+            "reaching the second backend as a condition on a face inside the model; "
+            "read as the fall of the transmission between two lengths of septum, so "
+            "what each junction does to the wave crossing once cancels and no "
+            "fitted constant is left"
+        ),
+    ),
+    Gate(
+        name="palace_lossy_guide",
+        reference="exact to first order - the surface resistance on each face of the guide",
+        activity=VERIFICATION,
+        criterion=DECLARED,
+        isolates=(
+            "a catalog's conducting sheet reaching the second backend as the surface "
+            "impedance of its metal, drawn as the guide's walls where the model ends "
+            "and as a plane inside it, each face of which carries it; read as the "
+            "power lost over the difference of two lengths, so what the ports and the "
+            "plane's ends do cancels; and the run made on the processes asked, with "
+            "the loss tangent that keeps Palace from hanging where that metal meets a "
+            "wave port"
+        ),
+    ),
+    Gate(
+        name="palace_stripline_lumped",
+        reference="exact - conformal mapping on the shipped stripline's cross-section",
+        activity=VERIFICATION,
+        criterion=STUDIED,
+        isolates=(
+            "the lumped port every board drives its trace through, on the second "
+            "backend: elements laid across the gap from the picks, driven in the "
+            "direction drawn, with a magnetic wall on the rest of their face, and "
+            "a matrix referenced to each port's own resistance, shown by the line at "
+            "unequal resistances de-embedding to the impedance it does at equal ones; "
+            "read through two lengths of line, so the network a port adds is fitted "
+            "and taken off before the impedance is compared, and the phase across the "
+            "lengths is read with no model of the port in it"
+        ),
+    ),
+    Gate(
+        name="palace_dipole",
+        reference="conservation of power in a model where nothing dissipates",
+        activity=IDENTITY,
+        criterion=DECLARED,
+        isolates=(
+            "a study open to free space on the second backend: the air the adapter "
+            "reserves round a radiator drawn as metal alone, the absorbing condition "
+            "on its skin, and the power Palace measures through it read back into "
+            "the run, so what the port reflects and what left through the open "
+            "surface add to what went in. The resonance and the run's own estimate "
+            "of what the surface moved are printed and not held: no closed form for a "
+            "strip dipole states its accuracy, and the estimate is too loose to hold "
+            "a comparison of two clearances to. Before a release, the same dipole in a "
+            "medium it is scaled to, held to the vacuum one within what moving the "
+            "open surface moves it: the medium fills the reserved air, is meshed at "
+            "its wavelength, and the absorbing condition takes it"
+        ),
+    ),
+    Gate(
+        name="openems_cavity",
         reference="exact - the wall condition on a spherical Bessel function",
         activity=VERIFICATION,
         criterion=EXTRAPOLATED,
@@ -250,7 +331,7 @@ GATES = (
         ),
     ),
     Gate(
-        name="pillbox",
+        name="openems_pillbox",
         reference="exact - Bessel roots, the dominant one independent of the height",
         activity=VERIFICATION,
         criterion=STUDIED,
@@ -264,7 +345,7 @@ GATES = (
         ),
     ),
     Gate(
-        name="coax",
+        name="openems_coax",
         reference="exact - Laplace's equation in one variable",
         activity=VERIFICATION,
         criterion=STUDIED,
@@ -276,7 +357,7 @@ GATES = (
         ),
     ),
     Gate(
-        name="stripline",
+        name="openems_stripline",
         reference="exact - conformal mapping on a TEM cross-section",
         activity=VERIFICATION,
         criterion=EXTRAPOLATED,
@@ -289,7 +370,7 @@ GATES = (
         ),
     ),
     Gate(
-        name="tdr",
+        name="openems_tdr",
         reference="exact - conformal mapping, on each of three stripline sections",
         activity=VERIFICATION,
         criterion=GRADED,
@@ -300,17 +381,45 @@ GATES = (
         ),
     ),
     Gate(
-        name="two_port",
+        name="openems_two_port",
         reference="reciprocity and passivity",
         activity=IDENTITY,
         criterion=DECLARED,
         isolates=(
             "what a matrix assembled from separate solves has to obey whatever the "
-            "structure is, which no closed form is needed to state"
+            "structure is, which no closed form is needed to state, with lumped ports "
+            "that send back part of what reaches them"
         ),
     ),
     Gate(
-        name="microstrip",
+        name="openems_medium",
+        reference="the scaling of Maxwell's equations with a uniform permittivity",
+        activity=IDENTITY,
+        criterion=DECLARED,
+        isolates=(
+            "the study's medium as the driver lays it, under every solid and through "
+            "the absorber: a strip dipole in it, over the band and at the resistance "
+            "it scales to, held to the dipole in vacuum on one grid within what "
+            "moving the absorber moves it"
+        ),
+    ),
+    Gate(
+        name="openems_stepped_guide",
+        reference="reciprocity, passivity, and the waves a uniform guide's planes predict",
+        activity=IDENTITY,
+        criterion=DECLARED,
+        isolates=(
+            "two waveguide ports whose walls end differently, one on the domain and "
+            "one on drawn metal, which the engine reads at different scales; every "
+            "other gate has its ports alike, where the scales cancel whether or not "
+            "anything undoes them. Each port is also read again inside its box, where "
+            "a port far from the step reads its mode alone and one near it is warned of. And "
+            "the guide changes behind one port, which sends back what reaches it and "
+            "which counting every port's waves takes out of the matrix"
+        ),
+    ),
+    Gate(
+        name="openems_microstrip",
         reference="Hammerstad, an empirical fit good to about a percent",
         activity=VALIDATION,
         criterion=COMPOSED,
@@ -326,7 +435,7 @@ GATES = (
         ),
     ),
     Gate(
-        name="lowpass",
+        name="openems_lowpass",
         reference="a board somebody else fabricated and measured",
         activity=VALIDATION,
         criterion=COMPOSED,

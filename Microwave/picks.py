@@ -17,9 +17,15 @@ to run without it. One module keeps the drawing and the envelope from answering
 differently about one port.
 
 Nothing here imports FreeCAD. It asks a shape for ``getElement``, ``Faces``,
-``Edges``, ``Vertexes``, ``Solids``, ``Volume``, ``common`` and ``translated``.
+``Edges``, ``Vertexes``, ``Solids``, ``Volume``, ``common`` and ``translated``,
+and a document object for ``Shape``, ``Parents`` and ``getSubObject``.
 ``translated`` takes a coordinate triple as readily as a vector. Measured under
 1.1.1: an edge answers no faces, and a face answers itself.
+
+Every shape read off a document object here is read where FreeCAD shows it.
+An object's ``Shape`` is in the coordinates of the container it stands in - an
+``App::Part``, a ``PartDesign::Body``, an ``App::LinkGroup`` - and the placement
+of each container above it is left out. :func:`placed` asks the tree instead.
 """
 
 from __future__ import annotations
@@ -27,6 +33,118 @@ from __future__ import annotations
 from typing import Any
 
 from .portbox import DIMENSIONS, KERNEL_TOLERANCE
+
+
+class Unplaced(ValueError):
+    """A shape this workbench cannot put where FreeCAD shows it."""
+
+
+def _label(obj: Any) -> str:
+    return str(getattr(obj, "Label", None) or getattr(obj, "Name", "?"))
+
+
+def placed(obj: Any) -> Any:
+    """``obj``'s whole shape where FreeCAD shows it, or ``None`` where it has none.
+
+    The top container holding the object hands back its shape along the path
+    down to it with every placement on the way applied, which is where FreeCAD
+    draws it through nested parts, a body and a link group alike - measured under
+    1.1.1, where ``getGlobalPlacement`` leaves a link group's placement out. An
+    object standing in no container is shown where its own ``Shape`` is.
+
+    :raises Unplaced: see :func:`_place`.
+    """
+    shape = getattr(obj, "Shape", None)
+    if shape is None:
+        return None
+    place = _place(obj)
+    if place is None:
+        return shape
+    root, path = place
+    return root.getSubObject(path)
+
+
+def local(obj: Any, shape: Any) -> Any:
+    """``shape``, given where it is to be shown, in ``obj``'s own coordinates.
+
+    What a document object of this workbench draws - a port's box, a mesh
+    preview - is worked out where FreeCAD shows the shapes it comes from, and
+    FreeCAD shows the object's own ``Shape`` moved by every container above it.
+    So the shape is moved back by those containers before it is assigned. The
+    accumulated placement a path answers includes the object's own, which is
+    taken off again. The move is made in the geometry rather than in the shape's
+    placement: a recompute puts a feature's ``Placement`` back on its shape
+    after ``execute``, so a placement given to the shape does not last.
+
+    :raises Unplaced: see :func:`_place`.
+    """
+    place = _place(obj)
+    if place is None or shape.isNull():
+        return shape
+    root, path = place
+    above = root.getSubObject(path, retType=3).multiply(obj.Placement.inverse())
+    return shape.transformGeometry(above.inverse().toMatrix())
+
+
+def _place(obj: Any) -> tuple[Any, str] | None:
+    """The top container ``obj`` stands in and the path down, or ``None``.
+
+    ``Parents`` names every such pair, and not all of them are places:
+
+    * a path through a link - an ``App::Link``, an element of a link array - is
+      a copy the link shows, and the object stands where it was drawn;
+    * a root in another open document is that document's drawing;
+    * a body lists a feature once for each way it claims it, along one path, so
+      a place is the root and the path rather than the entry, and the root is
+      the object rather than its label, which two documents can share.
+
+    :raises Unplaced: two containers hold the object, so where it is meant is
+        not something the drawing says.
+    """
+    home = getattr(obj, "Document", None)
+    places = {
+        (id(root), path): (root, path)
+        for root, path in getattr(obj, "Parents", None) or ()
+        if getattr(root, "Document", None) is home and not _through_a_link(root, path)
+    }
+    if not places:
+        return None
+    if len(places) > 1:
+        shown = sorted(f"{_label(root)}.{path}" for root, path in places.values())
+        raise Unplaced(
+            f"{_label(obj)!r} stands in more than one container - {', '.join(shown)} - "
+            "so where it is meant is not something the drawing says. Keep it in one"
+        )
+    ((root, path),) = places.values()
+    return root, path
+
+
+def _through_a_link(root: Any, path: str) -> bool:
+    """Whether the path from ``root`` passes through a link on its way down.
+
+    A link is what carries ``LinkedObject``, which a link group, a part and a
+    body do not.
+    """
+    along = getattr(root, "getSubObjectList", None)
+    chain = along(path)[:-1] if along else [root]
+    return any(getattr(step, "LinkedObject", None) is not None for step in chain)
+
+
+def element(obj: Any, name: str = "") -> Any:
+    """What ``name`` names on ``obj``, where FreeCAD shows it, or the whole shape.
+
+    :raises Unplaced: ``name`` reaches the element through a container, as a
+        path such as ``Part.Box.Face1`` does, or :func:`placed` does.
+    """
+    if "." in name:
+        raise Unplaced(
+            f"{_label(obj)!r} is picked at {name}, an element named through a "
+            "container it holds. Pick it on the object that owns it"
+        )
+    shape = placed(obj)
+    if shape is None or not name:
+        return shape
+    return shape.getElement(name)
 
 
 def named(link: Any) -> list[str]:
@@ -44,16 +162,15 @@ def named(link: Any) -> list[str]:
 
 def body(link: Any) -> Any:
     """The whole shape a pick was made on, or ``None`` where it has none."""
-    obj = link[0] if isinstance(link, tuple) else link
-    return getattr(obj, "Shape", None)
+    return placed(link[0] if isinstance(link, tuple) else link)
 
 
 def shapes(link: Any) -> list[Any]:
     """Every shape a ``PropertyLinkSub`` names, or the whole one."""
-    shape = body(link)
-    if shape is None:
+    obj = link[0] if isinstance(link, tuple) else link
+    if body(link) is None:
         return []
-    return [shape if not name else shape.getElement(name) for name in named(link)]
+    return [element(obj, name) for name in named(link)]
 
 
 def is_outline(link: Any) -> bool:

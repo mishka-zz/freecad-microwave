@@ -1,0 +1,30 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "speck_in_a_rod.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "rod",
+      "dim": 3,
+      "file": "speck_in_a_rod.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "speck",
+      "dim": 3,
+      "file": "speck_in_a_rod.2.brep",
+      "priority": 2
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "speck_in_a_rod.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0000000006003
+}

@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "substrate",
+      "dim": 3,
+      "file": "shared_interface.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "shared_interface.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "shared_interface.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 25600.0,
+  "outside": 5760.0
+}

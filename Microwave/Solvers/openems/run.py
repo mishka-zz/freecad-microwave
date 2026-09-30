@@ -11,35 +11,42 @@ A subprocess is the only option: openEMS lives in a different Python
 installation from FreeCAD's. It is also the right shape. A solver crash takes
 down a child process rather than the user's session and their unsaved document.
 
-A run can be stopped. See :class:`Cancellation`. A stopped run keeps nothing,
-because a truncated solve that can be read is worse than no answer.
+A run can be stopped - ``Microwave/Solvers/cancellation.py`` says how. A
+stopped run keeps nothing, because a truncated solve that can be read is worse
+than no answer.
+
+openEMS and CSXCAD print what they make of the structure on the driver's
+standard streams, and none of it is a marker. A warning there is often the only
+sign that what was solved is not what was written: a port's excitation laid on
+no cell, an absorber reset to a metal wall, a conducting sheet solved as a
+perfect conductor. Each exits zero. So a line of theirs that warns fails the
+run in its own words, except the ones named in :data:`STATED`, which are
+stated beside the answer with what each means for it.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
-import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..cancellation import Cancellation, Cancelled, running
+from ..interpreters import child_environment as _child_environment
+from ..interpreters import imports
 from .driver import MARKER, RESULTS_NAME
 
 #: Consulted before ``PATH``. Set it to a Python that can ``import openEMS``.
 INTERPRETER_ENV_VAR = "MICROWAVE_OPENEMS_PYTHON"
 
-#: Root of the workbench, so the child can import ``Microwave.Solvers.openems``.
-_PACKAGE_ROOT = Path(__file__).resolve().parents[3]
-
 #: What a candidate interpreter has to print to prove it imported the
-#: bindings. The token is assembled at runtime rather than written as a literal
-#: because a check on the exit status alone accepts ``/bin/echo``, which takes
-#: ``-c <source>``, prints the source and exits 0. Echoing reproduces the
-#: source, in which the token appears as three separate quoted words. Only
+#: bindings. The token is assembled at runtime rather than written as a literal,
+#: for the reason :func:`~Microwave.Solvers.interpreters.imports` states: the
+#: token appears in the source as three separate quoted words, and only
 #: executing the source prints them joined.
 _PROBE_TOKEN = "openems-bindings-ok"
 _PROBE = "import openEMS, CSXCAD; print('-'.join(['openems', 'bindings', 'ok']))"
@@ -51,95 +58,6 @@ class EngineNotFound(Exception):
 
 class SolverFailed(Exception):
     """The solver started and did not finish cleanly."""
-
-
-class Cancelled(Exception):
-    """The run was stopped on request, so it has no answer.
-
-    This is not a :class:`SolverFailed`. Nothing went wrong, and a caller
-    reporting failures must not report this one.
-    """
-
-
-def _terminate(process: subprocess.Popen | None) -> None:
-    """Send SIGTERM, and never SIGINT.
-
-    openEMS installs a graceful SIGINT handler while it timesteps
-    (``openems.cpp:1392`` through ``tools/signal.cpp``). The solve stops early,
-    ``RunFDTD`` returns normally, and the driver goes on to post-process, write
-    results and print DONE. A run interrupted a fraction of the way through
-    therefore comes back with exit 0, a readable results file, a matching digest
-    and an impedance that is badly wrong. Every guard downstream accepts it,
-    because nothing is different from the outside.
-
-    openEMS does not touch SIGTERM, so the default action applies and the
-    process ends where it stands, with no results and no DONE.
-
-    ``Popen.terminate`` handles the already-exited race itself, so there is no
-    poll here.
-    """
-    if process is not None:
-        process.terminate()
-
-
-class Cancellation:
-    """A stop request, and the child process it has to reach.
-
-    Stopping a solve means stopping the process. The reader in :func:`stream`
-    blocks in ``for line in process.stdout``, and only the pipe closing releases
-    it, so a flag on its own would be noticed no sooner than the next line
-    openEMS prints: four seconds while it timesteps
-    (``openEMS/openems.cpp:1445``), and unbounded while it builds. Cancelling
-    therefore signals the child. The flag answers the races a signal cannot,
-    namely a request that arrives before a process exists or between two runs of
-    a sweep.
-
-    Every child this module starts is watched, interpreter probes included.
-    With ``SolverPython`` blank, which is its default, discovery probes every
-    candidate in turn, and a cancellation that could not interrupt them would
-    leave the caller waiting out the whole sweep for a stop it had already asked
-    for.
-
-    It is safe from any thread. The request comes from the GUI thread and the
-    run is on another.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._requested = False
-        self._process: subprocess.Popen | None = None
-
-    @property
-    def requested(self) -> bool:
-        with self._lock:
-            return self._requested
-
-    def cancel(self) -> None:
-        """Ask the run to stop. Idempotent, and harmless before it starts."""
-        with self._lock:
-            self._requested = True
-            process = self._process
-        _terminate(process)
-
-    @contextmanager
-    def watching(self, process: subprocess.Popen) -> Iterator[None]:
-        """Point the request at ``process`` while it runs.
-
-        A request that arrived before the process existed is applied on entry,
-        under the same lock that :meth:`cancel` takes, so there is no window in
-        which a child is running and unreachable.
-        """
-        with self._lock:
-            self._process = process
-            requested = self._requested
-        if requested:
-            _terminate(process)
-        try:
-            yield
-        finally:
-            with self._lock:
-                if self._process is process:
-                    self._process = None
 
 
 @dataclass(frozen=True)
@@ -160,30 +78,100 @@ class Marker:
         return pairs
 
 
+#: What marks a line of the engine's as a warning or an error. openEMS and
+#: CSXCAD share no prefix for either, and print their informational lines -
+#: the banner, the grid's size, the timestep, the speed - without any of these.
+WARNS = re.compile(r"warning|error|fallback|disabling|abort|invalid|fail|-\s*nandB", re.IGNORECASE)
+
+#: A property openEMS' port builders lay a port's excitation, termination or
+#: probe in (``openEMS/python/openEMS/ports.py``, ``Port.__init__``), under the
+#: prefix a port is built with.
+PORT_PROPERTY = r"(\w+_)?port_(excite|resist|ut|it)_\d+[A-C]?!"
+
+
+@dataclass(frozen=True)
+class Stated:
+    """A line of the engine's that warns and does not fail the run.
+
+    :param said: matched against the line from its start.
+    :param means: what it means for the answer, as a sentence.
+    """
+
+    said: re.Pattern[str]
+    means: str
+
+
+#: The lines openEMS, CSXCAD and the bindings print on this route that warn
+#: and do not fail the run. Every other line that warns fails it.
+STATED = (
+    # ``CSProperties::WarnUnusedPrimitves``, called at the end of
+    # ``openEMS::SetupFDTD``, names a property and not a body. A port's own is
+    # not matched here: an unused one leaves the port undriven, unterminated or
+    # unread. A material's is named body by body by the driver, which can read
+    # which primitives were used (``driver._unlaid``).
+    Stated(
+        re.compile(
+            rf"Warning: Unused primitive \(type: \w+\) detected in property: (?!{PORT_PROPERTY})"
+        ),
+        "A piece of that material was given no cell, and the run names above each body "
+        "none of whose pieces was, with what spans it.",
+    ),
+    # ``CSProperties::WarnUnusedPrimitves``: a material the envelope lists that
+    # no body is made of.
+    Stated(
+        re.compile(r"Warning: No primitives found in property: "),
+        "The answer stands: nothing is drawn in that material.",
+    ),
+    # ``openEMS::SetupFDTD``: the timestep is below half a thousandth of the
+    # period at the top of the band (``Excitation::GetNyquistNum`` over a
+    # thousand, ``useful.cpp``, ``CalcNyquistNum``).
+    Stated(
+        re.compile(r"openEMS::SetupFDTD: Warning, the timestep seems to be very small"),
+        "The answer stands: a short timestep costs time and changes no field.",
+    ),
+    # Of the square roots in ``openEMS/python/openEMS/ports.py``, the one in
+    # ``WaveguidePort.CalcPort`` of ``k^2 - kc^2`` is the one taken of a real
+    # value that can be negative, which it is below the mode's cutoff; the
+    # driver states the port's split there itself (``driver._below_cutoff``).
+    Stated(
+        re.compile(
+            r".*[/\\]openEMS[/\\]ports\.py:\d+: RuntimeWarning: invalid value encountered in sqrt"
+        ),
+        "The answer stands: below the mode's cutoff the driver states the port's waves itself.",
+    ),
+)
+
+#: What differs between two lines that warn of one thing on different edges,
+#: faces or samples. A digit inside a name, as a material's, is the name's.
+NUMBER = re.compile(r"(?<![\w.])\d+(\.\d+)?(e[+-]?\d+)?")
+
+
+def judged(lines: Sequence[str]) -> tuple[list[str], list[str]]:
+    """What the engine printed that means the answer cannot be taken, in its
+    words, and what it printed that warns and is stated beside the answer.
+
+    Lines that differ only in their numbers - one per edge, face or sample -
+    are said once, with how many there were.
+    """
+    heard: dict[str, list[str]] = {}
+    for line in lines:
+        text = line.strip()
+        if WARNS.search(text):
+            heard.setdefault(NUMBER.sub("#", text), []).append(text)
+    complaints, stated = [], []
+    for said in heard.values():
+        once = said[0] if len(said) == 1 else f"{said[0]} ({len(said)} lines like it)"
+        known = next((known for known in STATED if known.said.match(said[0])), None)
+        if known is None:
+            complaints.append(once)
+        else:
+            stated.append(f"openEMS said: {once} {known.means}")
+    return complaints, stated
+
+
 def has_bindings(interpreter: str | Path, cancel: Cancellation | None = None) -> bool:
     """Whether ``interpreter`` can import openEMS and CSXCAD."""
-    try:
-        process = subprocess.Popen(
-            [str(interpreter), "-c", _PROBE],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            # A candidate that reads stdin - a REPL, a shell, a wrapper that
-            # prompts - would otherwise block for the whole timeout with nothing
-            # to show for it.
-            stdin=subprocess.DEVNULL,
-            env=_child_environment(),
-        )
-    except (OSError, ValueError):
-        return False
-    with (cancel or Cancellation()).watching(process):
-        try:
-            output, _ = process.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            output, _ = process.communicate()
-    if process.returncode != 0:
-        return False
-    return _PROBE_TOKEN.encode() in output
+    return imports(interpreter, _PROBE, _PROBE_TOKEN, (cancel or Cancellation()).watching)
 
 
 def find_interpreter(
@@ -234,26 +222,6 @@ def find_interpreter(
     )
 
 
-def _child_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment the solver runs in.
-
-    FreeCAD exports ``PYTHONHOME`` and ``PYTHONPATH`` pointing at its own
-    bundled interpreter. Inherited unchanged, the child loads FreeCAD's standard
-    library rather than its own and dies during startup with an encodings error
-    that says nothing about the cause. Both are therefore rebuilt rather than
-    inherited.
-
-    ``base`` defaults to the real environment. It is a parameter so that this
-    can be tested as the pure function it is, rather than by mocking
-    ``subprocess`` and asserting on the mock. The failure it prevents reproduces
-    only inside FreeCAD, which no test can stand up.
-    """
-    env = dict(os.environ if base is None else base)
-    env.pop("PYTHONHOME", None)
-    env["PYTHONPATH"] = str(_PACKAGE_ROOT)
-    return env
-
-
 def stream(
     envelope: str | Path,
     interpreter: str | Path | None = None,
@@ -263,7 +231,12 @@ def stream(
     """Run the solver, yielding :class:`Marker` for markers and raw text else.
 
     It yields rather than returns so that a task panel can show progress while
-    a run that takes minutes is in flight.
+    a run that takes minutes is in flight. After the driver's last line it
+    yields, as ``WARNING: `` text, what the engine warned of that
+    :data:`STATED` names.
+
+    :raises SolverFailed: the run did not finish, or finished and the engine
+        warned of something :data:`STATED` does not name.
     """
     envelope = Path(envelope)
     if not envelope.is_file():
@@ -286,20 +259,24 @@ def stream(
     if build_only:
         command.append("--build-only")
 
-    process = subprocess.Popen(
+    failure: str | None = None
+    finished = False
+    said: list[str] = []
+    # However this ends - read to the end, cancelled, abandoned half-way by a
+    # consumer that stopped iterating, or a consumer that raised - the child
+    # must not outlive the generator, and leaving the block ends it. Without
+    # that, closing the panel leaves openEMS holding every core with nothing
+    # left to read it.
+    with running(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
         env=_child_environment(),
-    )
-
-    failure: str | None = None
-    finished = False
-    assert process.stdout is not None
-    try:
-        with cancel.watching(process):
+    ) as process:
+        assert process.stdout is not None
+        with process.stdout, cancel.watching(process, group=True):
             for line in process.stdout:
                 line = line.rstrip("\n")
                 if line.startswith(MARKER):
@@ -310,23 +287,18 @@ def stream(
                         finished = True
                     yield Marker(name=name, detail=detail)
                 else:
+                    said.append(line)
                     yield line
-        code = process.wait()
-    finally:
-        # However this ends - read to the end, cancelled, abandoned half-way
-        # by a consumer that stopped iterating, or a consumer that raised - the
-        # child must not outlive the generator. Without this, closing the panel
-        # leaves openEMS holding every core with nothing left to read it.
-        _terminate(process)
-        process.wait()
-        process.stdout.close()
+            code = process.wait()
 
     if cancel.requested:
         raise Cancelled(f"the run of {envelope} was stopped")
+    complaints, remarks = judged(said)
     if code != 0 or failure:
         raise SolverFailed(
             f"openEMS exited with code {code}"
             + (f": {failure}" if failure else " without reporting a reason")
+            + "".join(f". openEMS said: {line}" for line in complaints)
         )
     if not finished:
         # The driver prints DONE last, so its absence means the run stopped
@@ -339,6 +311,12 @@ def stream(
             f"openEMS exited with code {code} but never reported DONE, so the "
             "run did not finish. Any results file beside the envelope is from an "
             "earlier solve and is not this run's answer"
+        )
+    for line in remarks:
+        yield f"WARNING: {line}"
+    if complaints:
+        raise SolverFailed(
+            "openEMS finished and said the answer cannot be taken: " + "; ".join(complaints)
         )
 
 

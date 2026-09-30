@@ -1,0 +1,12 @@
+{
+  "pieces": [
+    {
+      "label": "skin",
+      "dim": 2,
+      "file": "closed_shell.0.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 2200.0,
+  "outside": 0.0
+}

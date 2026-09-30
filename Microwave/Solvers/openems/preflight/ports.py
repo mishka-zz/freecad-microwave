@@ -19,17 +19,20 @@ from __future__ import annotations
 
 import numpy as np
 
+from ....portbox import FLATNESS
 from ....units import MM_PER_M
-from ..capabilities import Capabilities
+from ...capabilities import Capabilities
 from ..containment import contains
 from ..model import (
     AXIS_NAMES,
     CONDUCTOR_KINDS,
     DIMENSIONS,
     SPEED_OF_LIGHT,
+    Material,
     MeshGrid,
     Port,
     Problem,
+    origin_offset,
 )
 from .absorber import (
     _absorber_bounds,
@@ -56,7 +59,7 @@ def _check_lumped_excitation_beside_a_measured_line(problem: Problem) -> list[Fi
     This warns rather than refusing. The consequence is certain on what has been
     measured, but the mechanism is not established, so a refusal would block an
     untried geometry on the strength of one combination. The value here is
-    saying it before the minutes are spent. The assembly refuses by name
+    saying it before the minutes are spent. The driver refuses the run by name
     afterwards either way.
     """
     driven = [port for port in problem.ports if port.excite]
@@ -76,7 +79,7 @@ def _check_lumped_excitation_beside_a_measured_line(problem: Problem) -> list[Fi
             f"this run is driven by lumped port {lumped}, and a microstrip "
             "port measured in a lumped-driven run reports a non-finite "
             "reference impedance at every frequency on this engine. The run "
-            "will complete, take its full time and produce no S-matrix. Drive "
+            "will take its full time and then be refused, with no S-matrix. Drive "
             "the microstrip port instead, or measure both ports the same way",
         )
     ]
@@ -380,6 +383,17 @@ def _check_the_element_meets_its_metal(port: Port, problem: Problem) -> list[Fin
     return findings
 
 
+#: Points along each axis of a port's box at which the guide is asked to be
+#: vacuum.
+_HELD_SAMPLES = 5
+
+
+def _empty(material: Material) -> bool:
+    """Whether a material is vacuum as the port reads a guide: lossless, and of
+    vacuum's permittivity and permeability."""
+    return material.kind == "dielectric" and material.epsilon == 1.0 and material.mu == 1.0
+
+
 def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
     """This adapter drives openEMS' waveguide port at its vacuum default.
 
@@ -405,7 +419,9 @@ def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
     name.
 
     The fill is the solids that overlap the port box rather than the largest
-    permittivity in the model, which is usually somewhere else entirely.
+    permittivity in the model, which is usually somewhere else entirely. Where
+    the study's medium is not vacuum it fills whatever of the box no solid
+    covers, so every part of the box has to lie in a solid of vacuum.
     """
     if port.kind != "rect_waveguide":
         return []
@@ -444,6 +460,34 @@ def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
                 f"port",
             )
         )
+    medium = epsilon.get(problem.medium)
+    if findings or medium is None or _empty(medium):
+        return findings
+    # A lattice through the port's box, each point of which some solid of
+    # vacuum has to hold. A body drawn round the guide with a curved part cut
+    # from it reaches here as a triangulation, and the points ask it rather than
+    # its corners.
+    axes = [np.linspace(lower[axis], upper[axis], _HELD_SAMPLES) for axis in range(DIMENSIONS)]
+    points = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, DIMENSIONS)
+    covered = np.zeros(len(points), dtype=bool)
+    for solid in problem.solids:
+        filling = epsilon.get(solid.material)
+        if filling is not None and _empty(filling):
+            covered |= contains(solid, points)
+    held = bool(covered.all())
+    if not held:
+        findings.append(
+            Finding(
+                REFUSE,
+                port.name,
+                f"the guide is filled with the study's medium {medium.name!r} (relative "
+                f"permittivity {medium.epsilon:g}, permeability {medium.mu:g}) wherever no "
+                "body is drawn in it, and this adapter does not yet drive a filled waveguide "
+                "port: openEMS would report the cutoff, the phase constant and the mode "
+                "impedance as if the guide were empty. Draw the guide's inside as a box and "
+                "bind a vacuum material to it, or use a lumped or microstrip port",
+            )
+        )
     return findings
 
 
@@ -458,40 +502,76 @@ def _check_the_mode_propagates(port: Port, problem: Problem) -> list[Finding]:
 
     The cutoff taken here is the vacuum one, which is the one openEMS uses.
     ``WaveguidePort`` fixes ``ref_index = 1`` and ``CalcPort`` builds
-    ``beta = sqrt(k^2 - kc^2)`` from it (``openEMS/ports.py``:393-395). Dividing
+    ``beta = sqrt(k^2 - kc^2)`` from it (``openEMS/ports.py``). Dividing
     by ``sqrt(epsilon)`` here instead would make this check disagree with the
     engine it checks: it would conclude that a filled guide propagates while the
     engine computes that the mode does not exist. :func:`_check_the_guide_is_empty`
     refuses a guide that is not empty before this runs, so the two agree.
+
+    The cutoff is stated to six figures and rounded up, so a band started above
+    the figure starts above the cutoff.
+
+    Whether a point lies above, on or below the cutoff is asked as openEMS asks
+    it: the sign of ``k^2 - kc^2``, over ``RectWGPort``'s own ``kc`` and
+    ``WaveguidePort.CalcPort``'s own ``k``, for the port as the driver hands it
+    over, moved to the origin with the rest of the problem. The move can change
+    the port's width by a rounding, and ``kc`` with it. A point on the cutoff
+    has ``beta = 0``, and the port's impedance has no bound there, so a band
+    holding one is refused. A band reaching below the cutoff is refused too: a
+    port reads nothing there that means anything, and the driver moves what it
+    read to the port's reference plane by ``exp(alpha d)`` of the decaying mode.
+    A port read at its own scales takes the cutoff of the guide the grid holds, a
+    little below openEMS' own; the driver refuses a point on that cutoff after the
+    solve.
     """
     if port.kind != "rect_waveguide":
         return []
 
-    a, b, mode = port.waveguide_arguments(problem.length_unit)
+    placed = port.moved(origin_offset(problem.solids, problem.ports, problem.grid))
+    a, b, mode = placed.waveguide_arguments(problem.length_unit)
     first, second = (int(digit) for digit in mode[2:])
-    kc = float(np.hypot(first * np.pi / a, second * np.pi / b))
+    kc = np.sqrt((first * np.pi / a) ** 2 + (second * np.pi / b) ** 2)
     cutoff = SPEED_OF_LIGHT * kc / (2 * np.pi)
+    unit = 10.0 ** (np.floor(np.log10(cutoff / 1e9)) - 5)
+    stated = f"{np.ceil(cutoff / 1e9 / unit) * unit:.6g}"
+    frequency = problem.frequency.values()
+    past = (2.0 * np.pi * frequency / SPEED_OF_LIGHT) ** 2 - kc**2
+    on = np.flatnonzero(past == 0.0)
 
-    if cutoff >= problem.frequency.stop:
+    if on.size:
         return [
             Finding(
                 REFUSE,
                 port.name,
-                f"{port.mode} cuts off at {cutoff / 1e9:.3g} GHz in this guide, "
+                f"{port.mode} cuts off exactly at the band's point "
+                f"{frequency[on[0]] / 1e9:.9g} GHz, where the port's impedance has no "
+                "bound and no S-parameter can be normalised. Move the band so no "
+                "point falls on the cutoff",
+            )
+        ]
+    if not past[-1] > 0.0:
+        return [
+            Finding(
+                REFUSE,
+                port.name,
+                f"{port.mode} cuts off at {stated} GHz in this guide, "
                 f"above the top of the band ({problem.frequency.stop / 1e9:.3g} "
                 f"GHz). Nothing would propagate: the run would take its full "
                 f"length and return an S-matrix of noise. The guide measures "
                 f"{a * MM_PER_M:.4g} x {b * MM_PER_M:.4g} mm",
             )
         ]
-    if cutoff > problem.frequency.start:
+    if past[0] < 0.0:
         return [
             Finding(
-                WARN,
+                REFUSE,
                 port.name,
-                f"{port.mode} cuts off at {cutoff / 1e9:.3g} GHz, inside the "
-                f"band. Below that the mode decays rather than travels, so the "
-                f"results are only meaningful above it",
+                f"{port.mode} cuts off at {stated} GHz, inside the band, which starts "
+                f"at {problem.frequency.start / 1e9:.6g} GHz. Below the cutoff the mode "
+                "decays rather than travels, openEMS reads a port there that carries no "
+                "power, and the reflection it reports is not a number that means "
+                "anything; moved to the port's reference plane it grows further. Start "
+                f"the band above {stated} GHz",
             )
         ]
     return []
@@ -601,7 +681,7 @@ def _check_port_inside_the_grid(port: Port, grid: MeshGrid) -> list[Finding]:
                     "returns plausible numbers for geometry that was never "
                     "drawn. Draw the port inside the grid, or - if the grid "
                     "stops short because the absorber ate the domain - raise "
-                    "ElementsPerWavelength or lower PMLCells",
+                    "ElementsPerWavelength on the Yee grid or lower PMLCells",
                 )
             )
     return findings
@@ -790,7 +870,9 @@ def _check_port_clear_of_absorber(port: Port, grid: MeshGrid) -> list[Finding]:
 
     findings = []
     for what, position in positions.items():
-        if not covered and low <= position <= high:
+        # A plane drawn on the face the absorber begins at lies on it to within
+        # the arithmetic that placed it, which is FLATNESS and not zero.
+        if not covered and low - FLATNESS <= position <= high + FLATNESS:
             continue
         face = 0 if position < low else 1
         end = "min" if face == 0 else "max"
@@ -801,8 +883,8 @@ def _check_port_clear_of_absorber(port: Port, grid: MeshGrid) -> list[Finding]:
         # and it is no answer at all on an axis the absorber covers: there is
         # nowhere on that axis to move to.
         advice = (
-            "Move it further in, or raise ElementsPerWavelength or lower "
-            "PMLCells to make the absorber thinner"
+            "Move it further in, or raise ElementsPerWavelength on the Yee grid "
+            "or lower PMLCells to make the absorber thinner"
         )
         if beyond > 0:
             where = (
@@ -825,9 +907,9 @@ def _check_port_clear_of_absorber(port: Port, grid: MeshGrid) -> list[Finding]:
                 why = (
                     f"the field there is being attenuated on purpose and "
                     f"anything measured in it is meaningless. The axis has "
-                    f"{len(lines) - 1} cells and declares {cells} of absorber "
-                    f"at each end, so nothing on it is outside the attenuating "
-                    f"region"
+                    f"{len(lines) - 1} cells and declares {cells[0]} of absorber "
+                    f"at its lower face and {cells[1]} at its upper, so nothing on "
+                    f"it is outside the attenuating region"
                 )
             else:
                 where = f"inside the absorber (the interior runs {low:.4g} to {high:.4g})"
@@ -835,7 +917,7 @@ def _check_port_clear_of_absorber(port: Port, grid: MeshGrid) -> list[Finding]:
                 why = (
                     f"the field there is being attenuated on purpose and "
                     f"anything measured in it is meaningless. The absorber is "
-                    f"{cells} cells and {depth:.4g} mm deep at {axis}={end}, "
+                    f"{cells[face]} cells and {depth:.4g} mm deep at {axis}={end}, "
                     f"so this sits {inside:.4g} mm inside it"
                 )
 

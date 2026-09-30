@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 import Microwave.Objects
-from tests import published, stripline
+from tests import openems_stripline, published
 from tests.analytic import reference as analytic
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
@@ -215,10 +215,15 @@ def test_every_object_carries_what_its_class_declares(archive, doc):
         assert not missing, f"{name} was saved without {missing}; rebuild it with its script"
 
 
-def test_the_mesh_policy_is_the_current_one(archive):
+def test_the_yee_grid_is_the_current_one(archive):
     """A stale example is a document the adapter refuses, shipped as the thing
-    to open first: it would have no ElementsPerWavelength at all."""
-    assert "ElementsPerWavelength" in document_xml(archive)
+    to open first: it would have no ElementsPerWavelength at all.
+
+    On the object that carries it, rather than anywhere in the file. Two kinds
+    declare that name, and a document holding it on the wrong one is exactly
+    the staleness this catches.
+    """
+    assert "ElementsPerWavelength" in properties_of(archive, "EMYeeGrid")
 
 
 #: What every port carries, whatever kind it is.
@@ -234,6 +239,7 @@ SHARED_PORT_PROPERTIES = ("Number", "Excitation", "ReferenceImpedance", "Referen
 PORT_PROPERTIES = {
     "EMPortMicrostrip": ("FeedResistance", "TraceEnd", "FeedOffset", "MeasurementDistance"),
     "EMPortLumped": ("Resistance", "SourceEntity", "ReferenceEntity", "ExcitationAxis"),
+    "EMPortRectWaveguide": ("CrossSection", "PropagationAxis", "ReferenceDepth", "Mode"),
 }
 
 
@@ -400,7 +406,7 @@ def test_the_excitation_offers_only_what_the_adapter_can_produce(archive):
     from Microwave.Solvers.openems.policy import GAUSSIAN
 
     offered = choices_of(archive, "Waveform")
-    assert offered, "no analysis in this document"
+    assert offered, "no openEMS solver in this document"
     for choices in offered:
         assert choices == [GAUSSIAN]
 
@@ -591,8 +597,8 @@ class TestTheSteppedLineStillHasAProfileToRead:
 
         One step, not ``tdr.INVENTED_BINS`` of them. The bar is where a trace
         stops being answered at all, and a fixture sitting on it measures the
-        guard instead of the line - ``test_acceptance_tdr`` holds its own sweep
-        to one for the same reason.
+        guard instead of the line - ``test_acceptance_openems_tdr`` holds its
+        own sweep to one for the same reason.
         """
         analysis = properties_of(document, "EMAnalysis")
         step = float(analysis["FrequencyStop"]) / int(analysis["NumFrequencyPoints"])
@@ -747,11 +753,11 @@ class TestTheMeasuredLowPassIsTheBoardThatWasBuilt:
     """The fourth named example, and the only one drawn from somebody else.
 
     ``stepped_lowpass_measured.FCStd`` is scored against a network analyser in
-    ``tests/test_acceptance_lowpass.py``, and a measurement is only a reference
-    for the board it was taken on. Every dimension in it was transcribed out of
-    a paper, so what can go wrong here is not a detuned filter but a *different*
-    one - and a different one still solves, still has a corner, and still looks
-    entirely plausible next to the published curve.
+    ``tests/test_acceptance_openems_lowpass.py``, and a measurement is only a
+    reference for the board it was taken on. Every dimension in it was
+    transcribed out of a paper, so what can go wrong here is not a detuned
+    filter but a *different* one - and a different one still solves, still has a
+    corner, and still looks entirely plausible next to the published curve.
 
     So this compares the committed document against the transcription itself,
     which lives in one place and is what the gate builds from. The example
@@ -849,6 +855,53 @@ class TestTheMeasuredLowPassIsTheBoardThatWasBuilt:
         )
 
 
+class TestTheWaveguideRunsOutThroughSomethingThatAbsorbs:
+    """The one shipped drawing both backends answer, and why its X faces are safe.
+
+    Both faces state ``Through``, which says the guide has no end there. On
+    openEMS the absorber is taken out of the guide's own extent and there is one.
+    On Palace there is no absorber at all, and what makes the document safe is
+    that a port's plane stands across each of those faces: the mesher leaves out
+    what stands behind such a plane, so the model ends on the port and a wave
+    meets the port's condition rather than the perfect wall the boundary is
+    otherwise left with.
+
+    That was true of this file by accident and checked by nothing. The Palace
+    adapter now refuses a ``Through`` face no port bounds, which is what holds
+    the pairing at run time - and this is what says the drawing still states it,
+    since a port dropped or turned round leaves a file that opens and no longer
+    translates.
+    """
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def document():
+        with zipfile.ZipFile(EXAMPLES / "waveguide_wr42.FCStd") as opened:
+            return {name: opened.read(name) for name in opened.namelist()}
+
+    def test_the_guide_runs_out_through_both_ends(self, document):
+        for side in ("Min", "Max"):
+            assert enum_of(document, "EMMeshPolicy", f"PaddingX{side}") == "Through"
+
+    def test_and_a_port_faces_into_the_model_from_each_of_them(self, document):
+        """One port facing along x bounds the lower face, and one facing back
+        along it bounds the upper. Two ports facing the same way would leave one
+        of the two faces a wall on Palace, which the adapter refuses."""
+        ports = {
+            name: enum_of(document, name, "PropagationAxis")
+            for name, (kind, _) in workbench_objects(document).items()
+            if kind == "EMPortRectWaveguide"
+        }
+        assert sorted(ports.values()) == ["-X", "X"], ports
+
+    def test_and_each_port_stands_on_a_plane_of_its_own(self, document):
+        """A plane drawn across the guide rather than the guide's own end face.
+        A port on the end face bounds nothing the mesher has to leave out, and
+        the guide would then run out through a wall at its own extent."""
+        planes = {name for name in shapes(document) if name.startswith("Plane")}
+        assert len(planes) == 2, sorted(shapes(document))
+
+
 class TestTheStriplineIsStillExact:
     """The one example that can be scored rather than demonstrated.
 
@@ -862,8 +915,8 @@ class TestTheStriplineIsStillExact:
     names, and all but the strip's own position are settings rather than
     geometry, so opening the file and looking at it would show nothing.
 
-    ``tests/test_stripline_document.py`` is the other half: what this translates
-    to is the structure the acceptance gate solves, line for line.
+    ``tests/test_openems_stripline_document.py`` is the other half: what this
+    translates to is the structure the acceptance gate solves, line for line.
     """
 
     @staticmethod
@@ -1001,27 +1054,29 @@ class TestTheStriplineIsStillExact:
     def test_the_line_is_shielded_and_absorbs_only_at_its_ends(self, document):
         """The enclosure, drawn nowhere and the reason the line is exact: a
         stripline is enclosed by conductor, so nothing radiates and no PML tuned
-        for another wave impedance reflects anything back. Set a conducting wall
-        to absorb and it stops being a ground plane.
+        for another wave impedance reflects anything back. Each face the policy
+        ends the domain on is a perfect wall, and the two it runs out through
+        absorb, in the layer the solver states. A file still carrying a
+        condition per face on its solver is one the adapter refuses.
         """
-        for name, expected in (
-            ("BoundaryXMin", "PML"),
-            ("BoundaryXMax", "PML"),
-            ("BoundaryYMin", "PEC"),
-            ("BoundaryYMax", "PEC"),
-            ("BoundaryZMin", "PEC"),
-            ("BoundaryZMax", "PEC"),
-        ):
-            assert enum_of(document, "EMSolverOpenEMS", name) == expected
+        for side in ("Min", "Max"):
+            assert enum_of(document, "EMMeshPolicy", f"PaddingX{side}") == "Through"
+        assert enum_of(document, "EMSolverOpenEMS", "Absorber") == "PML"
+        root = ElementTree.fromstring(document["Document.xml"])
+        solver = next(
+            o for o in root.find("ObjectData").iter("Object") if o.get("name") == "EMSolverOpenEMS"
+        )
+        stated = [p.get("name") for p in solver.iter("Property")]
+        assert not [name for name in stated if name.startswith("Boundary")], stated
 
     def test_nothing_stands_between_the_drawing_and_the_walls(self, document):
         """Air outside a conducting wall is cells spent where the wall keeps the
         field out - and it moves the shield away from where it was drawn, which
-        is the dimension the parasitic cutoff below is set by."""
+        is the dimension the parasitic cutoff below is set by. The face says so
+        on the policy, so no count has to be read beside it."""
         for axis in ("Y", "Z"):
             for side in ("Min", "Max"):
-                assert enum_of(document, "EMMeshPolicy", f"Padding{axis}{side}") == "Air"
-                assert int(properties_of(document, "EMMeshPolicy")[f"AirCells{axis}{side}"]) == 0
+                assert enum_of(document, "EMMeshPolicy", f"Padding{axis}{side}") == "Ends"
 
     def test_the_line_runs_out_through_the_absorber(self, document):
         """Give it air at its ends instead and it radiates off an open circuit,
@@ -1038,13 +1093,13 @@ class TestTheStriplineIsStillExact:
         reference that describes infinite planes drops that cutoff into the band,
         and the probes read a beat rather than a line.
 
-        Asked of ``tests/stripline.py``, which owns the rule: a copy of the
-        expression could lose the fill term, which does nothing at vacuum and
-        everything if this example ever took a laminate.
+        Asked of ``tests/openems_stripline.py``, which owns the rule: a copy
+        of the expression could lose the fill term, which does nothing at
+        vacuum and everything if this example ever took a laminate.
         """
         shield = float(properties_of(document, "Fill")["Width"])
         top = float(properties_of(document, "EMAnalysis")["FrequencyStop"])
-        cutoff = stripline.parasitic_cutoff(
+        cutoff = openems_stripline.parasitic_cutoff(
             shield, float(properties_of(document, "Vacuum")["Permittivity"])
         )
         assert top < cutoff, (

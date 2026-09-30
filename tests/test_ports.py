@@ -41,14 +41,18 @@ class TestTheReferenceImpedanceIsShownOnlyWhenItIsRead:
     )
 
     @factories
-    def test_it_is_visible_on_a_new_port(self, factory, doc):
-        assert factory(doc=doc).getEditorMode("ReferenceImpedance") == []
+    def test_a_new_port_shows_it_exactly_when_it_reads_it(self, factory, doc):
+        port = factory(doc=doc)
+        read = str(port.ReferencedTo) == FIXED_IMPEDANCE
+
+        assert port.getEditorMode("ReferenceImpedance") == ([] if read else ["Hidden"])
 
     @factories
     def test_pointing_the_port_at_itself_hides_it(self, factory, doc):
         port = factory(doc=doc)
-        port.ReferencedTo = PORT_IMPEDANCE
-        port.Proxy.onChanged(port, "ReferencedTo")
+        for value in (FIXED_IMPEDANCE, PORT_IMPEDANCE):
+            port.ReferencedTo = value
+            port.Proxy.onChanged(port, "ReferencedTo")
 
         assert port.getEditorMode("ReferenceImpedance") == ["Hidden"]
 
@@ -68,6 +72,27 @@ class TestTheReferenceImpedanceIsShownOnlyWhenItIsRead:
         port.Proxy.onChanged(port, "Number")
 
         assert port.getEditorMode("ReferenceImpedance") == []
+
+
+class TestBothBackendsAnswerAGuideAsMade:
+    """A guide drawn and run with nothing changed is one both backends answer.
+
+    Against a fixed fifty, openEMS reports how far the guide's impedance is from
+    fifty with the solve's error magnified by up to the VSWR between the two,
+    and Palace has nothing to renormalise from and refuses the port.
+    """
+
+    def test_openems_reports_a_guide_as_made_against_its_own_impedance(self, doc):
+        from Microwave.Solvers.openems.ports import _reference_impedance
+
+        assert _reference_impedance(createEMPortRectWaveguide(doc=doc)) is None
+
+    def test_palace_takes_a_guide_as_made(self, doc):
+        from Microwave.Solvers.palace.document import (
+            _check_the_port_reports_against_its_own_mode,
+        )
+
+        _check_the_port_reports_against_its_own_mode(createEMPortRectWaveguide(doc=doc))
 
 
 class TestEveryPortArrivesNumbered:
@@ -138,23 +163,6 @@ class TestOneNameForOneThing:
         assert offered, "the enumeration is empty; this test would prove nothing"
         assert set(properties.AXIS_NAMES) <= offered
 
-    def test_the_air_padding_default_is_one_number(self, doc):
-        """``plan.DEFAULT_PADDING`` and ``EMMeshPolicy.AirCells*`` are the same
-        fact in two layers that may not import each other. They agree today; the
-        point is that nothing made them, which is how FLATNESS diverged."""
-        from Microwave.Objects.mesh import createEMMeshPolicy
-        from Microwave.Solvers.openems.plan import DEFAULT_PADDING
-
-        settings = createEMMeshPolicy(doc=doc)
-        declared = {
-            int(getattr(settings, f"AirCells{axis}{side}"))
-            for axis in ("X", "Y", "Z")
-            for side in ("Min", "Max")
-        }
-        adapter = {int(n) for pair in DEFAULT_PADDING for n in pair}
-
-        assert declared == adapter
-
     def test_the_run_length_default_is_one_number(self, doc):
         """``model.DEFAULT_TIMESTEPS`` against ``EMSolverOpenEMS.MaxTimesteps``.
 
@@ -224,7 +232,8 @@ class TestEachKindDeclaresItsOwnSurface:
     ``Length = 999`` moved nothing.
     """
 
-    #: Common to every kind, from ``EMPortBase``. ``Number`` is 1 and not 0: a
+    #: From ``EMPortBase``, on every kind whose own row does not set the same
+    #: property. ``Number`` is 1 and not 0: a
     #: port that arrives unnumbered is refused by the translation, and this
     #: asserting 0 here would pin that defect as the contract.
     BASE_DEFAULTS = {
@@ -276,7 +285,9 @@ class TestEachKindDeclaresItsOwnSurface:
             createEMPortRectWaveguide,
             EMPortRectWaveguide,
             {"CrossSection"},
-            {},
+            # Against its own mode, which is what a bench references a guide to
+            # and the one reference both backends answer.
+            {"ReferencedTo": PORT_IMPEDANCE},
             {"Mode": "TE10"},
             {"SourceEntity", "TraceEnd"},
         ),
@@ -314,7 +325,8 @@ class TestEachKindDeclaresItsOwnSurface:
     ):
         port = factory(doc=doc)
         for name, value in self.BASE_DEFAULTS.items():
-            assert getattr(port, name) == value, name
+            if name not in defaults:
+                assert getattr(port, name) == value, name
 
     @kinds
     def test_a_kind_has_its_own_properties_and_only_its_own(
@@ -365,7 +377,7 @@ class TestNoPortPropertyIsANoOp:
         merely contains it.
 
         **What this still cannot see** is *which kind* reaches a read. ``Length``
-        is read as ``obj.Length`` - but only the microstrip and waveguide
+        is read as ``obj.Length`` - but only the microstrip and coaxial
         builders read it, so on the base class it was a no-op for lumped ports
         and this check would pass it either way. What found it was setting it
         to 999 and watching the box not move. The guard for that is structural,
@@ -380,10 +392,24 @@ class TestNoPortPropertyIsANoOp:
         # Every module the translation is spread across, rather than whichever
         # one holds the port builders today. A property moving to a new module
         # is not a property nobody reads, and this net is coarse enough already.
+        # And the module every backend reads a waveguide port's reference plane
+        # through, which the openEMS builder calls.
         tree = ast.parse(
             "\n".join(
-                (root / f"{name}.py").read_text()
-                for name in ("document", "properties", "geometry", "materials", "ports", "policy")
+                [
+                    *(
+                        (root / f"{name}.py").read_text()
+                        for name in (
+                            "document",
+                            "properties",
+                            "geometry",
+                            "materials",
+                            "ports",
+                            "policy",
+                        )
+                    ),
+                    (root.parent / "reference_plane.py").read_text(),
+                ]
             )
         )
         return {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)} | {
@@ -422,7 +448,7 @@ class TestNoPortPropertyIsANoOp:
         """
         from Microwave.Solvers.openems import document
 
-        from .test_document_translation import ground, microstrip_port, model, trace
+        from .test_openems_document_translation import ground, microstrip_port, model, trace
 
         port = microstrip_port(1, trace(), ground(), Length=length)
         built = document.problem(model(port=port).Objects[0]).ports[0]

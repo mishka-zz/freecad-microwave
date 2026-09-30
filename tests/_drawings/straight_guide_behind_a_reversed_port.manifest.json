@@ -1,0 +1,23 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "straight_guide_behind_a_reversed_port.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "port1",
+      "dim": 2,
+      "file": "straight_guide_behind_a_reversed_port.1.brep",
+      "priority": 0,
+      "inward": [
+        -1.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "measure": 2300.4999999999995,
+  "outside": 1592.02
+}

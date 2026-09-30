@@ -49,31 +49,18 @@ state it the same way.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
 
+from ..properties import WANTED, reading_down_to
+
 #: The share of the record the measurement drops, which makes what it reports
 #: the difference between transforming the whole record and stopping that much
-#: early.
-TAIL = 0.1
-
-#: How much of this run's S-parameters may still come from that last tenth, as
-#: a share of the smallest response the study says it reads.
-#:
-#: A study that says nothing reads down to full scale, and there this is an
-#: absolute error in S: a matched line reading |S11| = 0.002 and a filter
-#: reading |S21| = 0.9 are held to one bar, which a relative measure could not
-#: do. It is also the bar the acceptance gates are set to.
-#:
-#: It is a share rather than an absolute figure because leakage is only harmless
-#: beside the term it lands on. A stopband of -40 dB is |S21| = 0.01, so a run
-#: leaking at an absolute bar of that size carries the whole of the only
-#: quantity the device exists to deliver. Scaling the bar with the declared
-#: floor keeps one promise wherever that floor sits: the smallest term the study
-#: reads is right to about a tenth of a dB.
+#: early. How much of the S-parameters may come from that last tenth is
+#: ``Solvers/properties.WANTED`` of the smallest response the study says it
+#: reads, the bar every backend holds its shortcut to.
 #:
 #: What was never recorded stands in a known ratio to what this measures: for a
 #: mode of time constant ``tau`` over a record of ``T``, ``1/(exp(T/(10 tau)) -
@@ -85,7 +72,7 @@ TAIL = 0.1
 #: record does not answer it. The window dropped is a share of the record, so
 #: what such a component contributes to this measure grows in proportion to the
 #: length. A run whose reported share rises when it is run for longer has one.
-WANTED = 0.01
+TAIL = 0.1
 
 #: Elements of the kernel the transform builds at once. The sum runs over
 #: blocks of timesteps, and each block's kernel is multiplied into that block's
@@ -193,8 +180,17 @@ def _share(outgoing: _Pair, incoming: _Pair) -> float:
 
     The worst frequency is reported rather than the mean. Leakage matters where
     the response is smallest, which is where a notch is read.
+
+    A frequency where the S-parameter is not a number is left out, since the
+    matrix reports nothing there. openEMS splits a waveguide port's waves at a
+    reference of ``nan`` below its mode's cutoff, and taken into the worst it
+    made the worst ``nan``, which no bar is below. A record with no such
+    frequency left is vouched for nowhere, as one too short to compare is.
     """
-    return float(np.max(np.abs(outgoing[0] / incoming[0] - outgoing[1] / incoming[1])))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        moved = np.abs(outgoing[0] / incoming[0] - outgoing[1] / incoming[1])
+    moved = moved[np.isfinite(moved)]
+    return float(np.max(moved)) if moved.size else 1.0
 
 
 def tail_shares(
@@ -273,17 +269,12 @@ def unfinished(shares: Mapping[int, float], smallest_response: float = 1.0) -> s
     # moving by 0.0%.
     named = ", ".join(f"{value * 100:.3g}% at port {number}" for number, value in still)
     against = f"{bar * 100:.3g}%"
-    # Three figures on the floor as well, for a second reason. Rounded to whole
-    # decibels a shallow declaration reads as "-0 dB", and a study that asked
-    # for a fraction of one is then told the bar of a study that asked for
-    # nothing.
-    carries = (
-        "a finished record moves"
-        if smallest_response >= 1.0
-        else f"a study reading down to {20 * math.log10(smallest_response):.3g} dB can carry"
-    )
+    if smallest_response >= 1.0:
+        carries = "a finished record moves"
+    else:
+        carries = reading_down_to(smallest_response)
     return (
         "the run stopped before the response did: dropping the last tenth of "
         f"the record moves this run's S-parameters by {named}, against the "
-        f"{against} {carries}. Raise max_timesteps"
+        f"{against} {carries}. Raise MaxTimesteps"
     )

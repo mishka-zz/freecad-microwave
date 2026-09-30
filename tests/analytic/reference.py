@@ -168,6 +168,60 @@ def phase_constant(
     return np.sqrt(np.asarray(k**2 - kc**2, dtype=complex))
 
 
+def wall_attenuation(
+    frequency: np.ndarray,
+    width: float,
+    height: float,
+    conductivity: float,
+    broad: int = 2,
+    narrow: int = 2,
+) -> np.ndarray:
+    """TE10's attenuation from metal of finite conductivity, in nepers per metre.
+
+    Dimensions in metres, conductivity in siemens per metre, above cutoff only.
+    Each face carries the surface resistance ``sqrt(omega mu0 / 2 sigma)`` of a
+    metal thick against its skin depth, and dissipates it against the tangential
+    magnetic field the lossless mode puts there - which is the perturbation
+    Pozar's section 3.3 takes, face by face instead of summed.
+
+    TE10's field does not vary across the narrow wall, so a face parallel to the
+    broad walls anywhere inside the guide meets the magnetic field a broad wall
+    does. ``broad`` and ``narrow`` count the faces of each kind: the four walls
+    of a guide are two and two, and a sheet across it at any height is two
+    broad faces more.
+    """
+    frequency = np.asarray(frequency, dtype=float)
+    if np.any(frequency <= cutoff_frequency(width, height)):
+        raise ValueError("the attenuation from the walls is stated above cutoff")
+    omega = 2 * np.pi * frequency
+    mu0 = Z_FREE_SPACE / SPEED_OF_LIGHT
+    beta = np.real(phase_constant(frequency, width, height))
+    resistance = np.sqrt(omega * mu0 / (2 * conductivity))
+    # Per unit length and per unit amplitude of the axial magnetic field.
+    carried = omega * mu0 * beta * width**3 * height / (4 * np.pi**2)
+    per_broad = resistance * width / 4 * (1 + (beta * width / np.pi) ** 2)
+    per_narrow = resistance * height / 2
+    return (broad * per_broad + narrow * per_narrow) / (2 * carried)
+
+
+def power_voltage_impedance(frequency: np.ndarray, width: float, height: float) -> np.ndarray:
+    """TE10's power-voltage impedance ``|V|^2 / 2P``, in ohms, above cutoff.
+
+    Dimensions in metres. ``V`` is the electric field's integral across the
+    narrow side at the middle of the broad one, where the field peaks, so it is
+    ``E0 b``. The power the mode carries is ``|E0|^2 a b / (4 Z_TE)``, the field
+    varying as a half sine across the broad side and not at all across the
+    narrow one, with ``Z_TE = k Z0 / beta`` the wave impedance. The ratio is
+    ``2 (b / a) Z_TE``: the wave impedance scaled by the section's shape.
+    """
+    frequency = np.asarray(frequency, dtype=float)
+    if np.any(frequency <= cutoff_frequency(width, height)):
+        raise ValueError("the power-voltage impedance is stated above cutoff")
+    k = 2 * np.pi * frequency / SPEED_OF_LIGHT
+    beta = np.real(phase_constant(frequency, width, height))
+    return 2 * (height / width) * Z_FREE_SPACE * k / beta
+
+
 # This is the module the project's correctness rests on, and an untested closed
 # form in it is worse than none: a guide_wavelength dividing by np.real(beta),
 # which is 0 below cutoff, carries a reachable division by zero nothing catches.

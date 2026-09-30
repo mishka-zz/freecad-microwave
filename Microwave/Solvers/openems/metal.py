@@ -19,9 +19,9 @@ would be meshed with. Nothing here reads a grid: a face is answered from the
 drawing and the policy alone, and :mod:`~.mesh` decides which of the answers
 becomes a line.
 
-docs/internals/conductor-width.md works out why a face is sized from the width
-behind it, and what a policy that ignores the width costs the metal openEMS
-builds.
+docs/internals/openems-conductor-width.md works out why a face is sized from
+the width behind it, and what a policy that ignores the width costs the metal
+openEMS builds.
 """
 
 from __future__ import annotations
@@ -47,10 +47,10 @@ from .regions import DIMENSIONS, MaterialClass, MeshParams, Region
 #: Placed by measurement, on a microstrip read as the propagation constant
 #: between two lengths of one line, and set just under the least share measured
 #: to answer acceptably rather than in the middle of the range. See
-#: ``docs/internals/conductor-width.md``, which carries the figures and the
-#: method. That measurement is of metal the grid lost. The same tolerance is
-#: applied to metal it gains, which is not measured and is the looser half of
-#: this figure.
+#: ``docs/internals/openems-conductor-width.md``, which carries the figures and
+#: the method. That measurement is of metal the grid lost. The same tolerance
+#: is applied to metal it gains, which is not measured and is the looser half
+#: of this figure.
 CONDUCTOR_WIDTH_KEPT = 0.95
 
 
@@ -355,13 +355,16 @@ def width_axes(lower: Sequence[float], upper: Sequence[float], cell: float) -> t
     return tuple(dim for dim in live if upper[dim] - lower[dim] > cell)
 
 
-def conductor_pieces(boxes: Sequence[Box]) -> list[int]:
+def conductor_pieces(boxes: Sequence[Box], by_face: bool = False) -> list[int]:
     """Which connected piece of metal each box is in, as an index per box.
 
     Touching counts, because two conductors butted face to face are one piece,
     which is the reading the rest of this module takes. Connectedness is not a
     pairwise question, so it is answered by walking chains rather than by any
     test two boxes can apply to each other.
+
+    :param by_face: join two boxes only where they share an area, rather than
+        where they meet at an edge or a corner as well.
     """
     piece = list(range(len(boxes)))
 
@@ -373,13 +376,26 @@ def conductor_pieces(boxes: Sequence[Box]) -> list[int]:
 
     for one in range(len(boxes)):
         for other in range(one + 1, len(boxes)):
-            if root(one) != root(other) and all(
-                boxes[one][0][axis] <= boxes[other][1][axis] + FLATNESS
-                and boxes[other][0][axis] <= boxes[one][1][axis] + FLATNESS
-                for axis in range(DIMENSIONS)
+            if (
+                root(one) != root(other)
+                and all(
+                    boxes[one][0][axis] <= boxes[other][1][axis] + FLATNESS
+                    and boxes[other][0][axis] <= boxes[one][1][axis] + FLATNESS
+                    for axis in range(DIMENSIONS)
+                )
+                and (not by_face or _share_an_area(boxes[one], boxes[other]))
             ):
                 piece[root(one)] = root(other)
     return [root(n) for n in range(len(boxes))]
+
+
+def _share_an_area(one: Box, other: Box) -> bool:
+    """Whether two touching boxes overlap by more than a point on two axes."""
+    overlaps = sum(
+        min(one[1][axis], other[1][axis]) - max(one[0][axis], other[0][axis]) > FLATNESS
+        for axis in range(DIMENSIONS)
+    )
+    return overlaps >= DIMENSIONS - 1
 
 
 def _grouped_into_conductors(regions: Sequence[Region]) -> Grouped:

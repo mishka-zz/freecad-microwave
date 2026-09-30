@@ -1,0 +1,26 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "plate_across_the_box.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "plate",
+      "dim": 3,
+      "file": "plate_across_the_box.1.brep",
+      "priority": 1,
+      "divides": true,
+      "leaves": true
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "plate_across_the_box.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 5600.0,
+  "outside": 2479.9999999999995
+}

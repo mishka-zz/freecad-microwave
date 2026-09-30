@@ -1,0 +1,30 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "speck_in_a_needle.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "needle",
+      "dim": 3,
+      "file": "speck_in_a_needle.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "speck",
+      "dim": 3,
+      "file": "speck_in_a_needle.2.brep",
+      "priority": 2
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "speck_in_a_needle.3.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 194457025.9331056,
+  "outside": 2013880.406460551
+}

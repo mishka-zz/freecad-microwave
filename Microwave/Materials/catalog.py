@@ -223,12 +223,32 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
             "openEMS turns it into a fixed conductivity that is exact only at "
             "band centre"
         )
+    epsilon_r = _number(raw.get("epsilon_r", 1.0), f"{where} epsilon_r", faults, minimum=1.0)
+    dispersion = _dispersion(raw["dispersion"], where, faults) if "dispersion" in raw else ()
+    # A study solves at the row nearest its band, and the headline is a row
+    # where it is quoted at a frequency, so a headline is held to what a row is.
+    if dispersion and measured_at <= 0:
+        faults.append(
+            f"{where}: a dispersion table beside an epsilon_r quoted at no "
+            "frequency. State measured_at, the frequency the headline values are "
+            "true at"
+        )
+    for point in dispersion:
+        if point.frequency == measured_at and (point.epsilon_r, point.loss_tangent) != (
+            epsilon_r,
+            loss_tangent,
+        ):
+            faults.append(
+                f"{where}: the headline and the dispersion row at {point.frequency:g} Hz "
+                "state different values at one frequency. Make them agree, or quote "
+                "the headline where the table has no row"
+            )
 
     return MaterialEntry(
         id=identifier,
         name=name,
         kind=kind,
-        epsilon_r=_number(raw.get("epsilon_r", 1.0), f"{where} epsilon_r", faults, minimum=1.0),
+        epsilon_r=epsilon_r,
         mu_r=_number(raw.get("mu_r", 1.0), f"{where} mu_r", faults, minimum=0.0, allow_zero=False),
         loss_tangent=loss_tangent,
         conductivity=_number(
@@ -250,7 +270,7 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
         if stated("thickness")
         else 0.0,
         measured_at=measured_at,
-        dispersion=_dispersion(raw["dispersion"], where, faults) if "dispersion" in raw else (),
+        dispersion=dispersion,
         color=color,
         description=str(raw.get("description", "")),
         datasheet=str(raw.get("datasheet", "")),

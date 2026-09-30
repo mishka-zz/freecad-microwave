@@ -19,8 +19,11 @@ those would be imported by all of them and would import them back.
 from __future__ import annotations
 
 import math
+import numbers
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 DIMENSIONS = 3
 
@@ -54,7 +57,7 @@ _GRADING_HEADROOM = 0.995
 #:
 #: The cost of that is measured rather than argued, on a stripline whose
 #: impedance is exact, against the same line meshed with its faces on the grid.
-#: See ``docs/internals/conductor-width.md``.
+#: See ``docs/internals/openems-conductor-width.md``.
 EDGE_LINE_INSIDE = 1.0 / 3.0
 
 
@@ -233,6 +236,39 @@ class SizingRegion:
         return self.label or "refinement region"
 
 
+#: Absorber cells at the lower and the upper face of each axis.
+Faces = tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+
+
+def faces_of(given: Any) -> Faces:
+    """Absorber cells per face, from one count for every face, one per axis, or
+    a pair per axis - the three forms ``pml_cells`` is written in."""
+    if isinstance(given, numbers.Integral):
+        given = [int(given)] * DIMENSIONS
+    spread = list(given)
+    if len(spread) != DIMENSIONS:
+        raise MeshError("pml_cells must be one value, one per dimension or a pair per dimension")
+    pairs = []
+    for entry in spread:
+        if isinstance(entry, numbers.Integral):
+            pair = (int(entry), int(entry))
+        else:
+            ends = [int(value) for value in entry]
+            if len(ends) != 2:
+                raise MeshError("pml_cells for an axis is one count or a pair")
+            pair = (ends[0], ends[1])
+        if min(pair) < 0:
+            raise MeshError("pml_cells must be >= 0")
+        pairs.append(pair)
+    return (pairs[0], pairs[1], pairs[2])
+
+
+def written(faces: Faces) -> list[int | list[int]]:
+    """Absorber cells per face as the envelope and the staleness key hold them:
+    one count per axis whose faces agree, and a pair where they differ."""
+    return [ends[0] if ends[0] == ends[1] else [ends[0], ends[1]] for ends in faces]
+
+
 @dataclass(frozen=True)
 class MeshParams:
     """Grid policy. All lengths in the caller's units, consistently.
@@ -246,21 +282,22 @@ class MeshParams:
         Conductors are exempt: their thickness is a loss term, not a wave to
         sample, and a refinement region is where a conductor gets its own count
         if one is genuinely wanted.
-    :param pml_cells: Uniform absorber cells at each end of an axis. Added
-        outside the domain on an air-padded face and taken out of the domain on
-        one the structure runs through. Zero disables the absorber there. One value for
-        all three axes, or one per axis - a rectangular waveguide is PEC on its
-        four side walls and absorbing only at the two ends, so its mesh must
-        not grow sideways or the walls move and the cutoff shifts.
-    :param cap: The coarsest cell anywhere - the sizing field's ceiling.
-        Defaults to ``dielectric_res``. It is the bulk size in vacuum, and
-        ``dielectric_res`` is the bulk size in the slowest material, so
-        ``cap >= dielectric_res`` always.
-
-        The air padding is counted in this size, because that padding is a
-        clearance for a wave in vacuum. A ``THROUGH`` face is counted in
-        nothing: the domain ends on the drawing and the absorber comes out of it
-        at the pitch the mesher lays there. See :func:`~.plan.domain`.
+    :param pml_cells: Uniform absorber cells at a face. Added outside the
+        domain on an air-padded face and taken out of the domain on one the
+        structure runs through. Zero disables the absorber there. One value for
+        every face, one per axis for both its faces, or a pair per axis for its
+        lower and upper face - a rectangular waveguide is PEC on its four side
+        walls and absorbing only at the two ends, so its mesh must not grow
+        sideways or the walls move and the cutoff shifts, and a one-port guide
+        ends on a wall at its far face, which must stand where it was drawn.
+    :param cap: The bulk size in vacuum, which each material's own bulk size is
+        derived from. Unset, nothing is derived and the ceiling is
+        ``dielectric_res``.
+    :param medium: The product a wave slows by the root of in the medium that
+        fills every cell no solid covers. The ceiling, the coarsest cell
+        anywhere, is ``cap`` in that medium. ``dielectric_res`` is the bulk size
+        in the slowest material, the medium among them, so the ceiling is never
+        below it.
     :param edge_line_inside: Where the pair of lines about a conductor's edge
         sits, as a share of the cell - see :data:`EDGE_LINE_INSIDE`, which is the
         default and is what the document layer builds. It is policy rather than a
@@ -280,10 +317,11 @@ class MeshParams:
     dielectric_res: float
     max_ratio: tuple[float, float, float] = (1.3, 1.3, 1.3)
     min_lines: int = 4
-    pml_cells: int | tuple[int, int, int] = 8
+    pml_cells: int | Sequence[int] | Sequence[Sequence[int]] = 8
     min_cell: float | None = None
     cap: float | None = None
     edge_line_inside: float = EDGE_LINE_INSIDE
+    medium: float = 1.0
 
     def __post_init__(self) -> None:
         if self.metal_res <= 0 or self.dielectric_res <= 0:
@@ -307,20 +345,17 @@ class MeshParams:
                 "pair straddling it"
             )
 
-        given = self.pml_cells
-        if isinstance(given, int):
-            cells = (given,) * DIMENSIONS
-        else:
-            spread = tuple(int(value) for value in given)
-            if len(spread) != DIMENSIONS:
-                raise MeshError("pml_cells must be one value or one per dimension")
-            cells = spread
-        if any(value < 0 for value in cells):
-            raise MeshError("pml_cells must be >= 0")
-        object.__setattr__(self, "pml_cells", cells)
-        if self.cap is not None and self.cap < self.dielectric_res:
+        object.__setattr__(self, "pml_cells", faces_of(self.pml_cells))
+        if not (math.isfinite(self.medium) and self.medium > 0.0):
             raise MeshError(
-                f"cap ({self.cap}) is finer than dielectric_res "
+                f"medium ({self.medium}) carries no wave; it is a product of relative "
+                "permittivity and permeability, which is positive"
+            )
+        # The two are one length where the medium is the slowest material, each
+        # reached by its own divisions, so they may differ in the last place.
+        if self.cap is not None and self._in_medium < self.dielectric_res * (1.0 - 1e-12):
+            raise MeshError(
+                f"the ceiling ({self._in_medium}) is finer than dielectric_res "
                 f"({self.dielectric_res}); the ceiling cannot be below the bulk "
                 "size it is a ceiling for"
             )
@@ -347,20 +382,21 @@ class MeshParams:
         return self.min_cell
 
     @property
-    def absorber(self) -> tuple[int, int, int]:
-        """Absorber cells per axis, settled.
+    def absorber(self) -> Faces:
+        """Absorber cells at the lower and the upper face of each axis, settled.
 
-        ``pml_cells`` takes one count for all three axes or one per axis, and
-        ``__post_init__`` spreads the single count over them. This is the
-        per-axis form, which is the only one anything meshing an axis can use.
+        ``pml_cells`` takes one count for every face, one per axis or a pair per
+        axis, and ``__post_init__`` spreads it over the faces. This is the
+        per-face form, which is the only one anything meshing a face can use.
         """
         cells = self.pml_cells
         assert not isinstance(cells, int)  # __post_init__ spreads it
-        return cells
+        return cells  # type: ignore[return-value]
 
     @property
     def ceiling(self) -> float:
-        """The coarsest cell anywhere. ``cap`` when given, else the bulk size.
+        """The coarsest cell anywhere. ``cap`` in the medium when given, else the
+        bulk size.
 
         ``cap`` stays ``None`` rather than being filled in, because "unset" and
         "set to the same number" have to differ. Per-material sizing is derived
@@ -368,14 +404,23 @@ class MeshParams:
         meant to be a vacuum wavelength would refine every dielectric by
         sqrt(epsilon) for a caller who asked for nothing of the sort.
         """
-        return self.dielectric_res if self.cap is None else self.cap
+        return (
+            self.dielectric_res if self.cap is None else max(self._in_medium, self.dielectric_res)
+        )
+
+    @property
+    def _in_medium(self) -> float:
+        """``cap`` in the medium: the bulk size where nothing else asks one."""
+        assert self.cap is not None
+        return self.cap / math.sqrt(self.medium)
 
     def slope(self, dim: int) -> float:
         """The slope :func:`~.sizing_field._settle` ramps this axis' field at.
 
-        ``ln(ratio)`` and not ``ratio - 1``; docs/internals/sizing-field.md
-        works out why the difference is enough to fail every smoothness check.
-        What the headroom is for is stated where it is declared.
+        ``ln(ratio)`` and not ``ratio - 1``;
+        docs/internals/openems-sizing-field.md works out why the
+        difference is enough to fail every smoothness check. What the
+        headroom is for is stated where it is declared.
         """
         return math.log(self.max_ratio[dim]) * _GRADING_HEADROOM
 

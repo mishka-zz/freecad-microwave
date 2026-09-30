@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>Microwave</name>
+  <description>Electromagnetic design in FreeCAD: mark up a device, run it on openEMS or Palace, and read S-parameters back into the document.</description>
+  <version>0.0.2</version>
+  <freecadmin>1.0.0</freecadmin>
+  <pythonmin>3.11.0</pythonmin>
+  <maintainer email="mike.volokhov@gmail.com">Mike Volokhov</maintainer>
+  <author email="mike.volokhov@gmail.com">Mike Volokhov</author>
+  <license file="LICENSE">LGPL-2.1-or-later</license>
+  <icon>Microwave/Resources/Workbench.svg</icon>
+  <!-- The mesher the Palace backend runs through. Optional, since the openEMS
+       backend needs none of it. -->
+  <depend type="python" optional="true">gmsh</depend>
+  <tag>Electromagnetics</tag>
+  <tag>Microwave</tag>
+  <tag>RF</tag>
+  <tag>FDTD</tag>
+  <tag>FEM</tag>
+  <content>
+    <workbench>
+      <classname>MicrowaveWorkbench</classname>
+      <subdirectory>./</subdirectory>
+    </workbench>
+  </content>
+</package>

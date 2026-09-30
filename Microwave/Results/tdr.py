@@ -279,6 +279,17 @@ def step_response(
     built on a swept measurement does, so nothing here asks the solver for zero
     hertz. :data:`INVENTED_BINS` is the bar the extrapolation is held to.
     """
+    # First, because nothing changes it. A reflection is moved onto another
+    # impedance from the one it was measured against, so a port the solver
+    # stated none for has no trace against any figure - and every other
+    # refusal's advice, a longer sweep or another driven port, would be taken
+    # and come back to this one.
+    stated = np.asarray(result.reference, dtype=complex)[:, result.index_of(port)]
+    if stated.size and not np.isfinite(stated).any():
+        raise ResultError(
+            f"cannot take a step response at port {port}: the solver states no "
+            "impedance for it, so there is nothing to measure its reflection against"
+        )
     _check_the_sweep(result, port)
     ohms, measured = _reference_of(result, port, reference)
     if not np.isfinite(ohms) or ohms <= 0.0:

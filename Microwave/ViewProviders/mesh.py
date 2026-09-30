@@ -10,3 +10,11 @@ class EMMeshPolicyViewProvider(HasDisplayMode):
 
 class EMMeshRegionViewProvider(HasDisplayMode):
     ICON = "MeshRegion.svg"
+
+
+class EMYeeGridViewProvider(HasDisplayMode):
+    ICON = "YeeGrid.svg"
+
+
+class EMGmshMeshViewProvider(HasDisplayMode):
+    ICON = "GmshMesh.svg"

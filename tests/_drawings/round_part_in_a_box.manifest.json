@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "round_part_in_a_box.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "rod",
+      "dim": 3,
+      "file": "round_part_in_a_box.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "round_part_in_a_box.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0
+}

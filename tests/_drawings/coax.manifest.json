@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "dielectric",
+      "dim": 3,
+      "file": "coax.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "conductor",
+      "dim": 3,
+      "file": "coax.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "coax.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 15707.963267948966,
+  "outside": 3769.9111843077517
+}

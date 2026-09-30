@@ -1,0 +1,12 @@
+{
+  "pieces": [
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "unlabelled_region.0.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 0.0,
+  "outside": 0.0
+}

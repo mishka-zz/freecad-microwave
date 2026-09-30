@@ -21,9 +21,9 @@ only placement here, and where the interior's lines go is settled before it
 runs. No region is read and no demand is raised, so nothing here reaches back
 into the mesher.
 
-docs/internals/domain-and-absorber.md works out why the block comes out of the
-domain rather than being added beyond it, and what that costs the user who
-drew the domain.
+docs/internals/openems-domain-and-absorber.md works out why the block comes
+out of the domain rather than being added beyond it, and what that costs the
+user who drew the domain.
 """
 
 from __future__ import annotations
@@ -59,13 +59,13 @@ def laid_pitches(
     """
     out: list[tuple[float | None, float | None]] = []
     for dim in range(DIMENSIONS):
-        cells = params.absorber[dim]
+        low, high = params.absorber[dim]
         axis = np.asarray(lines[dim], dtype=float)
         spacing = np.diff(axis)
         out.append(
             (
-                None if pitches[dim][0] is None else float(spacing[cells]),
-                None if pitches[dim][1] is None else float(spacing[-1 - cells]),
+                None if pitches[dim][0] is None else float(spacing[low]),
+                None if pitches[dim][1] is None else float(spacing[-1 - high]),
             )
         )
     return tuple(out)
@@ -146,37 +146,44 @@ def inside_the_absorber(
         cells = params.absorber[dim]
         low, high = pitches[dim]
         if low is not None:
-            lower[dim] += cells * low
+            lower[dim] += cells[0] * low
         if high is not None:
-            upper[dim] -= cells * high
+            upper[dim] -= cells[1] * high
         if upper[dim] <= lower[dim]:
             raise MeshError(
                 f"the absorber would consume the whole {_DIM_NAMES[dim]} axis: the "
                 f"structure spans {domain[0][dim]:.4g} to {domain[1][dim]:.4g} and "
-                f"{cells} absorber cells at each end take all of it. Coarsen the "
-                "mesh there, ask for fewer absorber cells, or give the face air"
+                f"{cells[0]} absorber cells at its lower face and {cells[1]} at its "
+                "upper take all of it. Coarsen the mesh there, ask for fewer absorber "
+                "cells, or give the face air"
             )
     return (tuple(lower), tuple(upper))  # type: ignore[return-value]
 
 
 def _add_absorber(
     interior: Sequence[float],
-    pml_cells: int,
+    pml_cells: tuple[int, int],
     pitches: tuple[float | None, float | None] = (None, None),
 ) -> list[float]:
-    """Extend the axis with uniformly spaced absorber cells at both ends.
+    """Extend the axis with uniformly spaced absorber cells at each face.
 
     Uniform by construction, and it has to be. A graded block reflects, and the
     reflection off it is indistinguishable from the one being measured.
 
+    ``pml_cells`` is the count at the lower face and at the upper one. A face
+    given none gets no line beyond the interior, which is where a wall stands:
+    openEMS lays a perfect conductor on the outermost line, so a line beyond the
+    drawing would move the wall off it.
+
     A face given ``None`` takes the interior's own edge pitch, which is the
     absorber standing in the air beyond the model. A face given a pitch was
     sized by :func:`~.mesh._absorber_cell` before the interior was meshed, and the
-    interior was cut short by exactly ``pml_cells`` of it. Laying it back here
+    interior was cut short by exactly that face's count of it. Laying it back here
     returns the axis to the extent the structure was drawn at, whatever the
     mesher did in between.
     """
-    if pml_cells == 0:
+    low_cells, high_cells = pml_cells
+    if not low_cells and not high_cells:
         return list(interior)
     if len(interior) < 2:
         raise MeshError("cannot add an absorber to an axis with fewer than two lines")
@@ -184,22 +191,25 @@ def _add_absorber(
     lines = list(interior)
     low_pitch = lines[1] - lines[0] if pitches[0] is None else pitches[0]
     high_pitch = lines[-1] - lines[-2] if pitches[1] is None else pitches[1]
-    below = [lines[0] - low_pitch * i for i in range(pml_cells, 0, -1)]
-    above = [lines[-1] + high_pitch * i for i in range(1, pml_cells + 1)]
+    below = [lines[0] - low_pitch * i for i in range(low_cells, 0, -1)]
+    above = [lines[-1] + high_pitch * i for i in range(1, high_cells + 1)]
     return below + lines + above
 
 
-def _validate_absorber(array: np.ndarray, spacings: np.ndarray, name: str, pml_cells: int) -> None:
-    if pml_cells == 0:
+def _validate_absorber(
+    array: np.ndarray, spacings: np.ndarray, name: str, pml_cells: tuple[int, int]
+) -> None:
+    low_cells, high_cells = pml_cells
+    if not low_cells and not high_cells:
         return
-    if array.size < 2 * pml_cells + 2:
+    if array.size < low_cells + high_cells + 2:
         raise MeshError(
-            f"{name} axis has {array.size} lines, too few for {pml_cells} "
-            "absorber cells at each end plus an interior"
+            f"{name} axis has {array.size} lines, too few for {low_cells} absorber "
+            f"cells at its lower face and {high_cells} at its upper plus an interior"
         )
     for label, block in (
-        ("lower", spacings[:pml_cells]),
-        ("upper", spacings[-pml_cells:]),
+        ("lower", spacings[:low_cells]),
+        ("upper", spacings[spacings.size - high_cells :]),
     ):
-        if not np.allclose(block, block[0], rtol=1e-9, atol=0.0):
+        if block.size and not np.allclose(block, block[0], rtol=1e-9, atol=0.0):
             raise MeshError(f"{name} axis {label} absorber is not uniformly spaced: {block}")

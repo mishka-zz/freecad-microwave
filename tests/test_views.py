@@ -23,7 +23,7 @@ import pytest
 from Microwave.Gui import views
 from Microwave.Results.sparameters import ResultError, SParameters
 
-from .test_document_translation import Obj, Shape
+from .test_openems_document_translation import Obj, Shape
 from .test_tdr import SECTION, V, against, line, measured, reflected, through
 
 #: The fixture line's length, in millimetres: three sections of the synthetic
@@ -111,6 +111,36 @@ def stored(monkeypatch, matrix):
     """``views`` reads the matrix through ``Objects.results.load``, which has
     its own tests. What is under test here is everything after it."""
     monkeypatch.setattr(views, "load", lambda _holder: matrix)
+
+
+def guide_port(number, x, axis, depth):
+    """A waveguide port on a cross-section at ``x``, referred ``depth`` in."""
+    face = Shape((x, 0.0, 0.0), (x, 10.7, 4.3))
+    face.face("Face1", (x, 0.0, 0.0), (x, 10.7, 4.3))
+    return Obj(
+        "EMPortRectWaveguide",
+        f"Port{number}",
+        Number=number,
+        Excitation=True,
+        ReferenceImpedance=50.0,
+        ReferencedTo="Port impedance",
+        ReferenceDepth=depth,
+        Mode="TE10",
+        PropagationAxis=axis,
+        CrossSection=(Obj("Part::Plane", f"Plane{number}", face), ["Face1"]),
+    )
+
+
+class TestAGuideIsMeasuredBetweenItsReferencePlanes:
+    """A waveguide port referred to its own face draws nothing, and its
+    reference plane is still the face."""
+
+    @pytest.mark.parametrize("depth", [0.0, 2.0])
+    def test_the_length_runs_between_the_planes_its_answer_is_referred_to(self, depth):
+        holder, _ = study(guide_port(1, 0.0, "X", depth), guide_port(2, LENGTH, "-X", depth))
+        boxes = views.port_boxes(holder)
+        first, second = (boxes[number].probe_point()[0] for number in (1, 2))
+        assert (first, second) == (pytest.approx(depth), pytest.approx(LENGTH - depth))
 
 
 class TestWhichPortsCanBeOffered:
@@ -255,5 +285,5 @@ class TestWhenThereIsNoTraceAtAll:
                 measured_impedance=matrix.measured_impedance,
             ),
         )
-        with pytest.raises(ResultError, match="needs a positive one"):
+        with pytest.raises(ResultError, match="states no impedance"):
             views.impedance_view(two_port(), 1)

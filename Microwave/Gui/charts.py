@@ -12,8 +12,9 @@ against the 3D view, a navigation toolbar, Save, and task panels for editing
 lines and axes, all of which the user already knows how to drive.
 
 This module imports none of that at module scope. ``Plot`` pulls in FreeCAD,
-PySide and matplotlib, and ``Gui/task_panel.py`` reaches the chart modules at
-import time, so an absent matplotlib would take the task panel with it.
+PySide and matplotlib, and ``Gui/openems_task_panel.py`` reaches the chart
+modules at import time, so an absent matplotlib would take the task panel
+with it.
 """
 
 from __future__ import annotations

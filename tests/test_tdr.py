@@ -14,6 +14,8 @@ No solver and no FreeCAD. The derivation reads an
 network assembled by hand exercises every line of it.
 """
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -577,6 +579,28 @@ class TestWhatItRefuses:
         result = reflected(line([50.0, 75.0, 50.0]), reference=0.0)
         with pytest.raises(ResultError, match="needs a positive one"):
             tdr.step_response(result, 1)
+
+    def test_a_port_with_no_impedance_stated_says_so_rather_than_naming_nan(self):
+        """A backend that normalises to the port's own mode states no number for
+        it, and "measured against nan ohm" names a figure nobody gave."""
+        result = reflected(line([50.0, 75.0, 50.0]))
+        unknown = np.full(np.shape(result.reference), np.nan + 0j)
+        result = replace(result, reference=unknown, measured_impedance=unknown)
+        with pytest.raises(ResultError, match="states no impedance") as refused:
+            tdr.step_response(result, 1)
+        assert "nan" not in str(refused.value)
+
+    def test_no_stated_impedance_is_refused_before_advice_that_would_not_help(self):
+        """An undriven port is advised to be driven and a sweep far above DC to
+        start lower, and both would be taken and end at this refusal - so it
+        comes first. A reference typed in does not help either: the reflection
+        is moved onto it from the impedance it was measured against."""
+        result = reflected(line([50.0, 75.0, 50.0], fmin=5e9))
+        unknown = np.full(np.shape(result.reference), np.nan + 0j)
+        result = replace(result, reference=unknown, measured_impedance=unknown)
+        for port, asked in ((1, None), (2, None), (1, 50.0)):
+            with pytest.raises(ResultError, match="states no impedance"):
+                tdr.step_response(result, port, reference=asked)
 
     def test_a_reference_asked_for_is_held_to_the_same_bar(self):
         """Nothing about a number being typed rather than measured makes it an

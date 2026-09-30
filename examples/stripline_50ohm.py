@@ -164,7 +164,7 @@ Expect it a little below the closed form, and expect that shortfall to be the
 cross-section this grid holds rather than anything the run does to it. Four
 times the absorber, twice the record, and the same grid lines solved as a
 static capacitance with no wave in them at all all leave the answer where this
-one is; ``tests/test_acceptance_stripline.py`` prints what each is worth. What
+one is; ``tests/test_acceptance_openems_stripline.py`` prints what each is worth. What
 the grid adds is a length at the strip, so what it holds answers as a strip a
 little wider than the one drawn, and a wider strip is a lower impedance. The
 drawn width reaches openEMS unchanged.
@@ -175,7 +175,7 @@ planes, and `ElementsPerWavelength` sets the bulk element everywhere else -
 with `EdgeRefinement` beside it as the ratio between that and the finer
 element at the strip's edges. Asking for elements across the gap alone does
 not converge on the arithmetic: it overshoots.
-``tests/test_acceptance_stripline.py`` solves that ladder and prints what each
+``tests/test_acceptance_openems_stripline.py`` solves that ladder and prints what each
 rung gives. Refine the bulk alone and you buy a much larger grid for almost
 nothing. Double the two together, leaving the ratio between them where it is,
 and you land on the sequence the acceptance suite refines along, where the
@@ -313,31 +313,26 @@ def study(doc):
     analysis.FrequencyStop = f"{BAND[1]:g} Hz"
     analysis.NumFrequencyPoints = POINTS
 
-    solver = solver_of(analysis)
-    # The line absorbs at its two ends and is walled everywhere else. Those
-    # walls are the shield, and the two across the gap are the ground planes the
-    # port drives against - drawn nowhere, because a boundary is not geometry.
-    solver.BoundaryXMin = "PML"
-    solver.BoundaryXMax = "PML"
-    for name in ("BoundaryYMin", "BoundaryYMax", "BoundaryZMin", "BoundaryZMax"):
-        setattr(solver, name, "PEC")
-
-    settings = document.contents(analysis).settings
-    # Per wavelength, which is what the mesh policy states - so the count is
+    found = document.contents(analysis)
+    settings, grid = found.settings, found.recipe
+    # Per wavelength, which is what the Yee grid states - so the count is
     # derived from the cell the cross-section wants rather than the other way
     # round. See GAP_STEPS.
-    settings.ElementsPerWavelength = WAVELENGTH / BULK
-    settings.EdgeRefinement = BULK / CELL
+    grid.ElementsPerWavelength = WAVELENGTH / BULK
+    grid.EdgeRefinement = BULK / CELL
     settings.MinElementsAcross = GAP_STEPS
     # The line runs out through the absorber at its ends, and the domain stops
-    # dead on the drawing everywhere else: air outside a conducting wall is
-    # cells spent on a region the wall keeps the field out of, and it would
-    # move the shield away from where it was drawn.
+    # dead on the drawing everywhere else, where the face is a perfect wall.
+    # Those walls are the shield, and the two across the gap are the ground
+    # planes the port drives against - drawn nowhere, because a wall the domain
+    # ends on is not geometry. Air outside a conducting wall is cells spent on a
+    # region the wall keeps the field out of, and it would move the shield away
+    # from where it was drawn.
     settings.PaddingXMin = "Through"
     settings.PaddingXMax = "Through"
     for axis in ("Y", "Z"):
         for side in ("Min", "Max"):
-            setattr(settings, f"AirCells{axis}{side}", 0)
+            setattr(settings, f"Padding{axis}{side}", "Ends")
     return analysis
 
 

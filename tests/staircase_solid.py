@@ -24,7 +24,8 @@ A capacitance rather than a resonance, so that it is comparable with the line:
 both are electrostatics, and both see the wall the *electric* field is excluded
 from - which is the only wall this rule builds. A resonance is partly made of the
 magnetic field, which the rule never touches, so a figure from here and a figure
-from ``test_acceptance_cavity.py`` are two measurements rather than one repeated.
+from ``test_acceptance_openems_cavity.py`` are two measurements rather than one
+repeated.
 
 **Do not read a convergence rate off it**, for the reason the plane version
 gives: it reproduces one rule of openEMS' faithfully and nothing else about it.

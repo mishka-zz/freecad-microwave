@@ -153,7 +153,7 @@ class TestAgainstTheAdapter:
     def test_the_inferred_axes_translate_without_a_refusal(self):
         from Microwave.Solvers.openems import document
 
-        from .test_document_translation import (
+        from .test_openems_document_translation import (
             ground,
             microstrip_port,
             model,
@@ -235,6 +235,21 @@ class TestFillingAPortIn:
             "1 extra selection(s) ignored - this port takes 2: TraceEnd, GroundReference"
         ]
 
+    def test_a_face_that_cannot_be_placed_still_makes_a_port_and_says_why(self):
+        """A pick shown in two places has no one position to read axes off, and
+        the port is made with its links set and the refusal beside it."""
+        guide = _shape(((0, 0, 0), (10.7, 4.3, 40)), {"Face5": ((0, 0, 0), (10.7, 4.3, 0))})
+
+        class Root:
+            Label = "Assembly"
+
+        guide.Parents = [(Root(), "One.Stub."), (Root(), "Two.Stub.")]
+        port = StubPort()
+        (note,) = port_setup.fill_waveguide(port, [(guide, "Face5")])
+        assert port.CrossSection == (guide, ["Face5"])
+        assert "'Stub' stands in more than one container" in note
+        assert note.endswith("The axes are left at their defaults")
+
     def test_a_lumped_port_takes_the_axis_from_its_two_faces(self):
         upper = _shape(((10, -1.5, 1.5), (12, 1.5, 1.5)))
         lower = _shape(((10, -1.5, 0.035), (12, 1.5, 0.035)))
@@ -291,7 +306,7 @@ class TestWhatGetsPicked:
 
 def _shape(box, faces=None, lumps=None):
     """A document object carrying one drawn shape, or a fold made of lumps."""
-    from .test_document_translation import Compound, Shape
+    from .test_openems_document_translation import Compound, Shape
 
     body = Compound(*(Shape(*lump) for lump in lumps)) if lumps else Shape(*box)
     for name, at in (faces or {}).items():

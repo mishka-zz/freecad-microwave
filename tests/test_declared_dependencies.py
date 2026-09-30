@@ -3,7 +3,7 @@
 
 """What the workbench needs installed, stated once and checked against CI.
 
-Almost none of it is imported by this code. Only numpy is; SciPy, pandas and
+Most of it is not imported by this code. numpy and gmsh are; SciPy, pandas and
 typing_extensions arrive because the vendored scikit-rf imports them, and
 vendoring a pure-Python library pins its version without doing anything at all
 about the presence of what it imports. So the dependency list cannot be derived
@@ -166,11 +166,12 @@ def test_the_workflow_installs_what_the_project_declares():
     assert declared() == installed_by_ci()
 
 
-def test_numpy_is_declared():
+def test_what_this_code_imports_is_declared():
     """A floor under the list above, which would otherwise be satisfied by two
-    empty sets. numpy is the one dependency this code imports directly, in the
-    mesher, the adapter and the document layer alike."""
-    assert "numpy" in declared()
+    empty sets. These are the dependencies this code imports directly - numpy in
+    the Yee mesher, the adapter and the document layer alike, and gmsh in the
+    tetrahedral one."""
+    assert {"numpy", "gmsh"} <= declared()
 
 
 def declared_python():
@@ -401,3 +402,38 @@ def test_the_readme_names_the_libraries_the_project_declares():
         f"README.md calls {sorted(optional)} optional, and pyproject.toml's extras "
         f"declare {sorted(declared_optional)}"
     )
+
+
+def _package_xml():
+    """``package.xml``'s root, with its namespace taken off every tag."""
+    import xml.etree.ElementTree as ElementTree
+
+    root = ElementTree.parse(ROOT / "package.xml").getroot()
+    for element in root.iter():
+        element.tag = element.tag.rpartition("}")[2]
+    return root
+
+
+def test_the_addon_manager_is_told_the_version_the_package_states():
+    """FreeCAD's Addon Manager reads ``package.xml`` and nothing else, so its
+    version is a third copy of the one ``Microwave/__init__.py`` holds."""
+    assert _package_xml().findtext("version") == Microwave.__version__
+
+
+def test_the_addon_manager_is_asked_for_gmsh_and_for_nothing_it_would_refuse():
+    """The Addon Manager installs a Python dependency only from its allow list,
+    and gmsh is on it. The libraries the vendored scikit-rf imports ship inside
+    FreeCAD's own Python, and typing_extensions is not on that list, so
+    declaring them would only put a refusal in front of a user."""
+    asked = {
+        element.text: element.get("optional") == "true"
+        for element in _package_xml().iter("depend")
+        if element.get("type") == "python"
+    }
+    assert asked == {"gmsh": True}
+    assert "gmsh" in declared()
+
+
+def test_the_workbench_class_the_addon_manager_names_is_the_one_registered():
+    classname = _package_xml().findtext("content/workbench/classname")
+    assert f"class {classname}(" in (ROOT / "InitGui.py").read_text(encoding="utf-8")

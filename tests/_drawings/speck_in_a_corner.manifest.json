@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "speck_in_a_corner.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "speck",
+      "dim": 3,
+      "file": "speck_in_a_corner.1.brep",
+      "priority": 1
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "speck_in_a_corner.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.0,
+  "outside": 2200.0000000006003
+}

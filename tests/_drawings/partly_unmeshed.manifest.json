@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "partly_unmeshed.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "partly_unmeshed.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "partly_unmeshed.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6000.000000000001,
+  "outside": 3165.685424949238
+}

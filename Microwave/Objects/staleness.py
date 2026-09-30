@@ -9,7 +9,8 @@ for an answer nobody reads: there is an Update Mesh button, and the panel
 derives the key itself whenever it opens. So ``Objects/preview.py`` marks the
 drawing stale instead of asking, and each class that owns properties says which
 of its own move no cell, so that an edit to one of those never reaches the
-preview at all.
+preview at all. A mesh FreeCAD draws is marked by the same declarations - see
+``Objects/fem_mesh.py``.
 
 The declaration is a complement. A class names what moves no cell, and
 everything else is an input. A property added tomorrow is therefore loud until
@@ -70,3 +71,45 @@ def stop_quiet_properties_touching(obj, names):
     for name in sorted(names):
         if hasattr(obj, name):
             obj.setPropertyStatus(name, "Output")
+
+
+def awaits_recompute(drawing):
+    """Whether a change to what ``drawing`` was built from awaits a recompute.
+
+    ``drawing`` is a mesh object this workbench put in a study, carrying what it
+    was built from in ``MeshedFrom``: the openEMS mesh preview, or a mesh FreeCAD
+    draws.
+
+    An edit to an object the drawing links marks it stale only when a recompute
+    reaches the drawing, so a change no full recompute has reached leaves it
+    reading Current. FreeCAD's touched state records such a change. An object
+    the drawing links is touched from the edit until its recompute: a shape
+    assigned from the console, an undo, a redo, and a document saved and opened
+    again all leave it so. A recompute of the edited objects alone clears their
+    mark and touches the drawing instead, which that recompute did not reach. A
+    shape reached through an ``App::Link`` follows the linked object at once and
+    leaves the link untouched, so that change waits for the recompute that marks
+    the drawing.
+
+    A touched object says nothing where a recompute cannot clear it, and this
+    passes over it rather than reporting a change that meshing again cannot
+    settle. FreeCAD leaves an object touched while anything it is built from
+    fails to recompute, and a container touched while any member does, used or
+    not. FreeCAD raises when asked for the dependencies of an object in a cycle,
+    which it cannot recompute either. A document whose recomputes are skipped
+    clears nothing, so there the check is not made.
+    """
+    if drawing.Document.RecomputesFrozen:
+        return False
+    if "Touched" in drawing.State:
+        return True
+    for obj in getattr(drawing, "MeshedFrom", None) or ():
+        if "Touched" not in obj.State:
+            continue
+        try:
+            built_from = obj.OutListRecursive
+        except Exception:
+            continue
+        if not any("Invalid" in each.State for each in (obj, *built_from)):
+            return True
+    return False

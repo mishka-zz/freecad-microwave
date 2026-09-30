@@ -15,38 +15,16 @@ builds it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 from ... import __version__
+from ..capabilities import Capabilities
+
+__all__ = ["ADAPTER_VERSION", "capabilities"]
 
 #: What produced a result, recorded in its provenance. The adapter ships with
 #: the workbench and has no release of its own, so this is the workbench's
 #: version rather than a second number that would agree with it at first and
 #: then stop.
 ADAPTER_VERSION = __version__
-
-
-@dataclass(frozen=True)
-class Capabilities:
-    """One adapter's declaration of what it can express."""
-
-    solver: str
-    port_types: frozenset[str]
-    materials: frozenset[str]
-    domains: frozenset[str]
-    outputs: frozenset[str]
-    excitations: frozenset[str]
-    geometry: frozenset[str]
-    notes: dict[str, str] = field(default_factory=dict)
-
-    def supports_port(self, port_type: str) -> bool:
-        return port_type in self.port_types
-
-    def supports_material(self, kind: str) -> bool:
-        return kind in self.materials
-
-    def supports_output(self, output: str) -> bool:
-        return output in self.outputs
 
 
 def capabilities() -> Capabilities:

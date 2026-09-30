@@ -65,7 +65,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install numpy scipy pandas typing_extensions pytest
+      - run: pip install numpy gmsh scipy pandas typing_extensions pytest
       - name: Fast suite
         run: python -m pytest -q -m "not slow"
 

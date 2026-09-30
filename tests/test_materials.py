@@ -203,16 +203,17 @@ class TestBindingWhatWasPicked:
 class TestPickingOneFromACatalog:
     def test_every_catalog_kind_has_a_document_spelling(self):
         """``Materials.model.KINDS`` is what a catalog file may say;
-        ``_MATERIAL_TYPES`` is what the user picks from a dropdown. One set, two
+        ``DOCUMENT_TYPES`` is what the user picks from a dropdown. One set, two
         spellings, and the map is a plain lookup - ``apply_entry`` indexes it
         with a kind ``parse_catalog`` has already accepted, so a kind added to
         one side alone parses a catalog cleanly and raises ``KeyError`` in the
         picker, on the user's document rather than on their file.
         """
-        from Microwave.Materials.model import KINDS
-        from Microwave.Objects.materials import _MATERIAL_TYPES
+        from Microwave.Materials.model import DOCUMENT_TYPES, KINDS
 
-        assert set(_MATERIAL_TYPES) == set(KINDS)
+        assert set(DOCUMENT_TYPES) == set(KINDS)
+        offered = createEMMaterial().getEnumerationsOfProperty("MaterialType")
+        assert set(DOCUMENT_TYPES.values()) <= set(offered)
 
     def test_the_values_are_copied_in(self):
         obj = create_from_entry(FreeCAD.ActiveDocument, CATALOG.get("fr4"), CATALOG)
@@ -391,7 +392,7 @@ def test_a_dispersion_row_chosen_for_the_band_reaches_the_solver():
     from Microwave.Gui import material_picker
     from Microwave.Solvers.openems import document
 
-    from .test_document_translation import model, part
+    from .test_openems_document_translation import model, part
 
     catalog = parse_catalog(
         'schema = 1\n[catalog]\nid = "r"\nname = "R"\nversion = "1"\n'

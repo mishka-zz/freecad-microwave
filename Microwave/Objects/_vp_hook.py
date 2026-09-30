@@ -117,3 +117,19 @@ class ViewProviderRestored:
     def onDocumentRestored(self, obj):
         restore_view_provider(obj, type(self).__name__)
         self.declare_what_moves_no_cell(obj)
+
+    def departures(self, obj):
+        """Where ``obj`` departs from what its class declares.
+
+        On the proxy, because an adapter reads a document by duck typing and
+        imports no class; ``Objects/declared.py`` says what departs.
+        """
+        from .declared import departures
+
+        return departures(obj)
+
+    def linked(self, obj):
+        """Every object a property ``obj``'s class declares links to."""
+        from .declared import linked
+
+        return linked(obj)

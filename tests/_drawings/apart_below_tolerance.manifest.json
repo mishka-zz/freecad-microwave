@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "apart_below_tolerance.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "apart_below_tolerance.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "apart_below_tolerance.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 1999.9999999999995,
+  "outside": 1199.9999999999998
+}

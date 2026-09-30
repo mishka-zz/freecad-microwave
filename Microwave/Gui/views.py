@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 from .. import portbox
 from ..Objects.analysis import analysis_of, members
-from ..Objects.port_shape import port_box
+from ..Objects.port_shape import reference_box
 from ..Objects.results import load
 from ..Results import tdr
 from ..Results.sparameters import ResultError
@@ -125,13 +125,13 @@ def port_boxes(holder) -> dict[int, portbox.PortBox]:
     """Every port of ``holder``'s study that has a box, by port number.
 
     A port that is not configured enough to have one is left out rather than
-    refused. :func:`~..Objects.port_shape.port_box` returns ``None`` for it,
+    refused. :func:`~..Objects.port_shape.reference_box` returns ``None`` for it,
     and the adapter says loudly what is wrong with it when the user asks for a
     solve. Drawing a chart is not the place to raise it a second time.
 
-    ``port_box`` decides which members are ports, and answers ``None`` for
+    ``reference_box`` decides which members are ports, and answers ``None`` for
     everything that is not one. A separate test for whether a member is a port
-    would restate what ``port_box`` already decides, and would ask for the
+    would restate what ``reference_box`` already decides, and would ask for the
     ``Number`` of something that has none.
     """
     analysis = analysis_of(holder)
@@ -142,7 +142,7 @@ def port_boxes(holder) -> dict[int, portbox.PortBox]:
         )
     found = {}
     for obj in members(analysis):
-        box = port_box(obj)
+        box = reference_box(obj)
         if box is not None:
             found[int(obj.Number)] = box
     return found

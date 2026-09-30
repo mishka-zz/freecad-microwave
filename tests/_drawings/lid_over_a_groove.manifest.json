@@ -1,0 +1,24 @@
+{
+  "pieces": [
+    {
+      "label": "block",
+      "dim": 3,
+      "file": "lid_over_a_groove.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "lid",
+      "dim": 3,
+      "file": "lid_over_a_groove.1.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "lid_over_a_groove.2.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 6379.936284210213,
+  "outside": 2396.446010528494
+}

@@ -19,6 +19,11 @@ Alternative test command:
 python3 -m pytest -m slow -s | grep GATE
 ```
 
+openEMS gates need the openEMS Python bindings. Palace gates draw their device
+under `freecadcmd`, and need Palace and a Python that can import `gmsh`. A gate
+that cannot reach its engine skips. A run that collected every gate then fails,
+and names what it could not reach on an `UNREACHED` line.
+
 ## Verification vs. Validation
 
 Test gates are categorized by standard ASME V&V metrology definitions:
@@ -30,6 +35,17 @@ solutions:
 - Resonant cavity frequencies from Bessel function roots.
 - Coaxial line characteristic impedance derived from Laplace's equation.
 - Symmetric stripline impedance derived from conformal mapping.
+
+On Palace:
+- The WR-42 guide's phase constant, and each port's power-voltage impedance,
+  against the closed forms of a rectangular guide.
+- A septum's attenuation against the below-cutoff rate of the half-width
+  guide, with the septum drawn as a sheet and as a body.
+- A brass wall's attenuation against the surface-resistance perturbation of the
+  guide's mode.
+- A stripline driven through lumped ports against conformal mapping, for its
+  impedance and its phase constant. A release run carries it through a
+  refinement sequence.
 
 Discrepancies in verification benchmarks directly reflect numerical
 discretization error ($\mathcal{O}(\Delta x^p)$).
@@ -57,6 +73,13 @@ data:
   normalization inflation, and bounded within 5% on shielded TEM lines).
 - Spatial invariance (verifying that rotating or shifting geometry along
   Cartesian axes yields identical results).
+- On Palace, power conservation on a strip dipole in free space: what the
+  matrix reflects and what leaves through the open surface account for what
+  went in.
+- On Palace, drawing invariance: the WR-42 guide drawn as one body, as two
+  bodies that meet, and as two bodies a hair apart gives one answer.
+- On Palace, scaling: a release run solves the dipole in a dielectric medium,
+  scaled so that it is the vacuum dipole, and holds the two answers together.
 
 ## Metrology evaluation methods
 
@@ -74,9 +97,9 @@ evaluate convergence:
   against reference curves according to IEEE Standard 1597.1, separating
   amplitude differences (ADM) from feature shape differences (FDM).
 
-## Instrument systematic effects
+## Instrument systematic effects (openEMS)
 
-Certain benchmark gates evaluate known systematic effects introduced by
+Certain openEMS benchmark gates evaluate known systematic effects introduced by
 discrete numerical probe formulations:
 - Voltage and current probe plane spatial displacement on lumped ports.
 - Resonator Q-factor and frequency loading from internal field sampling

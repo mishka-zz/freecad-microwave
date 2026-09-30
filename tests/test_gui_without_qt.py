@@ -23,9 +23,9 @@ developer happened to have a real Qt binding, so it differed machine to machine.
 defined conditionally on a library being importable - so there is no statement
 left whose meaning depends on how far an import got. What is tested here is the
 property that made it matter: **importing must not raise**, because
-``Gui/task_panel.py`` takes :func:`show_matrix` at module scope and an import
-that raises there costs the whole task panel. Everything the workbench does
-apart from drawing works without any of these libraries.
+``Gui/openems_task_panel.py`` takes :func:`show_matrix` at module scope and an
+import that raises there costs the whole task panel. Everything the workbench
+does apart from drawing works without any of these libraries.
 
 The interpreter below has none of matplotlib, Qt, FreeCAD or ``Plot`` - it is a
 bare Python with the workbench on its path, which is both stronger than naming
@@ -88,9 +88,9 @@ def test_the_modules_import_with_nothing_to_draw_with(facts):
 
 
 def test_the_entry_points_still_exist(facts):
-    """``task_panel`` binds :func:`show_matrix` at import. A module that defines
-    its entry point only in the working case turns a missing chart into a
-    missing panel."""
+    """``openems_task_panel`` binds :func:`show_matrix` at import. A module that
+    defines its entry point only in the working case turns a missing chart into
+    a missing panel."""
     assert facts["has_show_matrix"] == "True"
     assert facts["has_show_trace"] == "True"
 
@@ -120,9 +120,9 @@ def test_the_refusal_quotes_the_import_error_it_got(facts):
 def test_the_task_panel_imports_with_qt_present_and_matplotlib_absent():
     """The reported symptom itself, and the configuration a real FreeCAD is in.
 
-    FreeCAD ships Qt and does not always ship matplotlib. ``task_panel`` binds
-    :func:`show_matrix` at module scope, so a plot module that raises under those
-    conditions is a workbench whose analysis object cannot be opened.
+    FreeCAD ships Qt and does not always ship matplotlib. ``openems_task_panel``
+    binds :func:`show_matrix` at module scope, so a plot module that raises under
+    those conditions is a workbench whose analysis object cannot be opened.
 
     Qt comes from ``conftest``'s own stub, loaded here deliberately: it is what
     supplies a Qt that imports, which is half the condition being stated.
@@ -143,8 +143,8 @@ def test_the_task_panel_imports_with_qt_present_and_matplotlib_absent():
         conftest = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(conftest)
 
-        import Microwave.Gui.task_panel
-        print("task_panel=imported")
+        import Microwave.Gui.openems_task_panel
+        print("openems_task_panel=imported")
         """
     )
     finished = subprocess.run(
@@ -154,4 +154,4 @@ def test_the_task_panel_imports_with_qt_present_and_matplotlib_absent():
         cwd=str(WORKBENCH),
     )
     assert finished.returncode == 0, finished.stderr
-    assert "task_panel=imported" in finished.stdout
+    assert "openems_task_panel=imported" in finished.stdout

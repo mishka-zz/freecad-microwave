@@ -38,30 +38,38 @@ from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import Any
 
+from ... import drawn, picks, units
+from ...portbox import FLATNESS
+from .. import reference_plane
+from ..materials import check_each_links_a_material
+from ..medium import Medium, linked
+from ..medium import said as medium_said
+from ..mesh_regions import Relaxation, check_relaxations_were_used, relaxations, subject
+from ..overlaps import Filled
+from ..properties import smallest_response
+from ..sheets import PASSES, lets_through
 from .geometry import (
     Departure,
-    _check_relaxations_were_used,
     _elements_named,
     _reference_boxes,
-    _relaxations,
     _sizing_regions,
-    _subject,
 )
 from .lfs import Body
 from .lfs import features as lfs_features
-from .materials import _is_metal, _material
-from .model import Frequency, Material, Port, Problem, Solid, canonical
+from .materials import _is_metal, _material, check_no_two_fill_one_space
+from .model import THROUGH, Frequency, Material, MeshGrid, Port, Problem, Solid, canonical
 from .plan import grid_from, plan_grid, plan_mesh, structure_bounds
 from .policy import (
+    AIR_FACE,
     _absorber_cells,
     _boundary,
     _check_mesh_policy,
+    _check_yee_grid,
     _curve_tolerance,
     _frequency,
     _mesh_params,
     _padding,
     _skin,
-    _smallest_response,
     _termination,
     _threads,
     _waveform,
@@ -69,9 +77,14 @@ from .policy import (
     timestep_factor,
 )
 from .ports import _PORT_BUILDERS, _Context, _port_numbers
-from .properties import TranslationError, _kind, _label, stale_document
+from .properties import (
+    TranslationError,
+    _kind,
+    _label,
+    out_of_step,
+)
 from .regions import MeshError as MeshError
-from .regions import MeshParams, SizingRegion
+from .regions import MeshParams, SizingRegion, written
 
 # MeshError is re-exported on purpose. Most refusals a user can cause are
 # raised as TranslationError. The ones that need MeshParams to decide - geometry
@@ -82,6 +95,22 @@ from .regions import MeshParams, SizingRegion
 # both, or a modelling mistake is reported as an internal error.
 from .sizing import Feature
 from .spend import Spend
+
+#: The kind of solver object this adapter runs from. A study may hold another
+#: backend's solver beside it, and this is what tells them apart - here, and
+#: wherever else the workbench has to say which of them the mesh preview is
+#: laid from.
+SOLVER = "EMSolverOpenEMS"
+
+#: The kind of mesh recipe this adapter lays its grid from. A study may hold
+#: another pipeline's recipe beside it, and the two carry properties of the same
+#: name, so the kind is what tells them apart.
+RECIPE = "EMYeeGrid"
+
+#: What a user presses to put the recipe in a study that has none. Named in the
+#: refusal, because a study saved before the grid became an object of its own
+#: has no other route back.
+RECIPE_COMMAND = "Add openEMS Solver"
 
 #: Layering. Dielectrics underlay metals, and a port's own conductor (priority
 #: 10, from :class:`~.model.Port`) sits over both. ``MSLPort`` lays its strip
@@ -103,7 +132,10 @@ class Contents:
 
     analysis: Any
     solver: Any
+    #: The mesh policy: what the device asks of any mesh.
     settings: Any
+    #: The Yee grid: what this pipeline does about it.
+    recipe: Any
     bindings: tuple[Any, ...]
     ports: tuple[Any, ...]
     # Called refinements rather than regions: "region" already means the
@@ -130,12 +162,14 @@ def contents(analysis: Any) -> Contents:
     _check_is_an_analysis(analysis)
 
     members = _members(analysis)
+    out_of_step([analysis, *(obj for obj in members if _read_here(_kind(obj)))])
+    check_each_links_a_material(obj for obj in members if _kind(obj) == "EMMaterialBinding")
 
-    solvers = [obj for obj in members if _kind(obj) == "EMSolverOpenEMS"]
+    solvers = [obj for obj in members if _kind(obj) == SOLVER]
     if not solvers:
         raise TranslationError(
-            f"{_label(analysis)!r} holds no solver, so there is nothing to run "
-            "it with. Add an openEMS solver to the analysis"
+            f"{_label(analysis)!r} holds no openEMS solver, so there is nothing "
+            "to run it with. Add one to the analysis"
         )
     if len(solvers) > 1:
         names = ", ".join(_label(obj) for obj in solvers)
@@ -148,8 +182,8 @@ def contents(analysis: Any) -> Contents:
     settings = [obj for obj in members if _kind(obj) == "EMMeshPolicy"]
     if not settings:
         raise TranslationError(
-            f"{_label(analysis)!r} holds no mesh policy, so there is nothing to "
-            "mesh by. Add an EMMeshPolicy object to the analysis"
+            f"{_label(analysis)!r} holds no mesh policy, so nothing says what this "
+            f"device asks of a mesh. Press {RECIPE_COMMAND} to add one"
         )
     if len(settings) > 1:
         names = ", ".join(_label(obj) for obj in settings)
@@ -159,13 +193,36 @@ def contents(analysis: Any) -> Contents:
         )
     _check_mesh_policy(settings[0])
 
+    grids = [obj for obj in members if _kind(obj) == RECIPE]
+    if not grids:
+        raise TranslationError(
+            f"{_label(analysis)!r} holds no Yee grid, so nothing says how finely "
+            f"openEMS resolves it. Press {RECIPE_COMMAND} to add one"
+        )
+    if len(grids) > 1:
+        names = ", ".join(_label(obj) for obj in grids)
+        raise TranslationError(
+            f"{_label(analysis)!r} holds {len(grids)} Yee grids ({names}), and "
+            "nothing says which one the grid is laid from. Keep one"
+        )
+    _check_yee_grid(grids[0])
+
     return Contents(
         analysis=analysis,
         solver=solvers[0],
         settings=settings[0],
+        recipe=grids[0],
         bindings=tuple(obj for obj in members if _kind(obj) == "EMMaterialBinding"),
         ports=tuple(obj for obj in members if _kind(obj).startswith("EMPort")),
         refinements=tuple(obj for obj in members if _kind(obj) == "EMMeshRegion"),
+    )
+
+
+def _read_here(found: str) -> bool:
+    """Whether a member of that kind is read by this adapter, which is what
+    :class:`Contents` holds."""
+    return found in (SOLVER, "EMMeshPolicy", RECIPE, "EMMaterialBinding", "EMMeshRegion") or (
+        found.startswith("EMPort")
     )
 
 
@@ -199,7 +256,7 @@ def _check_is_an_analysis(analysis: Any) -> None:
     kind = _kind(analysis)
     if kind == "EMAnalysis":
         return
-    if kind == "EMSolverOpenEMS":
+    if kind == SOLVER:
         raise TranslationError(
             f"{_label(analysis)!r} is a solver, not a study. The band, the ports "
             "and the geometry belong to the EMAnalysis it sits in, and that is "
@@ -215,8 +272,9 @@ def _geometry(
     bindings: Sequence[Any],
     center_hz: float,
     skin: float,
-    relaxed: Mapping[tuple[str, str], Any] | None = None,
+    relaxed: Mapping[tuple[str, str], Relaxation] | None = None,
     held_to: float = 0.0,
+    grown: Mapping[str, Any] | None = None,
 ) -> tuple[
     tuple[Material, ...],
     tuple[Solid, ...],
@@ -235,15 +293,18 @@ def _geometry(
         length the physics does not need, where a dielectric skin would leave
         out the layer's own thickness, which decides the answer.
     :param relaxed: What each coarsened subject settles for, keyed the way
-        :func:`~.geometry._subject` keys it: by object and by sub-element, so a
-        conductor drawn as a face of a board is not relaxed along with the
-        board. It is applied to every piece a reference decomposes into and to
-        the body beside it, so the two cannot come to ask for different things.
+        :func:`~Microwave.Solvers.mesh_regions.subject` keys it: by object and
+        by sub-element, so a conductor drawn as a face of a board is not
+        relaxed along with the board. It is applied to every piece a reference
+        decomposes into and to the body beside it, so the two cannot come to
+        ask for different things.
 
         A reference is relaxed only where every element it names was coarsened.
         Its pieces are not paired back to the elements that produced them, so a
         partly coarsened reference has to relax all of them or none. Relaxing
         none cannot give up resolution nobody gave up.
+    :param grown: by object name, the body a slip grows in place of the
+        object's own shape. See :func:`_joined`.
     """
     relaxed = relaxed or {}
     used: set[tuple[str, str]] = set()
@@ -252,6 +313,8 @@ def _geometry(
     conductor_of: dict[tuple[str, str], str] = {}
     bodies: list[Body] = []
     departures: list[tuple[str, Departure | None]] = []
+    filled: list[Filled] = []
+    staged: list[tuple[Material, Any, list[Any], list[str]]] = []
 
     for binding in bindings:
         material_obj = getattr(binding, "Material", None)
@@ -278,49 +341,77 @@ def _geometry(
 
         for reference in references:
             obj, regions = _reference_boxes(
-                reference, skin if _is_metal(material) else None, held_to
+                reference, skin if _is_metal(material) else None, held_to, grown
             )
+            if material.kind in DIELECTRIC_KINDS:
+                _check_a_dielectric_holds_a_volume(material, regions)
             elements = _elements_named(reference)
             for element in elements:
                 conductor_of[(obj.Name, element)] = material.name
+            # The shape as drawn rather than the pieces it became: a conductor
+            # drawn as a surface is thickened into a solid, and that metal is
+            # not a body the user drew.
+            for element in elements:
+                drawn_as = picks.element(obj, element)
+                # Metal is read as openEMS fills it: each closed surface whole.
+                try:
+                    volume = drawn.filling(drawn_as, cavities=not _is_metal(material))
+                except drawn.Unmeasured as failed:
+                    raise TranslationError(
+                        f"{_element_label(obj, element)!r} is drawn as closed surfaces, and "
+                        f"the CAD kernel could not make a solid of them: {failed}. Check it "
+                        "with Part's Check geometry"
+                    ) from None
+                if volume is not None:
+                    filled.append(
+                        Filled(
+                            _element_label(obj, element),
+                            binding,
+                            material.name,
+                            volume,
+                            _is_metal(material),
+                        )
+                    )
+            staged.append((material, obj, regions, elements))
 
-            keys = [_subject(obj, element) for element in elements]
-            used.update(key for key in keys if key in relaxed)
-            relaxed_to = (
-                min(relaxed[key].size for key in keys)
-                if all(key in relaxed for key in keys)
-                else 0.0
+    check_no_two_fill_one_space(filled, materials)
+
+    for material, obj, regions, elements in staged:
+        keys = [subject(obj, element) for element in elements]
+        used.update(key for key in keys if key in relaxed)
+        relaxed_to = (
+            min(relaxed[key].size for key in keys) if all(key in relaxed for key in keys) else 0.0
+        )
+        for piece in regions:
+            solid = Solid(
+                material=material.name,
+                lower=piece.box.lower,
+                upper=piece.box.upper,
+                priority=METAL_PRIORITY if _is_metal(material) else DIELECTRIC_PRIORITY,
+                label=piece.label,
+                vertices=piece.vertices,
+                faces=piece.faces,
+                sheet_normal=piece.sheet_normal,
+                thickened=piece.thickened,
+                relaxed_to=relaxed_to,
             )
-            for piece in regions:
-                solid = Solid(
-                    material=material.name,
-                    lower=piece.box.lower,
-                    upper=piece.box.upper,
-                    priority=(METAL_PRIORITY if _is_metal(material) else DIELECTRIC_PRIORITY),
-                    label=piece.label,
-                    vertices=piece.vertices,
-                    faces=piece.faces,
-                    sheet_normal=piece.sheet_normal,
-                    thickened=piece.thickened,
-                    relaxed_to=relaxed_to,
-                )
-                solids.append(solid)
-                # The same region as a body the mesher can measure lengths
-                # off, built beside the solid so the two cannot describe
-                # different sets. It carries the geometry the piece itself
-                # names, so a binding naming one face measures that face rather
-                # than the solid it belongs to, and one lump of a compound
-                # measures that lump rather than the compound.
-                bodies.append(measured_body(piece, _is_metal(material), relaxed_to or None))
-                # Kept beside the solid rather than on it. What the driver
-                # receives is hashed as the run's provenance, and nothing on
-                # that side reads this figure. ``None`` means the measure could
-                # not state a distance. Sheets are left out and answered once
-                # for the whole model.
-                if not solid.is_sheet:
-                    departures.append((solid.name, piece.departure))
+            solids.append(solid)
+            # The same region as a body the mesher can measure lengths off,
+            # built beside the solid so the two cannot describe different sets.
+            # It carries the geometry the piece itself names, so a binding
+            # naming one face measures that face rather than the solid it
+            # belongs to, and one lump of a compound measures that lump rather
+            # than the compound.
+            bodies.append(measured_body(piece, _is_metal(material), relaxed_to or None))
+            # Kept beside the solid rather than on it. What the driver receives
+            # is hashed as the run's provenance, and nothing on that side reads
+            # this figure. ``None`` means the measure could not state a
+            # distance. Sheets are left out and answered once for the whole
+            # model.
+            if not solid.is_sheet:
+                departures.append((solid.name, piece.departure))
 
-    _check_relaxations_were_used(relaxed, used)
+    check_relaxations_were_used(relaxed, used)
     return (
         tuple(materials.values()),
         tuple(solids),
@@ -328,6 +419,11 @@ def _geometry(
         tuple(bodies),
         tuple(departures),
     )
+
+
+def _element_label(obj: Any, element: str) -> str:
+    """What a region names one element of an object by, as its pieces are labelled."""
+    return f"{_label(obj)}:{element}" if element else _label(obj)
 
 
 def _ports(found: Sequence[Any], ctx: _Context) -> tuple[Port, ...]:
@@ -372,6 +468,12 @@ class _Translated:
     #: user sees, and ``None`` where no distance could be stated. Sheets are
     #: left out.
     departures: tuple[tuple[str, Departure | None], ...]
+    #: The name of the material filling every cell no solid covers, and empty
+    #: for vacuum. It is one of :attr:`materials`.
+    medium: str = ""
+    #: What the run states of each slip a body of the medium's own material
+    #: takes. See :func:`_joined`.
+    joined: tuple[str, ...] = ()
     #: What reading the lengths off this drawing cost, filled in as they are
     #: read. It travels on the translation rather than being handed back by
     #: :attr:`measured`, because a grid is planned from the same reading and
@@ -395,25 +497,15 @@ class _Translated:
 
 @contextmanager
 def _reading(analysis: Any) -> Iterator[None]:
-    """Name the object where a document is out of step with its classes.
+    """State a pick the drawing no longer places as a refusal.
 
-    It wraps every route that reads a document. A property added since a file
-    was written is missing on whichever route reaches it first: Run today, and
-    Update Mesh as soon as the added property is a mesh property. See
-    :func:`~.properties.stale_document` for what is converted and what is left
-    alone.
-
-    The analysis is searched along with its members. It carries properties of
-    its own, and a study saved before one of those existed is out of step in the
-    same way.
+    It wraps every route that reads a document, so a pick is refused alike on
+    Run and on Update Mesh.
     """
     try:
         yield
-    except AttributeError as error:
-        refusal = stale_document(error, [analysis, *_members(analysis)])
-        if refusal is None:
-            raise
-        raise refusal from error
+    except picks.Unplaced as error:
+        raise TranslationError(str(error)) from error
 
 
 def _translate(analysis: Any) -> _Translated:
@@ -424,8 +516,7 @@ def _translate(analysis: Any) -> _Translated:
     picture of a mesh that is never solved.
 
     The guard sits here rather than on each caller for the same reason. Every
-    route into a document passes through this function, so a document out of
-    step with its classes is named once wherever it is met.
+    route into a document passes through this function.
     """
     with _reading(analysis):
         return _read_document(analysis)
@@ -436,13 +527,13 @@ def _read_document(analysis: Any) -> _Translated:
     frequency = _frequency(found.analysis)
     # The thickness a conductor drawn without one is given. It is measured
     # against the grid rather than against the drawing, so it is settled before
-    # the geometry is read: the mesh policy and the band supply everything it
+    # the geometry is read: the Yee grid and the band supply everything it
     # needs.
     materials, solids, conductor_of, bodies, departures = _geometry(
         found.bindings,
         frequency.center,
-        _skin(found.settings, frequency),
-        _relaxations(found.refinements),
+        _skin(found.recipe, frequency),
+        relaxations(found.refinements),
         _curve_tolerance(found.settings),
     )
 
@@ -452,19 +543,25 @@ def _read_document(analysis: Any) -> _Translated:
             "excite and nothing to measure"
         )
 
+    medium = _medium(found.settings, frequency.center)
+    if medium is not None and medium not in materials:
+        materials = (*materials, medium)
+
     ctx = _Context(
         frequency=frequency,
         conductor_of=conductor_of,
         materials={material.name: material for material in materials},
-        resolution=(
-            _wavelength(materials, frequency) / float(found.settings.ElementsPerWavelength)
-        ),
+        resolution=(_wavelength(materials, frequency) / float(found.recipe.ElementsPerWavelength)),
     )
     ports = _ports(found.ports, ctx)
 
-    boundary = _boundary(found.solver)
+    slowing = 1.0 if medium is None else medium.epsilon * medium.mu
+    padding = _padding(found.settings, frequency, slowing)
+    boundary = _boundary(found.solver, found.settings, solids, ports)
+    if medium is not None:
+        _check_the_absorber_takes_the_medium(found.settings, medium, boundary)
     absorber = _absorber_cells(boundary, int(found.solver.PMLCells))
-    params = _mesh_params(found.settings, materials, frequency, absorber)
+    params = _mesh_params(found.settings, found.recipe, materials, frequency, absorber, slowing)
 
     return _Translated(
         found=found,
@@ -473,12 +570,318 @@ def _read_document(analysis: Any) -> _Translated:
         solids=solids,
         ports=ports,
         params=params,
-        padding=_padding(found.settings),
+        padding=padding,
         boundary=boundary,
         sizing=_sizing_regions(found.refinements),
         bodies=bodies,
         departures=departures,
+        medium="" if medium is None else medium.name,
     )
+
+
+#: S/m. Above this openEMS takes a cell for metal and switches its perfectly
+#: matched layer off there (``FDTD/extensions/operator_ext_upml.cpp``,
+#: ``Operator_Ext_UPML::BuildExtension``).
+PML_OFF = 1e3
+
+
+def _medium(settings: Any, centre: float) -> Material | None:
+    """The medium the policy links, as this adapter states a material, or
+    ``None`` for vacuum.
+
+    A material bound to a body and linked as the medium as well translates to
+    the one material, which the caller then hands over once.
+    """
+    chosen = linked(settings.Medium, settings)
+    if chosen is None:
+        return None
+    return _material(chosen, centre)
+
+
+def _check_the_absorber_takes_the_medium(
+    settings: Any, medium: Material, boundary: Sequence[str]
+) -> None:
+    """Refuse a medium conducting enough that the absorber switches itself off.
+
+    openEMS takes a cell conducting above :data:`PML_OFF` for metal and lays no
+    perfectly matched layer there, so a medium that conductive leaves every
+    absorbing face a reflecting one.
+    """
+    lost = medium.kappa + medium.conductivity
+    if lost < PML_OFF or not any(word.startswith("PML") for word in boundary):
+        return
+    raise TranslationError(
+        f"{_label(settings)!r}: Medium {medium.name!r} conducts {lost:.3g} S/m at the band, "
+        f"and openEMS takes a cell conducting above {PML_OFF:g} S/m for metal and switches "
+        "its perfectly matched layer off there, so the absorber would reflect. Set the "
+        "solver's Absorber to Mur, or link a medium that conducts less"
+    )
+
+
+def _joined(read: _Translated) -> _Translated:
+    """``read`` with each slip a body of the medium's own material takes grown
+    into that body, and every other slip refused.
+
+    A slip is room a dielectric body stands against that is thinner than
+    :data:`~Microwave.drawn.SLIP` of the bodies round it: bodies drawn to meet
+    that miss each other. openEMS pins a line on each face of it, and a cell as
+    thin as the gap costs the whole run its timestep. Where
+    :func:`~Microwave.drawn.joined` finds a whole body of the medium's material
+    beside it that closes the gap, the room is the same material as that body,
+    and the body grown over it is the same device; the translation is read again
+    with that body grown, and the run states it. A gap drawn on purpose is drawn
+    as a body of its own.
+
+    Asked where a grid is laid or a run is built - Update Mesh and Run agree -
+    and not by the staleness key, which is asked on every recompute and keys
+    the drawing as it stands. It asks the CAD kernel to cut every bound solid
+    out of the box round the structure.
+    """
+    found = read.found
+    centre = read.frequency.center
+    fill = _medium(found.settings, centre) or _VACUUM
+    held: dict[str, list[Any]] = {}
+    sheets: dict[str, list[Any]] = {}
+    names: dict[str, str] = {}
+    dielectric: set[str] = set()
+    kin: set[str] = set()
+    for binding in found.bindings:
+        material = _material(binding.Material, centre)
+        for reference in getattr(binding, "References", ()) or ():
+            obj = reference[0] if isinstance(reference, tuple) else reference
+            for element in picks.named(reference):
+                shape = picks.element(obj, element)
+                key = f"{obj.Name}:{element}" if element else obj.Name
+                names[key] = _element_label(obj, element)
+                # A dielectric object fills the volume a closed surface bounds,
+                # as solid_boxes hands it over. The geometry has made that solid
+                # already, so the kernel can make it here.
+                whole_dielectric = material.kind in DIELECTRIC_KINDS and not element
+                filled = drawn.filling(shape) if whole_dielectric else None
+                shape = shape if filled is None else filled
+                whole = bool(getattr(shape, "Solids", None))
+                (held if whole else sheets).setdefault(key, []).append(shape)
+                if material.kind in DIELECTRIC_KINDS:
+                    dielectric.add(key)
+                    if whole and not element and _electrically(material) == _electrically(fill):
+                        kin.add(key)
+    if not dielectric:
+        return read
+    least, most = structure_bounds(read.solids, read.ports)
+    lower, upper = [float(one) for one in least], [float(one) for one in most]
+    if any(high - low <= FLATNESS for low, high in zip(lower, upper, strict=True)):
+        return read
+    try:
+        rooms = drawn.rooms(lower, upper, held, sheets)
+    except (RuntimeError, ValueError) as error:
+        raise TranslationError(
+            f"the solids bound in {_label(found.settings)!r}'s study could not be cut "
+            f"from the box round them to find the room they leave: {error}. Check each with "
+            "Part's Check geometry"
+        ) from error
+    if not rooms:
+        return read
+    extents = {key: drawn.extent(shapes) for key, shapes in {**held, **sheets}.items()}
+    opened = [
+        face
+        for face in (f"{axis}{side}" for axis in "XYZ" for side in ("Min", "Max"))
+        if str(getattr(found.settings, f"Padding{face}")) == AIR_FACE
+    ]
+    clear = [(port.start, port.stop) for port in read.ports]
+    taken: dict[str, list[drawn.Room]] = {}
+    unjoined = []
+    for room in drawn.slips(rooms, dielectric, extents, opened):
+        try:
+            into = drawn.joined(room, held, kin, extents, clear)
+        except (RuntimeError, ValueError) as error:
+            raise _slip(
+                read, room, names, f"The CAD kernel could not measure it: {error}"
+            ) from error
+        if into is None:
+            unjoined.append(room)
+        else:
+            taken.setdefault(into, []).append(room)
+    if unjoined:
+        raise _slip(read, min(unjoined, key=lambda one: 2.0 * one.volume / one.surface), names)
+    if not taken:
+        return read
+    grown = {}
+    for key, joined in taken.items():
+        try:
+            grown[key] = drawn.grown(held[key][0], joined)
+        except (RuntimeError, ValueError) as error:
+            raise _slip(read, joined[0], names, str(error)) from error
+    _, solids, _, bodies, departures = _geometry(
+        found.bindings,
+        centre,
+        _skin(found.recipe, read.frequency),
+        relaxations(found.refinements),
+        _curve_tolerance(found.settings),
+        grown,
+    )
+    return replace(
+        read,
+        solids=solids,
+        bodies=bodies,
+        departures=departures,
+        joined=tuple(
+            _said_joined(room, names[key], [names[one] for one in room.bounded_by if one != key])
+            for key, joined in taken.items()
+            for room in joined
+        ),
+    )
+
+
+#: The kinds of material a slip stands against, and the ones a body of the
+#: medium's own material may be.
+DIELECTRIC_KINDS = ("dielectric", "lossy_dielectric")
+
+
+def _check_a_dielectric_holds_a_volume(material: Material, regions: Sequence[Any]) -> None:
+    """Refuse a dielectric bound to a surface.
+
+    A dielectric acts through the volume it fills, and a surface fills none.
+    openEMS reads a cell's material only at its middle and a quarter of the way
+    in from each of its lines, so a surface is read only where it happens to lie
+    on one of those, and the answer would follow the grid. How thick the layer
+    is decides most of what it does, so nothing here supplies a thickness.
+    """
+    for piece in regions:
+        extents = zip(piece.box.lower, piece.box.upper, strict=True)
+        if any(high - low <= FLATNESS for low, high in extents):
+            raise TranslationError(
+                f"{piece.label!r} is bound to {material.name!r}, a dielectric, and is "
+                "flat, so it holds no volume for the dielectric to fill. openEMS reads "
+                "a cell's material only at its middle and a quarter of the way in from "
+                "each of its lines, so a surface is read only where it happens to lie "
+                "on one of those, and the answer would follow the grid. Bind the "
+                "material to a closed body as thick as the layer is"
+            )
+
+
+#: What fills every cell no solid covers where the policy links no medium.
+_VACUUM = Material(name="vacuum", kind="dielectric")
+
+
+def _electrically(material: Material) -> tuple[float, float, float]:
+    """What a cell of ``material`` is to the engine: its permittivity, its
+    permeability and the conductivity it is handed."""
+    return (material.epsilon, material.mu, material.kappa + material.conductivity)
+
+
+def _said_joined(room: drawn.Room, into: str, across: Sequence[str]) -> str:
+    """What the run states of one slip a body takes."""
+    names = [repr(one) for one in (into, *across)]
+    between = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+    return (
+        f"The room from {_corner(room.least)} to {_corner(room.most)} mm, "
+        f"{2.0 * room.volume / room.surface:.3g} mm thick between {between}, is solved as "
+        f"part of {into!r}. It is the medium, {into!r} is of the medium's own material, and "
+        "the device is the same with the gap closed into it, so no cell as thin as the gap "
+        "is laid."
+    )
+
+
+def _slip(
+    read: _Translated, room: drawn.Room, names: Mapping[str, str], reason: str = ""
+) -> TranslationError:
+    """The refusal of a slip no body of the medium's own material takes."""
+    labels = list(dict.fromkeys(names.get(key, key) for key in room.bounded_by))
+    quoted = [repr(name) for name in labels]
+    between = quoted[0] if len(quoted) == 1 else f"{', '.join(quoted[:-1])} and {quoted[-1]}"
+    return TranslationError(
+        f"{_label(read.found.settings)!r}: the room from {_corner(room.least)} to "
+        f"{_corner(room.most)} mm is {2.0 * room.volume / room.surface:.3g} mm thick between "
+        f"{between}, under {drawn.SLIP:g} of the least extent of the bodies round it, so it "
+        "reads as bodies drawn to meet that miss each other. openEMS would fill it with "
+        f"{_undrawn(read)} and lay cells as thin as the gap across it"
+        + (f". {reason}" if reason else "")
+        + ". Move the bodies to meet, or draw a body filling the gap and bind the material "
+        "meant there to it"
+    )
+
+
+def _undrawn(read: _Translated) -> str:
+    """What fills undrawn room, as a sentence names it."""
+    return f"the medium {read.medium!r}" if read.medium else "vacuum"
+
+
+def _corner(point: Any) -> str:
+    """A point in a sentence, its coordinates in millimetres."""
+    return "(" + ", ".join(f"{float(one):.4g}" for one in point) + ")"
+
+
+def _check_the_guides_are_uniform(read: _Translated, grid: MeshGrid) -> None:
+    """Refuse a waveguide port whose guide changes along its axis as far as the
+    wave is moved along it.
+
+    openEMS reads the wave on the grid line nearest its port box's far face, and
+    the driver moves it to the port's reference plane, so the guide has to be a
+    prism with metal walls from the face the mode is launched on to whichever
+    of the two lies deeper. Asked where a grid is laid or a run is built,
+    because it asks the CAD kernel to cut shapes; and after the grid, because the
+    plane the probes read is a grid line.
+
+    A side of the guide nothing is bound beyond is a wall only where it lies on
+    a face of the domain openEMS makes a perfect conductor. Anywhere else the
+    engine fills the undrawn room with the medium.
+    """
+    perfect = {material.name for material in read.materials if material.kind == "pec"}
+    # A sheet of finite conductivity is a wall where it reflects the wave that
+    # meets it, judged against free space, which is what fills a guide this
+    # adapter drives.
+    free_space = units.VACUUM_PERMEABILITY * units.SPEED_OF_LIGHT
+    reflecting = perfect | {
+        material.name
+        for material in read.materials
+        if material.kind == "conducting_sheet"
+        and lets_through(material.conductivity, material.thickness, [free_space])[0] <= PASSES
+    }
+    bound = [
+        reference_plane.Bound(
+            solid.name, body.shape, solid.material in reflecting, solid.material in perfect
+        )
+        for solid, body in zip(read.solids, read.bodies, strict=True)
+    ]
+    walls = [
+        (index // 2, float(grid[index // 2][-1 if index % 2 else 0]))
+        for index, word in enumerate(read.boundary)
+        if word == "PEC"
+    ]
+
+    filler = f"medium {read.medium!r}" if read.medium else "vacuum"
+
+    def outside(beyond: Any) -> str | None:
+        box = drawn.bound(beyond)
+        lows = (box.XMin, box.YMin, box.ZMin)
+        highs = (box.XMax, box.YMax, box.ZMax)
+        for dim, at in walls:
+            if highs[dim] - lows[dim] <= FLATNESS and abs(lows[dim] - at) <= FLATNESS:
+                return None
+        return f"the {filler} openEMS fills undrawn room with"
+
+    for obj, port in zip(read.found.ports, read.ports, strict=True):
+        if port.kind != "rect_waveguide":
+            continue
+        axis = port.propagation_axis
+        direction = 1 if port.stop[axis] > port.start[axis] else -1
+        read_at = direction * (port.probe_plane(grid[axis]) - port.start[axis])
+        stated = port.reference_depth
+        if read_at >= stated:
+            why = "openEMS reads the port"
+            remedy = (
+                f"openEMS reads this port {read_at:.4g} mm in from its face whatever "
+                f"ReferenceDepth says, so move what changes the guide more than {read_at:.4g} "
+                "mm from the face, or refine the mesh, which brings that plane closer"
+            )
+        else:
+            why = "its S-parameters are referred"
+            remedy = "Lower ReferenceDepth, or move what changes the guide past the plane"
+        link = obj.CrossSection
+        faces = [picks.element(link[0], name) for name in picks.named(link)]
+        reference_plane.check_uniform(
+            obj, faces, axis, direction, max(read_at, stated), stated, bound, outside, why, remedy
+        )
 
 
 def measured_body(piece: Any, metal: bool, relaxed_to: float | None = None) -> Body:
@@ -516,11 +919,11 @@ def measured_body(piece: Any, metal: bool, relaxed_to: float | None = None) -> B
 def measured(
     bodies: Sequence[Any], params: MeshParams, spend: Spend | None = None
 ) -> tuple[Feature, ...]:
-    """Every length the drawing carries, read at the policy the grid will use.
+    """Every length the drawing carries, read at the sizes the grid will use.
 
     It is a named function rather than an inline call because it is the whole
-    of the wiring between the mesh policy and what gets measured off the
-    geometry. Each value it forwards costs a different measurement if it goes
+    of the wiring between what the grid is laid to and what gets measured off
+    the geometry. Each value it forwards costs a different measurement if it goes
     missing, and a value it does not forward costs one too.
 
     What comes back is every length, and not the ones that survive a pruning.
@@ -598,6 +1001,7 @@ def mesh(analysis: Any) -> MeshPlan:
     """
     read = _translate(analysis)
     key = _digest_of(read)
+    read = _joined(read)
     lines, regions, bounds = plan_mesh(
         read.solids,
         read.ports,
@@ -609,11 +1013,13 @@ def mesh(analysis: Any) -> MeshPlan:
         read.spend,
     )
     drawn_lower, drawn_upper = structure_bounds(read.solids, read.ports)
+    grid = grid_from(lines, read.params, bounds, read.padding)
+    _check_the_guides_are_uniform(read, grid)
     return MeshPlan(
         lines=lines,
         regions=regions,
         params=read.params,
-        grid=grid_from(lines, read.params, bounds, read.padding),
+        grid=grid,
         inputs_digest=key,
         found=read.found,
         structure=(tuple(drawn_lower), tuple(drawn_upper)),
@@ -642,9 +1048,11 @@ def grid_inputs_digest(analysis: Any) -> str:
     and its priority to the payload, and its triangles only where it carries
     them; a solid cut into boxes carries none, and the lengths are read off the
     whole shape the cut came from. Two drawings that tile one region differently
-    hash alike and mesh differently. Measured, that moves grid lines and leaves
-    the line count unchanged. It is a stated limit of this key rather than a
-    defect in it.
+    hash alike and are measured differently, and whether the grid then differs
+    is decided by which demands the mesher prunes. Curvature read off the exact
+    shape is not in the payload either. It is a stated limit of this key rather
+    than a defect in it, and ``Gui/openems_mesh_preview.py::staleness`` does not
+    rest on the key for a change a recompute has not yet reached.
 
     In the other direction the key is not exact either. A port's whole
     dictionary goes into the payload, so a reference impedance moves the key and
@@ -674,7 +1082,7 @@ def _digest_of(read: _Translated) -> str:
             "dielectric_res": read.params.dielectric_res,
             "max_ratio": list(read.params.max_ratio),
             "min_lines": read.params.min_lines,
-            "pml_cells": list(read.params.absorber),
+            "pml_cells": written(read.params.absorber),
             "min_cell": read.params.floor,
             "cap": read.params.cap,
         },
@@ -689,6 +1097,10 @@ def _digest_of(read: _Translated) -> str:
             for region in read.sizing
         ],
     }
+    # Only where there is one: a study in vacuum is keyed on what it hands over,
+    # and nothing about vacuum is handed over.
+    if read.medium:
+        payload["medium"] = {"name": read.medium, "slowing": read.params.medium}
     serialised = json.dumps(canonical(payload), sort_keys=True)
     return hashlib.sha256(serialised.encode("utf-8")).hexdigest()
 
@@ -701,11 +1113,14 @@ def problem(analysis: Any, exciting: int | None = None) -> Problem:
     lowest-numbered port the user marked as a source. :func:`sweep` produces the
     whole set.
     """
-    return _problem_of(_translate(analysis), analysis, exciting)
+    return _problem_of(_translate(analysis), analysis, exciting)[0]
 
 
-def _problem_of(read: _Translated, analysis: Any, exciting: int | None) -> Problem:
-    """One envelope out of a translation already made.
+def _problem_of(
+    read: _Translated, analysis: Any, exciting: int | None
+) -> tuple[Problem, _Translated]:
+    """One envelope out of a translation already made, and the translation it
+    was built from once the slips are taken. See :func:`_joined`.
 
     It is split from :func:`problem` so that a caller wanting more than one
     thing off a document reads the document once. Anything comparing the answers
@@ -731,25 +1146,27 @@ def _problem_of(read: _Translated, analysis: Any, exciting: int | None) -> Probl
     # full mesh on a document that is about to be refused over a property that
     # costs nothing to look at.
     factor = timestep_factor(found.solver)
-    with _reading(analysis):
-        floor = _smallest_response(found.analysis)
+    floor = smallest_response(found.analysis)
     # Here rather than in `_translate`, which the mesh preview shares. What
     # drives the model is a question about a solve, and a preview drawn from a
     # document with a stale waveform is still the grid that would be solved.
-    _waveform(found.analysis)
+    _waveform(found.solver)
+    read = _joined(read)
+    grid = plan_grid(
+        read.solids,
+        ports,
+        read.materials,
+        read.params,
+        padding=read.padding,
+        sizing=read.sizing,
+        measured=read.measured,
+    )
+    _check_the_guides_are_uniform(read, grid)
 
     return Problem(
         title=_label(found.analysis),
         frequency=read.frequency,
-        grid=plan_grid(
-            read.solids,
-            ports,
-            read.materials,
-            read.params,
-            padding=read.padding,
-            sizing=read.sizing,
-            measured=read.measured,
-        ),
+        grid=grid,
         materials=read.materials,
         solids=read.solids,
         ports=ports,
@@ -758,11 +1175,16 @@ def _problem_of(read: _Translated, analysis: Any, exciting: int | None) -> Probl
         threads=_threads(found.solver),
         timestep_factor=factor,
         smallest_response=floor,
-    )
+        medium=read.medium,
+    ), read
 
 
 def geometry_report(analysis: Any) -> list[str]:
-    """What the drawing lost on its way to being solvable, one line each.
+    """What the drawing lost on its way to being solvable, one line each: how
+    far each curved region departs, and each slip a body of the medium's own
+    material grew over. Finding the slips asks the CAD kernel to cut every bound
+    solid out of the box round the structure, and a slip no such body closes is
+    refused here as it is at a run.
 
     A curved surface reaches the engine as a polyhedron whose facets are
     chords, so the solid solved is not the solid drawn. A region held as boxes
@@ -775,7 +1197,7 @@ def geometry_report(analysis: Any) -> list[str]:
     This measure divides a lost volume by an area, and a sheet has no volume to
     lose.
     """
-    return _report_of(_translate(analysis))
+    return _report_of(_joined(_translate(analysis)))
 
 
 def _report_of(read: _Translated) -> list[str]:
@@ -798,7 +1220,36 @@ def _report_of(read: _Translated) -> list[str]:
             "above: what departs on one is its outline, which lies in the plane "
             "its triangles cover, and is not a volume this can measure."
         )
-    return lines
+    if read.medium:
+        (filling,) = [one for one in read.materials if one.name == read.medium]
+        # The loss as openEMS holds it: a loss tangent folded into one
+        # conductivity at the centre of the band, which is a larger loss below
+        # the centre than the tangent states.
+        medium = Medium(
+            name=filling.name,
+            permittivity=filling.epsilon,
+            permeability=filling.mu,
+            loss_tangent=0.0,
+            conductivity=filling.kappa + filling.conductivity,
+        )
+        # A face the structure runs out through has its absorber at the
+        # structure, so the nearest absorbing face is where a wave returns least
+        # decayed.
+        absorbing = [
+            0.0 if face == THROUGH else float(face)
+            for face, word in zip(
+                (face for axis in read.padding for face in axis), read.boundary, strict=True
+            )
+            if word.startswith(("PML", "MUR"))
+        ]
+        lines += medium_said(
+            medium,
+            read.frequency.start,
+            read.frequency.stop,
+            min(absorbing, default=0.0),
+            bool(absorbing),
+        )
+    return [*lines, *read.joined]
 
 
 def sweep_and_report(analysis: Any) -> tuple[list[Problem], list[str]]:
@@ -808,8 +1259,7 @@ def sweep_and_report(analysis: Any) -> tuple[list[Problem], list[str]]:
     twice, which costs a second pass over every shape and leaves the report
     describing a drawing that may have moved between the two reads.
     """
-    read = _translate(analysis)
-    base = _problem_of(read, analysis, None)
+    base, read = _problem_of(_translate(analysis), analysis, None)
     return (
         [base.exciting(number) for number in _active(read.found.ports)],
         _report_of(read),

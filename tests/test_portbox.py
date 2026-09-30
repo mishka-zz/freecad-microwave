@@ -19,7 +19,7 @@ from Microwave import portbox
 from Microwave.Objects import port_shape
 from Microwave.Solvers.openems import document
 
-from .test_document_translation import (
+from .test_openems_document_translation import (
     LENGTH,
     PICK_DEPTH,
     coaxial_model,
@@ -29,6 +29,7 @@ from .test_document_translation import (
     mesh_settings,
     microstrip_port,
     model,
+    part,
     trace,
 )
 
@@ -411,13 +412,23 @@ class TestTheDrawingIsTheSolversBox:
         if flattened:
             assert drawn.start[0] == pytest.approx(-LENGTH / 2 + PICK_DEPTH, abs=1e-12)
 
+    def test_a_pick_that_cannot_be_placed_is_drawn_without_an_outline(self):
+        """The drawing reads what it can and never stops the recompute; the
+        adapter refuses the pick by name when the study runs."""
+        port = lumped_pick(trace(), area=False)
+        strip, names = port.SourceEntity
+        port.SourceEntity = (strip, [*names, "Part.Box.Face2"])
+        drawn = port_shape.port_box(port)
+        assert drawn is not None
+        assert abs(drawn.stop[0] - drawn.start[0]) > portbox.FLATNESS
+
     @pytest.mark.parametrize("length", [0.0, 80.0])
     def test_a_coaxial_port_draws_what_the_adapter_builds(self, length):
         """The one kind whose picture is not a box, so the one where the two
         could most easily part company: what is drawn is a tube of the bore's
         radius, and what the envelope carries is that bore's bounding box."""
         document_ = coaxial_model(Length=length)
-        port = document_.Objects[4]
+        port = part(document_, "Coax1")
         drawn = port_shape.port_box(port)
         solved = document.problem(document_.Objects[0]).ports[0]
 
@@ -468,6 +479,29 @@ class TestAPortThatIsFlatAcrossOneAxisCanStillBeDrawn:
         port = lumped_port(1, trace(), ground())
         assert min(self.made(port, monkeypatch)) > 1.0e-7
 
+    def test_a_reference_naming_two_faces_draws_the_port_to_each(self, monkeypatch):
+        """Palace lays an element to each face the reference names, so the
+        drawing shows one box to each rather than to the first alone."""
+        import sys
+        import types
+
+        calls = []
+        part = types.ModuleType("Part")
+        part.makeBox = lambda *arguments: calls.append(arguments) or "solid"
+        part.Compound = lambda pieces: pieces
+        freecad = types.ModuleType("FreeCAD")
+        freecad.Vector = lambda *values: values
+        monkeypatch.setitem(sys.modules, "Part", part)
+        monkeypatch.setitem(sys.modules, "FreeCAD", freecad)
+        plane = ground()
+        height = trace().Shape.BoundBox.ZMin
+        above = 2.0 * height
+        box = plane.Shape.BoundBox
+        plane.Shape.face("Face2", (box.XMin, box.YMin, above), (box.XMax, box.YMax, above))
+        port = lumped_port(1, trace(), plane, ReferenceEntity=(plane, ["Face1", "Face2"]))
+        port_shape.build(port)
+        assert sorted(arguments[3][2] for arguments in calls) == [0.0, height]
+
     def test_the_other_two_axes_are_left_alone(self, monkeypatch):
         """A clamp applied to every axis would quietly resize real geometry."""
         port = lumped_port(1, trace(), ground())
@@ -515,7 +549,7 @@ class TestARoundPortIsDrawnRound:
         return calls, pieces
 
     def port(self, **overrides):
-        return coaxial_model(**overrides).Objects[4]
+        return part(coaxial_model(**overrides), "Coax1")
 
     def test_it_is_cut_from_two_cylinders_on_the_two_radii(self, monkeypatch):
         calls, _ = self.cylinders(self.port(), monkeypatch)
@@ -557,20 +591,19 @@ class TestAnUnfinishedPortHasNoBox:
         port = microstrip_port(1, trace(), ground(), PropagationAxis="Z")
         assert port_shape.port_box(port) is None
 
-    def test_a_waveguide_with_no_length_cannot_be_drawn(self):
-        """Its default is five *mesh* cells, and there is no mesh here. The one
-        thing about a port that genuinely needs meshing first."""
-        from .test_document_translation import waveguide_model
+    def test_a_waveguide_referred_to_its_face_is_drawn_as_nothing(self):
+        """The plane it is referred to is the face, so there is no depth to draw."""
+        from .test_openems_document_translation import waveguide_model
 
         doc = waveguide_model()
         port = next(obj for obj in doc.Objects if type(obj.Proxy).__name__ == "EMPortRectWaveguide")
-        assert float(port.Length) == 0.0
+        assert float(port.ReferenceDepth) == 0.0
         assert port_shape.port_box(port) is None
 
-    def test_but_one_with_a_length_can(self):
-        from .test_document_translation import waveguide_model
+    def test_one_referred_further_in_is_drawn_to_that_plane(self):
+        from .test_openems_document_translation import waveguide_model
 
-        doc = waveguide_model(Length=3.0)
+        doc = waveguide_model(ReferenceDepth=3.0)
         port = next(obj for obj in doc.Objects if type(obj.Proxy).__name__ == "EMPortRectWaveguide")
         assert port_shape.port_box(port).length == 3.0
 

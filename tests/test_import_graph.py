@@ -21,7 +21,7 @@ reading that call as an edge would report a cycle the deferral is what avoids.
 What that costs is that a run-time import is invisible here, as it is to a
 reader of the file.
 
-``tests/test_adapter_openems.py`` asks the complementary question, by importing
+``tests/test_openems_adapter.py`` asks the complementary question, by importing
 each module in a child and looking at what arrived. That one sees a run-time
 import and cannot see a module nobody imports.
 """
@@ -39,7 +39,12 @@ PACKAGE = pathlib.Path(Microwave.__file__).resolve().parent
 #: below it, and nothing above.
 #:
 #: The first holds what has no layer of its own: a vocabulary of boxes, a units
-#: table, the pickers, the undo helper and the host's version floors. The second
+#: table, the pickers, the shapes the workbench draws itself, the undo helper,
+#: the host's version floors and the tetrahedral mesher. The mesher is here
+#: rather than above because a layer
+#: grants the right to import everything beneath it, and the one import it must
+#: not have is ``portbox`` - the module whose bending it exists not to repeat.
+#: What holds it is the assertion below and not its place. The second
 #: is the solver-neutral middle - the catalogs, the result objects and the
 #: adapters, none of which may know there is a document. The third is the
 #: document itself. The last is everything that draws: the view providers, the
@@ -49,7 +54,7 @@ PACKAGE = pathlib.Path(Microwave.__file__).resolve().parent
 #: Named by the first component under ``Microwave``, which is a package for some
 #: of them and a module for the rest.
 LAYERS = (
-    frozenset({"annulus", "host_versions", "picks", "portbox", "undo", "units"}),
+    frozenset({"Gmsh", "annulus", "drawn", "host_versions", "picks", "portbox", "undo", "units"}),
     frozenset({"Materials", "Results", "Solvers"}),
     frozenset({"Objects"}),
     frozenset({"Commands", "Gui", "ViewProviders"}),
@@ -265,6 +270,30 @@ def test_no_cycle_among_the_module_level_imports():
     assert not found, f"these import each other at module scope: {found}"
 
 
+#: The tetrahedral mesher, which is Gmsh and is nobody's adapter.
+MESHER = "Microwave.Gmsh"
+
+
+def test_the_mesher_imports_nothing_else_of_this_workbench():
+    """The mesher's whole guarantee, and a layer cannot say it.
+
+    Being in the deepest layer permits importing everything in that layer,
+    which is a right the mesher must not have: ``Microwave.portbox`` is there,
+    and a mesher reaching for it has begun to know what a port is. The claim is
+    that it reaches nothing outside its own package at all - not the document
+    objects, not the box vocabulary, not a solver - so it is written as itself.
+    """
+    edges = graph()
+    inside = sorted(name for name in edges if name.startswith(MESHER))
+    assert inside, f"{MESHER} was not found, so nothing was read"
+    reached = {
+        name: sorted(other for other in edges[name] if not other.startswith(MESHER))
+        for name in inside
+    }
+    wrong = {name: other for name, other in reached.items() if other}
+    assert not wrong, f"the mesher reaches into the workbench: {wrong}"
+
+
 #: FreeCAD's Coin binding, which ships inside FreeCAD and can be installed
 #: nowhere else.
 COIN = "pivy"
@@ -280,7 +309,7 @@ def test_no_view_provider_names_pivy_at_module_scope():
     ``tests/conftest.py`` puts a stub in ``sys.modules`` for the whole run, so
     a module-scope import of it succeeds everywhere in this suite. Outside
     FreeCAD there is no pivy to import - in the child interpreters
-    ``tests/test_adapter_openems.py`` runs, and in any editor or checker
+    ``tests/test_openems_adapter.py`` runs, and in any editor or checker
     reading this workbench - and none of those imports a view provider either.
     So the reading is done off the source, which needs no stub and reaches the
     modules nothing imports.

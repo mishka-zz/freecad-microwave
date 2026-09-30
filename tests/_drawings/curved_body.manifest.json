@@ -1,0 +1,18 @@
+{
+  "pieces": [
+    {
+      "label": "air",
+      "dim": 3,
+      "file": "curved_body.0.brep",
+      "priority": 0
+    },
+    {
+      "label": "walls",
+      "dim": 2,
+      "file": "curved_body.1.brep",
+      "priority": 0
+    }
+  ],
+  "measure": 9424.77796076938,
+  "outside": 2513.2741228718346
+}

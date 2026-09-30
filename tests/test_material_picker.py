@@ -10,8 +10,8 @@ those are tested. The dialog itself is a manual QA case.
 What it says about a catalog row quoted far from the band is a preview of
 pre-flight's warning about the finished model, sharing that check's threshold.
 The check itself is ``TestLossQuotedOutsideTheBand`` in
-``test_adapter_openems.py``, and what puts the frequency into the envelope for
-it to read is ``test_document_translation.py``.
+``test_openems_adapter.py``, and what puts the frequency into the envelope for
+it to read is ``test_openems_document_translation.py``.
 """
 
 import FreeCAD

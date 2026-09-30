@@ -9,7 +9,7 @@ view provider restored, and which objects the tree may claim.
 The set is derived from the classes themselves rather than from their names.
 Testing the proxy class name for a prefix makes renaming a class silently change
 which objects the workbench recognises, and ``EM`` is one letter away from
-matching anything. ``kinds`` lists the modules it reads, so a class added to one
+matching anything. ``classes`` lists the modules it reads, so a class added to one
 of them is recognised as it stands, and a class in a new module is not until that
 module is listed.
 """
@@ -17,15 +17,18 @@ module is listed.
 from __future__ import annotations
 
 import functools
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 
 @functools.cache
-def kinds() -> frozenset[str]:
-    """Every proxy class name this workbench defines, as a frozenset.
+def classes() -> Mapping[str, type]:
+    """Every proxy class this workbench defines, by the name it carries.
 
-    Cached because a document sweep calls it once per object, and the set is
-    fixed at import time.
+    Cached because a document sweep reaches it once per object, and the answer
+    is fixed at import time. Read-only, the cache handing every caller the one
+    mapping.
     """
     from . import _vp_hook, analysis, materials, mesh, ports, preview, results, solver
 
@@ -48,7 +51,45 @@ def kinds() -> frozenset[str]:
     # test_every_document_kind_has_a_view_provider catches that, comparing this
     # set against the injector's table.
     bases = {base for value in found.values() for base in value.__mro__[1:]}
-    return frozenset(name for name, value in found.items() if value not in bases)
+    return MappingProxyType({name: value for name, value in found.items() if value not in bases})
+
+
+@functools.cache
+def kinds() -> frozenset[str]:
+    """Every proxy class name this workbench defines, as a frozenset.
+
+    Cached like the mapping it is taken from: a document sweep asks once per
+    object.
+    """
+    return frozenset(classes())
+
+
+def solver_kinds() -> frozenset[str]:
+    """Every kind that is a solver.
+
+    Derived from the classes, so a backend added tomorrow answers here as it
+    stands. ``Objects/analysis.py::solvers_in`` reads it to say what a study is
+    for, and the check on ``Objects/analysis.py::NOT_MESHED_FROM`` reads it to
+    hold a hand-written list to naming every backend but the one the mesh
+    preview is laid from. The relation is the one :func:`kinds` has to the view
+    provider table: a typed table, and a derivation to hold it to.
+    """
+    from .solver import EMSolverBase
+
+    return frozenset(name for name, value in classes().items() if issubclass(value, EMSolverBase))
+
+
+def recipe_kinds() -> frozenset[str]:
+    """Every kind that is one meshing pipeline's own settings.
+
+    Derived from the classes, the way :func:`solver_kinds` is, and read for the
+    same job: the check on ``Objects/analysis.py::NOT_MESHED_FROM`` holds that
+    hand-written list to naming every recipe but the one the mesh preview is
+    laid from.
+    """
+    from .mesh import EMMeshRecipe
+
+    return frozenset(name for name, value in classes().items() if issubclass(value, EMMeshRecipe))
 
 
 def kind_of(obj: Any) -> str:

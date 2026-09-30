@@ -3,16 +3,18 @@
 
 """The document's own materials.
 
-An ``EMMaterial`` holds values, and the solve reads those values and nothing
-else. Where they came from is recorded beside them, in the Provenance group, and
-is never consulted at translation time, so a ``.FCStd`` solves unchanged on a
-machine with no catalogs installed at all.
+An ``EMMaterial`` holds values, and the solve reads them. A catalog is a
+starting point rather than a live link. Values are copied in once, and with them
+the entry's measured table where it has one. Where they came from is recorded
+beside them, in the Provenance group.
 
-A catalog is a starting point rather than a live link. Values are copied in
-once. An engineer who measures their own laminate and types 4.15 over the
-catalog's 4.3 keeps that number. ``SourceDigest`` still records what the catalog
-stated, so the two can be compared by hand. Nothing in the workbench compares
-them.
+An engineer who measures their own laminate and types 4.15 over the catalog's
+4.3 keeps that number. ``SourceDigest`` records the values as the catalog stated
+them, and translation compares it with the values the object holds now. While
+the two agree, each study solves at the table row nearest its own band. Once
+they differ, the material has been edited, and every study solves at the values
+shown. The catalog itself is never read at translation, so a ``.FCStd`` solves
+unchanged on a machine with no catalogs installed at all.
 """
 
 from __future__ import annotations
@@ -56,6 +58,24 @@ class EMMaterial(ViewProviderRestored):
             "Frequency the permittivity and loss tangent are quoted at (0 = unstated)",
         )
         obj.MeasuredAt = 0.0
+
+        # The catalog's own table, row by row, where the entry has one. Read-only,
+        # because a second place to edit the values would skip the rule that an
+        # edited material keeps what was typed. Solvers/materials.py reads it.
+        for name, description in (
+            ("DispersionFrequency", "Frequencies of the catalog's measured rows"),
+            ("DispersionPermittivity", "Permittivity the catalog states at each row"),
+            ("DispersionLossTangent", "Loss tangent the catalog states at each row"),
+        ):
+            obj.addProperty(
+                "App::PropertyFloatList",
+                name,
+                "Material",
+                f"{description}. While this material's values are the catalog's, each "
+                "study solves at the row nearest its band centre; edit a value and "
+                "every study solves at the values shown",
+            )
+            obj.setEditorMode(name, 1)
 
         # Provenance. Read-only in the editor, because these record what
         # happened rather than set anything. Editing Source would not fetch
@@ -117,8 +137,9 @@ def _identifier(name: str) -> str:
     return cleaned.strip("_") or "EMMaterial"
 
 
-def createEMMaterialBinding(name: str = "EMMaterialBinding") -> Any:
-    obj = FreeCAD.ActiveDocument.addObject("App::FeaturePython", name)
+def createEMMaterialBinding(name: str = "EMMaterialBinding", doc: Any = None) -> Any:
+    doc = doc or FreeCAD.ActiveDocument
+    obj = doc.addObject("App::FeaturePython", name)
     EMMaterialBinding(obj)
     from ._vp_hook import inject_view_provider
 
@@ -170,10 +191,11 @@ def fill_binding(binding: Any, selection: Iterable[Any]) -> list[str]:
 
 
 def apply_entry(obj: Any, entry: MaterialEntry, catalog: Catalog) -> Any:
-    """Copy one catalog entry's values onto an EMMaterial, with its provenance."""
-    from ..Materials.model import MaterialRef
+    """Copy one catalog entry's values onto an EMMaterial, with its table and
+    its provenance."""
+    from ..Materials.model import DOCUMENT_TYPES, MaterialRef
 
-    obj.MaterialType = _MATERIAL_TYPES[entry.kind]
+    obj.MaterialType = DOCUMENT_TYPES[entry.kind]
     obj.Permittivity = entry.epsilon_r
     obj.Permeability = entry.mu_r
     obj.Conductivity = entry.conductivity
@@ -181,22 +203,15 @@ def apply_entry(obj: Any, entry: MaterialEntry, catalog: Catalog) -> Any:
     obj.Thickness = entry.thickness
     obj.MeasuredAt = entry.measured_at
     obj.Color = entry.rgb()
+    obj.DispersionFrequency = [row.frequency for row in entry.rows]
+    obj.DispersionPermittivity = [row.epsilon_r for row in entry.rows]
+    obj.DispersionLossTangent = [row.loss_tangent for row in entry.rows]
 
     obj.Source = str(MaterialRef(catalog.id, entry.id))
     obj.SourceCatalog = f"{catalog.name} {catalog.version}".strip()
     obj.SourceDigest = entry.digest()
     obj.Description = entry.description
     return obj
-
-
-#: The catalog's vocabulary, which is also the adapter's, mapped onto the
-#: document object's enumeration. One set has two spellings: the enumeration is
-#: what a FreeCAD user sees in a dropdown, and the other is what a file holds.
-_MATERIAL_TYPES = {
-    "dielectric": "Dielectric",
-    "pec": "PEC",
-    "conducting_sheet": "ConductingSheet",
-}
 
 
 def sourced_from(doc: Any, ref: object) -> list[Any]:

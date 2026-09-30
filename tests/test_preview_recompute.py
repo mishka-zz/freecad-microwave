@@ -30,7 +30,8 @@ PROBE = os.path.join(os.path.dirname(__file__), "preview_recompute_probe.py")
 #: badge where it was: the display properties, which are a request to look at
 #: the same grid differently; the solver's run length, threads and where its
 #: interpreter is; whether a port drives the run; how finely the answer is
-#: reported; and a result object arriving in the study after a solve.
+#: reported; and a result object, another backend's mesh or another pipeline's
+#: mesh recipe arriving in the study.
 #:
 #: Written out rather than read off the classes under test. Taking the list
 #: from ``MOVES_NO_CELL`` would make a declaration that stopped covering a
@@ -53,6 +54,8 @@ MOVES_NO_CELL = (
     "Threads",
     "TimestepFactor",
     "a result arriving",
+    "a mesh arriving",
+    "another pipeline's recipe arriving",
     "a material moved into the study",
 )
 
@@ -70,6 +73,7 @@ MOVES_NO_CELL = (
 #: the drawing is reported stale for a solid edited and put back, and what that
 #: costs is one press of Update Mesh.
 MOVES_A_CELL = (
+    "the Yee grid",
     "the mesh policy",
     "a bound solid",
     "an edit behind a slice nudge",
@@ -149,6 +153,40 @@ def test_every_document_exercised_each_quiet_change(counted, name):
     above by never being counted."""
     missing = [document for document, case in counted.items() if name not in case]
     assert not missing, missing
+
+
+#: What the panel says where no full recompute has written the badge, by case.
+#: ``None`` is a drawing that matches.
+UNRECOMPUTED = {
+    "just drawn": None,
+    "saved and opened again": None,
+    "a bound solid touched": "has changed",
+    "a bound solid recomputed alone": "has changed",
+    "a bound solid touched, saved and opened again": "has changed",
+    "a bound solid recomputed alone, then a slice nudged": "has changed",
+    "that, then recomputed": "Out of date",
+}
+
+
+@pytest.mark.parametrize("case", UNRECOMPUTED)
+def test_a_change_no_full_recompute_reached_is_reported(counted, case):
+    """The badge is written by a recompute, and the key cannot see every change
+    of shape, so FreeCAD's touched state answers here - and a drawing nothing
+    has changed since reads current, or the panel would say stale beside "Mesh
+    drawn"."""
+    want = UNRECOMPUTED[case]
+    said = {
+        document: cases["verdicts"][case]
+        for document, cases in counted.items()
+        if case in cases["verdicts"]
+    }
+    assert said, f"no document reached {case!r}"
+    wrong = {
+        document: verdict
+        for document, verdict in said.items()
+        if (verdict is not None if want is None else not verdict or want not in verdict)
+    }
+    assert not wrong, wrong
 
 
 @pytest.mark.parametrize("name", MOVES_A_CELL)

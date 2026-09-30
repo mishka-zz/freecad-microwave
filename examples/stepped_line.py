@@ -23,10 +23,10 @@ discontinuity comes back scaled by that discontinuity's two-way transmission,
 and the conversion from a reflection to an impedance has no term to undo it.
 
 The gate that scores a trace like this reads a different board.
-``tests/test_acceptance_tdr.py`` steps a *stripline*, where every section has an
-exact impedance and one exact velocity runs under all three - a microstrip has
-neither, its mode being hybrid rather than TEM. So this example is a
-demonstration of the chart and not a measurement of anything.
+``tests/test_acceptance_openems_tdr.py`` steps a *stripline*, where every
+section has an exact impedance and one exact velocity runs under all three - a
+microstrip has neither, its mode being hybrid rather than TEM. So this example
+is a demonstration of the chart and not a measurement of anything.
 
 Why the ports are lumped
 ------------------------

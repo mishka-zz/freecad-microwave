@@ -10,11 +10,21 @@ import FreeCAD
 
 from ._vp_hook import ViewProviderRestored
 
+#: What ``EMMeshPolicy.Padding{axis}{side}`` may say about a face of the domain.
+#: Each is a statement about the problem rather than about a method: what lies
+#: beyond the structure there. A backend that cannot build free space refuses
+#: :data:`AIR` and takes the other two. The adapters repeat these strings rather
+#: than importing them, because this module sits behind ``import FreeCAD``, and
+#: ``tests/test_openems_document_translation.py`` holds the copies to these.
+AIR = "Air"
+THROUGH = "Through"
+ENDS = "Ends"
+
 
 class EMMeshRegion(ViewProviderRestored):
     """Local sizing: change how big the elements around this geometry are.
 
-    Sizes here are absolute lengths, where ``EMMeshPolicy`` is per wavelength.
+    Sizes here are absolute lengths, where a recipe sizes per wavelength.
     Global sizing resolves the wave, whose scale is lambda, and a region
     resolves a feature, whose scale is millimetres. openEMS spells it the same
     way: ``MSL_Losses.m`` sets its local overrides as lengths and never as a
@@ -22,16 +32,25 @@ class EMMeshRegion(ViewProviderRestored):
 
     The object points in both directions, and the two are not mirror images.
 
-    ``Refine`` covers a box - the bounding box of what it names - and asks for
-    elements no larger than ``ElementSize`` anywhere inside it. Asking for
-    something coarser than the mesher's own ceiling is refused by name. A
-    refinement that coarsens is a contradiction rather than a request.
+    ``Refine`` states where the drawing needs resolving: elements no larger than
+    ``ElementSize`` at what it names. That is one meaning, and each backend
+    realises it the way its mesh can. A rectilinear grid places whole lines, so
+    it refines every line across the bounding box of what the region names, and
+    each axis is refined as a slab through the model. A tetrahedral mesh sizes
+    the geometry where it is: along a face, an edge or a point the region names,
+    and throughout a body it names, growing away from there, so the space a
+    curved shape goes round is not refined with it. Asking for something
+    coarser than the mesher's own ceiling is a contradiction rather than a
+    request: a rectilinear grid refuses it by name, and a tetrahedral mesh lays
+    nothing for it and says so.
 
-    ``MinElementsAcross`` beside it asks for a count, and a count is spent on
-    each axis against that axis' own span. It therefore costs nothing along a
-    direction the box is long in, and it is the way to resolve something narrow
-    without refining everything level with it. It reaches every axis the box has
-    extent on, a thickness included.
+    ``MinElementsAcross`` beside it asks for a count, and on a rectilinear grid
+    a count is spent on each axis against that axis' own span. It therefore
+    costs nothing along a direction the box is long in, and it is the way to
+    resolve something narrow without refining everything level with it. It
+    reaches every axis the box has extent on, a thickness included. An element
+    size on tetrahedra is the same along every axis, and a backend meshing
+    tetrahedra says so rather than laying the count.
 
     ``Coarsen`` attaches to the object, and lets that object's own demands settle
     for ``ElementSize`` rather than the size they would otherwise ask for. It is
@@ -49,9 +68,12 @@ class EMMeshRegion(ViewProviderRestored):
 
     It gives up everything that geometry was asking for, and not only the bulk
     size: a conductor's edge treatment, a dielectric's own element count, a
-    curve's fidelity. A gap between the coarsened object and something else is
-    the exception and stays. A separation belongs to both objects, so
-    coarsening one does not coarsen the gap between them.
+    curve's fidelity. On a rectilinear grid a gap between the coarsened object
+    and something else is the exception and stays. A separation belongs to both
+    objects, so coarsening one does not coarsen the gap between them. A
+    tetrahedral mesh sizes metal only along its edges, so there the coarsening
+    is laid at those edges where every face the metal's bindings name is
+    coarsened, and a gap along them is meshed as the edges are.
 
     This object is neutral, like every object in this layer. "Element" covers an
     FDTD cell, a MoM segment and an FEM tetrahedron, and all three meshers size
@@ -74,9 +96,11 @@ class EMMeshRegion(ViewProviderRestored):
             "App::PropertyLinkSubList",
             "References",
             "Refinement",
-            "The geometry this is aimed at. Refining covers its bounding box,"
-            " and on a rectilinear grid each axis is refined as a slab through"
-            " the model; coarsening applies to the whole object instead",
+            "The geometry this is aimed at. Refining sizes it: a rectilinear"
+            " grid refines every line across its bounding box, and a tetrahedral"
+            " mesh sizes the geometry itself and grows away from it. Coarsening"
+            " lets what a material binding asks of it settle for ElementSize,"
+            " where the coarsenings name everything the bindings of that metal name",
         )
 
         obj.addProperty(
@@ -84,8 +108,8 @@ class EMMeshRegion(ViewProviderRestored):
             "ElementSize",
             "Refinement",
             "Target element size. Refining, it must be finer than the global"
-            " size set by ElementsPerWavelength; coarsening, it is the size"
-            " this geometry settles for",
+            " size the backend's own recipe sets with ElementsPerWavelength;"
+            " coarsening, it is the size this geometry settles for",
         )
         obj.ElementSize = 0.0
 
@@ -125,64 +149,38 @@ class EMMeshRegion(ViewProviderRestored):
 
 
 class EMMeshPolicy(ViewProviderRestored):
-    """Mesh policy: solver-neutral intent, in the vocabulary every mesher shares.
+    """Mesh policy: what the device asks of any mesh, whatever lays it.
+
+    Everything here is a demand about the problem. A count across a drawn
+    feature, a distance a curved surface may be solved from, a floor against a
+    sliver, and what lies beyond the structure on each face of the domain. None
+    of them names a primitive of a method's discretisation, so each is
+    answerable by every backend reading this object alone, in the unit it was
+    stated in, and each is refused or reported by name where a backend cannot
+    meet it.
 
     "Element" rather than "cell" throughout. A cell is FDTD's word, a segment is
     MoM's and a tetrahedron is FEM's, and all three backends read this object,
     so it is not named after any one of them. Inside ``Solvers/openems/`` the
     FDTD words are correct and are used.
 
-    Sizing is per wavelength and never in millimetres. A remembered millimetre
-    value silently under-resolves the moment the permittivity or the frequency
-    is raised. Local refinement is absolute instead, because it resolves a
-    feature, whose scale is millimetres, rather than the wave, whose scale is
+    What one meshing pipeline does about it is that pipeline's own object:
+    ``EMYeeGrid`` for the rectilinear grid openEMS is solved on, ``EMGmshMesh``
+    for the tetrahedra Palace is solved on. Elements per wavelength, an edge
+    refinement factor and a growth ratio each name a primitive of one method,
+    and one number of them is a different accuracy on each, so each pipeline
+    states its own.
+
+    How far the open surface stands from the structure is here rather than on a
+    recipe. It is a length, and a count of cells was one pipeline standing in
+    for it.
+
+    Local refinement is absolute rather than per wavelength, because it resolves
+    a feature, whose scale is millimetres, rather than the wave, whose scale is
     lambda. See ``EMMeshRegion``.
-
-    The defaults are openEMS' own, from ``MSL_Losses.m``: bulk elements at
-    lambda/20 in the slowest material in the model, conductor edges six times
-    finer. The refinement is what resolves the field at a conductor edge, which
-    is where a planar line's impedance is set and where the bulk size does not
-    reach.
-
-    How far a coarser refinement reaches is bounded by the mesher rather than
-    here. A conductor's width is held to a share of itself whatever this asks
-    for, so below some refinement the width rule sizes a narrow trace and
-    coarsening further stops changing the mesh across it.
-    ``tests/test_acceptance_microstrip.py`` solves one such line across the range
-    this property is meant to be moved over, prints where the two rules part
-    company and prints what that range costs against what the gate can see.
     """
 
     def __init__(self, obj):
-        obj.addProperty(
-            "App::PropertyFloat",
-            "ElementsPerWavelength",
-            "Mesh",
-            "Elements per wavelength in the slowest material, at the top of the band",
-        )
-        obj.ElementsPerWavelength = 20.0
-        # A float rather than an integer, because bisecting the default during a
-        # convergence study is ordinary work and the first bisection is not a
-        # whole number.
-        obj.addProperty(
-            "App::PropertyFloat",
-            "EdgeRefinement",
-            "Mesh",
-            "How many times finer than bulk the elements at conductor edges are",
-        )
-        obj.EdgeRefinement = 6.0
-
-        # One ratio rather than three. Per-axis grading is rectilinear-specific
-        # and does not belong on a neutral object. The mesher still takes a
-        # triple, so this can be re-expanded if a model ever needs it.
-        obj.addProperty(
-            "App::PropertyFloat",
-            "MaxGrowthRatio",
-            "Mesh",
-            "Largest size ratio between adjacent elements",
-        )
-        obj.MaxGrowthRatio = 1.3
-
         # MSL_Losses.m spans its substrate with linspace(0, thickness, 10). A
         # thin substrate carries the whole field, so one element across it
         # states a different problem rather than approximating this one.
@@ -234,27 +232,14 @@ class EMMeshPolicy(ViewProviderRestored):
         )
         obj.MinElementSize = 0.0
 
-        # 8 is also openems.plan.DEFAULT_PADDING. The element is the one air is
-        # meshed at - the bulk size in vacuum - so eight of them is eight
-        # ElementsPerWavelength-ths of a free-space wavelength at the top of the
-        # band, and 0.4 of one at the 20 above, whatever the substrate is. The
-        # calibration against openEMS' own tutorials sits on that constant. A
-        # test asserts the two stay equal, because this layer may not import an
-        # adapter.
-        for axis in ["X", "Y", "Z"]:
-            for side in ["Min", "Max"]:
-                pname = f"AirCells{axis}{side}"
-                obj.addProperty(
-                    "App::PropertyInteger",
-                    pname,
-                    "Domain",
-                    f"Air buffer elements outside the structure on {axis}{side},"
-                    " when that face is Air",
-                )
-                setattr(obj, pname, 8)
-
-        # Per-face, and not inferred. What Through does to the domain, and why a
-        # line needs it, is in openems.policy._padding.
+        # Per-face, and not inferred. What each value does to a domain made of
+        # cells, and why a line needs Through, is in openems.policy._padding.
+        #
+        # Each says what is beyond the drawing on that face, and each backend
+        # answers it: Air is the medium reserved beyond the face, Through a
+        # structure running on without end, and Ends a perfect wall on the drawn
+        # face. Air is first, so it is the default, because a structure nobody
+        # has said anything about is one with room around it.
         for axis in ["X", "Y", "Z"]:
             for side in ["Min", "Max"]:
                 pname = f"Padding{axis}{side}"
@@ -262,10 +247,43 @@ class EMMeshPolicy(ViewProviderRestored):
                     "App::PropertyEnumeration",
                     pname,
                     "Domain",
-                    f"Whether the structure ends inside the domain on {axis}{side}"
-                    " or runs out through the absorber",
+                    f"What lies beyond the structure on {axis}{side}: Air for the"
+                    " medium running out to an absorber, Through for the structure"
+                    " running out through the absorber, Ends for a domain that stops"
+                    " where the structure does with a perfect wall on that face",
                 )
-                setattr(obj, pname, ["Air", "Through"])
+                setattr(obj, pname, [AIR, THROUGH, ENDS])
+
+        # A length rather than a count of anything, because the distance is the
+        # problem's and every backend that builds open space pads by it. Zero
+        # derives it from the band, and Solvers/properties.py::clearance is the
+        # rule and the calibration behind it. A face that wants no room at all
+        # is Ends, so zero is free to mean "derived".
+        obj.addProperty(
+            "App::PropertyLength",
+            "Clearance",
+            "Domain",
+            "How far the medium reaches past the structure on each Air face"
+            " (0 = derived: 0.4 of the wavelength in the medium at the top of the"
+            " band). The derived value stands the same share of a wavelength off"
+            " at the top of every band, so it reflects a radiated wave by a fixed"
+            " amount whatever the band - a radiator wants more",
+        )
+        obj.Clearance = 0.0
+
+        # A link rather than numbers typed here, so the medium is a material of
+        # the catalog like any other and a study states it by name. Empty is
+        # vacuum, which is what fills undrawn room when nothing says otherwise.
+        # It fills the domain out to its faces and through the absorber, so it is
+        # one material for the whole study rather than one per face.
+        obj.addProperty(
+            "App::PropertyLink",
+            "Medium",
+            "Domain",
+            "The material filling every space no bound body fills, out to the"
+            " domain's faces and through the absorber (empty = vacuum). A"
+            " Dielectric; a body drawn and bound stands over it",
+        )
 
         obj.Proxy = self
 
@@ -279,6 +297,195 @@ class EMMeshPolicy(ViewProviderRestored):
         return None
 
 
+class EMMeshRecipe(ViewProviderRestored):
+    """Base for one meshing pipeline's own settings. Not a kind of its own.
+
+    A recipe holds the primitives of one method's discretisation: what only
+    that pipeline's mesher consumes, in the words that pipeline uses. The
+    device's own demands are ``EMMeshPolicy``, which every backend reads.
+
+    A study holds one recipe per pipeline, in its group beside the policy, and
+    each adapter finds its own by kind. So a drawing marked up once is answered
+    by each backend without either erasing the other's settings.
+
+    ``Objects/kinds.py::recipe_kinds`` derives the kinds from this class, and
+    ``Objects/analysis.py::NOT_MESHED_FROM`` is held to naming every recipe but
+    the one the mesh preview is laid from.
+
+    Where two recipes ask for the same thing they spell it the same way, and
+    that is on purpose. A user comparing two backends on one drawing states the
+    same numbers to both, and what differs is the accuracy each reaches at them
+    rather than the words. Each tooltip names the pipeline that reads it.
+    """
+
+    def execute(self, obj):
+        pass
+
+    def __getstate__(self):
+        return None
+
+    def __setstate__(self, state):
+        return None
+
+
+class EMYeeGrid(EMMeshRecipe):
+    """The rectilinear grid openEMS is solved on.
+
+    ``Solvers/openems/mesh.py`` lays it. A cell is a box, the grid is
+    separable, and a line laid for one feature runs through the whole model, so
+    what a cell size costs is decided per axis.
+
+    The defaults are openEMS' own, from ``MSL_Losses.m``: bulk cells at
+    lambda/20 in the slowest material in the model, conductor edges six times
+    finer. The refinement is what resolves the field at a conductor edge, which
+    is where a planar line's impedance is set and where the bulk size does not
+    reach.
+
+    How far a coarser refinement reaches is bounded by the mesher rather than
+    here. A conductor's width is held to a share of itself whatever this asks
+    for, so below some refinement the width rule sizes a narrow trace and
+    coarsening further stops changing the mesh across it.
+    ``tests/test_acceptance_openems_microstrip.py`` solves one such line across
+    the range this property is meant to be moved over, prints where the two rules
+    part company and prints what that range costs against what the gate can see.
+    """
+
+    #: Nothing. Every property here sizes or places a cell, and the mesh
+    #: preview links this object, so each edit ages the drawing.
+    MOVES_NO_CELL: tuple[str, ...] = ()
+
+    def __init__(self, obj):
+        obj.addProperty(
+            "App::PropertyFloat",
+            "ElementsPerWavelength",
+            "Mesh",
+            "Cells per wavelength in the slowest material, at the top of the band",
+        )
+        obj.ElementsPerWavelength = 20.0
+        # A float rather than an integer, because bisecting the default during a
+        # convergence study is ordinary work and the first bisection is not a
+        # whole number.
+        obj.addProperty(
+            "App::PropertyFloat",
+            "EdgeRefinement",
+            "Mesh",
+            "How many times finer than bulk the cells at conductor edges are",
+        )
+        obj.EdgeRefinement = 6.0
+
+        # One ratio rather than three. The mesher still takes a triple, so this
+        # can be re-expanded if a model ever needs it.
+        obj.addProperty(
+            "App::PropertyFloat",
+            "MaxGrowthRatio",
+            "Mesh",
+            "Largest size ratio between adjacent cells of the grid",
+        )
+        obj.MaxGrowthRatio = 1.3
+
+        self.declare_what_moves_no_cell(obj)
+
+        obj.Proxy = self
+
+
+class EMGmshMesh(EMMeshRecipe):
+    """The tetrahedral mesh Gmsh lays, which Palace reads.
+
+    ``Microwave/Gmsh/`` builds the request. An element is sized the same along
+    every axis and the size is laid as a field over the drawing, so a size asked
+    for at one place reaches only as far as the growth below carries it.
+
+    No air. How far the medium stands off is ``Clearance`` on the policy, and
+    the Palace adapter refuses a face stated ``Air`` by name.
+
+    A count across a thickness is not here either, and it is on the policy
+    rather than gone: an element size here is the same along every axis, so the
+    run states the count it did not lay with the size the mesh reached.
+
+    The refinement and the growth below are chosen together, and the other
+    recipe's are not these: one number means a cell's neighbour there and the
+    slope of a size field here. A rim is asked for at the bulk size over the
+    refinement, and grows back over a ramp as wide as that difference divided by
+    the growth less one - so what the refinement costs is set by the ramp, which
+    is the volume that is paid for, while what it buys is the element left
+    standing on the rim, which the growth coarsens whatever the size along the
+    rim. A steeper growth with a finer ask therefore reaches the same element at
+    the rim over a narrower ramp.
+    """
+
+    #: Nothing, and the declaration reaches nothing either: this object is on
+    #: ``Objects/analysis.py::NOT_MESHED_FROM``, so the openEMS mesh preview
+    #: neither links it nor counts it as membership. That list is where "none of
+    #: this moves a Yee cell" is stated.
+    MOVES_NO_CELL: tuple[str, ...] = ()
+
+    def __init__(self, obj):
+        obj.addProperty(
+            "App::PropertyFloat",
+            "ElementsPerWavelength",
+            "Mesh",
+            "Elements per wavelength in the slowest material, at the top of the band",
+        )
+        obj.ElementsPerWavelength = 20.0
+        obj.addProperty(
+            "App::PropertyFloat",
+            "EdgeRefinement",
+            "Mesh",
+            "How many times finer than bulk the elements are at an edge of metal the field is "
+            "singular along",
+        )
+        obj.EdgeRefinement = 8.0
+
+        # A second-order element follows a curved surface only across a limited
+        # arc, and one laid across a tighter curve is turned inside out. So each
+        # curved surface is sized by how sharply it bends as well as by the
+        # wavelength, whichever is finer, and a thin wire, a pin or a fillet is
+        # meshed at its own radius. On a surface the size is one length at each
+        # point, so it holds along a wire's length too, and that is where the
+        # cost of a thin one goes. Six puts a sixth of a turn under each element.
+        obj.addProperty(
+            "App::PropertyInteger",
+            "ElementsPerTurn",
+            "Mesh",
+            "Elements round a full turn of a curved surface, where that is finer than the "
+            "wavelength asks (0 = size by the wavelength alone)",
+        )
+        obj.ElementsPerTurn = 6
+
+        # A trend rather than a bound. Gmsh carries no option for the ratio
+        # between neighbouring tetrahedra: two that share a face differ by their
+        # shape as much as by the field, so what this sets is the slope of the
+        # size field away from a refined place.
+        #
+        # What bounds the slope is arithmetic rather than a cliff. A regular
+        # tetrahedron of edge a with one edge on a curve sized s has its other
+        # two vertices sqrt(3)/2 a off that curve, where a ramp of slope g - 1
+        # has already sized them at s + (g - 1) sqrt(3)/2 a; its target is the
+        # mean of its four vertex sizes, s + sqrt(3)/4 (g - 1) a, and the mesher
+        # stops refining once its circumradius, sqrt(6)/4 a, falls under that
+        # target. Solving for a leaves the edge at
+        # 4/sqrt(6) s / (1 - (g - 1)/sqrt(2)), which grows without bound at a
+        # growth of 1 + sqrt(2), about 2.41.
+        #
+        # Below that, a steeper growth buys a coarser tetrahedron rather than a
+        # request that goes unanswered: the size along the curve itself is met
+        # well above the value here. So what sits above this number is a caution
+        # and not a measured edge, and every run states the element it left
+        # standing at each place it sized, which is where to look before turning
+        # it.
+        obj.addProperty(
+            "App::PropertyFloat",
+            "MaxGrowthRatio",
+            "Mesh",
+            "How much the element size grows per element away from a refined place",
+        )
+        obj.MaxGrowthRatio = 1.6
+
+        self.declare_what_moves_no_cell(obj)
+
+        obj.Proxy = self
+
+
 def createEMMeshPolicy(doc: Any = None) -> Any:
     """The mesh policy, unowned. The analysis files it away."""
     doc = doc or FreeCAD.ActiveDocument
@@ -290,6 +497,34 @@ def createEMMeshPolicy(doc: Any = None) -> Any:
     from ._vp_hook import inject_view_provider
 
     inject_view_provider(obj, "EMMeshPolicy")
+    return obj
+
+
+def createEMYeeGrid(doc: Any = None) -> Any:
+    """openEMS' grid settings, unowned. The analysis files it away."""
+    doc = doc or FreeCAD.ActiveDocument
+
+    obj = doc.addObject("App::FeaturePython", "EMYeeGrid")
+    EMYeeGrid(obj)
+    obj.Label = "Yee Grid"
+
+    from ._vp_hook import inject_view_provider
+
+    inject_view_provider(obj, "EMYeeGrid")
+    return obj
+
+
+def createEMGmshMesh(doc: Any = None) -> Any:
+    """The tetrahedral mesh settings, unowned. The analysis files it away."""
+    doc = doc or FreeCAD.ActiveDocument
+
+    obj = doc.addObject("App::FeaturePython", "EMGmshMesh")
+    EMGmshMesh(obj)
+    obj.Label = "Gmsh Mesh"
+
+    from ._vp_hook import inject_view_provider
+
+    inject_view_provider(obj, "EMGmshMesh")
     return obj
 
 

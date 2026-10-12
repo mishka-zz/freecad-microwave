@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import re
+
 import FreeCAD
 
 from ._vp_hook import ViewProviderRestored
@@ -46,6 +48,18 @@ def next_port_number(doc):
     return number
 
 
+def port_label(word, number):
+    """What a port of the kind ``word`` numbered ``number`` is called in the
+    tree: its number, which is its index in S, and its kind."""
+    return f"Port {number} ({word})"
+
+
+def is_port_label(label, word):
+    """Whether ``label`` is one :func:`port_label` writes for ``word``, which a
+    change of the number rewrites. A label the user wrote is left alone."""
+    return re.fullmatch(rf"Port \d+ \({re.escape(word)}\)", str(label)) is not None
+
+
 class EMPortBase(ViewProviderRestored):
     """What every port has, and nothing more.
 
@@ -70,19 +84,30 @@ class EMPortBase(ViewProviderRestored):
     #: ``Placement`` is not here and cannot be. FreeCAD goes on touching an
     #: object whose placement is assigned whatever status the property carries,
     #: so an edit to one marks the drawing stale.
-    MOVES_NO_CELL = ("Excitation",)
+    #:
+    #: ``Status`` is written by ``execute`` itself, and an assignment to it must
+    #: reach neither a recompute nor a mesh key.
+    MOVES_NO_CELL = ("Driven", "Status")
 
     #: What a new port of this kind is reported against.
     REFERENCED_TO = FIXED_IMPEDANCE
 
-    def __init__(self, obj):
-        obj.addProperty("App::PropertyInteger", "Number", "Port", "Unique port number")
-        obj.Number = 0  # 0 means auto-assign
+    #: The word a port of this kind is labelled with, after its number.
+    WORD = ""
 
+    def __init__(self, obj):
         obj.addProperty(
-            "App::PropertyBool", "Excitation", "Port", "Whether the port is an active source"
+            "App::PropertyInteger",
+            "Number",
+            "Port",
+            "Port number, its row and column in the S-matrix. Unique in the study",
         )
-        obj.Excitation = True
+        # 0 is unset: a port is numbered where it is created, and a run refuses
+        # one left at 0.
+        obj.Number = 0
+
+        obj.addProperty("App::PropertyBool", "Driven", "Port", "Whether the run drives this port")
+        obj.Driven = True
 
         # The impedance the S-parameters are reported against - the "50" in
         # "50-ohm system". It is not a property of the structure. A microstrip
@@ -93,7 +118,7 @@ class EMPortBase(ViewProviderRestored):
             "App::PropertyFloat",
             "ReferenceImpedance",
             "Port",
-            "Impedance the S-parameters are reported against (Ohms)",
+            "Impedance the S-parameters are reported against, in ohms",
         )
         obj.ReferenceImpedance = 50.0
 
@@ -106,7 +131,9 @@ class EMPortBase(ViewProviderRestored):
             "App::PropertyEnumeration",
             "ReferencedTo",
             "Port",
-            "What this port's S-parameters are reported against",
+            "Fixed impedance: report this port's S-parameters against"
+            " ReferenceImpedance. Port impedance: report them against the port's"
+            " own impedance",
         )
         obj.ReferencedTo = [FIXED_IMPEDANCE, PORT_IMPEDANCE]
         obj.ReferencedTo = self.REFERENCED_TO
@@ -114,12 +141,19 @@ class EMPortBase(ViewProviderRestored):
         # calls nothing on this object until it is.
         self.onChanged(obj, "ReferencedTo")
 
+        _add_status(obj)
         self.declare_what_moves_no_cell(obj)
 
         obj.Proxy = self
 
+    def onDocumentRestored(self, obj):
+        """Give a port written before it carried ``Status`` the property."""
+        _add_status(obj)
+        super().onDocumentRestored(obj)
+
     def onChanged(self, obj, prop):
-        """Hide ``ReferenceImpedance`` when nothing reads it.
+        """Hide ``ReferenceImpedance`` when nothing reads it, and keep a label
+        of the form :func:`port_label` writes on the port's number.
 
         Hidden rather than read-only. A greyed-out ``50.00`` beside a result
         referenced to 475 ohm answers the question the user is asking, and
@@ -131,12 +165,17 @@ class EMPortBase(ViewProviderRestored):
         name. ``ReferencedTo`` is created before ``Proxy`` is assigned, so
         FreeCAD does not call this for it during construction and ``__init__``
         calls it by hand. Restore needs no guard: the editor mode is a status
-        bit on the property and travels in the file.
+        bit on the property and travels in the file, and the label a restored
+        number calls for is the label restored with it.
         """
         if prop == "ReferencedTo":
             obj.setEditorMode(
                 "ReferenceImpedance", 2 if str(obj.ReferencedTo) == PORT_IMPEDANCE else 0
             )
+        elif prop == "Number" and is_port_label(obj.Label, self.WORD):
+            label = port_label(self.WORD, obj.Number)
+            if obj.Label != label:
+                obj.Label = label
 
     def execute(self, obj):
         """Draw the box the solver will build, if there is one yet.
@@ -153,7 +192,7 @@ class EMPortBase(ViewProviderRestored):
         if not hasattr(obj, "Shape"):
             return
         from .. import picks
-        from .port_shape import build
+        from .port_shape import build, why_not_drawn
 
         # The box is worked out where FreeCAD shows the faces it stands on, and
         # the port is drawn moved by the containers it stands in itself.
@@ -162,6 +201,7 @@ class EMPortBase(ViewProviderRestored):
             obj.Shape = picks.local(obj, drawn)
         except picks.Unplaced:
             obj.Shape = drawn
+        _say_why(obj, "" if drawn.Faces else why_not_drawn(obj))
 
     def __getstate__(self):
         return None
@@ -173,12 +213,27 @@ class EMPortBase(ViewProviderRestored):
 class EMPortLumped(EMPortBase):
     """Lumped port across two faces or edges."""
 
+    WORD = "Lumped"
+
     def __init__(self, obj):
         super().__init__(obj)
-        obj.addProperty("App::PropertyLinkSub", "SourceEntity", "Lumped", "Source face/edge")
-        obj.addProperty("App::PropertyLinkSub", "ReferenceEntity", "Lumped", "Reference face/edge")
         obj.addProperty(
-            "App::PropertyEnumeration", "ExcitationAxis", "Lumped", "Axis of excitation"
+            "App::PropertyLinkSub",
+            "SourceEntity",
+            "Lumped",
+            "Face or edge on the source side of the gap",
+        )
+        obj.addProperty(
+            "App::PropertyLinkSub",
+            "ReferenceEntity",
+            "Lumped",
+            "Face or edge on the reference side of the gap",
+        )
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "ExcitationAxis",
+            "Lumped",
+            "Direction of the electric field across the gap, from source to reference",
         )
         obj.ExcitationAxis = ["X", "Y", "Z", "-X", "-Y", "-Z"]
         # A lumped port is its resistance: openEMS builds a resistive sheet
@@ -192,7 +247,7 @@ class EMPortLumped(EMPortBase):
             "App::PropertyFloat",
             "Resistance",
             "Lumped",
-            "Resistance of the lumped element; 0 lays metal across the gap (Ohms)",
+            "Resistance of the lumped element, in ohms (0 = metal across the gap)",
         )
         obj.Resistance = 50.0
         obj.Proxy = self
@@ -200,6 +255,8 @@ class EMPortLumped(EMPortBase):
 
 class EMPortMicrostrip(EMPortBase):
     """Microstrip port for trace-on-dielectric."""
+
+    WORD = "Microstrip"
 
     def __init__(self, obj):
         super().__init__(obj)
@@ -215,7 +272,10 @@ class EMPortMicrostrip(EMPortBase):
             "The trace's cross-section where the wave enters (a face, or an edge on a sheet)",
         )
         obj.addProperty(
-            "App::PropertyLinkSub", "GroundReference", "Microstrip", "Reference face/edge of ground"
+            "App::PropertyLinkSub",
+            "Ground",
+            "Microstrip",
+            "Face or edge of the ground the trace is referenced to",
         )
         # Absolute distances. FeedOffset and Length are measured inward from
         # TraceEnd. MeasurementDistance is measured from the source, because the
@@ -240,7 +300,7 @@ class EMPortMicrostrip(EMPortBase):
             "App::PropertyLength",
             "MeasurementDistance",
             "Microstrip",
-            "How far downstream of the source the probes sit; filled in from the"
+            "Distance from the source to the measurement probes. Set from the"
             " study's band when the port is made",
         )
         obj.MeasurementDistance = 0.0
@@ -248,7 +308,7 @@ class EMPortMicrostrip(EMPortBase):
             "App::PropertyLength",
             "Length",
             "Microstrip",
-            "Extent along the propagation axis (0 = end at the measurement plane)",
+            "Length of the port along PropagationAxis (0 = end at the measurement plane)",
         )
         obj.Length = 0.0
         # Zero is a bare voltage source, which is what the microstrip acceptance
@@ -258,7 +318,7 @@ class EMPortMicrostrip(EMPortBase):
             "App::PropertyFloat",
             "FeedResistance",
             "Microstrip",
-            "Series resistance damping the feed, 0 for a bare source (Ohms)",
+            "Series resistance damping the source, in ohms (0 = none)",
         )
         obj.FeedResistance = 0.0
         obj.addProperty(
@@ -272,7 +332,7 @@ class EMPortMicrostrip(EMPortBase):
             "App::PropertyEnumeration",
             "ExcitationAxis",
             "Microstrip",
-            "Direction of electric field, trace towards ground",
+            "Direction of the electric field, from trace to ground",
         )
         obj.ExcitationAxis = ["X", "Y", "Z", "-X", "-Y", "-Z"]
         # A board lies in XY with the trace above the ground plane, so the field
@@ -292,6 +352,8 @@ class EMPortRectWaveguide(EMPortBase):
     #: two.
     REFERENCED_TO = PORT_IMPEDANCE
 
+    WORD = "Waveguide"
+
     def __init__(self, obj):
         super().__init__(obj)
         obj.addProperty(
@@ -304,7 +366,7 @@ class EMPortRectWaveguide(EMPortBase):
             "App::PropertyEnumeration",
             "PropagationAxis",
             "Waveguide",
-            "Direction of wave propagation",
+            "Direction of wave propagation, into the guide",
         )
         obj.PropagationAxis = ["X", "Y", "Z", "-X", "-Y", "-Z"]
         # The mode is launched on the picked face on every backend, and this is
@@ -317,8 +379,8 @@ class EMPortRectWaveguide(EMPortBase):
             "App::PropertyLength",
             "ReferenceDepth",
             "Waveguide",
-            "How far into the guide from the picked face the S-parameters are"
-            " referred (0 = the face)",
+            "Distance into the guide from CrossSection to the plane the"
+            " S-parameters are referred to (0 = CrossSection itself)",
         )
         obj.ReferenceDepth = 0.0
         obj.addProperty(
@@ -341,6 +403,8 @@ class EMPortRectWaveguide(EMPortBase):
 
 class EMPortCoaxial(EMPortBase):
     """Coaxial port on a line drawn as two concentric conductors."""
+
+    WORD = "Coaxial"
 
     def __init__(self, obj):
         super().__init__(obj)
@@ -377,7 +441,7 @@ class EMPortCoaxial(EMPortBase):
             "App::PropertyLength",
             "MeasurementDistance",
             "Coaxial",
-            "How far downstream of the source the probes sit; filled in from the"
+            "Distance from the source to the measurement probes. Set from the"
             " study's band when the port is made",
         )
         obj.MeasurementDistance = 0.0
@@ -385,7 +449,7 @@ class EMPortCoaxial(EMPortBase):
             "App::PropertyLength",
             "Length",
             "Coaxial",
-            "Extent along the propagation axis (0 = end at the measurement plane)",
+            "Length of the port along PropagationAxis (0 = end at the measurement plane)",
         )
         obj.Length = 0.0
         obj.Proxy = self
@@ -404,6 +468,10 @@ def _create(proxy, feature, name, doc):
     obj = doc.addObject(feature, name)
     proxy(obj)
     obj.Number = next_port_number(doc)
+    # A port made under its kind's own name is labelled by its number; one made
+    # under a name of the caller's keeps that name.
+    if name == f"{proxy.WORD}Port":
+        obj.Label = port_label(proxy.WORD, obj.Number)
     from ._vp_hook import inject_view_provider
 
     inject_view_provider(obj, proxy.__name__)
@@ -453,3 +521,27 @@ def createEMPortCoaxial(name="CoaxialPort", doc=None):
     obj = _create(EMPortCoaxial, "Part::FeaturePython", name, doc)
     obj.MeasurementDistance = required_clearance(obj.Document)
     return obj
+
+
+def _add_status(obj):
+    """Give ``obj`` the read-only property saying why it is drawn as nothing."""
+    if hasattr(obj, "Status"):
+        return
+    obj.addProperty(
+        "App::PropertyString",
+        "Status",
+        "Port",
+        "Why the port is not drawn (empty when nothing is missing)",
+    )
+    obj.setEditorMode("Status", 1)
+
+
+def _say_why(obj, why):
+    """Write ``why`` into ``Status``, and warn once each time it changes to a
+    reason. The property shows it whenever the port is picked, and the warning
+    reaches a user who is not looking at the property editor."""
+    if not hasattr(obj, "Status") or str(obj.Status) == why:
+        return
+    obj.Status = why
+    if why:
+        FreeCAD.Console.PrintWarning(f"{obj.Label} is not drawn: {why}\n")

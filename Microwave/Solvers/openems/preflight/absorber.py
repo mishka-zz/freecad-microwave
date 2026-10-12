@@ -123,28 +123,28 @@ def _check_the_absorber_leaves_a_model(problem: Problem) -> list[Finding]:
         # can absorb on one end and be padded outward on the other, and a padded
         # end covers none of the model.
         taken = [
-            f"{gap:.4g} mm at {AXIS_NAMES[dim]}={end}"
-            for end, gap in (
-                ("min", interior[0] - float(lower[dim])),
-                ("max", float(upper[dim]) - interior[1]),
+            f"{cells} cells over {gap:.4g} mm at {AXIS_NAMES[dim]}={end}"
+            for end, gap, cells in zip(
+                ("min", "max"),
+                (interior[0] - float(lower[dim]), float(upper[dim]) - interior[1]),
+                _absorber_cells(grid, dim),
+                strict=True,
             )
             if gap > 0
         ]
         per_end = (
-            f" The absorber is {' and '.join(str(n) for n in _absorber_cells(grid, dim) if n)} "
-            f"cells deep and covers {' and '.join(taken)} of a {drawn:.4g} mm model."
+            f" The absorber takes {' and '.join(taken)} of the {drawn:.4g} mm structure."
             if taken
             else ""
         )
         findings.append(
             Finding(
                 WARN,
-                f"{AXIS_NAMES[dim]} domain",
-                f"the absorber leaves {share:.0%} of the structure outside it."
-                f"{per_end} Everything measured has to fit in that. Draw "
-                f"more structure, raise ElementsPerWavelength on the Yee grid, or "
-                f"lower PMLCells - note that *coarsening* the mesh deepens the "
-                f"absorber rather than leaving more room",
+                f"{AXIS_NAMES[dim]} axis",
+                f"the absorber leaves {share:.0%} of the structure outside it, and "
+                f"everything measured has to fit there.{per_end} Draw more "
+                "structure, raise ElementsPerWavelength in the openEMS mesh settings, or "
+                "lower PMLCells. A coarser mesh makes the absorber deeper",
             )
         )
     return findings
@@ -252,12 +252,11 @@ def _check_the_absorber_fits_the_axis(problem: Problem) -> list[Finding]:
         findings.append(
             Finding(
                 REFUSE,
-                f"{AXIS_NAMES[dim]} domain",
-                f"the axis has {lines} lines and declares {low} absorber cells at "
-                f"its lower face and {high} at its upper, which needs "
-                f"{low + high + 2}. The blocks overlap, so every cell on this axis "
-                f"absorbs and nothing on it is being solved. Lower PMLCells, or "
-                f"mesh this axis more finely",
+                f"{AXIS_NAMES[dim]} axis",
+                f"the axis has {lines} lines and {low} absorber cells at its lower "
+                f"face and {high} at its upper, which need {low + high + 2} lines, so "
+                "every cell on this axis absorbs and nothing on it is solved. Lower "
+                "PMLCells, or mesh this axis more finely",
             )
         )
     return findings
@@ -275,9 +274,9 @@ def _check_boundary(problem: Problem) -> list[Finding]:
         findings.append(
             Finding(
                 REFUSE,
-                f"boundary {face}",
-                f"{word!r} is not an openEMS boundary condition; expected "
-                f"PML_<n> or one of {sorted(_BOUNDARY_WORDS)}",
+                f"{face[0].upper()}{face[1:].capitalize()} face",
+                f"{word!r} is not an openEMS boundary condition. Use PML_<n> or "
+                f"one of {sorted(_BOUNDARY_WORDS)}",
             )
         )
     return findings
@@ -314,17 +313,16 @@ def _check_a_mur_wall_carries_no_excitation(problem: Problem) -> list[Finding]:
             if not low <= wall <= high:
                 continue
             face = f"{AXIS_NAMES[dim]}{'min' if side == 0 else 'max'}"
+            # The source may sit on the wall itself. openEMS then holds that
+            # wall shut until the drive is over, and the drive lasts the whole
+            # run, so the wall reflects for the entire solve.
             findings.append(
                 Finding(
                     WARN,
-                    f"boundary {face}",
-                    f"it is Mur and port {port.number} reaches it, so the "
-                    "source may sit on the wall itself. openEMS then holds "
-                    "that wall shut until the drive is over, and this "
-                    "adapter's drive lasts the whole run - the wall would "
-                    "reflect for the entire solve rather than absorb. Set "
-                    "Absorber to PML on the openEMS solver, or move the port "
-                    "clear of the face",
+                    f"{face[0].upper()}{face[1:].capitalize()} face",
+                    f"it is a Mur boundary and port {port.number} touches it, so "
+                    "the wall reflects for the whole run. Set Absorber to PML on "
+                    "the openEMS solver, or move the port away from this face",
                 )
             )
     return findings
@@ -360,21 +358,23 @@ def _check_absorber_agrees(problem: Problem, index: int, face: str, asked: int) 
 
     axis = AXIS_NAMES[dim]
     if not reserved:
-        consequence = "every clearance checked here is measured as though that wall did not absorb"
+        consequence = "the port clearance checks treat that wall as not absorbing"
     else:
         direction = "deeper into the model than" if asked > reserved else "short of"
         consequence = (
-            f"the absorber reaches {direction} the band set aside for it, and "
-            "every clearance checked here is measured against the other edge"
+            f"the absorber reaches {direction} the cells set aside for it, and "
+            "the port clearance checks measure against the wrong edge"
         )
+    # openEMS absorbs in the cells the boundary names, whatever the mesh set
+    # aside. The workbench writes both from PMLCells, so a run file that
+    # disagrees was written some other way.
     return [
         Finding(
             WARN,
-            f"boundary {face}",
+            f"{face[0].upper()}{face[1:].capitalize()} face",
             f"it asks for {asked} cells of PML and the mesh set aside "
-            f"{reserved} at that face of {axis}. openEMS absorbs in the {asked} it "
-            f"was told to, so {consequence}. The translation states both from "
-            "PMLCells, so this envelope was not written by it: write it again "
-            "from the document",
+            f"{reserved} at that face of {axis}, so {consequence}. Both come "
+            "from PMLCells when the workbench writes a run, so this one was "
+            "written some other way. Write it again from the document",
         )
     ]

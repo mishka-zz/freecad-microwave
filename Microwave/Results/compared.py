@@ -44,7 +44,15 @@ import numpy as np
 
 from .sparameters import SParameters, _engineering_hz, _magnitude, _ports, _term, describe_reference
 
-__all__ = ["DRAWING", "SIGN_BY_RULE", "Comparison", "Incomparable", "Term", "compare"]
+__all__ = [
+    "DRAWING",
+    "SIGN_BY_RULE",
+    "Comparison",
+    "Incomparable",
+    "Term",
+    "compare",
+    "written_difference",
+]
 
 #: The provenance key under which a stored matrix records a digest of the
 #: drawing it was solved from: the geometry, materials and ports, and nothing
@@ -126,7 +134,7 @@ class Comparison:
         """How far one term stands apart, and how large it is there."""
         first, second = self.by
         return (
-            f"{term.name} differs by at most {_difference(term.worst)} at "
+            f"{term.name} differs by at most {written_difference(term.worst)} at "
             f"{_engineering_hz(term.at)}, where |{term.name}| is {term.first:.3g} in what "
             f"{first} solved and {term.second:.3g} in what {second} solved"
         )
@@ -178,8 +186,8 @@ def compare(first: SParameters, first_by: str, second: SParameters, second_by: s
     if drawn and other and drawn != other:
         raise Incomparable(
             f"what {first_by} solved and what {second_by} solved are of two different "
-            "drawings: the geometry, a material or a port changed between the two runs. "
-            "Run the one solved before the change again"
+            "drawings: the geometry, a material, a port or what lies beyond the structure "
+            "changed between the two runs"
         )
     rows, columns = _shared(first.frequency, second.frequency)
     if not rows.size:
@@ -345,7 +353,7 @@ def _term_apart(
     )
 
 
-def _difference(value: float) -> str:
+def written_difference(value: float) -> str:
     """``0.014 (-37.1 dB)``, and no difference at all as ``0``."""
     return _magnitude(value) if value > 0.0 else "0"
 

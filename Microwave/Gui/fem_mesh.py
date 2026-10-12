@@ -15,11 +15,10 @@ the order it meets them, so neither a label nor a group's number reaches the
 document intact. The mesher names each group in the copy by its tag, which no
 writer rewrites, and each is renamed here to the label that tag stands for.
 
-**The object is FreeCAD's ``Fem::FemMeshObject``**, not a class of this
-workbench. FreeCAD draws it with its own view provider, and nothing of this
-workbench is needed to open or draw it. It is found again by a
-property naming the backend it was made for, as a result is found by the solver
-its provenance names.
+**The object is FreeCAD's ``Fem::FemMeshObjectPython``**, which FEM's own view
+provider draws, with a proxy of this workbench's for its icon - see
+``Objects/fem_mesh.py``. It is found again by a property naming the backend it
+was made for, as a result is found by the solver its provenance names.
 
 **It is replaced rather than refilled.** Undo does not bring back a mesh
 assigned over another, while an object taken out and a new one put in are undone
@@ -31,10 +30,9 @@ stale as the openEMS mesh preview is - ``Objects/fem_mesh.py`` says how.
 :func:`staleness` answers from the mark first, then from a change awaiting a
 recompute, then from the key, as the preview's does.
 
-**A result says whether it was solved on the mesh shown.** The mesh records the
-digest of the file the backend solves, and a run's matrix records the digest of
-the mesh it was solved on - :func:`solved_on`. ``Objects/fem_mesh.py`` compares
-the two.
+**A result records the mesh it was solved on.** The mesh records the digest of
+the file the backend solves, and a run's matrix records the digest of the mesh
+it was solved on - :func:`solved_on`.
 
 FreeCAD's FEM module is imported inside :func:`read` alone, and the rest of
 this module reads and writes properties, so it is testable against attribute
@@ -44,7 +42,7 @@ bags.
 import hashlib
 from dataclasses import replace
 
-from ..Objects.analysis import NOT_FEM_MESHED_FROM, members
+from ..Objects.analysis import NOT_FEM_MESHED_FROM, left_out, members
 from ..Objects.fem_mesh import (
     BUILT_FROM,
     DIGEST,
@@ -53,11 +51,11 @@ from ..Objects.fem_mesh import (
     NAME,
     STATUS,
     TYPE,
+    FemMeshProxy,
     label,
     made_for,
 )
-from ..Objects.fem_mesh import pair as _pair
-from ..Objects.kinds import is_ours, kind_of
+from ..Objects.kinds import is_ours
 from ..Objects.preview import CURRENT, OUT_OF_DATE
 from ..Objects.results import SOLVED_ON
 from ..Objects.staleness import awaits_recompute, stop_quiet_properties_touching
@@ -75,7 +73,6 @@ __all__ = [
     "identity",
     "inputs",
     "label",
-    "pair",
     "put",
     "read",
     "record",
@@ -116,7 +113,7 @@ def read(mesh):
     import Fem
 
     if not mesh.numbered:
-        raise Unshown("the mesher wrote no copy to show")
+        raise Unshown("Gmsh wrote no copy of the mesh to show")
     try:
         shown = Fem.read(mesh.numbered)
     except Exception as error:
@@ -134,10 +131,11 @@ def read(mesh):
             "no group came back for " + ", ".join(repr(wanted[number]) for number in missing)
         )
     if stray := sorted(set(found) - set(wanted)):
-        said.append(f"{mesh.numbered} holds groups the mesher did not write: {stray}")
+        said.append(f"{mesh.numbered} holds groups Gmsh did not write: {stray}")
     if unkept := sorted(name for name in wanted.values() if set(name) & set(UNREADABLE)):
         said.append(
-            f"{unkept} carry a line break, which FreeCAD does not read back out of a saved document"
+            f"{unkept} contain a line break, which FreeCAD loses when it saves the document. "
+            "Remove the line break from the label"
         )
     if said:
         raise Unshown("; ".join(said))
@@ -177,8 +175,8 @@ def put(analysis, backend, shown, *, key="", identity="", linked=None):
     and taken back out itself if it cannot be made whole. A caller whose step
     goes on to commit after a failure here is then left with the old mesh
     rather than with none, or with a mesh outside the study that nothing finds.
-    It is labelled once the old one is gone: FreeCAD keeps labels unique unless
-    told otherwise, and labelled beside the old one it would take a suffix.
+    It takes the old one's label where the user wrote it, and the workbench's
+    otherwise - a label beginning as the workbench's is the workbench's.
 
     Every mesh the study holds for ``backend`` is replaced, so a copy made in
     the tree goes with the one it was copied from. One taken out of the study
@@ -187,12 +185,14 @@ def put(analysis, backend, shown, *, key="", identity="", linked=None):
     # Before anything is made, so that a study that cannot be read costs the
     # old mesh nothing.
     current = key == inputs(analysis)
+    touched = "Touched" in analysis.State
     if linked is None:
         linked = built_from(analysis)
     document = analysis.Document
     old = [member for member in members(analysis) if made_for(member) == backend]
     made = document.addObject(TYPE, NAME)
     try:
+        FemMeshProxy(made)
         _record(made, backend, key, identity, linked)
         made.FemMesh = shown
         analysis.addObject(made)
@@ -201,18 +201,29 @@ def put(analysis, backend, shown, *, key="", identity="", linked=None):
         raise
 
     visible = getattr(getattr(old[0], "ViewObject", None), "Visibility", None) if old else None
+    named = label(backend)
+    if old and not str(old[0].Label).startswith(named):
+        named = str(old[0].Label)
     for gone in old:
         document.removeObject(gone.Name)
     # Last, since the study compares what it holds against what the mesh was
     # built from as the new object arrives and the old ones go.
     made.Status = CURRENT if current else OUT_OF_DATE
-    made.Label = label(backend, current)
+    made.Label = named
     view = getattr(made, "ViewObject", None)
+    if view is not None:
+        from ..ViewProviders.fem_mesh import attach
+
+        attach(made)
     if visible is not None and view is not None:
         view.Visibility = visible
     # Written a moment ago from a finished mesh, so the touched mark would say
     # the opposite of what is true. There is nothing for a recompute to do.
+    # Adding the mesh to the study touches the study too, and its mark is
+    # purged where this put it there and left where an earlier edit did.
     made.purgeTouched()
+    if not touched:
+        analysis.purgeTouched()
     return made
 
 
@@ -225,11 +236,11 @@ def _record(made, backend, key, identity, linked):
     that.
     """
     for kind, name, what in (
-        ("App::PropertyString", MADE_FOR, "The backend this mesh was made for"),
-        ("App::PropertyLinkList", BUILT_FROM, "Everything this mesh was built from"),
-        ("App::PropertyEnumeration", STATUS, "Whether this mesh still describes the study"),
-        ("App::PropertyString", DIGEST, "Digest of the study as it stood when this mesh was made"),
-        ("App::PropertyString", IDENTITY, "Digest of the file the backend solves"),
+        ("App::PropertyString", MADE_FOR, "The solver this mesh was made for"),
+        ("App::PropertyLinkList", BUILT_FROM, "The objects this mesh was built from"),
+        ("App::PropertyEnumeration", STATUS, "Whether this mesh still matches the study"),
+        ("App::PropertyString", DIGEST, "Digest of the study when this mesh was made"),
+        ("App::PropertyString", IDENTITY, "Digest of the mesh file the solver reads"),
     ):
         made.addProperty(kind, name, "Microwave", what)
         made.setEditorMode(name, 1)
@@ -243,13 +254,9 @@ def _record(made, backend, key, identity, linked):
 
 
 def record(analysis, backend, shown, **recorded):
-    """:func:`put`, and :func:`pair`, as one undo step named for what appears.
-
-    Returns the mesh and what :func:`pair` says.
-    """
+    """:func:`put`, as one undo step named for what appears. Returns the mesh."""
     with transaction(analysis.Document, "Store Mesh"):
-        made = put(analysis, backend, shown, **recorded)
-        return made, pair(analysis, backend)
+        return put(analysis, backend, shown, **recorded)
 
 
 def _built(analysis):
@@ -257,7 +264,7 @@ def _built(analysis):
     return [
         member
         for member in members(analysis)
-        if is_ours(member) and kind_of(member) not in NOT_FEM_MESHED_FROM
+        if is_ours(member) and not left_out(member, NOT_FEM_MESHED_FROM)
     ]
 
 
@@ -333,7 +340,7 @@ def staleness(analysis, backend):
         if mesh is None:
             return "no mesh yet"
         if not str(getattr(mesh, DIGEST, "") or ""):
-            return "the mesh records nothing of what it was made from"
+            return "the mesh does not record what it was made from"
         if str(getattr(mesh, STATUS, "")) != CURRENT:
             return CHANGED
         if awaits_recompute(mesh):
@@ -342,12 +349,6 @@ def staleness(analysis, backend):
     except Exception:
         return "the study cannot be read, so the mesh cannot be checked"
     return CHANGED if now != mesh.Digest else None
-
-
-def pair(analysis, backend):
-    """``Objects/fem_mesh.py``'s :func:`~..Objects.fem_mesh.pair` over what
-    ``analysis`` holds."""
-    return _pair(members(analysis), backend)
 
 
 def solved_on(result, identity):

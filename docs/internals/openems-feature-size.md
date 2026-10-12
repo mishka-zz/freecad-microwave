@@ -53,22 +53,24 @@ separation represents the cylinder length rather than its diameter. A nearest-fa
 query on a thin wire or pin would return its length and fail to detect that the
 wire is thin.
 
-To determine transverse dimensions across arbitrary solids, three complementary
-measurements are used:
+Transverse dimensions across arbitrary solids are read by these complementary
+measurements:
 
 ### 1. Principal surface curvature
 
 Twice the reciprocal of the maximum principal curvature gives the local
 diameter of curvature directly from the surface differential properties, without
-requiring an opposing face. The demand raised there is a thickness and never a
-radius. What the surface fidelity states is how far the grid may misplace the
-boundary, as a fraction of the radius it curves through - a tenth by default.
-The connection form bounds that displacement by half the thickness it is stated
-against, so stating it against the fidelity times the diameter is what holds the
-boundary to the fidelity times the radius. The diameter caps the demand from
-above. From below it is floored by the thickness whose own connection demand
-equals what an axis-aligned corner of the same edge size asks for, so a curved
-face never asks for less than the edges on it do.
+requiring an opposing face. The demand raised there is a thickness, not a
+radius. The surface fidelity sets how far the grid may misplace the boundary,
+as a fraction of the radius of curvature, a tenth by default. The connection
+form bounds that displacement by half the thickness it is stated against, so a
+demand of the fidelity times the diameter holds the boundary to the fidelity
+times the radius. The demand is that share of the diameter, raised to a floor
+and capped at the diameter itself. The floor is the
+thickness whose connection demand is the edge size over $\sqrt{2}$, which is
+the cell an axis-aligned metal edge asks for on each axis across it. Where the
+diameter is below the floor, the cap applies: a thin wire asks for its own
+diameter, as a connection demand, and is not floored.
 
 Curvature measures local bending rather than medial thickness. On a cylindrical
 pin, the radius of curvature equals the pin radius. On a fillet joining two thick
@@ -86,8 +88,11 @@ along the inward surface normal into the solid:
 3. This chord length is guaranteed to be greater than or equal to the local medial
    diameter at that sample point.
 
-Raycasting evaluates the exact triangulated boundary representation used by openEMS,
-ensuring that Yee cell material assignment matches discrete geometry directly.
+The chord is read off the triangulation of the solid as drawn, which is the
+triangulation the envelope carries. A curved conductor reaches openEMS grown
+from that surface by a share of a cell (`Problem.as_given` in
+`Solvers/openems/model.py`), so the thickness read is the conductor's as drawn
+and not the one openEMS is given.
 
 ### 3. Edge singularities and dihedral boundaries
 
@@ -104,16 +109,17 @@ Formulating the constraint over the full transverse plane ensures orientation
 invariance: an edge tilted relative to Cartesian grid axes is resolved
 identically regardless of spatial rotation.
 
-The alternative is a demand written per face normal, one for each of the two
-faces meeting at the join. That bounds the two normals and leaves the direction
-between them free: at a right angle it costs the ordinary diagonal price, and on
-a nearly closed blade it is unbounded. Two drawings of one wedge differing only
-by a rotation would then mesh several times apart, and furthest apart where the
-singularity is strongest.
+A demand written per face normal, one for each of the two faces meeting at
+the join, bounds the two normals and leaves the direction between them
+unbounded. At a right angle that direction needs the diagonal cell size, and on
+a nearly closed blade it needs an arbitrarily small one. Two drawings of one
+wedge that differ only by a rotation would then mesh to different line counts,
+and differ most where the singularity is strongest.
 
-For 2D planar conducting sheets (`ConductingSheet`), perimeter boundaries are
-evaluated using the same transverse plane criterion. The edge tangent defines
-the transverse plane, ensuring proper field resolution around the foil perimeter.
+For metal drawn as an area, whichever conductor kind it is, the outline edges
+are evaluated using the same transverse plane criterion. The edge tangent
+defines the transverse plane, ensuring proper field resolution around the foil
+perimeter.
 
 ## Interaction between edge and thickness constraints
 
@@ -129,9 +135,9 @@ the more restrictive one and determines local cell sizing. Above it the edge
 singularity constraint dominates near the boundary, while the thickness
 constraint relaxes into the interior at the sizing field's grading slope.
 
-## A rim is not a cross-section
+## Rims of metal drawn as an area
 
-For 2D planar conducting sheets (such as circular microstrip pads or ground plane
+For metal drawn as an area (such as circular microstrip pads or ground plane
 hole cutouts), the planar face carries zero surface curvature ($\kappa = 0$).
 Curvature exists only along the outer perimeter (the rim).
 
@@ -153,21 +159,28 @@ volumetric continuity, and are bounded by the mesh resolution limits.
 
 ## Floors, and which demands may be given up
 
-Geometric sizing constraints can be bounded below by a minimum cell floor
-(`min_cell`):
+Every demand is bounded below by the mesher's cell floor (`min_cell`). Some
+demands are also floored above it, and some are not:
 
 1. **Fidelity constraints (Fillets and Curvature)**:
-   Fillet radii and cosmetic rounding can be floored. If a fillet radius is
-   smaller than `min_cell`, relaxing the constraint reduces local geometric
-   fidelity slightly without altering electrical connectivity. The edge remains
-   bounded by standard edge singularity criteria.
+   A fidelity demand is floored at the thickness whose connection demand is the
+   edge size over $\sqrt{2}$, the cell an axis-aligned metal edge asks for on
+   each axis across it. A fillet whose radius goes to zero becomes such an
+   edge, and the floor keeps it from asking more than the edge does. Flooring
+   it reduces local geometric fidelity without altering electrical
+   connectivity. On a curved face the demand is also capped at the diameter of
+   curvature, so a body thinner than the floor, such as a thin wire, asks for
+   its diameter: that is a connection demand and falls under item 2. A rim has
+   no such cap and is always floored.
 
 2. **Continuity constraints (Conductor Cross-Sections)**:
-   Volumetric conductor cross-sections cannot be floored arbitrarily. If cell
-   dimensions exceed the local conductor thickness, Yee point sampling can sever
-   the conductor into isolated discrete cells, breaking DC and RF continuity.
+   Volumetric conductor cross-sections cannot be floored arbitrarily. openEMS
+   marks an edge metal by one point on it (`CalcPEC_Range`,
+   `openEMS/FDTD/operator.cpp:2029-2061`), so where the cells are larger than
+   the conductor is thick, no sampled point may fall inside it, and the metal
+   openEMS builds then breaks into pieces that do not touch.
    Therefore, the inward normal chord constraint for conductors is enforced
-   without an artificial lower floor.
+   with no floor above `min_cell`.
 
 ### Courant limit implications
 
@@ -175,12 +188,15 @@ When a conductor features a razor-sharp wedge or needle tip tapering to zero
 thickness, the inward normal chord approaches zero near the apex. The mesher's
 global cell floor prevents infinite refinement.
 
-Because the Courant stability condition scales the simulation time step by the
-smallest cell across the entire domain:
+openEMS takes one time step for the whole domain, the smallest any edge of the
+operator allows (`Operator::CalcTimestep_Var3`,
+`openEMS/FDTD/operator.cpp:1942-2014`, the default at
+`openEMS/FDTD/operator.cpp:57`). The Courant condition on the smallest cells
+estimates it:
 
 $$\Delta t \le \frac{1}{c \sqrt{\frac{1}{\Delta x^2} + \frac{1}{\Delta y^2} + \frac{1}{\Delta z^2}}}$$
 
-excessive refinement at non-critical needle tips can significantly increase total
+Excessive refinement at non-critical needle tips therefore can significantly increase total
 simulation run time. Where tapered conductor tips are non-functional, modeling
 them with a blunt cutoff avoids unnecessary time step reductions.
 
@@ -194,28 +210,27 @@ On axis-aligned substrates, thickness is extracted directly from bounding boxes.
 For arbitrary or non-aligned dielectric solids, thickness is measured via inward
 normal raycasting.
 
-### Sampled coarsely, on purpose
+### Coarse sampling of dielectric surfaces
 
 Unlike conductors, dielectric surfaces do not exhibit singular field cusps.
 Consequently, dielectric surfaces are sampled at the coarser background grid
 resolution rather than fine conductor edge resolutions.
 
-Sampling dielectrics at fine conductor cell sizes would create millions of
-unnecessary raycast queries across large substrate slabs. Instead:
-- The raycast reach is bounded by $n \cdot h_{\text{coarse}}$, the widest
-  anything here measures over.
+Sampling dielectrics at fine conductor cell sizes would cast a ray from every
+fine sample across every substrate slab. Instead:
+- The raycast reach is bounded by $n \cdot h_{\text{coarse}}$, the widest span
+  a dielectric demand measures.
 - Chords exceeding this reach are treated as bulk substrate and ask for nothing.
 - For thin dielectric layers, the measured thickness chord establishes a span
   constraint, ensuring $n$ cells span the dielectric thickness.
 
-Two consequences follow, and both are awkward. Nothing floors the demand, so a
-layer running out to a taper takes it down to the mesher's cell floor and sets
-the timestep with it. And the two measurements are not sent from the same
-places: a cross-section spaces its face samples at the metal cell and a count
-spaces them at the coarsest one, so a localised pocket - one that only part of a
-face looks into - is found far more often on metal than on a dielectric. What a
-line sees once sent is the same either way: every crossing within the reach it
-was given.
+The demand has no floor above the mesher's cell floor, so a layer that tapers
+to a point drives the cells down to that floor and sets the timestep. The two
+measurements sample faces at different spacings. A conductor cross-section
+spaces its samples at the metal cell, and a dielectric count spaces them at the
+coarsest cell. A localised pocket, one that only part of a face looks into, is
+therefore found more often on metal than on a dielectric. Each ray reports
+every crossing within its reach in both cases.
 
 ### Span constraints vs. point constraints
 

@@ -2,7 +2,7 @@
 <package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
   <name>Microwave</name>
   <description>Electromagnetic design in FreeCAD: mark up a device, run it on openEMS or Palace, and read S-parameters back into the document.</description>
-  <version>0.0.2</version>
+  <version>0.0.3</version>
   <freecadmin>1.0.0</freecadmin>
   <pythonmin>3.11.0</pythonmin>
   <maintainer email="mike.volokhov@gmail.com">Mike Volokhov</maintainer>

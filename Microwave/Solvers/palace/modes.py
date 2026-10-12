@@ -76,7 +76,7 @@ IN_PHASE = 4
 def _falls(constant: complex) -> str:
     """How far a mode of this constant goes before falling by e, as the log says it."""
     rate = abs(constant.imag)
-    return f"{_MM_PER_M / rate:.3g} mm" if rate else "no distance a number states"
+    return f"falls to 1/e in {_MM_PER_M / rate:.3g} mm" if rate else "does not decay"
 
 
 class SolvedShort(Exception):
@@ -130,56 +130,55 @@ def judged(
     """
     if len(found) < MODES:
         raise SolvedShort(
-            f"the mode run at {port!r} found {len(found)} of the {MODES} modes asked for, "
-            "so how many of them propagate is not known"
+            f"{port!r}: the mode run found {len(found)} of the {MODES} modes asked for, "
+            "so the number of propagating modes is unknown"
         )
     ghz = frequency / 1e9
     carried = sorted((k for k in found if propagates(k)), key=lambda k: -k.real)
     if len(carried) > 1:
-        face = (
-            f"a face {divided_by} divides, whose parts carry" if divided_by else "a face carrying"
-        )
+        face = f"its face, divided by {divided_by}, carries" if divided_by else "its face carries"
         listed = ", ".join(f"{k.real:.2f}" for k in carried)
         # Every mode asked for propagates, so more may.
         count = f"at least {len(carried)}" if len(carried) == len(found) else str(len(carried))
+        # A wave port takes the first mode only, so the power the others carry
+        # stands in no term of the matrix.
         raise TranslationError(
-            f"{port!r} stands on {face} {count} modes at {ghz:g} GHz, {where} - "
-            f"{listed} per metre - and a wave port takes the first: what the "
-            "others carry is missing from the answer. End the band below where the second "
-            "propagates, or change the cross-section so it carries one mode"
+            f"{port!r}: {face} {count} modes at {ghz:g} GHz, {where} ({listed} per metre), "
+            "so the results miss the power in all but the first. End the band below the "
+            "cutoff of the second mode, or change the cross-section so it carries one mode"
         )
     dying = sorted((k for k in found if not propagates(k)), key=lambda k: abs(k.imag))
     if not carried:
         hidden = (
-            ". A lossy filling can also hide the guide's own mode from the mode run: "
-            "draw the port where the guide is filled with a lossless material"
+            ". A lossy filling can also hide the guide's mode: draw the port where the "
+            "guide is filled with a lossless material"
             if lossy
             else ""
         )
         raise TranslationError(
-            f"{port!r} stands on a face carrying no mode at {ghz:g} GHz, {where}: the "
-            f"slowest to die of those found falls by e in {_falls(dying[0])}, "
-            "so nothing reaches the port as a wave. Start the band above the guide's "
-            f"cutoff{hidden}"
+            f"{port!r}: its face carries no mode at {ghz:g} GHz, {where}; the "
+            f"slowest-decaying mode found {_falls(dying[0])}. Start the band "
+            f"above the guide's cutoff{hidden}"
         )
     (only,) = carried
     share = reflected(only)
+    # Palace matches a wave port to the real part of the constant alone, so the
+    # face reflects part of a mode that loses power as it travels. The share is
+    # exact for a TE mode and an estimate otherwise.
     if IN_PHASE * share > BAR:
         raise TranslationError(
-            f"{port!r} carries a mode of {only.real:.2f}{only.imag:+.2f}i per metre at "
-            f"{ghz:g} GHz, {where}. Palace matches a wave port to the real part alone, "
-            f"so the face reflects {share:.3g} of the power as though the model did, and "
-            f"two faces reflecting in phase make {IN_PHASE} times that. Draw the port "
-            "where the guide loses less, or start the band further above its cutoff"
+            f"{port!r}: its mode is {only.real:.2f}{only.imag:+.2f}i per metre at "
+            f"{ghz:g} GHz, {where}, so the port face reflects {share:.3g} of the power as "
+            f"though the model did, and two ports up to {IN_PHASE} times that. Draw the "
+            "port where the guide loses less, or start the band further above its cutoff"
         )
     said = (
         f"{port!r} carries one mode at {ghz:g} GHz, {only.real:.2f} per metre; the "
-        f"slowest to die of the others found falls by e in {_falls(dying[0])}"
+        f"slowest-decaying other mode {_falls(dying[0])}"
     )
     if _lossy(only):
         said += (
-            f"; Palace matches the port to the real part of the constant, so as a TE mode "
-            f"its face reflects {share:.2g} of the power, and two faces in phase "
+            f"; the port face reflects about {share:.2g} of the power, and two ports up to "
             f"{IN_PHASE} times that"
         )
     return said

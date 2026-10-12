@@ -310,6 +310,7 @@ class TestWhatTheRunSays:
         assert said is not None
         assert said.startswith("the waveguide ports give out 0.2% more power than was driven")
         assert "at 21.5 GHz" in said
+        assert said.endswith(". Draw the port farther from what changes the guide")
 
     def test_the_least_error_is_the_root_and_not_half(self):
         """Apart where the share is large: a column's power off by 0.2 takes an
@@ -317,7 +318,7 @@ class TestWhatTheRunSays:
         error = f"{(math.sqrt(1.2) - 1) * 100:.3g}%"
         assert error != f"{0.2 / 2 * 100:.3g}%"
         for said in (_said(below=-0.2), _said(above=0.2)):
-            assert said is not None and f"off by at least {error}," in said
+            assert said is not None and f"off by at least {error}" in said
 
     def test_power_sent_back_to_an_undriven_port_lowers_the_least_error(self):
         """The true column then carries that power as well, and the same share
@@ -325,7 +326,7 @@ class TestWhatTheRunSays:
         error = f"{(math.sqrt(1.5 + 0.2) - math.sqrt(1.5)) * 100:.3g}%"
         assert error != f"{(math.sqrt(1.2) - 1) * 100:.3g}%"
         for said in (_said(below=-0.2, sent=0.5), _said(above=0.2, sent=0.5)):
-            assert said is not None and f"off by at least {error}," in said
+            assert said is not None and f"off by at least {error}" in said
 
     def test_more_power_out_than_in_wherever_the_model_loses_power(self):
         assert _said(below=-2e-3, below_only=LOSSY)
@@ -335,6 +336,11 @@ class TestWhatTheRunSays:
         assert said is not None
         assert said.startswith("the waveguide ports account for 0.3% less power than was")
         assert "at 25.25 GHz" in said and "a second mode propagates" in said
+        assert said.endswith(
+            ". Draw the port farther from what changes the guide, or end the band below "
+            "where a second mode propagates in the ports' guides. A port driven in a "
+            "higher mode always has the lowest mode beside it"
+        )
 
     def test_nothing_of_less_power_where_the_model_can_lose_it(self):
         assert _said(above=3e-3, below_only=LOSSY) is None

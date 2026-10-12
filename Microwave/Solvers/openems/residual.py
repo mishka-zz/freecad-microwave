@@ -275,6 +275,6 @@ def unfinished(shares: Mapping[int, float], smallest_response: float = 1.0) -> s
         carries = reading_down_to(smallest_response)
     return (
         "the run stopped before the response did: dropping the last tenth of "
-        f"the record moves this run's S-parameters by {named}, against the "
+        f"the record moves this run's S-parameters by {named}, more than the "
         f"{against} {carries}. Raise MaxTimesteps"
     )

@@ -141,7 +141,7 @@ class TestWhatTheMapIsAskedInTheProfilesDimensions:
     def test_a_region_no_label_covers(self):
         said = coverage.complaints(SOUND, BOUNDS, [*FILLED, 7], 3)
         assert len(said) == 1
-        assert "dimension 3" in said[0] and said[0].endswith(": 7")
+        assert "covers every volume" in said[0] and said[0].endswith(": 7")
 
     def test_where_the_model_ends_left_unclaimed(self):
         said = coverage.complaints(SOUND, {**BOUNDS, 9: 1}, FILLED, 3)
@@ -170,9 +170,13 @@ class TestWhatTheMapIsAskedInTheProfilesDimensions:
         outside_ascii = "\u00e9" * (keeps // 2) + "Z"
         assert len(outside_ascii) < keeps < len(outside_ascii.encode())
         for wrong, why in (
-            ("m" * (keeps + 1), "longer"),
-            (outside_ascii, "longer"),
-            ('a"b', "cuts the name at"),
+            (
+                "m" * (keeps + 1),
+                f"bytes long, over the {keeps} bytes a {Profile.written} file "
+                "keeps of a group name. Shorten it",
+            ),
+            (outside_ascii, "bytes long, over the"),
+            ('a"b', "cannot carry in a group name. Rename it"),
             ("", "empty"),
         ):
             said = coverage.complaints({**SOUND, wrong: [(2, 4)]}, BOUNDS, FILLED, 3)
@@ -248,7 +252,7 @@ class TestWhatTheMapIsAskedInTheProfilesDimensions:
         """
         left_over = coverage.complaints({"walls": [(2, 3)]}, {3: 2}, [3], 3)
         assert any(
-            line.endswith("dimension 3, and these are left over: 3") for line in left_over
+            line.endswith("covers every volume, and these are left over: 3") for line in left_over
         ), left_over
 
         unclaimed = coverage.complaints({"air": [(3, 1)]}, {1: 1}, [1], 3)
@@ -321,7 +325,7 @@ class TestTheLabelForWhatIsLeftWhereTheModelEnds:
     def test_a_remainder_the_written_format_cannot_carry_is_refused(self):
         said = coverage.complaints(SOUND, {**BOUNDS, 9: 1}, FILLED, 3, remainder='a"b')
         assert len(said) == 1
-        assert "cuts the name at" in said[0]
+        assert said[0].endswith("cannot carry in a group name. Rename it")
 
     def test_a_drawing_that_reached_nothing_is_not_told_about_the_remainder_too(self):
         """The one event is that nothing was handed over, and a remainder
@@ -404,7 +408,7 @@ class TestWhatIsFilledHoldsTogether:
         drawn = {"near": [(2, 1)], "far": [(2, 2)]}
         said = coverage.apart(drawn, [[1], [2]], 2)
         assert "no curve joins these parts" in said[0]
-        assert "have to share a curve" in said[0]
+        assert said[0].endswith(". Make bodies meant to meet share a curve")
 
 
 def _defined(path):

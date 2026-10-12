@@ -1,148 +1,161 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-"""What a stored result can be shown as, and what it cannot.
+"""What a kept table can be shown as in time, and what it cannot.
 
 This module is glue like :mod:`.results`, and it is Qt-free for the same
-reason. It reads the document for geometry and the result layer for numbers,
+reason. It reads what a run kept for geometry and the result layer for numbers,
 and it decides everything without a display. The chart modules take what it
 returns and draw it.
 
-The one derivation here is the distance axis, and it is why this module exists
-rather than the chart calling ``tdr`` directly. A step response comes back
+The one derivation here is the distance axis. A step response comes back
 against time. Putting it on a board needs a velocity, a velocity needs a
-separation between two reference planes, and a result object holds no geometry
-at all. The two halves have to be brought together somewhere, and that
-somewhere knows both a FreeCAD document and an ``SParameters``.
+separation between two reference planes, and a matrix holds no geometry at all.
+A run keeps each port's box as it was when the run was asked, so the separation
+is taken from there: the drawing as it stands now may have moved since, and a
+distance read off it would place an old answer on a new board. A table no run
+kept, such as a Touchstone file brought in, has no boxes and is drawn against
+time alone.
 
 A missing distance axis is not an error. The trace against time is the
-measurement, and distance is derived from it. :class:`ImpedanceView` carries
-the
-reason instead of raising it, and the chart states it where the axis would have
-been offered.
+measurement, and distance is derived from it. The reason comes back beside the
+table instead of being raised, and the chart states it where the axis would
+have been offered.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 from .. import portbox
-from ..Objects.analysis import analysis_of, members
-from ..Objects.port_shape import reference_box
-from ..Objects.results import load
 from ..Results import tdr
+from ..Results.overlay import Table
 from ..Results.sparameters import ResultError
+
+#: The port kinds that are a guide: nothing propagates in one below its cutoff,
+#: so its band never reaches down to DC.
+GUIDES = ("EMPortRectWaveguide",)
 
 
 class ViewError(ValueError):
-    """The document does not hold what a view needs. The message names what."""
+    """The table does not hold what a view needs. The message names what."""
 
 
-@dataclass(frozen=True)
-class ImpedanceView:
-    """One port's impedance profile, and whether it can be drawn on a board."""
+def table_of(holder) -> Table:
+    """The matrix ``holder`` stores, named by its run, with what its run was
+    asked, or with nothing where no run kept it.
 
-    trace: tdr.Trace
-    title: str = ""
-    #: Propagation velocity in m/s, or ``None`` when none could be measured.
-    speed: float | None = None
-    #: Why there is no velocity, when there is none. Empty when there is one.
-    without_distance: str = ""
-
-
-def traceable_ports(result) -> list[int]:
-    """Every port of ``result`` a step response could be taken at, in order.
-
-    This answers what the menu should offer, so it asks :mod:`~..Results.tdr`
-    itself rather than reproducing that module's conditions. A restatement
-    here could offer a menu entry that refuses when pressed.
+    The document layer is imported here rather than at the top, so the chart
+    that draws what this module decides imports without FreeCAD.
     """
-    found = []
-    for number in result.port_numbers:
-        try:
-            tdr.step_response(result, number)
-        except ResultError:
+    from ..Objects.results import load
+    from .results import asked_of, run_of, source
+
+    run = run_of(holder)
+    return Table(
+        load(holder),
+        source(holder),
+        {} if run is None else asked_of(run),
+        document=getattr(getattr(holder, "Document", None), "Name", ""),
+    )
+
+
+def guide_refusal(table: Table, port: int) -> str:
+    """Why ``port`` of ``table`` has no low-pass step response because it is a
+    guide, or ``""`` where its run says it is not one or no run says anything.
+    """
+    for member in table.snapshot.get("members", ()):
+        if not isinstance(member, dict):
             continue
-        found.append(number)
-    return found
+        if member.get("kind") in GUIDES and member.get("Number") == port:
+            # A low-pass step response needs the band down to DC, and a guide
+            # carries nothing below its cutoff, so no sweep gives one.
+            return (
+                f"cannot take a step response at port {port}: it is a waveguide "
+                "port, which carries nothing below its cutoff, and a step response "
+                "needs the band down to DC. Read its return loss and group delay "
+                "off the S-parameter chart"
+            )
+    return ""
 
 
-def impedance_view(holder, port: int) -> ImpedanceView:
-    """The impedance profile at ``port`` of the matrix stored in ``holder``.
-
-    Raises :class:`~..Results.sparameters.ResultError` when there is no trace
-    to draw. That covers every case :mod:`~..Results.tdr` refuses by name, and
-    each of those messages says what to change. A trace that exists but cannot
-    be put on a distance axis comes back with the reason on it instead.
-    """
-    result = load(holder)
-    trace = tdr.step_response(result, port)
-    title = str(result.provenance.get("title") or "")
+def refusal(table: Table, port: int, edge: float | None = None) -> str:
+    """Why ``port`` of ``table`` gives no step response with a window ending at
+    ``edge``, the band's own where it is ``None``, or ``""`` where it gives one."""
+    said = guide_refusal(table, port)
+    if said:
+        return said
     try:
-        speed = _velocity(holder, result, port)
-    except (ResultError, ViewError) as error:
-        return ImpedanceView(trace=trace, title=title, without_distance=str(error))
-    return ImpedanceView(trace=trace, title=title, speed=speed)
+        tdr.step_response(table.result, port, edge=edge)
+    except ResultError as error:
+        return str(error)
+    return ""
 
 
-def _velocity(holder, result, port: int) -> float:
-    """Propagation velocity in m/s, measured from this study's own transmission.
+def traceable_ports(table: Table) -> list[int]:
+    """Every port of ``table`` a step response could be taken at, in order.
+
+    This answers what the menu should offer, so it asks the same question the
+    chart asks rather than reproducing its conditions. A restatement here could
+    offer a menu entry that refuses when pressed.
+    """
+    return [number for number in table.result.port_numbers if not refusal(table, number)]
+
+
+def boxes(table: Table) -> dict[int, portbox.PortBox]:
+    """Each port's box as the run that solved ``table`` kept it, by number.
+
+    :raises ViewError: no run kept ``table``, so it holds no geometry.
+    """
+    kept = table.snapshot.get("ports")
+    if kept is None:
+        raise ViewError(
+            "cannot measure a velocity: no run kept this table, so its port "
+            "positions are unknown. A table read from a file holds no geometry"
+        )
+    try:
+        return {int(number): portbox.PortBox(**box) for number, box in kept.items()}
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ViewError(
+            "cannot measure a velocity: the run stored its port positions in a form "
+            f"this version cannot read ({error})"
+        ) from error
+
+
+def velocity(table: Table, port: int) -> float:
+    """Propagation velocity in m/s, measured from ``table``'s own transmission
+    over the separation its run kept.
 
     Nothing is typed by hand and nothing is assumed about the substrate. The
     delay comes out of the same solve the trace does, and the length it divides
-    into comes off the drawing. A velocity factor guessed from a permittivity
-    would put a plausible scale on the axis and be wrong by whatever the
-    dispersion and the launches are worth.
+    into comes off the ports as that solve was asked. A velocity factor guessed
+    from a permittivity would put a plausible scale on the axis and be wrong by
+    whatever the dispersion and the launches are worth.
+
+    :raises ViewError: the run kept no pair of ports to measure between.
+    :raises ResultError: the transmission gives no velocity.
     """
-    boxes = port_boxes(holder)
-    if port not in boxes:
+    found = boxes(table)
+    if port not in found:
         raise ViewError(
-            f"cannot measure a velocity: port {port} has no box in the "
-            "document, so there is no reference plane to measure from"
+            f"cannot measure a velocity: port {port} has no box in what its run "
+            "kept, so it has no reference plane to measure from"
         )
-    others = [number for number in boxes if number != port]
+    # A velocity is a length divided by a delay, and the delay comes from the
+    # transmission between exactly two ports.
+    others = [number for number in found if number != port]
     if not others:
         raise ViewError(
-            "cannot measure a velocity: it is a length divided by a delay, and "
-            "this study draws one port - so nothing was transmitted through "
-            "anything and there is no delay to measure. A distance axis wants a "
-            "second port at the far end of the line"
+            "cannot measure a velocity: this run had one port, so there is no "
+            "transmission to time. A distance axis needs a second port at the far "
+            "end of the line"
         )
     if len(others) > 1:
         raise ViewError(
-            f"cannot measure a velocity: it is a length divided by a delay, and "
-            f"this study draws {len(boxes)} ports - so which pair the length "
-            "belongs to is not a question the drawing answers. A two-port line "
-            "measures its own velocity; anything else reads against time"
+            f"cannot measure a velocity: this run had {len(found)} ports, so the "
+            "length to divide by is ambiguous. Only a two-port line gives a "
+            "distance axis; read this table against time"
         )
     other = others[0]
-    separation = math.dist(boxes[port].probe_point(), boxes[other].probe_point()) * 1e-3
-    return tdr.velocity(result, other, port, separation)
-
-
-def port_boxes(holder) -> dict[int, portbox.PortBox]:
-    """Every port of ``holder``'s study that has a box, by port number.
-
-    A port that is not configured enough to have one is left out rather than
-    refused. :func:`~..Objects.port_shape.reference_box` returns ``None`` for it,
-    and the adapter says loudly what is wrong with it when the user asks for a
-    solve. Drawing a chart is not the place to raise it a second time.
-
-    ``reference_box`` decides which members are ports, and answers ``None`` for
-    everything that is not one. A separate test for whether a member is a port
-    would restate what ``reference_box`` already decides, and would ask for the
-    ``Number`` of something that has none.
-    """
-    analysis = analysis_of(holder)
-    if analysis is None:
-        raise ViewError(
-            "cannot measure a velocity: this result is not inside an analysis, "
-            "so the ports it was measured at cannot be found"
-        )
-    found = {}
-    for obj in members(analysis):
-        box = reference_box(obj)
-        if box is not None:
-            found[int(obj.Number)] = box
-    return found
+    separation = math.dist(found[port].probe_point(), found[other].probe_point()) * 1e-3
+    return tdr.velocity(table.result, other, port, separation)

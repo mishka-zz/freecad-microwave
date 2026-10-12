@@ -1,0 +1,11 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Show Run Log: a page of lines, one of them a warning in orange. -->
+  <path d="M14 6 H38 L50 18 V58 H14 Z" stroke="#37474f" stroke-width="5" fill="#eceff1"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M37 6 V19 H50" stroke="#37474f" stroke-width="4" fill="none"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M21 28 H43 M21 46 H39" stroke="#78909c" stroke-width="4.5" fill="none"
+        stroke-linecap="round"/>
+  <path d="M21 37 H43" stroke="#e8833a" stroke-width="4.5" fill="none"
+        stroke-linecap="round"/>
+</svg>

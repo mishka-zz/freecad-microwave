@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-from ..Objects.preview import OUT_OF_DATE
-from . import Provider, icon
+from . import Provider, out_of_date
 
 
 class EMMeshPreviewViewProvider(Provider):
@@ -13,7 +12,9 @@ class EMMeshPreviewViewProvider(Provider):
     it, and colour it. Implementing ``attach``, ``getDisplayModes`` or
     ``setDisplayMode`` here would take that over and the geometry would stop
     appearing. That is the usual way a Python view provider on a Part object
-    ends up invisible. This class adds an icon and nothing else.
+    ends up invisible. This class adds an icon and its overlay, and names the
+    object the preview links that Delete may take without asking. It draws
+    nothing.
     """
 
     def __init__(self, vobj):
@@ -32,20 +33,31 @@ class EMMeshPreviewViewProvider(Provider):
             # Console mode has no view object worth configuring.
             pass
 
-    def getIcon(self):
-        """A grid, greyed with an amber badge when the drawing is out of date.
+    ICON = "MeshOpenEMS.svg"
 
-        The badge is amber rather than red. Red is FreeCAD's mark for something
-        that failed, and a preview describing an older version of the model has
-        not failed. The preview does not remesh until asked. The object's
-        ``onChanged`` signals the change. The tree
-        caches icons and will not ask again on its own.
+    def getOverlayIcons(self):
+        """The out-of-date overlay while the drawing has moved since the mesh.
+
+        It is amber rather than red. Red is FreeCAD's mark for something that
+        failed, and a preview describing an older version of the model has not
+        failed. The preview does not remesh until asked. The object's
+        ``onChanged`` signals the change. The tree caches icons and will not ask
+        again on its own.
         """
-        stale = getattr(getattr(self, "Object", None), "Status", None) == OUT_OF_DATE
-        return icon("MeshPreviewStale.svg" if stale else "MeshPreview.svg")
+        return out_of_date(getattr(self, "Object", None))
+
+    def canDelete(self, obj):
+        """Whether ``obj``, which this mesh links, goes without a question:
+        the solver it is meshed for, which deletes the mesh with it. FreeCAD's
+        Delete asks this of each object linking one being deleted
+        (``src/Gui/CommandDoc.cpp``, ``StdCmdDelete::activated``)."""
+        from ..Objects.analysis import companions
+
+        mesh = getattr(self, "Object", None)
+        return any(member is mesh for member in companions(obj))
 
     def attach(self, vobj):
-        # This only keeps a handle for getIcon. Part's own view provider still
+        # This only keeps a handle for getOverlayIcons. Part's own view provider
         # does all the drawing. Implementing getDisplayModes or setDisplayMode
         # here would take that over and the geometry would stop appearing.
         self.Object = vobj.Object

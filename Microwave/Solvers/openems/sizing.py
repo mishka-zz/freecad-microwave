@@ -274,8 +274,7 @@ def edge(thickness: float, tangent: Sequence[float]) -> tuple[float, float, floa
     ``sqrt(1 - tau_i^2)``. It is then scaled until the worst direction spends
     the thickness exactly, so the whole circle is inside the budget and the
     worst of it is tight. The profile is a judgement. The scale is not: the
-    scale makes any profile feasible, and this profile prices within a few
-    percent of the cheapest over the line-count objective. The working is in
+    scale makes any profile feasible. The working is in
     docs/internals/openems-cell-allocation.md.
 
     An axis the tangent runs along comes back ``inf``: cells packed along an

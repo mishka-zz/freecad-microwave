@@ -240,10 +240,11 @@ def _encloses(vertices: Sequence[Vertex], faces: Sequence[Face], point: Vertex) 
     threshold that is not a choice. It is taken as a magnitude, so it answers the
     same for a surface wound either way round.
 
-    It is asked only about a corner of a different surface in the same set, and a
-    solid keeps that corner clear of this surface. A point on the boundary, where
-    the angle is the interior angle there and under the threshold from both
-    sides, therefore does not arise.
+    It is asked only about a corner of a different surface in the same set, and
+    shells that touch nowhere keep that corner clear of this surface. Two shells
+    that touch - a lump flush against a void's wall - can put the corner on it,
+    where the angle is the interior angle there and the answer follows rounding.
+    Such a set is not a manifold solid.
     """
     total = 0.0
     for first, second, third in faces:
@@ -371,41 +372,37 @@ def _every_shell_wound_with_the_rest(
     alternate with the depth, and a shell whose sign does not is the one that
     disagrees.
 
-    Nesting is read from the boxes, which is enough here: shells that share no
-    vertex either nest or stand apart, and a box contains another box exactly
-    when the shell does.
+    Nesting is read as :func:`pieces` reads it, at each shell's lowest corner:
+    shells that share no vertex either nest or stand apart, so one corner says
+    which. A box holding another box does not say it, since a void can stand in
+    the material between another void and that void's box.
     """
     shells = parts(faces)
     if len(shells) < 2:
         return None
     boxes = [_box(vertices, shell) for shell in shells]
+    corners = [min(tuple(vertices[index]) for face in shell for index in face) for shell in shells]
     # Converted once rather than once a shell, the whole list being read each time.
     points = np.asarray(vertices, dtype=float)
     signs = [_signed_volume(points, shell) for shell in shells]
     if not any(signs):
-        return "its triangles enclose nothing at all, so no side of them is material"
+        return "its triangles enclose no volume"
     outward = 1.0 if sum(signs) > 0.0 else -1.0
-    for number, (box, sign) in enumerate(zip(boxes, signs)):
+    for number, (corner, sign) in enumerate(zip(corners, signs)):
         depth = sum(
-            1 for other, outer in enumerate(boxes) if other != number and _within(box, outer)
+            1
+            for other, outer in enumerate(boxes)
+            if other != number
+            and _inside(corner, outer)
+            and _encloses(vertices, shells[other], corner)
         )
         wanted = outward * (-1.0) ** depth
         if sign == 0.0 or (sign > 0.0) != (wanted > 0.0):
             return (
                 f"shell {number} of {len(shells)} is wound against the rest of the "
-                "surface, so the two disagree about which side of them is material"
+                "surface, so the two disagree on which side is inside"
             )
     return None
-
-
-def _within(inner: tuple[Vertex, Vertex], outer: tuple[Vertex, Vertex]) -> bool:
-    """Whether one shell's box lies inside another's."""
-    low, high = inner
-    outer_low, outer_high = outer
-    return all(
-        outer_low[axis] <= low[axis] and high[axis] <= outer_high[axis]
-        for axis in range(_DIMENSIONS)
-    )
 
 
 def _well_formed(vertices: Sequence[Vertex], faces: Sequence[Face]) -> str | None:
@@ -443,14 +440,14 @@ def _each_directed_edge_once(faces: Sequence[Face]) -> str | None:
                 )
             seen[(start, end)] = number
 
+    # openEMS reads an open surface as a sheet rather than a solid.
     unmatched = [edge for edge in seen if (edge[1], edge[0]) not in seen]
     if unmatched:
         start, end = unmatched[0]
         return (
             f"the edge from vertex {start} to vertex {end} is used by one face "
-            f"only, so the surface is open there ({len(unmatched)} such edges). "
-            "An open surface is read as a sheet rather than a solid, and then "
-            "contains no point at all"
+            f"only, so the surface is open there ({len(unmatched)} such edges) and "
+            "contains no point"
         )
     return None
 
@@ -479,12 +476,10 @@ def _every_vertex_link_is_one_cycle(faces: Sequence[Face]) -> str | None:
         while step != start:
             step = ring[step]
             walked += 1
+        # A polyhedron cannot represent two pieces meeting at one vertex,
+        # whichever way the faces are wound.
         if walked != len(ring):
-            return (
-                f"vertex {vertex} belongs to more than one separate sheet of the "
-                "surface - two pieces meeting at a single point. A polyhedron "
-                "cannot represent that, whichever way the faces are wound"
-            )
+            return f"two separate sheets of the surface meet at vertex {vertex} and nowhere else"
     return None
 
 

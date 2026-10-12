@@ -13,6 +13,9 @@ asserts line by line. Solving it lands on the same impedance:
 compare against the hand-built gate's. The two agreeing bound the error the
 document layer adds.
 
+Its study carries an openEMS solver alone. Its ports are microstrip ports,
+which Palace does not drive, so Palace refuses the study.
+
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
@@ -50,7 +53,7 @@ COPPER_CONDUCTIVITY = 5.8e7
 def geometry(doc):
     """What the user draws. Both conductors are faces, not solids.
 
-    The gate treats them as zero-thickness sheets carrying a ConductingSheet
+    The gate treats them as zero-thickness sheets carrying a Conducting Sheet
     material, which is how openEMS' own ``MSL_Losses.m`` models copper foil and
     what Hammerstad's closed form assumes. Drawing them as 35 um solids is
     legal - the adapter collapses them onto the substrate surface - but it
@@ -94,7 +97,7 @@ def markup(analysis, board, plane, strip):
 
     copper = createEMMaterial("Copper")
     copper.Label = "Copper"
-    copper.MaterialType = "ConductingSheet"
+    copper.MaterialType = "Conducting Sheet"
     copper.Conductivity = COPPER_CONDUCTIVITY
     copper.Thickness = COPPER_THICKNESS
 
@@ -115,7 +118,7 @@ def markup(analysis, board, plane, strip):
     port = createEMPortMicrostrip("Port1")
     port.Label = "Port1"
     port.Number = 1
-    port.Excitation = True
+    port.Driven = True
     # A bare voltage source. The line runs out through the absorber, so there
     # is nothing for a reflection off the feed to come back from, and an
     # undamped source gives a cleaner incident wave. ReferenceImpedance stays
@@ -137,7 +140,7 @@ def markup(analysis, board, plane, strip):
     port.FeedOffset = 20.0
     port.MeasurementDistance = 30.0
     port.TraceEnd = (strip, [trace_end(strip)])
-    port.GroundReference = (plane, ["Face1"])
+    port.Ground = (plane, ["Face1"])
     port.PropagationAxis = "X"
     port.ExcitationAxis = "-Z"
     analysis.addObject(port)
@@ -154,7 +157,7 @@ def study(doc):
     analysis.Label = "Microstrip 50 ohm"
     analysis.FrequencyStart = "1 GHz"
     analysis.FrequencyStop = "10 GHz"
-    analysis.NumFrequencyPoints = 201
+    analysis.FrequencyPoints = 201
 
     solver = solver_of(analysis)
     # Long enough that the excitation has decayed into numerical noise, so where
@@ -165,8 +168,8 @@ def study(doc):
     # The line is meant to be infinite: put the absorber on the board at both
     # ends, so the line runs out through it. Give it air instead and it radiates
     # off an open circuit, and every impedance read from it is contaminated.
-    settings.PaddingXMin = "Through"
-    settings.PaddingXMax = "Through"
+    settings.BoundaryXMin = "Through"
+    settings.BoundaryXMax = "Through"
     return analysis
 
 

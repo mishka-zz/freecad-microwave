@@ -62,16 +62,18 @@ KINDS = ("test_acceptance_", "test_")
 
 #: Files named for no backend that reach one, and why each is about none.
 SHARED = {
-    "Microwave/Commands.py": "the commands of every backend; Update Mesh builds openEMS's",
+    "Microwave/Commands.py": "the commands of every backend; Mesh builds openEMS's",
     "Microwave/Gui/material_picker.py": "borrows the openEMS pre-flight's band limit",
     "Microwave/Gui/panels.py": "opens the run panel of whichever backend the solver names",
     "Microwave/Gui/results.py": "reads every backend's output into one result object",
+    "Microwave/batch.py": "solves a study on whichever backends its solvers name",
     "docs/images/build.py": "draws the manual's figures, one of them the openEMS preview",
-    "tests/conftest.py": "the suite's fixtures, among them the openEMS corpus and runner",
+    "tests/conftest.py": "the suite's fixtures, among them each backend's solve census",
     "tests/import_sweep.py": "imports every package, the adapters with the rest",
     "tests/placement_probe.py": "places one drawing through each adapter's reader",
     "tests/preview_recompute_probe.py": "what an edit costs each kind of preview",
     "tests/test_analysis.py": "the study container, holding an openEMS study as its case",
+    "tests/test_batch.py": "the run without the GUI, standing in for each backend's engine",
     "tests/test_example_document.py": "reads the shipped examples against their fixtures",
     "tests/test_gui_smoke.py": "drives the workbench's GUI, the openEMS panel with it",
     "tests/test_import_graph.py": "reads which way every package's imports run",
@@ -87,6 +89,7 @@ SHARED = {
     "tests/test_solver.py": "the solver objects of both backends",
     "tests/test_sparameters.py": "the neutral S-parameter layer, fed once by the openEMS reader",
     "tests/test_study_properties.py": "what the study states, and whether each backend answers it",
+    "tests/test_tiers.py": "the tiers, held to each backend's solve census",
     "tests/test_version.py": "the openEMS adapter's ADAPTER_VERSION restates Microwave.__version__",
     "tests/test_views.py": "builds its documents from the openEMS translation fakes",
 }

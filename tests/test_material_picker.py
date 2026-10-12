@@ -144,7 +144,10 @@ class TestTheColumnsThePickerShows:
 class TestTheNoteInThePicker:
     def test_a_material_quoted_far_from_the_band_is_flagged(self):
         note = material_picker.frequency_note(CATALOG.get("fr4"), 10e9)
-        assert "1 MHz" in note and "10 GHz" in note
+        assert note == (
+            "Loss quoted at 1 MHz, far from the study's centre at 10 GHz, "
+            "so openEMS solves with the loss measured at 1 MHz."
+        )
 
     def test_one_quoted_near_it_is_not(self):
         assert material_picker.frequency_note(CATALOG.get("ptfe"), 10e9) == ""
@@ -283,7 +286,7 @@ class TestTheEntryPointTheCommandActuallyCalls:
 
         icon, title, text = shown(boxes)
         assert (icon, title) == (boxes.Warning, "Add Material from Catalog")
-        assert "no material catalogs loaded" in text
+        assert text.startswith("no material catalogs are loaded. Put a .toml catalog in ")
 
     def test_it_reports_every_failure_it_was_given(self, monkeypatch):
         from Microwave.Materials.library import Library, LoadFailure

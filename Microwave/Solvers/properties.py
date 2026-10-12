@@ -104,15 +104,14 @@ def out_of_step(objects: Iterable[Any]) -> None:
         if departed.phrases
     )
     raise TranslationError(
-        "This study does not match what this build of the workbench declares, which is "
-        "how a document an earlier build saved comes back, and no build carries one "
-        f"across: {said}. "
-        "Make each object that lacks a property, holds one as another type or offers other "
-        "choices anew: Add openEMS Solver and Add Palace Solver make whatever solver, "
-        "recipe and mesh policy a study lacks, and a port, a material or a study is made "
-        "again as it was made first. Copy what the old object held first: a property this "
-        "build does not declare is read by no run, and the property editor deletes it "
-        "(right-click it, Delete Property)"
+        "This study was saved by an earlier build of the workbench and does not match this "
+        f"one: {said}. "
+        "Make anew each object that lacks a property, holds one as another type or offers "
+        "other choices: Add openEMS Solver and Add Palace Solver make whatever solver, "
+        "recipe and mesh policy a study lacks, and a port, a material, a Mesh "
+        "Refinement or a study is made again as it was made first. Copy what the old "
+        "object held first. A property this build does not declare is read by no run. "
+        "Delete it in the property editor (right-click it, Delete Property)"
     )
 
 
@@ -169,7 +168,7 @@ def clearance(stated: Any, stop: float, settings: Any, slowing: float = 1.0) -> 
     means derived: :data:`CLEARANCE_WAVELENGTHS` of the wavelength in the medium
     at ``stop``, since that is the wavelength the field beyond the structure
     falls off and radiates at. A clearance of nothing on a face open to free
-    space is the face ``Ends`` states, so zero is free to mean "derive it".
+    space is the face ``PEC Wall`` states, so zero is free to mean "derive it".
 
     Each adapter reads the property itself and hands it here, so what it reads
     is in its own source, and the rule for what the value means is written
@@ -182,9 +181,8 @@ def clearance(stated: Any, stop: float, settings: Any, slowing: float = 1.0) -> 
     length = value(stated)
     if not math.isfinite(length) or length < 0.0:
         raise TranslationError(
-            f"{label(settings)!r}: Clearance is {length:g} mm. It is how far the medium "
-            "reaches past the structure on each Air face, so it is a length of zero or "
-            "more, and zero derives it from the band"
+            f"{label(settings)!r}: Clearance is {length:g} mm. Enter 0 mm to derive it "
+            "from the band, or a positive length"
         )
     if length > 0.0:
         return length
@@ -224,12 +222,11 @@ def smallest_response(analysis: Any) -> float:
     one, so a positive value is a typing slip, and a slip quietly taken as "full
     scale" would leave the property reading as though it had been honoured.
     """
-    declared = float(analysis.SmallestResponse)
+    declared = float(analysis.ResponseFloor)
     if not math.isfinite(declared) or declared > 0.0:
         raise TranslationError(
-            f"{label(analysis)!r}: SmallestResponse is {declared:g} dB. It is "
-            "how far down the response is read, so it is zero for full scale "
-            "and negative below it"
+            f"{label(analysis)!r}: ResponseFloor is {declared:g} dB. Enter 0 dB for "
+            "full scale, or a negative value to read below it"
         )
     return 10.0 ** (declared / 20.0)
 

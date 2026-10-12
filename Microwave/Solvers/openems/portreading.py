@@ -123,10 +123,10 @@ def unread(provenance: Mapping[str, Any]) -> str | None:
     if not refused:
         return None
     return (
-        "; ".join(refused) + ". So is every other waveguide port's in this run. The "
-        "voltage and current are then read at scales the cells at each port's walls set, "
-        "so a transmission between ports whose walls end differently is read at the "
-        "ratio of the two, and a port whose voltage and current scales differ shows a "
+        "; ".join(refused) + ". So is every other waveguide port's in this run. openEMS "
+        "reads each port's voltage and current at scales set by the cells at its walls, "
+        "so a transmission between ports whose walls fall differently on the grid is "
+        "off by the ratio of the two, and a port whose two scales differ shows a "
         "reflection that is not there"
     )
 
@@ -266,8 +266,8 @@ def read(
     m, n = mode
     if (m == 0) == (n == 0):
         raise NotRead(
-            f"its mode TE{m}{n} has a field varying across both walls, and only a "
-            "mode varying across one is modelled"
+            f"its mode TE{m}{n} varies across both pairs of walls, and only a mode "
+            "varying across one pair is corrected"
         )
     first, second = (axis + 1) % 3, (axis + 2) % 3
     # The field varies across one axis and lies along the other, on which it is
@@ -299,11 +299,12 @@ def read(
         line = grid[dim]
         for side, wall in zip(sorted((box[0][dim], box[1][dim])), walls, strict=True):
             near = line[max(wall - 1, 0)], line[min(wall + 1, len(line) - 1)]
+            # A wall drawn as a sheet across the field ties no edge crossing
+            # it, so it reaches here too.
             if not near[0] <= side <= near[1]:
                 raise NotRead(
-                    "the guide the engine built at its plane is not the one its box was drawn "
-                    "on, which is also what a wall drawn as a sheet across the field gives, "
-                    "since a sheet ties no edge crossing it"
+                    "the guide openEMS built at its plane is not the one its box was drawn "
+                    "on, as happens where a wall is drawn as a sheet across the field"
                 )
     wide, high = s[right] - s[left], u[top] - u[bottom]
 
@@ -742,7 +743,7 @@ def _walls(
             raise NotRead(
                 _NOT_A_CONDUCTOR
                 if end in (0, len(u) - 1)
-                else "its guide ends between two grid lines rather than on one the engine ties"
+                else "its guide ends between two grid lines instead of on a conducting one"
             )
 
     for o in (-1, 0, 1):
@@ -763,7 +764,7 @@ _NOT_A_CONDUCTOR = "a side of its guide is not a conductor"
 
 
 _NOT_A_RECTANGLE = (
-    "the metal the engine built at its plane, or within a cell of it, is not a rectangular guide"
+    "the metal openEMS built at its plane, or within a cell of it, is not a rectangular guide"
 )
 
 

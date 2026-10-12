@@ -4,9 +4,10 @@
 """S-parameters, solver-neutral.
 
 One N×N matrix against frequency, referenced to the impedance the user asked
-for, with the provenance to say where it came from. An adapter reads its own
-output into :meth:`SParameters.from_runs`. Plots, Touchstone and extracted
-scalars then work the same whichever backend ran.
+for, with the provenance to say where it came from. openEMS runs are assembled
+into one by :meth:`SParameters.from_runs`, and a Palace table by
+``Gui/results.py``'s ``from_palace``. Plots, Touchstone and extracted scalars
+then work the same whichever backend ran.
 
 Imports numpy and the standard library at module scope. scikit-rf is reached
 through :mod:`._skrf`, and only when a matrix is assembled or written.
@@ -14,6 +15,7 @@ through :mod:`._skrf`, and only when a matrix is assembled or written.
 
 from __future__ import annotations
 
+import math
 import textwrap
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -77,9 +79,11 @@ SENT_BACK = "sent_back"
 #: error in the solve.
 MAGNIFIED = "magnified"
 
-#: The provenance key under which an adapter says, per port number, which of a
-#: guide's impedances that port states. The openEMS adapter writes it and
-#: spells it itself, since it imports nothing from this layer.
+#: The provenance key under which a backend's result says, per port number,
+#: which impedance of a guide's mode that port is at, or that it is a lumped
+#: port at its resistance. The openEMS adapter writes it and spells it itself,
+#: since it imports nothing from this layer, and the Palace result names every
+#: port.
 IMPEDANCE_STATED = "impedance_stated"
 
 #: What a lumped port states under :data:`IMPEDANCE_STATED`: its resistance,
@@ -116,16 +120,29 @@ def _span(hz: np.ndarray) -> str:
     return f"lowest {hz.min() / 1e9:.4g} GHz, highest {hz.max() / 1e9:.4g} GHz"
 
 
-def _engineering_hz(hz: float) -> str:
+def _engineering_hz(hz: float, up: bool = False) -> str:
     """One frequency, in the unit an engineer would have said it in.
 
     A Touchstone body is in hertz because the format says so. A header is read
     by a person, and 1e+10 is not how 10 GHz is written.
+
+    :param up: round up rather than to nearest, for a figure the user is told
+        to enter as a lower bound.
     """
-    for scale, unit in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")):
-        if abs(hz) >= scale:
-            return f"{hz / scale:.6g} {unit}"
-    return f"{hz:.6g} Hz"
+    scale, unit = next(
+        (
+            (scale, unit)
+            for scale, unit in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz"))
+            if abs(hz) >= scale
+        ),
+        (1.0, "Hz"),
+    )
+    value = hz / scale
+    if up and value > 0:
+        # The sixth significant figure, which is the last one shown.
+        step = 10.0 ** (math.floor(math.log10(value)) - 5)
+        value = math.ceil(value / step) * step
+    return f"{value:.6g} {unit}"
 
 
 def _band(hz: np.ndarray) -> str:
@@ -224,7 +241,7 @@ def describe_reference(
     :meth:`SParameters.from_runs` is the one place that knows.
 
     Every form has to read as English after the words "referenced to", which the
-    chart's footnote, the Touchstone refusals and caveat, the file's header and
+    chart's basis, the Touchstone refusals and caveat, the file's header and
     the task panel's log line all prepend.
     """
     reference = np.atleast_2d(np.asarray(reference, dtype=complex))
@@ -366,13 +383,13 @@ def _start_past(frequency: np.ndarray, unpowered: np.ndarray, powered: np.ndarra
     past = frequency[(frequency > top) & powered]
     if past.size:
         return (
-            f"Start the band at {_engineering_hz(float(past.min()))} or above, where every "
+            f"Set FrequencyStart to {_engineering_hz(float(past.min()), up=True)} or above, "
+            "where every "
             "port carries power"
         )
     return (
-        f"The band holds no point above them, so where a port starts to carry power is "
-        f"not known from here: start the band above the cutoff of each port's mode, "
-        f"which lies above {_engineering_hz(top)}"
+        "No point of the band lies above them. Set FrequencyStart above the cutoff of each "
+        f"port's mode, which lies above {_engineering_hz(top)}"
     )
 
 
@@ -401,8 +418,8 @@ def _unpowered_where(
     )
     lead = "At each of them" if where == "there" else f"A{where[1:]}"
     return (
-        f"{lead} a port carries no power: {each}. A port's impedance has no real part "
-        f"where it carries none, {cause}"
+        f"{lead} a port carries no power: {each}. A port carries no power where its "
+        f"impedance has no real part, {cause}"
     )
 
 
@@ -518,11 +535,17 @@ class SParameters:
     def _require_complete(self, action: str) -> None:
         missing = self.unmeasured
         if missing:
+            # Mirror symmetry derives the second column of a two-port only.
+            mirror = (
+                ", or, if the device is mirror-symmetric, set the study's Symmetry to Mirror "
+                "and run again"
+                if self.ports == 2
+                else ""
+            )
             raise ResultError(
                 f"cannot {action}: port(s) {list(missing)} were never driven, so "
                 f"{len(missing)} column(s) of this {self.ports}-port matrix are "
-                "not measured. Mark them as excitation sources and solve again, "
-                "or declare the study symmetric so the rest can be derived"
+                f"not measured. Set Driven to true on those ports and run again{mirror}"
             )
 
     @property
@@ -617,16 +640,16 @@ class SParameters:
                 said.append(
                     (
                         f"The runs disagreed about port impedance {where}",
-                        "Move the measurement planes onto clean feed line so the "
-                        "extraction works across the whole band",
+                        "Move the ports' measurement planes onto uniform feed line",
                     )
                 )
             else:
+                # The runs agreed and every port carried power, so the solve
+                # itself returned no field.
                 said.append(
                     (
-                        f"Nothing disagreed about port impedance {where} and every port "
-                        "carried power: the solve itself returned no field",
-                        "Check the port planes landed on grid lines",
+                        f"The solve returned no field {where}",
+                        "Check that the port planes lie on grid lines",
                     )
                 )
         return said
@@ -770,19 +793,21 @@ class SParameters:
         for column, record in sorted(records.items(), key=lambda item: int(item[0])):
             if not record["bound"] > bar:
                 continue
+            # The undriven ports sent back part of what reached them, which is
+            # an error in S itself, so a term much smaller than the bound is off
+            # by more than its own size.
             said.append(
-                f"A term of column {column} can be off S by up to about "
+                f"A term driven from port {column} can be off by up to about "
                 f"{_magnitude(record['bound'])} at {_engineering_hz(record['frequency'])}, "
-                f"against a bar of {_magnitude(bar)}: the ports not driven in the runs "
-                f"behind it sent back part of what reached them, port {record['port']} "
-                "most. That is an error in S itself, so a term much smaller than it is "
-                "off by more than its own size"
+                f"above the threshold of {_magnitude(bar)}, because the undriven ports "
+                f"sent back part of what reached them, port {record['port']} most. A "
+                "term much smaller than this is off by more than its own size"
             )
         if not said:
             return None
-        remedy = f"Drive {_ports(self.unmeasured)} as well and every wave is counted out"
+        remedy = f"Set Driven to true on {_ports(self.unmeasured)} as well and run again"
         if self.ports == 2:
-            remedy += ", or declare the mirror if the device is one"
+            remedy += ", or set the study's Symmetry to Mirror if the device is mirror-symmetric"
         return ". ".join([*said, remedy])
 
     def magnified(self) -> str | None:
@@ -814,9 +839,8 @@ class SParameters:
             f"{_ports([int(n) for n in named]).capitalize()} {'is' if one else 'are'} "
             f"reported against {against} and {own} at "
             f"{_engineering_hz(record['frequency'])}, so renormalising there can magnify an "
-            f"error in the solve by up to {_up_to(record['factor'], 2)} times. Reference "
-            f"{'it to its' if one else 'them to their'} own impedance, where the error is "
-            "not magnified"
+            f"error in the solve by up to {_up_to(record['factor'], 2)} times. Set "
+            f"ReferencedTo to Port impedance on {'that port' if one else 'those ports'}"
         )
 
     def nonreciprocal(self, bar: float) -> str | None:
@@ -856,9 +880,9 @@ class SParameters:
         other = _term(self.port_numbers[column], self.port_numbers[row])
         return (
             f"{one} and {other} differ by up to {_magnitude(gap, 3)} at "
-            f"{_engineering_hz(float(self.frequency[point]))}, against a bar of "
-            f"{_magnitude(bar, 3)}. Every material a model holds is reciprocal, so the "
-            f"device's two are equal, and at least one of them is off by "
+            f"{_engineering_hz(float(self.frequency[point]))}, above the threshold of "
+            f"{_magnitude(bar, 3)}. Every material is reciprocal, so the two terms are "
+            f"equal for the device, and at least one is off by "
             f"{_magnitude(gap / 2, 3)} or more there"
         )
 
@@ -1122,8 +1146,8 @@ class SParameters:
             said.append(f"At port {number} it is {meaning}.")
         if any(meaning != LUMPED_RESISTANCE for meaning in stated.values()):
             said.append(
-                "A guide's S-parameters referenced to its own mode are the same whichever "
-                "of its impedances is stated, and renormalising them is not."
+                "A guide's S-parameters referenced to its own mode do not depend on which "
+                "of its impedances is stated. Renormalised ones do."
             )
         if LUMPED_RESISTANCE in stated.values():
             said.append(
@@ -1177,9 +1201,9 @@ class SParameters:
         if mismatch is not None:
             lines.append(
                 f"! The two ports' measured reference impedances differ by "
-                f"{float(mismatch):.3e}. Two ports of a true mirror have the "
-                f"same one, so that is how far the declaration is from what was "
-                f"measured - not an error bar on the numbers below."
+                f"{float(mismatch):.3e}. The ports of a true mirror have equal "
+                f"impedances, so this is how far the declared symmetry is from what "
+                f"was measured. It is not an error bar on the numbers below."
             )
         return "\n".join(lines) + "\n"
 
@@ -1348,16 +1372,14 @@ def _check_runs_can_form_one_matrix(
         # port whose box lies outside the grid does this, and the engine clips
         # such a box away without comment. The check reads the incident wave
         # rather than the answer, because the incident wave is where the cause
-        # is visible.
+        # is visible. Every S-parameter of such a run is 0/0.
         incident = np.asarray(run.port(int(run.excited_port)).incident)
         if incident.size and not np.any(incident):
             raise ResultError(
                 f"the run driven by port {int(run.excited_port)} recorded "
-                "no incident wave at any frequency, so it measured nothing "
-                "and every S-parameter from it is 0/0. Check that the "
-                "port's box lies inside the grid - openEMS clips one that "
-                "does not away without comment - and that the face it was "
-                "built from spans the gap it is meant to drive"
+                "no incident wave at any frequency, so it returns no "
+                "S-parameters. Check that the port's box lies inside the grid "
+                "and that the face it was built from spans the gap it drives"
             )
 
         if run.provenance.get("cells") != runs[0].provenance.get("cells"):
@@ -1371,10 +1393,9 @@ def _check_runs_can_form_one_matrix(
         # so a column solved against another model would be filed under it.
         if run.provenance.get("modelled") != runs[0].provenance.get("modelled"):
             raise ResultError(
-                f"the run driven by port {int(run.excited_port)} was given its lossy "
-                f"materials otherwise than the run driven by port "
-                f"{int(runs[0].excited_port)}, so they describe different models "
-                "and cannot form one matrix"
+                f"the run driven by port {int(run.excited_port)} modelled its lossy "
+                f"materials differently from the run driven by port "
+                f"{int(runs[0].excited_port)}, so the runs cannot form one matrix"
             )
 
 
@@ -1414,7 +1435,7 @@ def _measured_impedance(
             if not np.all(np.isfinite(values[:, column]))
         )
         raise ResultError(
-            f"port {bad} reports a non-finite reference impedance at "
+            f"port {bad} returns no reference impedance at "
             f"{int(missing.sum())} of {missing.size} frequency points "
             f"({_span(frequency[missing])}) in the run driven by {drivers}, so no "
             "S-matrix can be normalised"
@@ -1596,9 +1617,8 @@ def _volts(
         row, column = int(worst_row), int(worst_column)
         points = int(blank[:, row, column].sum())
         raise ResultError(
-            f"{_term(numbers[row], numbers[column])} is not a number at {points} "
-            f"of {blank.shape[0]} frequency points, so no S-matrix can be "
-            "normalised from these runs. The run driven by port "
+            f"{_term(numbers[row], numbers[column])} has no value at {points} "
+            f"of {blank.shape[0]} frequency points, because the run driven by port "
             f"{numbers[column]} returned no usable field there"
         )
 
@@ -1614,13 +1634,14 @@ def _volts(
     # Singular to working precision: past this no digit of the inverse stands.
     inseparable = kept & ~(np.linalg.cond(scaled) < 1 / np.finfo(float).eps)
     if inseparable.any():
+        # The runs' incident waves are in proportion there, so ``A D^-1`` has
+        # no inverse: something behind each port's plane reflects all of what
+        # reaches it.
         raise ResultError(
-            f"the runs' incident waves are in proportion at {int(inseparable.sum())} "
-            f"of {inseparable.size} frequency points, so no column can be told "
-            "apart from the others there: what the undriven ports send back "
-            "returns all of what reaches them. Something behind a port's plane "
-            "reflects it whole - draw each guide or line running on unchanged "
-            "from its port into the absorber"
+            f"the undriven ports reflect all of what reaches them at "
+            f"{int(inseparable.sum())} of {inseparable.size} frequency points, so no "
+            "column can be told apart from the others there. Draw each guide or line "
+            "running on unchanged from its port into the absorber"
         )
     volts[kept] = volts[kept] @ np.linalg.inv(scaled[kept])
     return volts
@@ -1895,9 +1916,11 @@ def _provenance(runs: Sequence[Any], driven: Sequence[int], spread: float) -> di
         "recorded_samples",
         "tail_share",
         "near_field",
+        "port_reading",
         "power_balance",
         "max_timesteps",
         "end_criteria",
+        "timesteps",
     )
     provenance = {key: value for key, value in runs[0].provenance.items() if key not in per_solve}
     # Which impedance a port states is kept where every run states the same.

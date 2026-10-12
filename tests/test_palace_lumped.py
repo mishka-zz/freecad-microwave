@@ -176,7 +176,7 @@ def material(kind, name):
 def lumped(number, strip, fill, edge, **overrides):
     properties = dict(
         Number=number,
-        Excitation=True,
+        Driven=True,
         ReferencedTo="Port impedance",
         ReferenceImpedance=50.0,
         Resistance=50.0,
@@ -218,12 +218,10 @@ def stripline(width=WIDTH, parts=None, ports=None, extra=()):
             "mesh",
             "EMMeshPolicy",
             dict(
-                MinElementSize=0.0,
                 CurveTolerance=0.0,
-                MinElementsAcross=9,
                 Clearance=0.0,
                 Medium=None,
-                **{f"Padding{axis}{side}": "Ends" for axis in AXES for side in ("Min", "Max")},
+                **{f"Boundary{axis}{side}": "PEC Wall" for axis in AXES for side in ("Min", "Max")},
             ),
         ),
     )
@@ -238,6 +236,8 @@ def stripline(width=WIDTH, parts=None, ports=None, extra=()):
                 EdgeRefinement=8.0,
                 ElementsPerTurn=6,
                 MaxGrowthRatio=1.6,
+                MinElementsAcross=9,
+                MinElementSize=0.0,
             ),
         ),
     )
@@ -269,8 +269,8 @@ def stripline(width=WIDTH, parts=None, ports=None, extra=()):
         "Study",
         FrequencyStart=2e9,
         FrequencyStop=8e9,
-        NumFrequencyPoints=3,
-        SmallestResponse=0.0,
+        FrequencyPoints=3,
+        ResponseFloor=0.0,
         Group=members,
     )
     return SimpleNamespace(study=study, fill=fill, strip=strip)
@@ -377,6 +377,9 @@ def kernel(monkeypatch):
     monkeypatch.setattr(drawn, "apart", apart)
     monkeypatch.setattr(drawn, "shared_area", shared_area)
     monkeypatch.setattr(drawn, "skin", skin)
+    # No edge of a box faces another across a sheet: which do is held under a
+    # real kernel by tests/test_palace_narrow.py.
+    monkeypatch.setattr(drawn, "facing", lambda *_, **__: [])
     return asked
 
 
@@ -431,6 +434,21 @@ class TestWhatALumpedPortBecomes:
             "rest of the face of Port1",
             "rest of the face of Port2",
         )
+
+    def test_its_plane_is_the_wall_a_narrow_edge_faces_its_reflection_in(self, monkeypatch):
+        """The plane outside the elements is a magnetic wall, so the narrow edges
+        of the strip are sought against each plane as a mirror."""
+        asked = []
+
+        def facing(faces, reach, others=(), mirrors=(), walls=None):
+            asked.append(list(mirrors))
+            return []
+
+        monkeypatch.setattr(drawn, "facing", facing)
+        described = problem(stripline().study)
+        planes = [shape for plane in described.planes for shape in plane.shapes]
+        assert planes and asked
+        assert all(mirrors == planes for mirrors in asked)
 
     def test_the_face_it_lies_in_is_a_plane_named_after_its_port(self):
         described = problem(stripline().study)
@@ -534,12 +552,16 @@ class TestWhatALumpedPortRefusesBeforeAMesh:
         like any other. Only a wave port's plane makes that face the port's.
         """
         line = stripline()
-        settings = next(m for m in line.study.Group if hasattr(m, "PaddingXMin"))
-        settings.PaddingXMin = "Through"
-        refused(line, "PaddingXMin", "runs out through the absorber")
+        settings = next(m for m in line.study.Group if hasattr(m, "BoundaryXMin"))
+        settings.BoundaryXMin = "Through"
+        refused(line, "BoundaryXMin is Through, and Palace builds no absorber")
 
     def test_no_resistance(self):
-        refused(with_port(Resistance=0.0), "'Port1': Resistance is 0 ohm", "PEC")
+        refused(
+            with_port(Resistance=0.0),
+            "'Port1': Resistance is 0 ohm",
+            "Draw a short as a sheet bound to PEC, or give the port its resistance",
+        )
         assert problem(with_port(Resistance=50.0).study).lumped[0].resistance == 50.0
 
     @pytest.mark.parametrize("resistance", [-50.0, math.nan, math.inf])
@@ -586,11 +608,12 @@ class TestWhatALumpedPortRefusesBeforeAMesh:
     def test_picks_that_do_not_face_each_other(self):
         line = stripline()
         line.fill.Shape.elements["Face7"] = face("corner", (8.0, 3.0, 0.0), (9.0, 4.0, 0.0))
-        refused(
+        said = refused(
             with_port(line, ReferenceEntity=(line.fill, ["Face7"])),
             "'Port1' driven to Face7 of 'Fill': SourceEntity and ReferenceEntity do not overlap",
-            "Pick a reference that faces the source",
+            "Pick a ReferenceEntity that faces SourceEntity across the gap",
         )
+        assert said.count("Pick a") == 1
         problem(with_port(line, ReferenceEntity=(line.fill, [BOTTOM])).study)
 
     def test_a_source_edge_at_an_angle_to_the_axes(self):
@@ -600,7 +623,7 @@ class TestWhatALumpedPortRefusesBeforeAMesh:
         line.strip.Shape.elements["Edge3"] = slant
         refused(
             with_port(line, SourceEntity=(line.strip, ["Edge3"])),
-            "'Port1' is driven from an edge that runs at an angle to the axes",
+            "'Port1' is driven from an edge at an angle to the axes",
             "Draw the trace's end along an axis",
         )
         problem(with_port(line, SourceEntity=(line.strip, ["Edge1"])).study)
@@ -609,7 +632,7 @@ class TestWhatALumpedPortRefusesBeforeAMesh:
         line = stripline()
         refused(
             with_port(line, SourceEntity=(line.strip, ["Face1"])),
-            "'Port1' is driven from a face that spans the two axes across Z",
+            "'Port1' is driven from a face that spans both axes across Z",
             "Select the edge",
         )
         problem(with_port(line, SourceEntity=(line.strip, ["Edge1"])).study)
@@ -665,7 +688,7 @@ class TestWhatALumpedPortRefusesBeforeAMesh:
         line = stripline(parts=parts)
         line = with_port(line, ReferenceEntity=(line.fill, [BOTTOM]))
         line.study.Group = [m for m in line.study.Group if m.Label != "Port2"]
-        refused(line, "'Port1' lays 'Port1 element 1', which lies partly on the boundary")
+        refused(line, "'Port1' lays 'Port1 element 1' partly on the region's boundary and partly")
         parts[1] = ((-HALF, -SHIELD / 2, 0.5), (HALF, SHIELD / 2, SEPARATION))
         line = stripline(parts=parts)
         line = with_port(line, ReferenceEntity=(line.fill, [BOTTOM]))
@@ -699,7 +722,7 @@ class TestWhatALumpedPortRefusesBeforeAMesh:
                 References=[(sheet, [])],
             ),
         ]
-        refused(line, "'Port1' lays 'Port1 element 1', which lies partly on the boundary")
+        refused(line, "'Port1' lays 'Port1 element 1' partly on the region's boundary and partly")
 
     def test_a_coplanar_face_touching_the_element_is_no_part_of_its_plane(self):
         """A body standing past the end face above the strip puts the element
@@ -742,7 +765,7 @@ class TestWhatALumpedPortRefusesBeforeAMesh:
             raise ValueError("Null input shape")
 
         monkeypatch.setattr(drawn, "skin", failing)
-        refused(stripline(), "could not be fused", "Null input shape", "closed bodies")
+        refused(stripline(), "could not fuse", "Null input shape", "closed bodies")
 
     def test_a_lumped_port_beside_a_wave_port(self):
         line = stripline()
@@ -750,7 +773,7 @@ class TestWhatALumpedPortRefusesBeforeAMesh:
             "EMPortRectWaveguide",
             "Guide",
             Number=3,
-            Excitation=True,
+            Driven=True,
             ReferencedTo="Port impedance",
             ReferenceImpedance=50.0,
             Mode="TE10",
@@ -1041,8 +1064,8 @@ class TestWhatTheMeshDecides:
         said = between_the_boundary(described, mesh)
         assert said[0] == (
             "'Port1' lays 'Port1 element 1', both of whose ends lie on the region's "
-            "boundary, which this solver makes a perfect conductor where no metal is drawn, "
-            "so the element is driven between two parts of that boundary. 'StripBinding' "
+            "boundary, which is a perfect conductor where no metal is drawn, so the element "
+            "is driven between two parts of that boundary. 'StripBinding' "
             "lies on the region's boundary at an end, and stands on the wall there"
         )
 
@@ -1064,8 +1087,8 @@ class TestWhatTheMeshDecides:
         said = between_the_boundary(described, mesh)
         assert said[0] == (
             "'Port1' lays 'Port1 element 1', both of whose ends lie on the region's "
-            "boundary, which this solver makes a perfect conductor where no metal is drawn, "
-            "so the element is driven between two parts of that boundary"
+            "boundary, which is a perfect conductor where no metal is drawn, so the element "
+            "is driven between two parts of that boundary"
         )
 
     def test_a_strip_inside_the_region_is_not_said(self):
@@ -1095,7 +1118,7 @@ class TestWhatTheMeshDecides:
         described = problem(stripline().study)
         said = pipeline.beside(described, meshed(described))
         assert said[0].startswith(
-            "'Port1': the whole of the region's face its elements lie in, 'rest of the face "
+            "'Port1': the region's face its elements lie in, 'rest of the face "
             "of Port1', is a magnetic wall wherever no metal is drawn on it"
         )
 
@@ -1104,7 +1127,7 @@ class TestWhatTheMeshDecides:
         said = pipeline.beside(
             described, meshed(described, plane_sits=INTERIOR, element_sits=INTERIOR)
         )
-        assert said[0].startswith("'Port1' stands inside the model")
+        assert said[0].startswith("'Port1': 'Port1 element 1' stands inside the model")
 
     def test_an_element_inside_the_region_says_what_faces_it_and_how_far(self):
         """The strip ends five micrometres short of the end face, so its element
@@ -1260,13 +1283,86 @@ class TestTheAnswerRead:
         stored = results_glue.from_palace(answer, "guide")
         assert stored.provenance[IMPEDANCE_STATED] == {"1": POWER_VOLTAGE}
 
-    def test_a_shortfall_through_a_lumped_port_gives_the_share_and_no_advice(self):
-        shortfall = balance.Shortfall(excitation=1, frequency=8e9, share=2e-3, port=2)
-        said = balance.said(shortfall, {1: "Port1", 2: "Port2"}, lumped={1, 2})
-        assert said == (
-            f"{balance.WARNING}Driven from 'Port1', the matrix leaves 0.2% of the power "
-            "unaccounted for at 8 GHz. Most of it left through 'Port2', a lumped port"
+
+def through_lumped(share, dissipates=False):
+    """A column through two lumped ports leaving ``share`` of the watt - one
+    figure at 8 GHz, or one at each GHz from 2 - with faces reading what no
+    model gives."""
+    shares = np.atleast_1d(np.asarray(share, dtype=float))
+    matrix = np.zeros((shares.size, 2, 1), dtype=complex)
+    matrix[:, 1, 0] = np.sqrt(1.0 - shares)
+    return Scattering(
+        frequency=np.array([8e9]) if shares.size == 1 else 1e9 * np.arange(2, 2 + shares.size),
+        out=(1, 2),
+        driven=(1,),
+        matrix=matrix,
+        flux=np.tile([[-0.7], [0.2]], (shares.size, 1, 1)),
+        dissipates=dissipates,
+        stated={1: RESISTANCE, 2: RESISTANCE},
+    )
+
+
+NAMED = {1: "Port1", 2: "Port2"}
+
+
+class TestTheBalanceOfALumpedRun:
+    """A lumped port's face reads the field's curl, and its matrix the field
+    averaged along it, so the faces are not read, and what the matrix leaves is
+    stated and warned of only where it is more than went in."""
+
+    def test_the_faces_are_not_read(self):
+        (short,) = balance.shortfalls(through_lumped(3e-3, dissipates=True))
+        assert short.share == pytest.approx(3e-3, rel=1e-9, abs=0.0)
+        assert short.lumped and short.port is None
+
+    def test_a_lossless_share_is_the_solvers_and_no_warning_however_large(self):
+        (short,) = balance.shortfalls(through_lumped(0.2))
+        assert balance.said(short, NAMED) == (
+            "Driven from 'Port1', 20% (0.97 dB) of the power does not come back at the "
+            "ports at 8 GHz. It is the solver's error, since nothing in the model dissipates"
         )
+
+    def test_a_model_that_dissipates_is_given_a_budget_and_no_warning(self):
+        (short,) = balance.shortfalls(through_lumped(0.3, dissipates=True))
+        assert balance.said(short, NAMED) == (
+            "Driven from 'Port1', 30% (1.5 dB) of the power does not come back at the "
+            "ports at 8 GHz. It is dissipated in the model or is the solver's error, which "
+            "this run cannot separate"
+        )
+
+    def test_a_share_no_loss_in_decibels_can_state_is_written_without_one(self):
+        """An open surface read negative leaves a share past the whole watt."""
+        short = balance.Shortfall(1, 8e9, 1.2, None, radiated=-0.3, lumped=True)
+        assert balance.said(short, NAMED) == (
+            "Driven from 'Port1', 90% (10 dB) of the power does not come back at the ports "
+            "at 8 GHz: -30% left through the open surface, and the other 120% is the "
+            "solver's error, since nothing in the model dissipates"
+        )
+
+    def test_an_open_surface_read_as_no_number_warns(self):
+        short = balance.Shortfall(1, 8e9, math.nan, None, radiated=math.nan, lumped=True)
+        assert balance.said(short, NAMED).startswith(balance.WARNING)
+
+    def test_a_share_is_written_to_two_figures(self):
+        (short,) = balance.shortfalls(through_lumped(0.01234))
+        assert "1.2% (0.054 dB)" in balance.said(short, NAMED)
+
+    def test_more_than_went_in_is_not_hidden_by_a_larger_share_the_other_way(self):
+        for dissipates in (False, True):
+            (short,) = balance.shortfalls(through_lumped([0.3, -5 * balance.BAR], dissipates))
+            assert short.frequency == 3e9
+            assert balance.said(short, NAMED).startswith(balance.WARNING)
+
+    def test_more_than_went_in_warns_past_the_bar_whatever_dissipates(self):
+        for dissipates in (False, True):
+            (short,) = balance.shortfalls(through_lumped(-2 * balance.BAR, dissipates))
+            said = balance.said(short, NAMED)
+            assert said.startswith(balance.WARNING)
+            assert said.endswith("Refine the mesh")
+            (short,) = balance.shortfalls(through_lumped(-balance.BAR / 2, dissipates))
+            said = balance.said(short, NAMED)
+            assert not said.startswith(balance.WARNING)
+            assert "more power than went in" in said
 
 
 class TestTheRunOfALumpedPort:

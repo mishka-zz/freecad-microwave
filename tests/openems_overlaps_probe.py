@@ -220,7 +220,7 @@ def can_round_copper():
     perfect = createEMMaterial("PEC")
     perfect.MaterialType = "PEC"
     copper = createEMMaterial("Copper")
-    copper.MaterialType = "ConductingSheet"
+    copper.MaterialType = "Conducting Sheet"
     copper.Conductivity = 5.8e7
     copper.Thickness = 0.035
     analysis.addObject(bind("Can", perfect, can))

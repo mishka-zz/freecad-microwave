@@ -12,9 +12,9 @@ approximations were chosen over alternatives.
 |---|---|
 | [Cell allocation across three axes](openems-cell-allocation.md) | openEMS: resolving geometric lengths across independently sized Cartesian grid axes |
 | [Deciding where the grid lines go](openems-sizing-field.md) | openEMS: grid anchors, sizing field formulation, arclength placement, and symmetry |
-| [Measuring what the grid has to resolve](openems-feature-size.md) | openEMS: extracting local feature sizes and gap widths from CAD models |
+| [Extracting local feature sizes from CAD geometry](openems-feature-size.md) | openEMS: extracting local feature sizes and gap widths from CAD models |
 | [Conductor width discretization and warning thresholds](openems-conductor-width.md) | openEMS: conductor width discretization, edge treatment, and face sizing |
-| [Where the domain ends, and where the absorber goes](openems-domain-and-absorber.md) | openEMS: boundary padding, absorbing boundary layer (PML) depth, and domain sizing |
+| [Boundary padding, domain sizing, and absorbing boundaries](openems-domain-and-absorber.md) | openEMS: boundary padding, absorbing boundary layer (PML) depth, and domain sizing |
 | [The open boundary on Palace](palace-open-boundary.md) | The reserved air, the first-order absorbing condition, and the figures a run states about it |
 | [Building one S-matrix out of several runs](s-matrix-from-runs.md) | openEMS: assembling multi-port S-parameters from sequential solves and applying symmetry |
 | [Extracting phase velocity from transmission phase](velocity-from-phase.md) | Deriving phase velocity and distance axes from broadband phase data |
@@ -23,9 +23,9 @@ approximations were chosen over alternatives.
 
 The workbench translates FreeCAD geometry into numerical models for
 electromagnetic solvers. In particular, openEMS discretizes structures onto a
-rectilinear Yee grid. Because openEMS evaluates fields without alerting the user
-to subtle discretization artifacts (such as artificial gaps, mode splitting, or
-detuning), the grid generation rules must guarantee correct physical behavior.
+rectilinear Yee grid. openEMS does not report discretization artifacts such as
+artificial gaps, mode splitting or detuning, so the grid generation rules must
+prevent them.
 
 These documents record:
 - The derivations, benchmark findings, and trade-offs that established each rule.

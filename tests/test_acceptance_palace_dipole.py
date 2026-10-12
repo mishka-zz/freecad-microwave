@@ -4,7 +4,7 @@
 """Acceptance gate: a strip dipole in free space, answered by Palace.
 
 Two sheets of perfect conductor end to end with a gap between them, one lumped
-port across the gap, and every face of the domain set to ``Air``. Nothing is
+port across the gap, and every face of the domain set to ``Open``. Nothing is
 bound to a dielectric, so the air the adapter reserves round the sheets is the
 whole region, and the power the port puts in leaves by two ways only: back
 through the port, and out through the open surface.

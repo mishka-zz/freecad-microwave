@@ -5,7 +5,7 @@
 
 The mesh policy names it by ``Medium``, a link to a material, and an empty link
 is vacuum. The medium reaches out to the domain's faces and through the
-absorber beyond an ``Air`` face, so it is one volume of one material. Each
+absorber beyond an ``Open`` face, so it is one volume of one material. Each
 adapter reads the link itself and hands it here, so what it reads is in its own
 source, builds the medium in its own terms from the object :func:`linked`
 returns, and states it with :func:`said`.
@@ -111,10 +111,8 @@ def linked(chosen: Any, settings: Any) -> Any | None:
     declared = str(chosen.MaterialType)
     if declared != DOCUMENT_TYPES["dielectric"]:
         raise TranslationError(
-            f"{label(settings)!r}: Medium links {label(chosen)!r}, a {declared}. The medium "
-            "fills every space no bound body fills and reaches through the absorber, so it "
-            "is a Dielectric with one set of values across the band. Link a dielectric, or "
-            "clear the link for vacuum"
+            f"{label(settings)!r}: Medium links {label(chosen)!r}, a {declared}, and a "
+            "medium is a Dielectric. Link a dielectric material, or clear the link for vacuum"
         )
     return chosen
 
@@ -141,13 +139,15 @@ def medium(chosen: Any, settings: Any, centre: float) -> Medium:
 
 
 def _checked(found: Medium) -> Medium:
-    stated_values = (("permittivity", found.permittivity), ("permeability", found.permeability))
+    """``found``, refused where a value carries no wave or is not a loss."""
+    stated_values = (("Permittivity", found.permittivity), ("Permeability", found.permeability))
     for name, stated in stated_values:
         if not (math.isfinite(stated) and stated > 0.0):
-            raise ValueError(f"a relative {name} of {stated:g} carries no wave")
-    for name, loss in (("loss tangent", found.loss_tangent), ("conductivity", found.conductivity)):
+            raise ValueError(f"{name} is {stated:g}. Enter a finite value above 0")
+    losses = (("LossTangent", found.loss_tangent, ""), ("Conductivity", found.conductivity, " S/m"))
+    for name, loss, unit in losses:
         if not (math.isfinite(loss) and loss >= 0.0):
-            raise ValueError(f"a {name} of {loss:g} is not a loss")
+            raise ValueError(f"{name} is {loss:g}{unit}. Enter a finite value of 0 or more")
     return found
 
 

@@ -50,8 +50,8 @@ def capabilities() -> Capabilities:
             "no_absorbing_layer": "there is no perfectly matched layer. A "
             "problem open to free space is bounded by a surface carrying a "
             "first-order absorbing condition. The workbench reserves air round "
-            "everything bound to a material, Clearance deep on each face Padding "
-            "says Air and flush on every other, and the condition stands on the "
+            "everything bound to a material, Clearance deep on each face Boundary "
+            "says Open and flush on every other, and the condition stands on the "
             "open sides of it",
             "wave_port_beside_open": "a study open to free space is driven through "
             "lumped ports. A wave port beside the absorbing surface is refused by "

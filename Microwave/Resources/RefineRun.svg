@@ -1,0 +1,7 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Solve Again Finer: the Run Simulation circle and triangle, with a badge of finer cells. -->
+  <circle cx="27" cy="27" r="21" fill="none" stroke="#37474f" stroke-width="5"/>
+  <path d="M22 17.5 L38.5 27 L22 36.5 Z" fill="#e8833a"/>
+  <rect x="32" y="32" width="28" height="28" rx="3" fill="#ffffff" stroke="#607d8b" stroke-width="3"/>
+  <path d="M40 34 V58 M34 40 H58 M46 34 V58 M34 46 H58 M52 34 V58 M34 52 H58" stroke="#607d8b" stroke-width="2" fill="none"/>
+</svg>

@@ -32,8 +32,6 @@ from Microwave.Gui import results as glue  # noqa: E402
 from Microwave.Objects.analysis import members  # noqa: E402
 from Microwave.Objects.kinds import kind_of  # noqa: E402
 from Microwave.Objects.materials import createEMMaterial  # noqa: E402
-from Microwave.Objects.mesh import createEMGmshMesh  # noqa: E402
-from Microwave.Objects.solver import createEMSolverPalace  # noqa: E402
 
 
 def _example():
@@ -58,10 +56,11 @@ def build():
     air, planes = WR42.geometry(doc)
     analysis = WR42.study(doc)
     ports = WR42.markup(analysis, air, planes)
-    palace = createEMSolverPalace(doc)
-    analysis.addObject(palace)
-    tetrahedra = createEMGmshMesh(doc)
-    analysis.addObject(tetrahedra)
+    # The example's study carries the Palace solver and its mesh.
+    palace, tetrahedra = (
+        next(m for m in members(analysis) if kind_of(m) == kind)
+        for kind in ("EMSolverPalace", "EMGmshMesh")
+    )
     doc.recompute()
     return {
         "doc": doc,
@@ -116,7 +115,7 @@ MOVES = {
     "a port's plane": shifted,
     "a port's reference depth": lambda d: setattr(d["port"], "ReferenceDepth", 0.1),
     "the medium": filled,
-    "a face of the domain": lambda d: setattr(d["policy"], "PaddingZMax", "Air"),
+    "a face of the domain": lambda d: setattr(d["policy"], "BoundaryZMax", "Open"),
     "the clearance": lambda d: setattr(d["policy"], "Clearance", 3.0),
 }
 
@@ -129,13 +128,15 @@ STAYS = {
     "reopened": reopened,
     "a label": lambda d: setattr(d["material"], "Label", "Air"),
     "a colour": lambda d: setattr(d["material"], "Color", (0.1, 0.2, 0.3)),
-    "points": lambda d: setattr(d["analysis"], "NumFrequencyPoints", 11),
+    "points": lambda d: setattr(d["analysis"], "FrequencyPoints", 11),
     "the grid's density": lambda d: setattr(d["grid"], "ElementsPerWavelength", 12),
     "the tetrahedra's density": lambda d: setattr(d["tetrahedra"], "ElementsPerWavelength", 12),
     "the order": lambda d: setattr(d["palace"], "Order", 3),
-    "the policy's demand on a mesh": lambda d: setattr(d["policy"], "MinElementsAcross", 5),
+    "the policy's demand on a curve": lambda d: setattr(d["policy"], "CurveTolerance", 0.01),
+    "the grid's count across a dielectric": lambda d: setattr(d["grid"], "MinElementsAcross", 5),
     "a port's referencing": lambda d: setattr(d["port"], "ReferencedTo", "Fixed impedance"),
-    "a port's excitation": lambda d: setattr(d["port"], "Excitation", False),
+    "a port's excitation": lambda d: setattr(d["port"], "Driven", False),
+    "a port's status": lambda d: setattr(d["port"], "Status", "CrossSection is not picked"),
 }
 
 

@@ -198,7 +198,7 @@ def record(
         # A figure that is not a number compares false against the bar, so a
         # port holding one is counted as not weighed rather than as quiet.
         if not all(np.all(np.isfinite(np.asarray(f, dtype=float))) for f in figures):
-            missed[number] = "its waves' difference is not a number"
+            missed[number] = "the planes inside its box give no finite reading"
             continue
         held = 1 - np.exp(-np.asarray(port.decay, dtype=float) * port.depth)
         parts[number] = 2 * np.asarray(port.differ, dtype=float) / held**2
@@ -273,24 +273,24 @@ def said(provenance: Mapping[str, Any], finished: bool = True) -> str | None:
     lines = []
     if finished and float(found.get("share", 0.0)) > float(found.get("bar", BAR)):
         port = found["port"]
+        # A guide carrying each port's mode alone predicts the waves at the
+        # port's plane exactly from those at the planes inside its box.
         text = (
-            f"the waves the waveguide ports read differ from those planes inside their boxes "
-            f"predict along each guide, by enough for the matrix to be off by something "
-            f"of the order of {percent(found['share'])} of the wave driven in at "
-            f"{found['frequency'] / 1e9:.6g} GHz, the largest part of it at port {port}. A "
-            "guide carrying each port's mode alone predicts them exactly. A change in the "
-            "guide near a port leaves a field there that the port reads with its mode"
+            f"the waves the waveguide ports read differ from what planes inside their "
+            f"boxes predict, so the matrix may be off by about "
+            f"{percent(found['share'])} of the driven wave at "
+            f"{found['frequency'] / 1e9:.6g} GHz, mostly at port {port}. A change in "
+            "the guide near a port leaves a field there that the port reads with its mode"
         )
         side = found.get("side")
         if side == "behind":
             text += (
-                f". At port {port} the difference grows with depth faster than a field "
-                "dying away from the structure could, so it comes from the source's side "
-                "of the plane. A guide changing behind the port gives that, and the "
-                "matrix may then be right. So does the port's own source where its box is "
-                "not drawn on the guide's walls, and a port whose mode is near its cutoff. "
-                "Draw the port's box on the guide's walls, and the port farther from what "
-                "changes the guide"
+                f". At port {port} the difference grows toward the source faster than a "
+                "field from the structure could, so it comes from behind the plane: from "
+                "a change in the guide behind the port, which may leave the matrix right, "
+                "from the port's own source where its box is not drawn on the guide's "
+                "walls, or from a mode near its cutoff. Draw the port's box on the "
+                "guide's walls, and the port farther from what changes the guide"
             )
         elif side == "front":
             text += ". Draw the port farther from what changes the guide"
@@ -303,14 +303,14 @@ def said(provenance: Mapping[str, Any], finished: bool = True) -> str | None:
         else:
             text += (
                 f". The planes inside port {port}'s box cannot tell whether the change "
-                "stands in front of the port or behind it. Draw the port farther from "
-                "what changes the guide"
+                "is in front of the port or behind it. Draw the port farther from what "
+                "changes the guide"
             )
         lines.append(text)
     for number, port in found["ports"].items():
         if port.get("missed"):
             lines.append(
-                f"port {number} is not weighed for a field besides its mode, because "
+                f"port {number} is not checked for a field besides its mode, because "
                 f"{port['reason']}"
             )
     return ". ".join(lines) if lines else None

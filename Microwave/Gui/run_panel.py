@@ -22,15 +22,13 @@ answers :meth:`RunPanel.worker_slots`.
 # hands its edit back, and nothing here has
 # a reduced behaviour a guard could select.
 import html
-import traceback
 
 import FreeCADGui
 from PySide import QtCore, QtGui, QtWidgets
 
 from .. import __version__
-from ..Results.sparameters import ResultError
-from ..Solvers.cancellation import Cancellation, Cancelled
-from . import symmetry as symmetry_check
+from ..Solvers.cancellation import Cancellation
+from .run_steps import FAILED, WARNED, Steps, run_job
 
 #: Lines a log keeps. ``QPlainTextEdit`` discards the oldest blocks, which for a
 #: run's log is backwards: the head of it says what was run. The cap bounds a
@@ -48,6 +46,28 @@ def version_line() -> str:
     return f"<small><font color='gray'>Microwave {__version__}</font></small>"
 
 
+#: The colour a line of each tone is drawn in: the colour the status line gives
+#: a warning and a failure.
+TONES = {WARNED: "orange", FAILED: "red"}
+
+
+def append(view, text, tone=None):
+    """Add ``text`` to the end of the log ``view``, each of its lines in the
+    colour of ``tone``, or in the view's own where ``tone`` has none."""
+    view.appendPlainText(text)
+    if tone not in TONES:
+        return
+    drawn = QtGui.QTextCharFormat()
+    drawn.setForeground(QtGui.QColor(TONES[tone]))
+    block = view.document().lastBlock()
+    for _ in range(text.count("\n")):
+        block = block.previous()
+    cursor = QtGui.QTextCursor(view.document())
+    cursor.setPosition(block.position())
+    cursor.movePosition(QtGui.QTextCursor.End, QtGui.QTextCursor.KeepAnchor)
+    cursor.mergeCharFormat(drawn)
+
+
 def log_view():
     """The read-only log a run writes into."""
     view = QtWidgets.QPlainTextEdit()
@@ -62,56 +82,47 @@ def log_view():
     return view
 
 
-def attempt(job, explain, cancellation, say):
-    """Run ``job``, and say how it ended: ``(succeeded, answer, failure)``.
+def show_log(run):
+    """What ``run`` said, in a window of its own that nothing can edit, each
+    line it warned of drawn as the panel drew it. Returns the window."""
+    from .notify import main_window
 
-    ``job`` is handed the cancellation and ``say``, a function to say a line
-    with. ``failure`` is ``None`` unless something went wrong, and the text
-    saying what where it did - which may be empty, and is still a failure. A
-    stop is not one: nothing went wrong and the user asked for it, so it is
-    said as a line instead.
-
-    What the job raises is sorted by ``explain``, which a panel supplies because
-    the panel knows which failures are the model's or the machine's and which
-    are a defect here. ``explain`` returns the lines saying what went wrong, or
-    ``None`` for a failure it does not recognise - which is reported with its
-    traceback, because that is what a report of a defect needs.
-
-    A function rather than the body of :class:`JobWorker`, because nothing
-    inside a ``QThread`` subclass can be run without a display, and what this
-    decides is ordinary control flow.
-    """
-    try:
-        return True, job(cancellation, say), None
-    except Cancelled as stopped:
-        say(str(stopped))
-        return False, None, None
-    except Exception as error:
-        lines = explain(error)
-        if lines is None:
-            lines = [f"Internal error: {error}", traceback.format_exc()]
-        return False, None, "\n".join(lines)
+    warned = {line for said in run.Diagnostics for line in str(said).split("\n")}
+    dialog = QtWidgets.QDialog(main_window())
+    dialog.setWindowTitle(f"Log of {run.Label}")
+    view = log_view()
+    for line in str(run.Log).split("\n"):
+        append(view, line, WARNED if line in warned else None)
+    view.moveCursor(QtGui.QTextCursor.Start)
+    QtWidgets.QVBoxLayout(dialog).addWidget(view)
+    dialog.resize(900, 600)
+    dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+    dialog.show()
+    _logs.append((dialog, run.Document.Name))
+    return dialog
 
 
-def run_job(job, explain, cancellation, said, keep, failed, finished):
-    """Run ``job``, and say how it ended through the callables.
+#: Each log window shown and the document its run is in. A window belongs to
+#: the main window rather than to a document, so FreeCAD leaves it open when the
+#: document closes; :func:`closed` closes it.
+_logs: list = []
 
-    ``keep`` is handed the answer before anything is said about the end, since
-    a panel told the run finished reads the answer at once - and on another
-    thread, where the telling is queued and may be read before this function
-    returns. ``failed`` hears the failure, however little it says, and
-    ``finished`` whether the job succeeded, always last, so a panel listening
-    for the end of a run hears it whatever happened. A function for the reason
-    :func:`attempt` is one.
-    """
-    succeeded, failure = False, None
-    try:
-        succeeded, answer, failure = attempt(job, explain, cancellation, said)
-        keep(answer)
-    finally:
-        if failure is not None:
-            failed(failure)
-        finished(succeeded)
+
+def closed(document):
+    """Close each log window of a run in the document named ``document``, which
+    is closing, and forget each window already closed."""
+    kept = []
+    for dialog, name in _logs:
+        try:
+            if name == document:
+                dialog.close()
+                continue
+            dialog.isVisible()
+        except RuntimeError:
+            # Qt has deleted a window the user closed, and its wrapper says so.
+            continue
+        kept.append((dialog, name))
+    _logs[:] = kept
 
 
 class JobWorker(QtCore.QThread):
@@ -147,18 +158,14 @@ class JobWorker(QtCore.QThread):
         self.answer = answer
 
 
-class RunPanel:
-    """A run's worker, how it is let go, and FreeCAD's task dialog protocol."""
+class RunPanel(Steps):
+    """A run's worker, how it is let go, and FreeCAD's task dialog protocol,
+    and the widgets a run's status and log are shown in."""
 
-    def set_status(self, text, color=None):
-        # The colour is remembered, because searching the rendered label for
-        # the word "warning" misses every amber verdict phrased differently.
-        # Check would then paint "Ready to run" in green over a line saying no
-        # S-matrix will be stored.
-        self.status_color = color
-        text = html.escape(str(text))
+    def show_status(self, text, color):
+        text = html.escape(text)
         # No colour means no <font> at all, so the palette supplies one. The
-        # neutral statuses are Idle, Translating and every progress marker,
+        # neutral statuses are Idle, Checking and every progress marker,
         # which is where a run spends all its time. They would otherwise be
         # written black and be unreadable on a dark theme. Naming the other
         # colour instead fails the same way on a light one.
@@ -166,68 +173,27 @@ class RunPanel:
             f"Status: <font color='{color}'>{text}</font>" if color else f"Status: {text}"
         )
 
-    def log(self, line):
-        self.log_view.appendPlainText(line)
+    def show_refined(self, holder):
+        """Draw the run this one refines and ``holder``, the matrix this run
+        filed, on one set of axes, at the term that moved most, with their
+        difference. Returns whether it drew, which it does not for a run that
+        refines none, or one whose run is gone."""
+        from . import refine
+        from . import results as results_glue
+        from .plot_s_params import show_overlay
 
-    def report_derived(self, matrix):
-        """Say which columns a declared mirror filled, and how far the two ports
-        stood from being the one port the declaration makes them."""
-        if not matrix.derived:
-            return
-        self.log(
-            f"Column(s) {list(matrix.derived)} were derived from the "
-            "declared mirror symmetry, not measured."
-        )
-        # The derivation takes the two ports to be one, so a disagreement
-        # between the impedances they measured is how far the declaration
-        # is from what was measured. It is exactly zero for lumped ports,
-        # whose Z_ref is the number the user typed. A port that measures its
-        # own impedance does not come back identical at the two ends of a
-        # symmetric line.
-        mismatch = float(matrix.provenance.get("symmetry_impedance_mismatch", 0.0))
-        if mismatch > symmetry_check.RESULT_TOLERANCE:
-            self.log(
-                f"Symmetry: the two ports measured reference impedances "
-                f"{mismatch:.2%} apart, so they are not quite the one port "
-                "the declaration makes them. Drive both ports to measure "
-                "the second column instead."
-            )
+        before = None if self.refined is None else self.refined.run
+        if before is None or results_glue.matrix_of(before) is None:
+            return False
+        tables = results_glue.overlaid([before, holder])
+        show_overlay(tables, refine.most(tables[0].result, tables[1].result), against=0)
+        return True
 
-    def report_symmetry(self, matrix, symmetry):
-        """Test a declared symmetry when the run happened to measure both ends.
+    def show_line(self, line, tone=None):
+        append(self.log_view, line, tone)
 
-        The test costs nothing, and it is the only thing that makes the
-        declaration falsifiable. Solve both ports once and read the
-        disagreement. If it is small, every later run can be half the cost.
-        Nothing is refused on the strength of it. The number is reported, and
-        the engineer decides.
-        """
-        if symmetry is None:
-            return
-        try:
-            gap = matrix.mirror_disagreement()
-        except ResultError:
-            # mirror_disagreement refuses a matrix it derived, because the
-            # answer would be zero by construction. It also refuses an
-            # incomplete matrix, and anything that is not a two-port. Each
-            # panel reports which columns it measured, and none of those cases
-            # is a reason to say anything here. Guarding on those
-            # conditions here would restate ``mirror_disagreement``'s own
-            # rule.
-            return
-
-        if gap > symmetry_check.RESULT_TOLERANCE:
-            self.log(
-                f"Symmetry: measured S22 and S11 differ by {gap:.2%} of the "
-                "largest term, so this device, or the grid or mesh it was solved "
-                "on, is not the mirror the study declares. Deriving a column from "
-                "one solve would carry that error."
-            )
-        else:
-            self.log(
-                f"Symmetry: measured S22 matches S11 to {gap:.2%} - the mirror "
-                "declaration holds, so one solve would have done."
-            )
+    def clear_shown(self):
+        self.log_view.clear()
 
     def worker_slots(self):
         """Which of the worker's signals goes where.

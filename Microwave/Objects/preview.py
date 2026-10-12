@@ -3,10 +3,10 @@
 
 import FreeCAD
 
-from ._vp_hook import ViewProviderRestored, redraw_preview
+from ._vp_hook import SharesLabel, ViewProviderRestored, redraw_preview
 
 
-class EMMeshPreview(ViewProviderRestored):
+class EMMeshPreview(SharesLabel, ViewProviderRestored):
     """The generated grid, as geometry that can be looked at.
 
     A ``Part::FeaturePython`` rather than a view-only overlay. Restore-time
@@ -41,7 +41,11 @@ class EMMeshPreview(ViewProviderRestored):
 
     def __init__(self, obj):
         obj.addProperty(
-            "App::PropertyEnumeration", "Display", "Preview", "Which view of the mesh to draw"
+            "App::PropertyEnumeration",
+            "Display",
+            "Preview",
+            "Outline: the domain and the absorber as boxes. Slices: three planes of"
+            " the grid. Anchors: the planes the grid is pinned to",
         )
         obj.Display = ["Outline", "Slices", "Anchors"]
         obj.Display = "Slices"
@@ -59,16 +63,16 @@ class EMMeshPreview(ViewProviderRestored):
                 "App::PropertyDistance",
                 where,
                 "Slices",
-                f"Where the {axis} plane sits; snapped to the nearest grid line",
+                f"Position of the {axis} slice, snapped to the nearest grid line",
             )
             setattr(obj, where, 0.0)
 
         # Links, so FreeCAD's dependency graph reaches this object and marks it
         # touched when anything it was meshed from changes. The marker is the
         # reason they exist: FEM's own mesh objects carry the same thing (a
-        # Shape link plus three link lists) and no execute(), so a recompute
-        # clears the marker without remeshing. The marker is a hint, and the
-        # panel's staleness line is the answer.
+        # Shape link plus link lists to what it is meshed with) and no
+        # execute(), so a recompute clears the marker without remeshing. The
+        # marker is a hint, and the panel's staleness line is the answer.
         #
         # There is no link back to the study. The preview is a member of the
         # analysis group, and group membership is itself a dependency edge
@@ -81,7 +85,7 @@ class EMMeshPreview(ViewProviderRestored):
             "App::PropertyLinkList",
             "MeshedFrom",
             "Provenance",
-            "Everything the drawn grid was meshed from",
+            "The objects the drawn grid was built from",
         )
         obj.setEditorMode("MeshedFrom", 1)
 
@@ -92,7 +96,7 @@ class EMMeshPreview(ViewProviderRestored):
             "App::PropertyEnumeration",
             "Status",
             "Provenance",
-            "Whether the drawn grid still describes the document",
+            "Whether the drawn grid matches the document. Press Mesh to update it",
         )
         obj.Status = [CURRENT, OUT_OF_DATE]
         obj.Status = OUT_OF_DATE
@@ -100,10 +104,10 @@ class EMMeshPreview(ViewProviderRestored):
             "App::PropertyString",
             "Digest",
             "Provenance",
-            "Digest of what the grid this preview shows was computed from",
+            "Checksum of the inputs the drawn grid was computed from",
         )
         obj.addProperty(
-            "App::PropertyInteger", "Cells", "Provenance", "Cells in the grid this preview shows"
+            "App::PropertyInteger", "Cells", "Provenance", "Number of cells in the drawn grid"
         )
         for name in ("Status", "Digest", "Cells"):
             obj.setEditorMode(name, 1)
@@ -120,9 +124,9 @@ class EMMeshPreview(ViewProviderRestored):
         FreeCAD restores the properties an object had rather than reconciling it
         against its class, so a preview whose file was written without the grid
         properties comes back without them. Adding them here is what keeps
-        Update Mesh from failing on the write. They come back empty, and an
+        Mesh from failing on the write. They come back empty, and an
         empty grid is one nothing can be drawn from, so a display property does
-        nothing until the next Update Mesh fills them.
+        nothing until the next Mesh fills them.
 
         The status that keeps a display change off the document is put back by
         the mixin, for the same reason and with the same guard.
@@ -168,7 +172,7 @@ class EMMeshPreview(ViewProviderRestored):
 
         A display property that needs a button press is not how FreeCAD behaves
         anywhere else: Apply is not pressed after changing Transparency. Mesh
-        policy can cost seconds on a real board, so it waits for Update Mesh.
+        policy can cost seconds on a real board, so it waits for Mesh.
 
         A display property does not touch the object, so nothing recomputes it
         for one and ``execute`` does not run - see ``Objects/staleness.py``. The
@@ -216,7 +220,7 @@ def createEMMeshPreview(doc=None):
     doc = doc or FreeCAD.ActiveDocument
     obj = doc.addObject("Part::FeaturePython", "EMMeshPreview")
     EMMeshPreview(obj)
-    obj.Label = "Mesh Preview"
+    obj.Label = "Mesh (openEMS)"
 
     from ._vp_hook import inject_view_provider
 

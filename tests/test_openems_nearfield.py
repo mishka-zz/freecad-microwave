@@ -134,11 +134,11 @@ class TestTheRecord:
             {1: weighed([0.0, math.nan, 0.0]), 2: weighed([0.0, 0.5e-6, 0.0])}, {}, {}, FREQUENCY
         )
         assert found["ports"]["1"] == {
-            "reason": "its waves' difference is not a number",
+            "reason": "the planes inside its box give no finite reading",
             "missed": True,
         }
         assert found["share"] == pytest.approx(1e-3, rel=1e-12, abs=0.0)
-        assert "port 1 is not weighed" in nearfield.said({nearfield.KEY: found})
+        assert "port 1 is not checked" in nearfield.said({nearfield.KEY: found})
 
     def test_so_is_a_shallower_plane_that_is_not_a_number(self):
         found = nearfield.record(
@@ -239,9 +239,9 @@ class TestWhatTheRunSays:
     def test_past_it_the_share_the_frequency_and_the_port(self):
         said = self.said(2.5e-3, growth=0.5)
         assert said is not None
-        assert "off by something of the order of 0.25% of the wave driven in" in said
+        assert "may be off by about 0.25% of the driven wave" in said
         assert "at 21 GHz" in said
-        assert "the largest part of it at port 2" in said
+        assert "mostly at port 2" in said
         assert said.endswith("Draw the port farther from what changes the guide")
         assert "may be right" not in said and "cannot tell" not in said
 
@@ -250,10 +250,8 @@ class TestWhatTheRunSays:
         source launching more than its mode does not, so the remedy is named."""
         said = self.said(2.5e-3, growth=2.0)
         assert said is not None
-        assert "grows with depth faster than a field dying away from the structure could" in said
-        assert (
-            "A guide changing behind the port gives that, and the matrix may then be right" in said
-        )
+        assert "grows toward the source faster than a field from the structure could" in said
+        assert "a change in the guide behind the port, which may leave the matrix right" in said
         assert "the port's own source where its box is not drawn on the guide's walls" in said
         assert "near its cutoff" in said
         assert "Draw the port's box on the guide's walls" in said
@@ -261,13 +259,16 @@ class TestWhatTheRunSays:
     def test_a_growth_between_the_two_cannot_tell_which(self):
         said = self.said(2.5e-3, growth=1.0)
         assert said is not None
-        assert "cannot tell whether the change stands in front of the port or behind it" in said
-        assert "may then be right" not in said
+        assert "cannot tell whether the change is in front of the port or behind it" in said
+        assert "may leave the matrix right" not in said
 
     def test_a_port_read_at_one_plane_cannot_say_which(self):
         said = self.said(2.5e-3)
         assert said is not None
         assert "Port 2 is read at one plane inside its box, which cannot tell" in said
+        assert said.endswith(
+            ". Draw the port farther from what changes the guide, or its box deeper"
+        )
 
     def test_nothing_of_the_share_where_the_record_did_not_finish(self):
         """A record cut short moves the planes apart by itself."""
@@ -276,7 +277,7 @@ class TestWhatTheRunSays:
     def test_a_port_it_could_not_weigh_is_named_with_the_reason(self):
         said = self.said(0.0, growth=0.5, missed={5: "its box holds no grid line"})
         assert said == (
-            "port 5 is not weighed for a field besides its mode, because its box holds no grid line"
+            "port 5 is not checked for a field besides its mode, because its box holds no grid line"
         )
         assert self.said(0.0, growth=0.5, finished=False, missed={5: "R"}) is not None
 

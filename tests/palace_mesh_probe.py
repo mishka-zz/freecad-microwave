@@ -38,9 +38,9 @@ import FreeCAD  # noqa: E402
 import FreeCADGui  # noqa: E402
 
 from Microwave.Gui import fem_mesh  # noqa: E402
+from Microwave.Gui import results as glue  # noqa: E402
+from Microwave.Objects.kinds import kind_of  # noqa: E402
 from Microwave.Objects.mesh import createEMMeshRegion  # noqa: E402
-from Microwave.Objects.results import SOLVED_ON, createEMSParameters  # noqa: E402
-from Microwave.Objects.results import label as result_label  # noqa: E402
 from Microwave.Solvers.palace import document, pipeline  # noqa: E402
 from Microwave.Solvers.palace.capabilities import capabilities  # noqa: E402
 from tests.palace_waveguide_probe import build, missing  # noqa: E402
@@ -72,7 +72,7 @@ def meshed(analysis, out, size):
     key, linked = fem_mesh.inputs(analysis), fem_mesh.built_from(analysis)
     prepared = pipeline.prepare(analysis, os.path.join(out, f"run{size}"))
     made = pipeline.meshed(prepared, numbered_as=fem_mesh.FORMAT)
-    shown, _ = fem_mesh.record(
+    shown = fem_mesh.record(
         analysis,
         capabilities().solver,
         fem_mesh.read(made),
@@ -89,8 +89,18 @@ def mark(analysis):
     return {
         "status": str(found.Status),
         "label": found.Label,
+        "overlaid": overlaid(found),
         "says": fem_mesh.staleness(analysis, capabilities().solver),
     }
+
+
+def overlaid(obj):
+    """The overlays the tree draws on ``obj``'s icon, by file name, or ``None``
+    where it has no view of ours."""
+    proxy = getattr(getattr(obj, "ViewObject", None), "Proxy", None)
+    if proxy is None or not hasattr(proxy, "getOverlayIcons"):
+        return None
+    return sorted(os.path.basename(path) for path in proxy.getOverlayIcons().values())
 
 
 def edited(doc, change):
@@ -112,7 +122,8 @@ def marks(out):
     refined = doc.addObject("Part::Box", "Refined")
     refined.Length = refined.Width = refined.Height = 1.0
     refined.Placement.Base = FreeCAD.Vector(5.0, 2.0, 1.0)
-    region = createEMMeshRegion(doc)
+    recipe = next(obj for obj in analysis.Group if kind_of(obj) == "EMGmshMesh")
+    region = createEMMeshRegion(doc, recipe)
     region.References = [(refined, [""])]
     region.ElementSize = 1.0
     analysis.addObject(region)
@@ -125,9 +136,9 @@ def marks(out):
 
     meshed(analysis, out, size)
     answer["made"] = mark(analysis)
-    edited(doc, lambda: setattr(port, "Excitation", not port.Excitation))
+    edited(doc, lambda: setattr(port, "Driven", not port.Driven))
     answer["excitation"] = mark(analysis)
-    edited(doc, lambda: setattr(analysis, "NumFrequencyPoints", analysis.NumFrequencyPoints + 1))
+    edited(doc, lambda: setattr(analysis, "FrequencyPoints", analysis.FrequencyPoints + 1))
     answer["points"] = mark(analysis)
     doc.openTransaction("Edit")
     body.Height = float(body.Height) * 1.01
@@ -172,18 +183,34 @@ def marks(out):
     edited(doc, lambda: setattr(second_body, "Height", float(second_body.Height) * 1.01))
     answer["second study's body"] = mark(other)
 
-    # A result solved on the second study's mesh, and that mesh then deleted.
-    result = createEMSParameters(doc)
+    # A run solved on the second study's mesh, and that mesh then deleted.
     shown = fem_mesh.find(other, capabilities().solver)
-    solved_on = {"solver": capabilities().solver, SOLVED_ON: shown.Identity}
-    result.Provenance = json.dumps(solved_on)
-    result.Label = result_label(capabilities().solver)
-    other.addObject(result)
+    result = glue.put(other, solved(shown.Identity))
+    run = glue.run_of(result)
     doc.recompute()
-    answer["result beside its mesh"] = result.Label
+    answer["run beside its mesh"] = [run.Label, result.Label]
     doc.removeObject(shown.Name)
-    answer["result, its mesh deleted"] = result.Label
+    answer["run, its mesh deleted"] = [run.Label, result.Label]
     return answer
+
+
+def solved(identity):
+    """A one-port matrix recording that it was solved on the mesh ``identity``."""
+    import numpy as np
+
+    from Microwave.Results.sparameters import SParameters
+
+    return fem_mesh.solved_on(
+        SParameters(
+            frequency=np.array([20e9, 26e9]),
+            s=np.zeros((2, 1, 1), dtype=complex),
+            port_numbers=(1,),
+            reference=np.full((2, 1), 50.0),
+            measured_impedance=np.full((2, 1), 50.0 + 0j),
+            provenance={"solver": capabilities().solver},
+        ),
+        identity,
+    )
 
 
 def seen(obj):
@@ -193,6 +220,7 @@ def seen(obj):
         "type": obj.TypeId,
         "label": obj.Label,
         "provider": type(view).__name__ if view is not None else None,
+        "icon": os.path.basename(view.Proxy.getIcon()) if view is not None else None,
         "modes": list(view.listDisplayModes()) if view is not None else [],
         "visible": bool(view.Visibility) if view is not None else None,
         "volumes": obj.FemMesh.VolumeCount,

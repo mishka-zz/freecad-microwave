@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import FreeCAD  # noqa: E402
 import Part  # noqa: E402
 
+from Microwave.Objects.kinds import kind_of  # noqa: E402
 from Microwave.Objects.mesh import createEMMeshRegion  # noqa: E402
 from Microwave.Solvers.palace import attributes, pipeline, write  # noqa: E402
 from tests.palace_waveguide_probe import BROAD, NARROW, build, missing  # noqa: E402
@@ -72,7 +73,8 @@ def main(out):
         if shape is not None:
             drawn = doc.addObject("Part::Feature", "Region")
             drawn.Shape = shape()
-            region = createEMMeshRegion(doc)
+            recipe = next(obj for obj in analysis.Group if kind_of(obj) == "EMGmshMesh")
+            region = createEMMeshRegion(doc, recipe)
             region.Mode = "Refine"
             region.ElementSize = SIZE
             region.References = [(drawn, "")]

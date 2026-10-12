@@ -14,7 +14,7 @@ their own, and this side is the one with the kernel.
 The dipole is two sheets of perfect conductor in one plane, end to end along x
 with a gap between them, and one lumped port across the gap from the end edge of
 one arm to the end edge of the other. Nothing is bound to a dielectric: the
-study sets every face of the domain to ``Air``, so the air the adapter reserves
+study sets every face of the domain to ``Open``, so the air the adapter reserves
 round the sheets is the region the field is in, and its skin carries the
 absorbing condition.
 
@@ -88,7 +88,7 @@ MESH_SIZES = re.compile(
     r"asked for elements around ([0-9.eE+-]+) mm"
 )
 UNKNOWNS = re.compile(r"\bND \(p = \d+\): (\d+)")
-ESTIMATE = re.compile(r"estimates it moved the column's terms by ([0-9.eE+-]+)")
+ESTIMATE = re.compile(r"column's terms move by about ([0-9.eE+-]+)")
 
 
 def end_edge(arm, x):
@@ -117,7 +117,7 @@ def build(doc, clearance, per_wavelength, permittivity=1.0):
     analysis.Label = "Strip dipole on Palace"
     analysis.FrequencyStart = f"{FREQ_START / scale:.12g} Hz"
     analysis.FrequencyStop = f"{FREQ_STOP / scale:.12g} Hz"
-    analysis.NumFrequencyPoints = POINTS
+    analysis.FrequencyPoints = POINTS
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [obj for obj in analysis.Group if obj is not member]
@@ -142,7 +142,7 @@ def build(doc, clearance, per_wavelength, permittivity=1.0):
     port = createEMPortLumped("Feed", doc)
     port.Label = "Feed"
     port.Number = 1
-    port.Excitation = True
+    port.Driven = True
     port.Resistance = RESISTANCE / scale
     port.ReferencedTo = PORT_IMPEDANCE
     port.ExcitationAxis = "X"
@@ -162,7 +162,7 @@ def build(doc, clearance, per_wavelength, permittivity=1.0):
         settings.Medium = medium
     for axis in "XYZ":
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Air")
+            setattr(settings, f"Boundary{axis}{side}", "Open")
     doc.recompute()
     return analysis, solver
 

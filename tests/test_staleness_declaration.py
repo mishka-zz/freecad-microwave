@@ -134,7 +134,7 @@ class TestTheStudyMarksThePreviewItself:
         # Written out rather than read off the class under test. Taking the
         # list from MOVES_NO_CELL would make a name dropped from it stop being
         # tested for, which is the fault this asks about.
-        ["NumFrequencyPoints", "SmallestResponse", "Symmetry"],
+        ["FrequencyPoints", "ResponseFloor", "Symmetry"],
     )
     def test_what_the_mesher_never_reads_leaves_it_alone(self, name, doc):
         study, drawing = self._study_with_preview(doc)
@@ -198,7 +198,7 @@ class TestMembership:
     """What the study holds is a grid input, and no property announces it.
 
     ``Gui/openems_mesh_preview.py::_link`` rebuilds the preview's link list at
-    each Update Mesh and nowhere else, so an object added afterwards is in no
+    each Mesh and nowhere else, so an object added afterwards is in no
     list: it reaches the preview through nothing, and neither does any later
     edit to it. Comparing what the study holds against what the drawing was
     made from is what answers that, and it translates nothing.
@@ -221,7 +221,7 @@ class TestMembership:
 
     def test_a_refinement_region_added_after_the_drawing_ages_it(self, doc):
         """The case the drawing cannot see any other way. A region created
-        after Update Mesh is in no link list, so its ``ElementSize`` is
+        after Mesh is in no link list, so its ``ElementSize`` is
         invisible for as long as the region is."""
         study, drawing = self._drawn(doc)
         study.addObject(mesh.createEMMeshRegion(doc=doc))
@@ -313,11 +313,11 @@ class TestTheStudyMarksAMeshFreeCADDraws:
         study, made = self._meshed(doc)
         study.Proxy.onChanged(study, name)
         assert made.Status == preview.OUT_OF_DATE
-        assert made.Label == "Mesh (Palace) - out of date"
+        assert made.Label == "Mesh (Palace)"
 
     @pytest.mark.parametrize(
         "name",
-        ["NumFrequencyPoints", "SmallestResponse", "Symmetry", "Label"],
+        ["FrequencyPoints", "ResponseFloor", "Symmetry", "Label"],
     )
     def test_what_it_declares_leaves_it_alone(self, name, doc):
         study, made = self._meshed(doc)
@@ -363,12 +363,6 @@ class TestTheStudyMarksAMeshFreeCADDraws:
             del doc.Transacting
         assert made.Status == preview.CURRENT
 
-    def test_a_label_freecad_numbered_to_keep_it_unique_is_marked(self, doc):
-        study, made = self._meshed(doc)
-        made.Label = "Mesh (Palace)001"
-        study.Proxy.onChanged(study, "FrequencyStop")
-        assert made.Label == "Mesh (Palace) - out of date"
-
     def test_a_label_somebody_wrote_is_left_alone_and_the_mark_still_written(self, doc):
         study, made = self._meshed(doc)
         made.Label = "Iris mesh"
@@ -405,7 +399,7 @@ class TestARecomputeReachingAMeshFreeCADDraws:
         study = analysis.createEMAnalysis(doc=doc)
         made = shown.put(study, "Palace", "a mesh", key=shown.inputs(study))
         _DocumentWatcher().slotRecomputedObject(made)
-        assert (made.Status, made.Label) == (preview.OUT_OF_DATE, "Mesh (Palace) - out of date")
+        assert (made.Status, made.Label) == (preview.OUT_OF_DATE, "Mesh (Palace)")
 
     def test_a_mesh_nobody_made_for_a_backend_is_left_alone(self, doc):
         """It may carry a property of the same name for a reason of its own."""
@@ -420,49 +414,29 @@ class TestARecomputeReachingAMeshFreeCADDraws:
         assert (theirs.Status, theirs.Label) == (preview.CURRENT, "Mesh (Palace)")
 
 
-class TestTheStudyPairsAResultWithTheMeshItShows:
-    """What the study holds decides which mesh it shows, so a change to that is
-    when the study asks again."""
+class TestAStudyChangingWhatItHoldsLeavesItsRunsAlone:
+    """A run records the mesh it was solved on, and nothing the study holds
+    afterwards writes a status into a run's labels."""
 
-    def _solved(self, doc):
-        import json
+    def test_the_mesh_deleted_leaves_the_run_as_it_was(self, doc):
+        import numpy as np
 
         from Microwave.Gui import fem_mesh as shown
+        from Microwave.Gui import results as glue
+        from Microwave.Results.sparameters import SParameters
 
         study = analysis.createEMAnalysis(doc=doc)
         made = shown.put(study, "Palace", "a mesh", key=shown.inputs(study), identity="solved")
-        result = results.createEMSParameters(doc=doc)
-        result.Provenance = json.dumps({"solver": "Palace", results.SOLVED_ON: "solved"})
-        result.Label = results.label("Palace")
-        study.addObject(result)
-        return study, made, result
-
-    def test_the_mesh_deleted_marks_the_result(self, doc):
-        study, made, result = self._solved(doc)
+        solved = SParameters(
+            frequency=np.array([1e9, 2e9]),
+            s=np.zeros((2, 1, 1), dtype=complex),
+            port_numbers=(1,),
+            reference=np.full((2, 1), 50.0),
+            measured_impedance=np.full((2, 1), 50.0 + 0j),
+            provenance={"solver": "Palace", results.SOLVED_ON: "solved"},
+        )
+        result = glue.put(study, solved)
+        labels = (glue.run_of(result).Label, result.Label)
         doc.removeObject(made.Name)
         study.Proxy.onChanged(study, "Group")
-        assert result.Label == results.label("Palace", apart=True)
-
-    def test_another_mesh_shown_marks_it_and_its_own_back_unmarks_it(self, doc):
-        from Microwave.Gui import fem_mesh as shown
-
-        study, made, result = self._solved(doc)
-        spare = shown.put(study, "Elsewhere", "a mesh", identity="spare")
-        spare.MeshedFor = "Palace"
-        study.Group = [member for member in study.Group if member is not made]
-        study.Proxy.onChanged(study, "Group")
-        assert result.Label == results.label("Palace", apart=True)
-        study.Group = [member for member in study.Group if member is not spare]
-        study.addObject(made)
-        study.Proxy.onChanged(study, "Group")
-        assert result.Label == results.label("Palace")
-
-    def test_an_undo_is_left_alone(self, doc):
-        study, made, result = self._solved(doc)
-        doc.removeObject(made.Name)
-        doc.Transacting = True
-        try:
-            study.Proxy.onChanged(study, "Group")
-        finally:
-            del doc.Transacting
-        assert result.Label == results.label("Palace")
+        assert (glue.run_of(result).Label, result.Label) == labels

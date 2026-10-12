@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -113,8 +114,8 @@ STATED = (
         re.compile(
             rf"Warning: Unused primitive \(type: \w+\) detected in property: (?!{PORT_PROPERTY})"
         ),
-        "A piece of that material was given no cell, and the run names above each body "
-        "none of whose pieces was, with what spans it.",
+        "Part of that material got no cell. A body that got none at all is named above, "
+        "with what covers it.",
     ),
     # ``CSProperties::WarnUnusedPrimitves``: a material the envelope lists that
     # no body is made of.
@@ -127,7 +128,7 @@ STATED = (
     # thousand, ``useful.cpp``, ``CalcNyquistNum``).
     Stated(
         re.compile(r"openEMS::SetupFDTD: Warning, the timestep seems to be very small"),
-        "The answer stands: a short timestep costs time and changes no field.",
+        "The answer stands: a short timestep costs run time and changes no field.",
     ),
     # Of the square roots in ``openEMS/python/openEMS/ports.py``, the one in
     # ``WaveguidePort.CalcPort`` of ``k^2 - kc^2`` is the one taken of a real
@@ -137,7 +138,7 @@ STATED = (
         re.compile(
             r".*[/\\]openEMS[/\\]ports\.py:\d+: RuntimeWarning: invalid value encountered in sqrt"
         ),
-        "The answer stands: below the mode's cutoff the driver states the port's waves itself.",
+        "The answer stands: below the mode's cutoff the workbench computes the port's waves.",
     ),
 )
 
@@ -174,27 +175,45 @@ def has_bindings(interpreter: str | Path, cancel: Cancellation | None = None) ->
     return imports(interpreter, _PROBE, _PROBE_TOKEN, (cancel or Cancellation()).watching)
 
 
-def find_interpreter(
-    explicit: str | Path | None = None, cancel: Cancellation | None = None
-) -> Path:
-    """Locate a Python that owns the openEMS bindings.
+def interpreter_for(explicit: str | Path | None = None, cancel: Cancellation | None = None) -> Path:
+    """The Python a run given ``explicit`` starts openEMS with, verified by
+    importing the bindings: ``explicit`` itself where it is set, since
+    :func:`stream` launches a configured interpreter as given, and what
+    :func:`find_interpreter` finds where it is not.
 
-    The order is the caller's explicit setting, then
-    ``MICROWAVE_OPENEMS_PYTHON``, then the interpreter this code is running in,
-    then ``python3`` on ``PATH``. There is no other source. Each candidate is
-    verified by importing the bindings, because a path that exists and cannot
-    import openEMS fails later and much less clearly.
+    :raises EngineNotFound: that Python cannot import the bindings.
+    :raises Cancelled: the caller stopped the probe.
+    """
+    if not explicit:
+        return find_interpreter(cancel=cancel)
+    path = Path(explicit)
+    found = has_bindings(path, cancel=cancel)
+    if cancel is not None and cancel.requested:
+        raise Cancelled("stopped while looking for the openEMS interpreter")
+    if not found:
+        raise EngineNotFound(
+            f"SolverPython is {path}, which cannot import openEMS and CSXCAD. Set "
+            "SolverPython to a Python that can, or clear it to search"
+        )
+    return path
+
+
+def find_interpreter(cancel: Cancellation | None = None) -> Path:
+    """Search for a Python that owns the openEMS bindings.
+
+    The order is ``MICROWAVE_OPENEMS_PYTHON``, then the interpreter this code is
+    running in, then ``python3`` on ``PATH``. There is no other source. Each
+    candidate is verified by importing the bindings, because a path that exists
+    and cannot import openEMS fails later and much less clearly.
 
     Nothing beyond that list is guessed at. The workbench either ships an engine
     or is pointed at one. Adopting whatever is on the system without a word
     leaves the user debugging a version they did not know they had.
 
-    :func:`stream` never passes ``explicit``. A configured interpreter is
-    launched as given and this search is skipped, so a wrong path there fails
-    when the subprocess starts rather than here.
+    A configured interpreter is not a candidate: :func:`stream` launches it as
+    given, and :func:`interpreter_for` verifies it alone.
     """
     candidates: list[tuple[str, str | Path | None]] = [
-        ("the configured interpreter", explicit),
         (f"${INTERPRETER_ENV_VAR}", os.environ.get(INTERPRETER_ENV_VAR)),
         ("this interpreter", sys.executable),
         ("python3 on PATH", shutil.which("python3")),
@@ -217,8 +236,8 @@ def find_interpreter(
 
     detail = "\n  ".join(tried) if tried else "nothing to try"
     raise EngineNotFound(
-        "openEMS was not found. Point the workbench at a Python that can "
-        f"'import openEMS', or set ${INTERPRETER_ENV_VAR}.\nTried:\n  {detail}"
+        "openEMS was not found. Set SolverPython to a Python that can import openEMS, "
+        f"or set ${INTERPRETER_ENV_VAR}.\nTried:\n  {detail}"
     )
 
 
@@ -267,14 +286,22 @@ def stream(
     # must not outlive the generator, and leaving the block ends it. Without
     # that, closing the panel leaves openEMS holding every core with nothing
     # left to read it.
-    with running(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=_child_environment(),
-    ) as process:
+    with ExitStack() as stack:
+        try:
+            process = stack.enter_context(
+                running(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=_child_environment(),
+                )
+            )
+        except OSError as error:
+            # A configured interpreter is launched as given, so a path that is
+            # not a program is the machine's to fix and not a defect here.
+            raise SolverFailed(f"openEMS could not be started with {python}: {error}") from error
         assert process.stdout is not None
         with process.stdout, cancel.watching(process, group=True):
             for line in process.stdout:
@@ -287,9 +314,16 @@ def stream(
                         finished = True
                     yield Marker(name=name, detail=detail)
                 else:
+                    # What the driver prints is yielded between two blank
+                    # lines, which set it apart from what is said about the
+                    # run either side.
+                    if not said:
+                        yield ""
                     said.append(line)
                     yield line
             code = process.wait()
+            if said:
+                yield ""
 
     if cancel.requested:
         raise Cancelled(f"the run of {envelope} was stopped")
@@ -303,20 +337,18 @@ def stream(
     if not finished:
         # The driver prints DONE last, so its absence means the run stopped
         # somewhere it did not report: killed, out of memory, a crash in a
-        # native library. The exit code alone does not catch that, and `run`
-        # below would then fall back to whatever results.json lies in the
-        # directory, which for a re-run is the previous solve's answer. This
-        # layer exists to stop a stale number being reported as a fresh one.
+        # native library. The exit code alone does not catch that, and a
+        # results.json in the directory can then be a previous solve's answer.
+        # This layer exists to stop a stale number being reported as a fresh one.
         raise SolverFailed(
-            f"openEMS exited with code {code} but never reported DONE, so the "
-            "run did not finish. Any results file beside the envelope is from an "
-            "earlier solve and is not this run's answer"
+            f"openEMS exited with code {code} before the run finished, so any results "
+            "file in the run directory is from an earlier solve"
         )
     for line in remarks:
         yield f"WARNING: {line}"
     if complaints:
         raise SolverFailed(
-            "openEMS finished and said the answer cannot be taken: " + "; ".join(complaints)
+            "openEMS finished and warned that the results cannot be used: " + "; ".join(complaints)
         )
 
 
@@ -329,11 +361,11 @@ def run(
 ) -> Path | None:
     """Run to completion. Returns the results file, or ``None`` for build-only.
 
-    A cancelled run raises :class:`Cancelled` from ``stream`` and never reaches
-    the fallback below, so it cannot be answered with the ``results.json`` a
-    previous solve left in the directory. A crashed run is treated the same way,
-    for the same reason: without DONE, nothing in that directory belongs to this
-    run.
+    The results file is the one the driver names on its RESULTS line and no
+    other. A ``results.json`` already in the directory can be a previous solve's,
+    so a run that names none is refused rather than answered with it. A
+    cancelled run raises :class:`Cancelled` from ``stream``, and a crashed run,
+    which never reports DONE, raises :class:`SolverFailed` there.
     """
     results: Path | None = None
     for item in stream(envelope, interpreter=interpreter, build_only=build_only, cancel=cancel):
@@ -346,10 +378,10 @@ def run(
         return None
 
     if results is None:
-        expected = Path(envelope).parent / RESULTS_NAME
-        if not expected.is_file():
-            raise SolverFailed(f"the solver finished but wrote no results to {expected}")
-        results = expected
+        raise SolverFailed(
+            f"the run of {envelope} reported DONE without naming its results, so no "
+            f"{RESULTS_NAME} beside it is known to be this run's answer"
+        )
     return results
 
 

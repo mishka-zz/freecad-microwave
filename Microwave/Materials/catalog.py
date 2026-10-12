@@ -71,25 +71,27 @@ def _number(
     allow_zero: bool = True,
 ) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        faults.append(f"{where} is {value!r}, which is not a number")
+        faults.append(f"{where} is {value!r}. Enter a number")
         return 0.0
     number = float(value)
     # TOML 1.0 has `nan` and `inf` as float literals, so a catalog can state
     # them, and `number < minimum` is False for NaN. Every range check below
     # passes it, so an epsilon_r of nan loads, shows in the picker, and solves.
     if not math.isfinite(number):
-        faults.append(f"{where} is {number}, which is not a finite number")
+        faults.append(f"{where} is {number}. Enter a finite number")
         return 0.0
     if minimum is not None and number < minimum:
-        faults.append(f"{where} is {number:g}; it cannot be below {minimum:g}")
+        faults.append(f"{where} is {number:g}. Enter {minimum:g} or more")
     if not allow_zero and number == 0:
-        faults.append(f"{where} is zero, and this kind of material needs a real one")
+        faults.append(f"{where} is 0. Enter a value above 0")
     return number
 
 
 def _dispersion(rows: Any, where: str, faults: list[str]) -> tuple[DispersionPoint, ...]:
     if not isinstance(rows, list):
-        faults.append(f"{where}: dispersion must be a list of [[material.dispersion]] rows")
+        faults.append(
+            f"{where}: dispersion is not a list. Write each row as a [[material.dispersion]] table"
+        )
         return ()
     points = []
     for index, row in enumerate(rows, start=1):
@@ -100,7 +102,7 @@ def _dispersion(rows: Any, where: str, faults: list[str]) -> tuple[DispersionPoi
         if missing:
             faults.append(
                 f"{where}: dispersion row {index} has no {', '.join(missing)}. "
-                "A row is a measurement; all three are what makes it one"
+                "Each row needs frequency, epsilon_r and loss_tangent"
             )
             continue
         points.append(
@@ -129,8 +131,8 @@ def _dispersion(rows: Any, where: str, faults: list[str]) -> tuple[DispersionPoi
     frequencies = [point.frequency for point in points]
     if frequencies != sorted(frequencies) or len(set(frequencies)) != len(frequencies):
         faults.append(
-            f"{where}: dispersion rows must go up in frequency with no repeats, "
-            f"and these are {frequencies}"
+            f"{where}: the dispersion frequencies are {frequencies}. List the rows "
+            "in increasing frequency, with no repeats"
         )
     return tuple(points)
 
@@ -145,17 +147,18 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
 
     if not isinstance(identifier, str) or not SLUG.match(identifier):
         faults.append(
-            f"{where} has no usable id. An id is lower case letters, digits, "
-            "'.', '-' or '_', and is how documents refer to this material for ever"
+            f"{where} has no usable id. Give it one of lower-case letters, digits, "
+            "'.', '-' and '_', starting with a letter or a digit. Documents refer to "
+            "the material by its id, so keep it once a document uses it"
         )
         return None
 
     kind = raw.get("kind")
     if kind not in KINDS:
         faults.append(
-            f"{where}: kind is {kind!r}; expected one of {', '.join(KINDS)}. "
-            "There is no dispersive kind - put the datasheet's table in "
-            "[[material.dispersion]] on a dielectric instead"
+            f"{where}: kind is {kind!r}. Use one of {', '.join(KINDS)}. For a "
+            "frequency-dependent material, use a dielectric with "
+            "[[material.dispersion]] rows"
         )
         return None
 
@@ -164,8 +167,7 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
     if wrong_kind:
         subject, pronoun = _names(wrong_kind)
         faults.append(
-            f"{where}: {subject} nothing for a {kind} and would be read by "
-            f"nothing. Remove {pronoun}, or change the kind"
+            f"{where}: {subject} not apply to a {kind}. Remove {pronoun}, or change the kind"
         )
     # An unknown key is a refusal rather than a note. ``schema`` carries forward
     # compatibility. Merely mentioning an unknown key lets
@@ -175,18 +177,18 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
     unknown = sorted(set(raw) - allowed - _all_kind_keys())
     if unknown:
         subject, _ = _names(unknown)
+        # A key a later format adds belongs to a file that declares that
+        # format's schema, which this reader then refuses as a whole.
         faults.append(
-            f"{where}: {subject} nothing to this workbench. Check the spelling, "
-            f"or raise the file's schema if it was written for a later version"
+            f"{where}: {subject} not name a key this workbench reads. Check the "
+            "spelling. A key from a later version needs a newer workbench"
         )
     missing = sorted(REQUIRED[kind] - set(raw))
     if missing:
-        hint = (
-            f" It also has an unknown key {unknown[0]!r}, which may be the typo." if unknown else ""
-        )
+        hint = f" The unknown key {unknown[0]!r} may be a misspelling." if unknown else ""
         faults.append(
-            f"{where} declares kind {kind!r} but has no {', '.join(missing)}. "
-            f"There is no honest default for it - write it out explicitly.{hint}"
+            f"{where} is a {kind} with no {', '.join(missing)}. State "
+            f"{_names(missing)[1]} explicitly; there is no default.{hint}"
         )
 
     # Past here, only keys that are both present and meaningful for this kind
@@ -198,12 +200,12 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
 
     name = raw.get("name", identifier)
     if not isinstance(name, str) or not name:
-        faults.append(f"{where}: name must be a non-empty string")
+        faults.append(f"{where}: name is empty or is not text. Enter it in quotes")
         name = identifier
 
     color = raw.get("color", "#888888")
     if not isinstance(color, str) or not COLOR.match(color):
-        faults.append(f"{where}: color is {color!r}; expected '#RRGGBB'")
+        faults.append(f"{where}: color is {color!r}. Enter it as '#RRGGBB'")
         color = "#888888"
 
     loss_tangent = (
@@ -216,12 +218,13 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
         if stated("measured_at")
         else 0.0
     )
+    # A loss tangent is quoted at a frequency and means little without one.
+    # openEMS turns it into a fixed conductivity that is exact only at band
+    # centre.
     if loss_tangent > 0 and measured_at <= 0:
         faults.append(
-            f"{where}: loss_tangent is {loss_tangent:g} with no measured_at. A "
-            "loss tangent is quoted at a frequency and means little without one; "
-            "openEMS turns it into a fixed conductivity that is exact only at "
-            "band centre"
+            f"{where}: loss_tangent is {loss_tangent:g} with no measured_at. Add "
+            "measured_at, the frequency in Hz the loss tangent is quoted at"
         )
     epsilon_r = _number(raw.get("epsilon_r", 1.0), f"{where} epsilon_r", faults, minimum=1.0)
     dispersion = _dispersion(raw["dispersion"], where, faults) if "dispersion" in raw else ()
@@ -229,9 +232,8 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
     # where it is quoted at a frequency, so a headline is held to what a row is.
     if dispersion and measured_at <= 0:
         faults.append(
-            f"{where}: a dispersion table beside an epsilon_r quoted at no "
-            "frequency. State measured_at, the frequency the headline values are "
-            "true at"
+            f"{where} has a dispersion table and no measured_at. Add measured_at, "
+            "the frequency in Hz that epsilon_r and loss_tangent are quoted at"
         )
     for point in dispersion:
         if point.frequency == measured_at and (point.epsilon_r, point.loss_tangent) != (
@@ -239,9 +241,9 @@ def _entry(raw: Any, position: int, faults: list[str]) -> MaterialEntry | None:
             loss_tangent,
         ):
             faults.append(
-                f"{where}: the headline and the dispersion row at {point.frequency:g} Hz "
-                "state different values at one frequency. Make them agree, or quote "
-                "the headline where the table has no row"
+                f"{where}: epsilon_r and loss_tangent differ from the dispersion row at "
+                f"{point.frequency:g} Hz, which is measured_at. Make them agree, or set "
+                "measured_at to a frequency the table has no row at"
             )
 
     return MaterialEntry(
@@ -282,10 +284,11 @@ def _all_kind_keys() -> frozenset[str]:
 
 
 def _names(keys: list[str]) -> tuple[str, str]:
-    """The subject and its pronoun, so refusals read as English either way."""
+    """The subject with its verb, and its pronoun, so refusals read as English
+    either way."""
     if len(keys) == 1:
-        return f"{keys[0]} means", "it"
-    return f"{', '.join(keys)} mean", "them"
+        return f"{keys[0]} does", "it"
+    return f"{', '.join(keys)} do", "them"
 
 
 def parse_catalog(text: str, origin: str = "<string>", *, bundled: bool = False) -> Catalog:
@@ -303,32 +306,30 @@ def parse_catalog(text: str, origin: str = "<string>", *, bundled: bool = False)
     faults: list[str] = []
 
     if "schema" not in data:
-        raise CatalogError(
-            f"{origin}: no 'schema' key. A catalog must say which format it is "
-            f"written in; this workbench reads schema {SCHEMA}"
-        )
+        raise CatalogError(f"{origin}: no 'schema' key. This workbench reads schema {SCHEMA}")
     schema = data["schema"]
     if not isinstance(schema, int) or isinstance(schema, bool) or schema < 1:
         raise CatalogError(
-            f"{origin}: schema is {schema!r}. It is a whole number from 1 "
-            f"upwards; this workbench reads {SCHEMA}"
+            f"{origin}: schema is {schema!r}. Enter a whole number from 1 upwards; "
+            f"this workbench reads schema {SCHEMA}"
         )
     if schema > SCHEMA:
         raise CatalogError(
-            f"{origin}: schema {schema}, and this workbench reads {SCHEMA}. The "
-            "file was written for a later version; upgrade rather than guess"
+            f"{origin}: schema is {schema} and this workbench reads schema {SCHEMA}, "
+            "so the file was written for a later version. Upgrade the workbench to read it"
         )
 
     header = data.get("catalog")
     if not isinstance(header, dict):
-        raise CatalogError(f"{origin}: no [catalog] table saying what this file is")
+        raise CatalogError(f"{origin}: no [catalog] table. Add one with id, name and version")
 
     identifier = header.get("id")
     if not isinstance(identifier, str) or not SLUG.match(identifier):
         raise CatalogError(
-            f"{origin}: [catalog] has no usable id. It is this catalog's identity "
-            "- the 'generic' in 'generic:fr4' - and it is not the filename, so "
-            "renaming the file leaves every document that used it still correct"
+            f"{origin}: [catalog] has no usable id. Give it one of lower-case letters, "
+            "digits, '.', '-' and '_', starting with a letter or a digit. Documents "
+            "refer to the catalog by this id, the 'generic' in 'generic:fr4', and not "
+            "by its file name"
         )
     for key in ("name", "version"):
         if not isinstance(header.get(key), str) or not header[key]:
@@ -354,14 +355,13 @@ def parse_catalog(text: str, origin: str = "<string>", *, bundled: bool = False)
     for entry, position in zip(entries, at_position):
         if entry.id in seen:
             faults.append(
-                f"two materials share the id {entry.id!r}, at entries "
-                f"{seen[entry.id]} and {position}. An id is how a document names "
-                "one of them for ever, so it has to pick out exactly one"
+                f"entries {seen[entry.id]} and {position} share the id {entry.id!r}. "
+                "Give each material its own id"
             )
         seen[entry.id] = position
 
     if not entries and not faults:
-        faults.append("no [[material]] entries, so nothing would be added to the picker")
+        faults.append("no [[material]] entries. Add at least one")
 
     _fault(origin, faults)
 
@@ -388,8 +388,5 @@ def read_catalog(path: pathlib.Path, *, bundled: bool = False) -> Catalog:
         # it escapes load_library's ``except CatalogError`` and takes down every
         # other catalog with it, which that function's docstring promises cannot
         # happen.
-        raise CatalogError(
-            f"{path}: is not UTF-8 text - {error}. Catalogs are UTF-8; "
-            "re-save the file with that encoding"
-        ) from error
+        raise CatalogError(f"{path}: not UTF-8 text ({error}). Save the file as UTF-8") from error
     return parse_catalog(text, str(path), bundled=bundled)

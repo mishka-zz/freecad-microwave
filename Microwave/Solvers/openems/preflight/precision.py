@@ -71,16 +71,11 @@ def _check_vertices_survive_single_precision(problem: Problem) -> list[Finding]:
                 # a place the user cannot find in their model.
                 f"two of its corners stand {apart:.4g} mm apart in "
                 f"{AXIS_NAMES[axis]} at "
-                f"({', '.join(f'{value:g}' for value in here)}). openEMS holds a "
-                "corner as a single-precision float, and across a structure this "
-                f"size that format separates values by {spacing:.3g} mm, so the "
-                "two arrive as one point and the faces between them collapse. "
-                "The engine still reads the shape as a solid, prints nothing, "
-                "and samples no cell inside it, so the run returns a matrix for "
-                "a model this object is missing from. Draw the feature coarser, "
-                "or shrink the domain: the spacing follows the size of the whole "
-                "structure, absorber margin included, rather than the size of "
-                "this object",
+                f"({', '.join(f'{value:g}' for value in here)}). openEMS stores a "
+                "corner as a single-precision float, which across a structure this "
+                f"size resolves only {spacing:.3g} mm, so the two merge and the run "
+                "solves the model without this object. Draw the feature coarser, "
+                "or make the whole domain smaller, absorber margin included",
             )
         )
     return findings

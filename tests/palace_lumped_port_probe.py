@@ -110,7 +110,7 @@ def study(doc, bodies, metal, reference=("bottom", "top"), source_x=START):
     analysis = createEMAnalysis(doc)
     analysis.FrequencyStart = "2 GHz"
     analysis.FrequencyStop = "8 GHz"
-    analysis.NumFrequencyPoints = 3
+    analysis.FrequencyPoints = 3
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [obj for obj in analysis.Group if obj is not member]
@@ -135,11 +135,11 @@ def study(doc, bodies, metal, reference=("bottom", "top"), source_x=START):
     mesh.ElementsPerWavelength = 8.0
     # No air outside the drawing. What bounds this problem is a condition on
     # the body's own faces, so every face of the domain ends where the
-    # structure does, and a face left saying Air is refused by name.
+    # structure does, and a face left saying Open is refused by name.
     settings = contents(analysis).settings
     for axis in "XYZ":
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Ends")
+            setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
 
     faces = {
         "bottom": lambda b: abs(b.ZMin) < 1e-3 and b.ZLength < 1e-3 and b.XLength > 1.0,
@@ -149,7 +149,7 @@ def study(doc, bodies, metal, reference=("bottom", "top"), source_x=START):
     port = createEMPortLumped("Port1")
     port.Label = "Port1"
     port.Number = 1
-    port.Excitation = True
+    port.Driven = True
     port.Resistance = 50.0
     port.ReferencedTo = PORT_IMPEDANCE
     port.ExcitationAxis = "Z"
@@ -343,17 +343,15 @@ def board(doc):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [obj for obj in analysis.Group if obj is not member]
             doc.removeObject(member.Name)
-    analysis.addObject(createEMSolverPalace(doc))
-    analysis.addObject(createEMGmshMesh(doc))
     mesh = contents(analysis).recipe
     mesh.ElementsPerWavelength = BOARD_ELEMENTS_PER_WAVELENGTH
     # No air outside the drawing. What bounds this problem is a condition on
     # the body's own faces, so every face of the domain ends where the
-    # structure does, and a face left saying Air is refused by name.
+    # structure does, and a face left saying Open is refused by name.
     settings = contents(analysis).settings
     for axis in "XYZ":
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Ends")
+            setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
     doc.recompute()
     return analysis
 
@@ -387,7 +385,7 @@ def outside(doc, opened=False):
     if opened:
         settings = contents(analysis).settings
         settings.Clearance = CLEARANCE
-        settings.PaddingXMin = "Air"
+        settings.BoundaryXMin = "Open"
     doc.recompute()
     return analysis
 

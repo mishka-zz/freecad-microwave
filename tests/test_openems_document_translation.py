@@ -175,6 +175,12 @@ class CurvedFace:
         self._at = at
         self._radius = radius
 
+    def hashCode(self):
+        return id(self)
+
+    def isSame(self, other):
+        return other is self
+
     def curvatureAt(self, u, v):
         """Convex, unless this face is a saddle. A convex wall's centre of
         curvature is in the metal, which the kernel answers as negative."""
@@ -277,10 +283,9 @@ class Shape:
         self.Solids = [] if (self.Volume == 0.0 and not solid) else [self]
         # No faces, because these shapes carry no surface: a face here would be
         # asked for its parameters the moment a conductor was bound to it, and
-        # answering that is the kernel's job. What reads this is the count a
-        # compound compares against its solids' to find a face belonging to
-        # none of them, and two empty counts answer it correctly for a compound
-        # made of nothing else. A compound with a loose face in it is beyond
+        # answering that is the kernel's job. What reads this is the search of
+        # a compound's faces for one belonging to none of its solids, and an
+        # empty list holds none. A compound with a loose face in it is beyond
         # what these can say, and is a corpus specimen.
         #
         # ``curves`` is the exception: it carries what the departure arithmetic
@@ -700,6 +705,7 @@ class Analysis(Obj):
         "EMSolverOpenEMS",
         "EMMeshPolicy",
         "EMYeeGrid",
+        "EMGmshMesh",
         "EMMaterialBinding",
         "EMMeshRegion",
         "EMMeshPreview",
@@ -802,7 +808,7 @@ def copper():
     return Obj(
         "EMMaterial",
         "Copper",
-        MaterialType="ConductingSheet",
+        MaterialType="Conducting Sheet",
         Permittivity=1.0,
         Permeability=1.0,
         Conductivity=5.8e7,
@@ -835,7 +841,7 @@ MEASUREMENT_DISTANCE = 30.0
 def microstrip_port(number, trace_obj, ground_obj, **overrides):
     properties = dict(
         Number=number,
-        Excitation=True,
+        Driven=True,
         FeedResistance=0.0,
         FeedOffset=FEED_OFFSET,
         MeasurementDistance=MEASUREMENT_DISTANCE,
@@ -843,7 +849,7 @@ def microstrip_port(number, trace_obj, ground_obj, **overrides):
         ReferencedTo=FIXED_IMPEDANCE,
         Length=0.0,
         TraceEnd=(trace_obj, ["Face1"]),
-        GroundReference=(ground_obj, ["Face1"]),
+        Ground=(ground_obj, ["Face1"]),
         PropagationAxis="X",
         ExcitationAxis="-Z",
     )
@@ -858,16 +864,14 @@ def mesh_settings(**overrides):
     ``conftest.only_declared``, which says what that catches and what it costs.
     """
     properties = dict(
-        MinElementsAcross=9,
-        MinElementSize=0.0,
         Clearance=0.0,
         Medium=None,
-        PaddingXMin="Through",
-        PaddingXMax="Through",
-        PaddingYMin="Air",
-        PaddingYMax="Air",
-        PaddingZMin="Air",
-        PaddingZMax="Air",
+        BoundaryXMin="Through",
+        BoundaryXMax="Through",
+        BoundaryYMin="Open",
+        BoundaryYMax="Open",
+        BoundaryZMin="Open",
+        BoundaryZMax="Open",
     )
     properties.update(overrides)
     return Obj("EMMeshPolicy", "MeshSettings", **only_declared("mesh", "EMMeshPolicy", properties))
@@ -879,6 +883,8 @@ def yee_grid(**overrides):
         ElementsPerWavelength=20.0,
         EdgeRefinement=6.0,
         MaxGrowthRatio=1.3,
+        MinElementsAcross=9,
+        MinElementSize=0.0,
     )
     properties.update(overrides)
     return Obj("EMYeeGrid", "YeeGrid", **only_declared("mesh", "EMYeeGrid", properties))
@@ -889,8 +895,8 @@ def analysis(**overrides):
     properties = dict(
         FrequencyStart=1e9,
         FrequencyStop=10e9,
-        NumFrequencyPoints=201,
-        SmallestResponse=0.0,
+        FrequencyPoints=201,
+        ResponseFloor=0.0,
     )
     properties.update(overrides)
     return Analysis("EMAnalysis", "Analysis", **only_declared("analysis", "EMAnalysis", properties))
@@ -963,7 +969,9 @@ def _folded():
 
 
 def refinement(name, *references, **overrides):
-    """An ``EMMeshRegion`` aimed at whole objects."""
+    """An ``EMMeshRegion`` aimed at whole objects. Put in a document by
+    :func:`_add`, it amends that document's Yee grid unless ``MeshSettings`` is
+    given."""
     properties = dict(
         References=[(obj, []) for obj in references],
         Mode="Refine",
@@ -1055,7 +1063,12 @@ def diagonal_trace():
 
 
 def _add(doc, obj):
-    """Put another object in an existing document, as the toolbar would."""
+    """Put another object in an existing document, as the toolbar would: a
+    region amends the study's only mesh settings unless it names others."""
+    if type(obj.Proxy).__name__ == "EMMeshRegion" and not hasattr(obj, "MeshSettings"):
+        obj.MeshSettings = next(
+            (one for one in doc.Objects if type(one.Proxy).__name__ == "EMYeeGrid"), None
+        )
     obj.Document = doc
     doc.Objects.append(obj)
     return obj
@@ -1283,7 +1296,8 @@ class TestThePortCarriesItsDirection:
         findings = preflight.check(document.problem(model(port=port).Objects[0]))
 
         warnings = [f for f in findings if f.severity == preflight.WARN]
-        assert any("near field has not decayed" in f.message for f in warnings)
+        said = [f for f in warnings if "near field makes the impedance read high" in f.message]
+        assert said and said[0].message.endswith(". Raise MeasurementDistance on the port")
         assert preflight.refusals(findings) == []
 
     def test_the_trace_takes_its_conductor_from_the_document(self, study):
@@ -1326,10 +1340,12 @@ class TestThePortCarriesItsDirection:
         findings = preflight.check(problem)
 
         warnings = [f for f in findings if f.severity == preflight.WARN]
-        assert any("nothing has checked it" in f.message for f in warnings)
-        assert [f.subject for f in warnings if "nothing has checked it" in f.message] == [
-            problem.ports[0].name
-        ]
+        said = [f for f in warnings if "nothing has checked that direction" in f.message]
+        assert [f.subject for f in said] == [problem.ports[0].name]
+        assert said[0].message.endswith(
+            ". Check that PropagationAxis points into the structure, or draw the "
+            "conductor as a solid and pick its end"
+        )
         assert preflight.refusals(findings) == []
 
     def test_and_it_reaches_the_driver_through_the_envelope(self):
@@ -1493,6 +1509,39 @@ class TestItRefusesRatherThanGuesses:
         labels = [solid.label for solid in problem.solids if solid.label.startswith("Trace")]
         assert sorted(labels) == ["Trace#1", "Trace#2"]
 
+    def test_an_outline_enclosing_no_area_is_refused_as_what_was_drawn(self):
+        """A sketch is edges and encloses nothing, so the cut covers more than
+        its area of nothing - and that is the drawing, not a fault in reading
+        it."""
+        doc = model()
+        outline = part(doc, "Trace")
+        outline.Shape = Shape(
+            (0.0, 0.0, HEIGHT),
+            (LENGTH, WIDTH, HEIGHT),
+            rings=[[(0.0, 0.0), (LENGTH, 0.0), (LENGTH, WIDTH), (0.0, WIDTH)]],
+            area=0.0,
+        )
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("Make a face of it, or bind the body it outlines"),
+        ) as refused:
+            geometry.solid_boxes(outline)
+        assert "fault in reading" not in str(refused.value)
+
+    def test_an_outline_that_is_not_rectilinear_is_refused_as_what_was_drawn(self):
+        """A sketch with a diagonal in it cannot be cut into rectangles, and is
+        refused for enclosing nothing before it is triangulated."""
+        doc = model()
+        outline = part(doc, "Trace")
+        outline.Shape = Shape(
+            (0.0, 0.0, HEIGHT),
+            (LENGTH, WIDTH, HEIGHT),
+            rings=[[(0.0, 0.0), (LENGTH, 0.0), (0.0, WIDTH)]],
+            area=0.0,
+        )
+        with pytest.raises(document.TranslationError, match="drawn as edges"):
+            geometry.solid_boxes(outline)
+
     def test_pieces_that_overlap_are_refused_by_the_area_they_do_not_add_up_to(self):
         """Even-odd reads an overlap as *outside*, so a compound of two faces
         laid over each other cuts into less metal than either the drawing or the
@@ -1525,6 +1574,7 @@ class TestItRefusesRatherThanGuesses:
         with pytest.raises(document.TranslationError) as refusal:
             document.problem(doc.Objects[0])
         assert "laid over one another" in str(refusal.value)
+        assert str(refusal.value).endswith("Fuse them, or draw them apart")
 
     def test_a_flat_shape_with_one_diagonal_edge_is_carried_as_an_area(self):
         """The cut into rectangles is exact or it does not happen - a best fit
@@ -1567,12 +1617,15 @@ class TestItRefusesRatherThanGuesses:
             "EMPortSomethingElse",
             "Exotic",
             Number=1,
-            Excitation=True,
+            Driven=True,
             ReferenceImpedance=50.0,
             ReferencedTo=FIXED_IMPEDANCE,
             Length=0.0,
         )
-        with pytest.raises(document.TranslationError, match="no openEMS builder"):
+        with pytest.raises(
+            document.TranslationError,
+            match="openEMS does not support a port of kind EMPortSomethingElse",
+        ):
             document.problem(model(port=port).Objects[0])
 
     @pytest.mark.parametrize("impedance", [0.0, -50.0])
@@ -1598,6 +1651,7 @@ class TestItRefusesRatherThanGuesses:
         # AXIS_NAMES import comment in Solvers/openems/ports.py.
         assert "ReferenceImpedance" in message
         assert "reference_impedance" not in message
+        assert message.endswith(" ohm. Enter a positive impedance"), message
 
     def test_a_model_drawn_below_the_origin_is_translated_rather_than_refused(self):
         """Where a device sits in the CAD document is not a fault in it.
@@ -1650,7 +1704,7 @@ class TestItRefusesRatherThanGuesses:
     @pytest.mark.parametrize(
         "obj_name, prop, value, names",
         [
-            ("Analysis", "NumFrequencyPoints", 1, "Analysis"),
+            ("Analysis", "FrequencyPoints", 1, "Analysis"),
             ("Simulation", "MaxTimesteps", 0, "Simulation"),
             ("Simulation", "Threads", -1, "Threads"),
             ("DielectricBinding", "Permittivity", 0.5, "FR4"),
@@ -1666,7 +1720,7 @@ class TestItRefusesRatherThanGuesses:
         """One traceback fixed is one property fixed, and every row here is one.
 
         Each is a separate route, so a fix covering some of them cannot claim
-        the rest. The material rows also reach the user through *Update Mesh*,
+        the rest. The material rows also reach the user through *Mesh*,
         which is the thinner catch of the two: the toolbar command has no
         catch-all at all.
         """
@@ -1685,6 +1739,33 @@ class TestItRefusesRatherThanGuesses:
             "one gave \"'FR4': material 'FR4': ...\""
         )
 
+    @pytest.mark.parametrize(
+        "obj_name, prop, value, said",
+        [
+            ("Analysis", "FrequencyPoints", 1, "FrequencyPoints is 1. Enter 2 or more"),
+            (
+                "DielectricBinding",
+                "Permittivity",
+                0.5,
+                "material 'FR4': Permittivity is 0.5. Enter a finite value of 1 or more",
+            ),
+            (
+                "DielectricBinding",
+                "Permeability",
+                0.0,
+                "material 'FR4': Permeability is 0. Enter a value above 0",
+            ),
+        ],
+    )
+    def test_a_value_refused_says_what_to_enter(self, obj_name, prop, value, said):
+        doc = model()
+        target = doc.Objects[0] if obj_name == "Analysis" else part(doc, obj_name)
+        target = getattr(target, "Material", target)
+        setattr(target, prop, value)
+        with pytest.raises(document.TranslationError) as raised:
+            document.problem(doc.Objects[0])
+        assert str(raised.value).endswith(said)
+
     @pytest.mark.parametrize("prop", ["Permittivity", "Permeability"])
     def test_a_permittivity_on_a_conductor_is_named_not_ignored(self, prop):
         """A permittivity on a conductor means nothing to openEMS -
@@ -1701,12 +1782,18 @@ class TestItRefusesRatherThanGuesses:
         # Matched on text only this refusal has, for the same reason.
         for binding in ("GroundBinding", "TraceBinding"):
             setattr(part(doc, binding).Material, prop, 20.0)
-        with pytest.raises(document.TranslationError, match="conductor carries relative"):
+        with pytest.raises(
+            document.TranslationError, match="conductor carries Permittivity"
+        ) as raised:
             document.mesh(doc.Objects[0])
+        assert str(raised.value).endswith(
+            "which openEMS ignores but which resize every cell of the mesh. Set both to 1, "
+            "or set MaterialType to Dielectric"
+        )
 
     def test_a_material_fault_is_named_on_the_mesh_path_too(self):
         """``document.mesh`` never builds a Problem, so nothing downstream of
-        it would have converted this. It is the *Update Mesh* button."""
+        it would have converted this. It is the *Mesh* button."""
         doc = model()
         part(doc, "DielectricBinding").Material.Permittivity = 0.5
         with pytest.raises(document.TranslationError, match="FR4"):
@@ -1747,11 +1834,21 @@ class TestItRefusesRatherThanGuesses:
         with pytest.raises(document.TranslationError) as raised:
             document.problem(doc.Objects[0])
         assert "WG1" in str(raised.value), "it should name the object to fix"
+        if mode == "TM11":
+            assert str(raised.value) == (
+                "'WG1': Mode is 'TM11', which openEMS cannot run. Use a TE mode written "
+                "as TE10, TE01, TE20 and so on"
+            )
 
     def test_a_dispersive_material_is_refused_not_flattened(self):
         doc = model()
-        part(doc, "DielectricBinding").Material.MaterialType = "FrequencyDependentDielectric"
-        with pytest.raises(document.TranslationError, match="dispersive"):
+        part(doc, "DielectricBinding").Material.MaterialType = "Frequency Dependent Dielectric"
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape(
+                "Set MaterialType to Dielectric, with the loss tangent at the band centre"
+            ),
+        ):
             document.problem(doc.Objects[0])
 
     def test_an_empty_binding_is_refused(self):
@@ -1770,7 +1867,12 @@ class TestItRefusesRatherThanGuesses:
         """
         doc = model()
         removes(doc, "TraceBinding")
-        with pytest.raises(document.TranslationError, match="no material bound"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape(
+                "has no material bound where the port sits. Bind one with Bind Material to Shape"
+            ),
+        ):
             document.problem(doc.Objects[0])
 
     def test_a_trace_bound_to_a_dielectric_is_refused(self):
@@ -1785,7 +1887,10 @@ class TestItRefusesRatherThanGuesses:
         replaces(doc, "Trace", thick)
         part(doc, "TraceBinding").References = [(thick, [])]
         part(doc, "TraceBinding").Material = fr4()
-        with pytest.raises(document.TranslationError, match="carries no current"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("carries no current. Bind a conductor to the trace"),
+        ):
             document.problem(doc.Objects[0])
 
     def test_a_dielectric_bound_to_a_flat_object_is_refused(self):
@@ -1802,7 +1907,12 @@ class TestItRefusesRatherThanGuesses:
         doc = model()
         replaces(doc, "Substrate", board)
         part(doc, "DielectricBinding").References = [(board, ["Top"])]
-        with pytest.raises(document.TranslationError, match="holds no volume"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape(
+                "holds no volume to fill. Bind the material to a closed body as thick as the layer"
+            ),
+        ):
             document.problem(doc.Objects[0])
 
     def test_a_reversed_excitation_axis_is_reported(self):
@@ -1830,7 +1940,10 @@ class TestItRefusesRatherThanGuesses:
         assert port.stop[0] < port.start[0]
 
         part(doc, "Port1").PropagationAxis = "X"
-        with pytest.raises(document.TranslationError, match="out of the structure"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("out of the structure into open space. Set PropagationAxis to -X"),
+        ):
             document.problem(doc.Objects[0])
 
     def test_the_wrong_face_of_the_trace_is_reported(self):
@@ -1840,20 +1953,54 @@ class TestItRefusesRatherThanGuesses:
             "Side", (-LENGTH / 2, -WIDTH / 2, HEIGHT), (LENGTH / 2, -WIDTH / 2, HEIGHT)
         )
         port = microstrip_port(1, strip, plane, TraceEnd=(strip, ["Side"]))
-        with pytest.raises(document.TranslationError, match="end face of the trace"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("Select the end face of the trace, where the wave enters"),
+        ):
             document.problem(model(port=port).Objects[0])
 
     def test_two_ports_with_one_number_are_refused(self):
         doc = model()
         doc.Objects.append(microstrip_port(1, part(doc, "Trace"), part(doc, "Ground")))
-        with pytest.raises(document.TranslationError, match="ambiguous"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("so S11 is ambiguous. Give each port its own Number"),
+        ):
             document.problem(doc.Objects[0])
 
     def test_a_port_with_no_number_is_refused(self):
-        refuses_a_microstrip("number is unset", number=0)
+        refuses_a_microstrip(
+            re.escape(
+                "port number is unset. Set Number to a unique value of 1 or more; it "
+                "indexes the S-matrix"
+            ),
+            number=0,
+        )
 
     def test_no_excited_port_is_refused(self):
-        refuses_a_microstrip("nothing would drive", Excitation=False)
+        refuses_a_microstrip(
+            re.escape("nothing drives the model. Set Driven on at least one port"),
+            Driven=False,
+        )
+
+    @pytest.mark.parametrize(
+        ("overrides", "said"),
+        [
+            (
+                {"analysis": analysis(FrequencyStart=0.0)},
+                "Set FrequencyStart above 0 and below FrequencyStop",
+            ),
+            ({"simulation": simulation(MaxTimesteps=0)}, "MaxTimesteps is 0. Enter 1 or more"),
+            (
+                {"simulation": simulation(Threads=-1)},
+                "Threads is -1. Enter 0 to let openEMS choose, or a positive count",
+            ),
+        ],
+        ids=["band", "timesteps", "threads"],
+    )
+    def test_a_run_setting_out_of_range_names_the_value_to_enter(self, overrides, said):
+        with pytest.raises(document.TranslationError, match=re.escape(said)):
+            document.problem(model(**overrides).Objects[0])
 
     def test_a_second_solver_in_one_analysis_is_refused(self):
         """Two openEMS solvers in one study and nothing says which one runs.
@@ -1874,8 +2021,9 @@ class TestItRefusesRatherThanGuesses:
         envelope, the same pulse is built either way, and the run would finish
         with an S-matrix that answers a question nobody asked.
         """
-        with pytest.raises(document.TranslationError, match="Sinusoid"):
+        with pytest.raises(document.TranslationError, match="Sinusoid") as raised:
             document.problem(model(simulation=simulation(Waveform="Sinusoid")).Objects[0])
+        assert str(raised.value).endswith("Set Waveform to Gaussian")
 
 
 class TestPolicyMapsOntoThePhysics:
@@ -1897,7 +2045,7 @@ class TestPolicyMapsOntoThePhysics:
     def test_a_conductor_walled_axis_gets_no_absorber_cells(self):
         """A waveguide's side walls are PEC, and meshing absorber cells outside
         them would move the walls - which moves the cutoff frequency."""
-        settings = mesh_settings(PaddingYMin="Ends", PaddingYMax="Ends")
+        settings = mesh_settings(BoundaryYMin="PEC Wall", BoundaryYMax="PEC Wall")
         problem = document.problem(model(settings=settings).Objects[0])
         assert problem.boundary[2:4] == ("PEC", "PEC")
         assert problem.grid.params["pml_cells"] == [8, 0, 8]
@@ -1988,14 +2136,20 @@ class TestPolicyMapsOntoThePhysics:
         it had, and openEMS takes a perfect conductor as having no loss."""
         doc = model()
         part(doc, "GroundBinding").Material.MaterialType = "PEC"
-        with pytest.raises(document.TranslationError, match="a PEC carries a conductivity"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("Set it to 0, or set MaterialType to Conducting Sheet"),
+        ):
             document.problem(doc.Objects[0])
 
     @pytest.mark.parametrize("value", [-0.02, float("nan"), float("inf")])
     def test_a_conductivity_that_is_not_a_loss_is_refused(self, value):
         doc = model()
         part(doc, "DielectricBinding").Material.Conductivity = value
-        with pytest.raises(document.TranslationError, match="conductivity is"):
+        with pytest.raises(
+            document.TranslationError,
+            match=r"conductivity is \S+ S/m. Enter a finite value of 0 or more",
+        ):
             document.problem(doc.Objects[0])
 
     def test_a_loss_tangent_on_a_conductor_is_refused_rather_than_dropped(self):
@@ -2009,7 +2163,10 @@ class TestPolicyMapsOntoThePhysics:
         """
         doc = model()
         part(doc, "GroundBinding").Material.LossTangent = 0.02
-        with pytest.raises(document.TranslationError, match="loss tangent"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("Set it to 0, or set MaterialType to Dielectric"),
+        ):
             document.problem(doc.Objects[0])
 
     @pytest.mark.parametrize("value", [-0.02, float("nan"), float("-inf")])
@@ -2023,7 +2180,10 @@ class TestPolicyMapsOntoThePhysics:
         """
         doc = model()
         part(doc, "DielectricBinding").Material.LossTangent = value
-        with pytest.raises(document.TranslationError, match="loss tangent"):
+        with pytest.raises(
+            document.TranslationError,
+            match=r"loss tangent is \S+. Enter a finite value of 0 or more",
+        ):
             document.problem(doc.Objects[0])
 
     def test_energy_termination_stays_off_by_default(self, study):
@@ -2044,7 +2204,7 @@ class TestPolicyMapsOntoThePhysics:
         use instead, and that level is held to doing what the message says."""
         with pytest.raises(document.TranslationError, match="EnergyDecay") as refused:
             document.problem(model(simulation=simulation(EnergyDecay=decay)).Objects[0])
-        advised = float(re.search(r"negative: (\S+) is \S+ dB down", str(refused.value)).group(1))
+        advised = float(re.search(r"such as (\S+) for \S+ dB down", str(refused.value)).group(1))
         problem = document.problem(model(simulation=simulation(EnergyDecay=advised)).Objects[0])
         assert problem.termination.end_criteria == pytest.approx(10 ** (-decay / 10), abs=0.0)
 
@@ -2111,7 +2271,7 @@ class TestPolicyMapsOntoThePhysics:
         """Decibels where it is declared and plotted, a magnitude in S where it
         is compared against one. Amplitude, so twenty a decade - halving it
         would make every declared floor the square of what was asked for."""
-        analysis_obj = analysis(SmallestResponse=declared)
+        analysis_obj = analysis(ResponseFloor=declared)
         problem = document.problem(model(analysis=analysis_obj).Objects[0])
         assert problem.smallest_response == pytest.approx(magnitude)
 
@@ -2124,10 +2284,10 @@ class TestPolicyMapsOntoThePhysics:
         The two that are not above zero are here because the comparison alone
         lets them through: ``nan`` fails every comparison, and ``-inf`` converts
         to a magnitude of zero, which is a bar nothing can be judged against."""
-        analysis_obj = analysis(SmallestResponse=declared)
+        analysis_obj = analysis(ResponseFloor=declared)
         with pytest.raises(document.TranslationError) as raised:
             document.problem(model(analysis=analysis_obj).Objects[0])
-        assert "SmallestResponse" in str(raised.value)
+        assert "ResponseFloor" in str(raised.value)
         assert "Analysis" in str(raised.value), "it should name the object to fix"
 
     def test_the_factor_is_refused_before_anything_is_meshed(self):
@@ -2188,12 +2348,12 @@ class TestTheMeshObjectsReachTheMesher:
         assert params["min_cell"] == pytest.approx(params["metal_res"] / 1000.0)
 
     def test_an_explicit_floor_is_used_verbatim(self):
-        settings = mesh_settings(MinElementSize=0.004)
-        params = document.problem(model(settings=settings).Objects[0]).grid.params
+        grid = yee_grid(MinElementSize=0.004)
+        params = document.problem(model(grid=grid).Objects[0]).grid.params
         assert params["min_cell"] == pytest.approx(0.004)
 
     #: Every face open to free space, so each of the six is laid from Clearance.
-    OPEN = {f"Padding{a}{s}": "Air" for a in "XYZ" for s in ("Min", "Max")}
+    OPEN = {f"Boundary{a}{s}": "Open" for a in "XYZ" for s in ("Min", "Max")}
 
     @staticmethod
     def air(problem):
@@ -2243,15 +2403,21 @@ class TestTheMeshObjectsReachTheMesher:
         with pytest.raises(document.TranslationError, match="Clearance is") as raised:
             document.problem(model(settings=settings).Objects[0])
         assert "'MeshSettings'" in str(raised.value)
+        assert str(raised.value).endswith(
+            ". Enter 0 mm to derive it from the band, or a positive length"
+        )
 
     def test_refinement_below_one_is_refused_by_name(self):
         grid = yee_grid(EdgeRefinement=0.5)
-        with pytest.raises(document.TranslationError, match="EdgeRefinement is 0.5"):
+        with pytest.raises(document.TranslationError, match="EdgeRefinement is 0.5") as raised:
             document.problem(model(grid=grid).Objects[0])
+        assert str(raised.value).endswith("Enter 1 or more, where 1 means no refinement")
 
     def test_zero_elements_per_wavelength_is_refused(self):
         grid = yee_grid(ElementsPerWavelength=0.0)
-        with pytest.raises(document.TranslationError, match="ElementsPerWavelength is 0"):
+        with pytest.raises(
+            document.TranslationError, match="ElementsPerWavelength is 0. Enter a value above 0"
+        ):
             document.problem(model(grid=grid).Objects[0])
 
     @pytest.mark.parametrize("across", [0, -1])
@@ -2259,27 +2425,29 @@ class TestTheMeshObjectsReachTheMesher:
         """The mesher holds the same bound and states it as ``min_lines``, which
         is no property anybody can find. Zero is also a value a user reaches
         honestly: the same-named property on a refinement region documents it as
-        "inherit the global count"."""
-        settings = mesh_settings(MinElementsAcross=across)
+        inheriting the count of its mesh settings."""
+        grid = yee_grid(MinElementsAcross=across)
         with pytest.raises(
             document.TranslationError, match=f"MinElementsAcross is {across}"
         ) as raised:
-            document.problem(model(settings=settings).Objects[0])
-        assert "'MeshSettings'" in str(raised.value)
+            document.problem(model(grid=grid).Objects[0])
+        assert "'YeeGrid'" in str(raised.value)
+        assert "Enter 1 or more; 1 asks for no minimum" in str(raised.value)
 
-    def test_a_floor_above_the_edge_cell_is_refused_naming_both_objects(self):
+    def test_a_floor_above_the_edge_cell_is_refused_naming_the_grid(self):
         """The floor guards against a sliver a boolean left. Above the cell a
         conductor's edge is meshed at it would override the resolution it is
         there to protect, and the mesher states that bound as ``min_cell``
         against ``metal_res`` - neither of which is a property.
         """
         params = document.problem(model().Objects[0]).grid.params
-        settings = mesh_settings(MinElementSize=params["metal_res"] * 2.0)
+        grid = yee_grid(MinElementSize=params["metal_res"] * 2.0)
         with pytest.raises(document.TranslationError, match="MinElementSize is") as raised:
-            document.problem(model(settings=settings).Objects[0])
+            document.problem(model(grid=grid).Objects[0])
         said = str(raised.value)
-        assert "'MeshSettings'" in said and "'YeeGrid'" in said
+        assert "'YeeGrid'" in said
         assert "min_cell" not in said and "metal_res" not in said
+        assert said.endswith(f". Lower MinElementSize below {params['metal_res']:.4g} mm")
 
     def test_a_floor_under_the_edge_cell_is_taken_as_stated(self):
         """The other side of the bound, so the refusal above cannot be passing by
@@ -2289,8 +2457,8 @@ class TestTheMeshObjectsReachTheMesher:
         """
         params = document.problem(model().Objects[0]).grid.params
         floor = params["metal_res"] / 2.0
-        settings = mesh_settings(MinElementSize=floor)
-        laid = document.problem(model(settings=settings).Objects[0]).grid.params
+        grid = yee_grid(MinElementSize=floor)
+        laid = document.problem(model(grid=grid).Objects[0]).grid.params
         assert laid["min_cell"] == pytest.approx(floor)
 
 
@@ -2424,7 +2592,7 @@ class TestASlipBetweenBodies:
         opened = [
             face
             for face in (f"{axis}{side}" for axis in "XYZ" for side in ("Min", "Max"))
-            if str(getattr(policy(study), f"Padding{face}")) == "Air"
+            if str(getattr(policy(study), f"Boundary{face}")) == "Open"
         ]
         assert opened
         self.thin(monkeypatch, 0.9, opened[:1])
@@ -2476,10 +2644,10 @@ class TestThePreviewShowsWhatGetsSolved:
         """Every run in a sweep shares one grid, so which port is driven is not
         a question a preview has to answer - and refusing to draw a mesh until
         a port is marked would hide the mesh exactly when it is being set up."""
-        port = microstrip_port(1, trace(), ground(), Excitation=False)
+        port = microstrip_port(1, trace(), ground(), Driven=False)
         doc = model(port=port)
         assert document.mesh(doc.Objects[0]).lines.cell_count > 0
-        with pytest.raises(document.TranslationError, match="no port has Excitation"):
+        with pytest.raises(document.TranslationError, match="no port has Driven"):
             document.problem(doc.Objects[0])
 
     def test_a_preview_still_refuses_a_model_it_cannot_mesh(self, study):
@@ -2658,6 +2826,38 @@ class TestLocalRefinementReachesTheMesher:
         study = doc.Objects[0]
         _add(doc, refinement("Empty"))
         with pytest.raises(document.TranslationError, match="refines nothing"):
+            document.mesh(study)
+
+    def test_a_region_amending_another_backends_settings_leaves_the_grid_alone(self, doc):
+        """A region is the backend's whose settings it amends, so the same place
+        refined for Palace is no line of this grid."""
+        study = doc.Objects[0]
+        before = list(document.mesh(study).lines[0])
+        theirs = _add(doc, Obj("EMGmshMesh", "GmshMesh", ElementsPerWavelength=4.0))
+        _add(doc, refinement("Fine", self._pad(doc), ElementSize=0.05, MeshSettings=theirs))
+        assert list(document.mesh(study).lines[0]) == before
+
+    def test_a_region_amending_nothing_is_refused_by_name(self, doc):
+        study = doc.Objects[0]
+        _add(doc, refinement("Loose", self._pad(doc), MeshSettings=None))
+        with pytest.raises(document.TranslationError, match="amends no mesh settings") as raised:
+            document.mesh(study)
+        assert "'Loose'" in str(raised.value)
+
+    def test_a_region_amending_another_studys_grid_is_refused_naming_both(self, doc):
+        study = doc.Objects[0]
+        elsewhere = yee_grid()
+        elsewhere.Label = "Other Grid"
+        _add(doc, refinement("Fine", self._pad(doc), MeshSettings=elsewhere))
+        with pytest.raises(document.TranslationError, match="does not hold") as raised:
+            document.mesh(study)
+        said = str(raised.value)
+        assert "'Fine'" in said and "'Other Grid'" in said and f"'{study.Label}'" in said
+
+    def test_a_region_amending_what_is_no_mesh_settings_is_refused_by_name(self, doc):
+        study = doc.Objects[0]
+        _add(doc, refinement("Fine", self._pad(doc), MeshSettings=policy(study)))
+        with pytest.raises(document.TranslationError, match="no backend's mesh settings"):
             document.mesh(study)
 
 
@@ -2846,8 +3046,8 @@ def explicit_analysis(*members, **overrides):
     properties = dict(
         FrequencyStart=1e9,
         FrequencyStop=10e9,
-        NumFrequencyPoints=201,
-        SmallestResponse=0.0,
+        FrequencyPoints=201,
+        ResponseFloor=0.0,
         Group=list(members),
     )
     name = overrides.pop("name", "Analysis")
@@ -2969,11 +3169,17 @@ class TestARunStartsFromAStudy:
         user reaches for. The band and the ports live one level up."""
         doc = model()
         solver = solver_of(doc.Objects[0])
-        with pytest.raises(document.TranslationError, match="is a solver, not a study"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("is a solver, not a study") + "$",
+        ):
             document.problem(solver)
 
     def test_something_that_is_no_study_at_all_says_that_instead(self):
-        with pytest.raises(document.TranslationError, match="not an EM analysis"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("is not an EM analysis") + "$",
+        ):
             document.problem(substrate())
 
     def test_an_object_that_is_no_mesh_policy_says_so(self):
@@ -2981,7 +3187,10 @@ class TestARunStartsFromAStudy:
         passes, because ``_Context`` divides by ElementsPerWavelength to size
         ports before mesh parameters exist."""
         doc = model(grid=Obj("EMYeeGrid", "YeeGrid"))
-        with pytest.raises(document.TranslationError, match="does not look like a Yee grid"):
+        with pytest.raises(
+            document.TranslationError,
+            match="has no ElementsPerWavelength, so it cannot size the openEMS mesh",
+        ):
             document.problem(doc.Objects[0])
 
 
@@ -3000,7 +3209,7 @@ class TestTheSweepIsOneGeometry:
     def test_an_inactive_port_is_still_measured(self):
         """It just is not driven. A two-port with one source still reports S21."""
         doc = model()
-        doc.Objects.append(_far_end_port(doc, 2, Excitation=False))
+        doc.Objects.append(_far_end_port(doc, 2, Driven=False))
 
         problems = document.sweep(doc.Objects[0])
         assert len(problems) == 1
@@ -3110,13 +3319,13 @@ def open_ends():
     """A mesh policy leaving air beyond the line's ends, so a lumped port drawn
     on a trace's end face stands inside the domain rather than in a face of it,
     which is refused."""
-    return mesh_settings(PaddingXMin="Air", PaddingXMax="Air")
+    return mesh_settings(BoundaryXMin="Open", BoundaryXMax="Open")
 
 
 def lumped_port(number, source, reference, **overrides):
     properties = dict(
         Number=number,
-        Excitation=True,
+        Driven=True,
         Resistance=50.0,
         ReferenceImpedance=50.0,
         ReferencedTo=FIXED_IMPEDANCE,
@@ -3165,7 +3374,9 @@ class TestALumpedPort:
     def test_it_needs_a_gap_to_drive_across(self):
         strip = trace()
         port = lumped_port(1, strip, strip)
-        with pytest.raises(document.TranslationError, match="there is none"):
+        with pytest.raises(
+            document.TranslationError, match="no gap along ExcitationAxis to drive across"
+        ):
             document.problem(model(port=port).Objects[0])
 
     @pytest.mark.parametrize(
@@ -3195,9 +3406,9 @@ def running_out():
     absorber at both ends, which is what a port standing inside it needs: with
     a wall behind it, the guide behind the port would be a shorted stub."""
     return mesh_settings(
-        **{f"Padding{a}{s}": "Ends" for a in "XY" for s in ("Min", "Max")},
-        PaddingZMin="Through",
-        PaddingZMax="Through",
+        **{f"Boundary{a}{s}": "PEC Wall" for a in "XY" for s in ("Min", "Max")},
+        BoundaryZMin="Through",
+        BoundaryZMax="Through",
     )
 
 
@@ -3219,7 +3430,7 @@ def waveguide_model(inset=0.0, settings=None, **port_overrides):
     )
     properties = dict(
         Number=1,
-        Excitation=True,
+        Driven=True,
         ReferenceImpedance=50.0,
         ReferencedTo=FIXED_IMPEDANCE,
         ReferenceDepth=0.0,
@@ -3231,7 +3442,7 @@ def waveguide_model(inset=0.0, settings=None, **port_overrides):
     port = Obj("EMPortRectWaveguide", "WG1", **properties)
 
     settings = settings or mesh_settings(
-        **{f"Padding{a}{s}": "Ends" for a in "XYZ" for s in ("Min", "Max")}
+        **{f"Boundary{a}{s}": "PEC Wall" for a in "XYZ" for s in ("Min", "Max")}
     )
     grid = yee_grid()
     solver_obj = simulation()
@@ -3372,7 +3583,7 @@ def coaxial_model(**port_overrides):
     )
     properties = dict(
         Number=1,
-        Excitation=True,
+        Driven=True,
         ReferenceImpedance=50.0,
         ReferencedTo=PORT_IMPEDANCE,
         Annulus=(line, ["Face1"]),
@@ -3385,7 +3596,9 @@ def coaxial_model(**port_overrides):
     # No air around the line and walls instead of an absorber: the line is 7 mm
     # across, and eight absorber cells sized for a 6 GHz wavelength would eat it
     # whole. Nothing here is about the domain.
-    settings = mesh_settings(**{f"Padding{a}{s}": "Ends" for a in "XYZ" for s in ("Min", "Max")})
+    settings = mesh_settings(
+        **{f"Boundary{a}{s}": "PEC Wall" for a in "XYZ" for s in ("Min", "Max")}
+    )
     return Document(
         analysis(FrequencyStart=1e9, FrequencyStop=6e9),
         settings,
@@ -3454,7 +3667,13 @@ class TestACoaxialPort:
         metal.Permittivity = 1.0
         metal.Permeability = 1.0
 
-        with pytest.raises(document.TranslationError, match="which is a conductor"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape(
+                "which is a conductor. Select the end face of the dielectric between the inner "
+                "conductor and the shield"
+            ),
+        ):
             document.problem(model.Objects[0])
 
     def test_two_rings_on_one_port_are_refused(self):
@@ -3466,11 +3685,19 @@ class TestACoaxialPort:
         line.Shape.ring("Face2", (0.0, 0.0, COAX_LENGTH), COAX_INNER, COAX_OUTER, flat=2)
         part(model, "Coax1").Annulus = (line, ["Face1", "Face2"])
 
-        with pytest.raises(document.TranslationError, match="names 2 sub-elements"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("names 2 sub-elements (Face1, Face2). Select one ring"),
+        ):
             document.problem(model.Objects[0])
 
     def test_probes_on_the_source_are_refused_with_the_number_to_use(self):
-        with pytest.raises(document.TranslationError, match="MeasurementDistance is 0"):
+        with pytest.raises(
+            document.TranslationError,
+            match=r"MeasurementDistance is 0 mm, .* Set MeasurementDistance to at least \S+ mm "
+            + re.escape(f"({portbox.CLEARANCE:g} free-space wavelengths at ")
+            + r"\S+ GHz\)$",
+        ):
             self.translated(MeasurementDistance=0.0)
 
     def test_it_carries_no_excitation_axis_and_no_metal(self):
@@ -3510,7 +3737,9 @@ class TestWhatTheMarkupMustResolveTo:
         impostor.Conductivity = 1.0e6
         part(doc, "GroundBinding").Material = impostor
 
-        with pytest.raises(document.TranslationError, match="both labelled"):
+        with pytest.raises(
+            document.TranslationError, match=re.escape("both labelled 'Copper'. Rename one")
+        ):
             document.problem(doc.Objects[0])
 
     def test_the_same_material_twice_is_fine(self):
@@ -3522,7 +3751,10 @@ class TestWhatTheMarkupMustResolveTo:
     def test_missing_mesh_settings_is_refused(self):
         doc = model()
         removes(doc, "MeshSettings")
-        with pytest.raises(document.TranslationError, match="holds no mesh policy"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("holds no mesh policy. Press Add openEMS Solver to add one"),
+        ):
             document.problem(doc.Objects[0])
 
     def test_a_multi_face_selection_is_unioned(self):
@@ -3539,7 +3771,10 @@ class TestWhatTheMarkupMustResolveTo:
     def test_a_binding_with_no_material_is_refused(self):
         doc = model()
         part(doc, "DielectricBinding").Material = None
-        with pytest.raises(document.TranslationError, match="no material assigned"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("has no material assigned. Set its Material, or delete the binding"),
+        ):
             document.problem(doc.Objects[0])
 
     @pytest.mark.parametrize("linked", [obj.Name for obj in model().Objects])
@@ -3673,7 +3908,12 @@ class TestGeometryTheUserActuallyDrew:
         thick = Obj("Part::Box", "Trace", strip)
 
         port = lumped_port(1, thick, ground(), SourceEntity=(thick, []))
-        with pytest.raises(document.TranslationError, match="That is a solid"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape(
+                "so the port would reach through the conductor. Select the face at the gap"
+            ),
+        ):
             document.problem(model(port=port).Objects[0])
 
     def test_a_negative_length_would_reverse_the_port(self):
@@ -3690,10 +3930,13 @@ class TestGeometryTheUserActuallyDrew:
         somewhere other than the property editor, but it is an internal
         invariant rather than the user-facing refusal its old name promised.
         """
-        refuses_a_microstrip("reverses the port", Length=-5.0)
+        refuses_a_microstrip("Enter a length of 0 mm or more", Length=-5.0)
 
     def test_a_negative_feed_resistance_is_refused(self):
-        refuses_a_microstrip("negative resistance", FeedResistance=-50.0)
+        refuses_a_microstrip(
+            re.escape("FeedResistance is -50.0 ohm. Enter 0 or a positive resistance"),
+            FeedResistance=-50.0,
+        )
 
     def test_a_negative_lumped_resistance_is_refused(self):
         """openEMS does not refuse it; it raises UnboundLocalError.
@@ -3703,7 +3946,10 @@ class TestGeometryTheUserActuallyDrew:
         fails inside the bindings on a name that means nothing here.
         """
         doc = model(port=lumped_port(1, trace(), ground(), Resistance=-1.0))
-        with pytest.raises(document.TranslationError, match="negative resistance"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("Resistance is -1.0 ohm. Enter 0 or a positive resistance"),
+        ):
             document.problem(doc.Objects[0])
 
 
@@ -3794,7 +4040,10 @@ class TestOneObjectDrawnInSeveralLumps:
 
         monkeypatch.setattr(drawn, "filling", failing)
         obj, _, _ = self.lumps()
-        with pytest.raises(document.TranslationError, match="drawn as closed surfaces.*BRep_API"):
+        with pytest.raises(
+            document.TranslationError,
+            match=r"drawn as closed surfaces.*BRep_API.*\. Run Part > Check geometry on it",
+        ):
             geometry.solid_boxes(obj)
 
     def test_metal_the_kernel_cannot_make_a_solid_of_is_refused_by_name(self, monkeypatch):
@@ -3835,6 +4084,85 @@ class TestOneObjectDrawnInSeveralLumps:
             f"halving the gap took the cells across it from {wide:.4g} to "
             f"{narrow:.4g}, so the grid there is not the gap's doing"
         )
+
+
+class TestWhatAShapeHoldsBesideItsFaces:
+    """An edge belonging to none of a shape's faces, or a point belonging to
+    none of its edges, is drawn beside the area or the volume, and the
+    translation refuses the mix by name rather than leave it out."""
+
+    class Part:
+        def __init__(self, **held):
+            self.__dict__.update(held)
+
+        def isSame(self, other):
+            return other is self
+
+        def hashCode(self):
+            return 0
+
+    def face(self):
+        """A face and its edges, each edge holding its own two vertices."""
+        return self.Part(Edges=[self.Part(Vertexes=[self.Part(), self.Part()]) for _ in range(4)])
+
+    def shape(self, faces, solids=(), edges=(), points=()):
+        """What the kernel lists of a shape: every edge of its faces and every
+        vertex of its edges, with ``edges`` and ``points`` beside them."""
+        every = [*(edge for face in faces for edge in face.Edges), *edges]
+        return SimpleNamespace(
+            Faces=faces,
+            Solids=list(solids),
+            Edges=every,
+            Vertexes=[*(vertex for edge in every for vertex in edge.Vertexes), *points],
+        )
+
+    def test_a_face_holds_nothing_stray_of_its_own(self):
+        assert drawn.stray(self.shape([self.face()])) == ([], [])
+
+    def test_a_point_a_face_holds_inside_it_is_the_face_s(self):
+        """A fragment of a face and a point leaves the point inside the face,
+        a vertex of the face and of none of its edges."""
+        face, inside = self.face(), self.Part()
+        face.Vertexes = [*(vertex for edge in face.Edges for vertex in edge.Vertexes), inside]
+        held = self.shape([face], points=[inside])
+        assert drawn.stray(held) == ([], [])
+
+    def test_a_point_and_a_line_a_solid_holds_inside_it_are_the_solid_s(self):
+        """A fragment of a solid and a point or a line leaves them inside the
+        solid, among its own and among no face's."""
+        faces = [self.face() for _ in range(6)]
+        line, point = self.Part(Vertexes=[self.Part(), self.Part()]), self.Part()
+        own = [edge for face in faces for edge in face.Edges]
+        solid = SimpleNamespace(
+            Faces=faces,
+            Edges=[*own, line],
+            Vertexes=[*(vertex for edge in [*own, line] for vertex in edge.Vertexes), point],
+        )
+        held = self.shape(faces, [solid], edges=[line], points=[point])
+        assert drawn.stray(held) == ([], [])
+
+    def test_an_edge_beside_a_face_is_refused_as_what_was_drawn(self):
+        """A sketch put in one compound with a face made from it: the face is
+        bounded by copies of the sketch's edges, so the sketch's are its own."""
+        sketched = self.Part(Vertexes=[self.Part(), self.Part()])
+        held = Obj("Part::Feature", "Drawn", self.shape([self.face()], edges=[sketched]))
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape(
+                "'Drawn' holds a face and 1 edge outside its faces. Edges and points carry no "
+                "material. Hide the object that draws them, or remove it from the compound"
+            ),
+        ):
+            geometry.solid_boxes(held, skin=0.035)
+
+    def test_a_point_beside_a_solid_is_refused_as_what_was_drawn(self):
+        faces = [self.face() for _ in range(6)]
+        solid = SimpleNamespace(Faces=faces)
+        held = Obj("Part::Feature", "Block", self.shape(faces, [solid], points=[self.Part()]))
+        with pytest.raises(
+            document.TranslationError, match="'Block' holds a solid and 1 point outside its faces"
+        ):
+            geometry.solid_boxes(held)
 
 
 class TestOneObjectDrawnInSeveralSheets:
@@ -3977,7 +4305,7 @@ def _wr42_document(depth=WG_REFERENCE_DEPTH):
             "EMPortRectWaveguide",
             f"WG{number}",
             Number=number,
-            Excitation=excite,
+            Driven=excite,
             FeedResistance=0.0,
             ReferenceImpedance=50.0,
             ReferencedTo=FIXED_IMPEDANCE,
@@ -3987,7 +4315,9 @@ def _wr42_document(depth=WG_REFERENCE_DEPTH):
             Mode="TE10",
         )
 
-    settings = mesh_settings(**{f"Padding{a}{s}": "Ends" for a in "XYZ" for s in ("Min", "Max")})
+    settings = mesh_settings(
+        **{f"Boundary{a}{s}": "PEC Wall" for a in "XYZ" for s in ("Min", "Max")}
+    )
     grid = yee_grid(ElementsPerWavelength=1.0 / WG_RES_FRACTION, EdgeRefinement=1.0)
     solver_obj = simulation(MaxTimesteps=12000)
     return Document(
@@ -4119,7 +4449,7 @@ def test_a_document_lumped_port_presents_the_resistance_it_was_given(interpreter
         2,
         strip,
         plane,
-        Excitation=False,
+        Driven=False,
         Resistance=load,
         ReferenceImpedance=load,
         ReferencedTo=FIXED_IMPEDANCE,
@@ -4128,7 +4458,7 @@ def test_a_document_lumped_port_presents_the_resistance_it_was_given(interpreter
     )
     # The far end is air rather than Through: the line has to actually end for
     # there to be anything for the resistor to terminate.
-    doc = model(port=feed, settings=mesh_settings(PaddingXMax="Air"))
+    doc = model(port=feed, settings=mesh_settings(BoundaryXMax="Open"))
     replaces(doc, "Ground", plane)
     replaces(doc, "Trace", strip)
     part(doc, "GroundBinding").References = [(plane, [])]
@@ -4185,11 +4515,11 @@ class TestMaterialsResolvePerFace:
         gold.Label = "Gold"
         gold.Conductivity = 4.1e7
 
-        # Air padding, not Through: a region bound to the trace's *end* face
+        # Open padding, not Through: a region bound to the trace's *end* face
         # would otherwise sit in the band Through clips away.
         doc = model(
             port=microstrip_port(1, strip, ground()),
-            settings=mesh_settings(PaddingXMin="Air", PaddingXMax="Air"),
+            settings=mesh_settings(BoundaryXMin="Open", BoundaryXMax="Open"),
         )
         replaces(doc, "Trace", strip)
         part(doc, "TraceBinding").References = [(strip, ["Face1"])]
@@ -4452,7 +4782,7 @@ class TestTheGridInputsDigest:
         a key taken over one of them would go on matching while the other moved
         every cell."""
         before = document.grid_inputs_digest(study)
-        policy(study).MinElementsAcross = 15
+        policy(study).Clearance = 5.0
         assert document.grid_inputs_digest(study) != before
 
     def test_it_moves_when_the_geometry_moves(self, study):
@@ -4472,7 +4802,7 @@ class TestTheGridInputsDigest:
 
     def test_it_moves_when_the_padding_mode_moves(self, study):
         before = document.grid_inputs_digest(study)
-        policy(study).PaddingYMin = "Through"
+        policy(study).BoundaryYMin = "Through"
         assert document.grid_inputs_digest(study) != before
 
     @pytest.mark.parametrize(
@@ -4498,7 +4828,7 @@ class TestTheGridInputsDigest:
         """On the study rather than the solver, and still not a grid input: it
         decides how a finished run is judged, not how one is meshed."""
         before = document.grid_inputs_digest(study)
-        study.SmallestResponse = -40.0
+        study.ResponseFloor = -40.0
         assert document.grid_inputs_digest(study) == before
 
     def test_equal_inputs_mean_an_equal_grid(self, study):
@@ -4632,7 +4962,9 @@ class TestATriangulationHasToStillBeTheShape:
 
     def test_the_refusal_says_it_already_tried_asking_more_finely(self):
         doc, _ = self.board(coarsens=0.5 / (geometry.DEFLECTION_OF_EXTENT * HEIGHT), stubborn=True)
-        with pytest.raises(document.TranslationError, match="sharper requests"):
+        with pytest.raises(
+            document.TranslationError, match="even at the finest triangulation tried"
+        ):
             document.problem(doc.Objects[0])
 
 
@@ -5287,6 +5619,11 @@ class TestAConductorDrawnAsASkinIsGivenThickness:
         with pytest.raises(document.TranslationError) as refused:
             document.problem(doc.Objects[0])
         assert "measures across" in str(refused.value)
+        assert str(refused.value).endswith(
+            "raise ElementsPerWavelength or EdgeRefinement in the openEMS mesh settings until "
+            "that cell is small against this shape, or draw the conductor as a solid of the "
+            "thickness you want"
+        )
         assert "bar rather than the sheet" in str(refused.value)
 
     def test_nor_where_the_metal_built_is_not_a_sweep_of_the_surface(self):
@@ -5310,6 +5647,9 @@ class TestAConductorDrawnAsASkinIsGivenThickness:
         with pytest.raises(document.TranslationError) as refused:
             document.problem(doc.Objects[0])
         assert "would not offset it into a solid" in str(refused.value)
+        assert str(refused.value).endswith(
+            "Draw the conductor as a solid, or run Part > Check geometry on it"
+        )
         assert "MakeOffsetShape" in str(refused.value)
 
     def test_and_a_solid_that_will_not_close_is_still_a_fault_in_the_drawing(self):
@@ -5361,12 +5701,12 @@ class TestADocumentOlderThanItsClasses:
         """What an object carries and no class declares stops nothing by
         itself, and is named with the rest where the run is stopped."""
         doc = model()
-        self.departs(doc.Objects[0], "has no SmallestResponse")
+        self.departs(doc.Objects[0], "has no ResponseFloor")
         self.departs(part(doc, "YeeGrid"), "carries AirCellsZMin 8", stops=False)
         with pytest.raises(document.TranslationError) as refused:
             document.problem(doc.Objects[0])
         said = str(refused.value)
-        assert "'Analysis' has no SmallestResponse" in said
+        assert "'Analysis' has no ResponseFloor" in said
         assert "'YeeGrid' carries AirCellsZMin 8" in said
         assert "earlier build" in said
 
@@ -5385,8 +5725,8 @@ class TestADocumentOlderThanItsClasses:
         """The object that lacks a property is the one the refusal names, rather
         than the read failing on it."""
         doc = model()
-        del self.departs(doc.Objects[0], "has no SmallestResponse").SmallestResponse
-        with pytest.raises(document.TranslationError, match="'Analysis' has no SmallestResponse"):
+        del self.departs(doc.Objects[0], "has no ResponseFloor").ResponseFloor
+        with pytest.raises(document.TranslationError, match="'Analysis' has no ResponseFloor"):
             document.problem(doc.Objects[0])
 
     def test_a_material_is_asked_through_the_binding_that_links_it(self):
@@ -5756,6 +6096,7 @@ class TestAskingForASurfaceWithinADistanceOfTheDrawing:
             "a ceiling of one facet should stop the ladder at its first rung"
         )
         assert "facets" in str(raised.value)
+        assert str(raised.value).endswith(". Raise CurveTolerance, or redraw the surface")
 
     def test_a_shape_whose_surfaces_may_cancel_is_never_held_to_a_distance(self):
         """A tube's outer wall moves in while its bore moves out and the volume
@@ -5956,7 +6297,7 @@ class TestTheLeverReachesTheTranslationFromTheDocument:
 
 def closed(**overrides):
     """A mesh policy saying the domain ends on the structure on every face."""
-    faces = {f"Padding{axis}{side}": "Ends" for axis in "XYZ" for side in ("Min", "Max")}
+    faces = {f"Boundary{axis}{side}": "PEC Wall" for axis in "XYZ" for side in ("Min", "Max")}
     faces.update(overrides)
     return mesh_settings(**faces)
 
@@ -5966,7 +6307,7 @@ def guide_port(number, obj, face, axis="Z"):
         "EMPortRectWaveguide",
         f"WG{number}",
         Number=number,
-        Excitation=number == 1,
+        Driven=number == 1,
         ReferenceImpedance=50.0,
         ReferencedTo=FIXED_IMPEDANCE,
         ReferenceDepth=0.0,
@@ -6001,23 +6342,23 @@ def guide_study(bodies, ports, settings=None):
     ).Objects[0]
 
 
-class TestTheFacesFollowThePadding:
+class TestTheFacesFollowTheBoundary:
     """What lies beyond each face of the domain decides the condition on it.
 
-    ``Ends`` stops the domain on the structure, and a backend building no
-    absorber puts a perfect wall there; ``Air`` and ``Through`` absorb. An
-    ``Ends`` face waveguide ports stand across, whole, absorbs as the port does.
+    ``PEC Wall`` stops the domain on the structure, and a backend building no
+    absorber puts a perfect wall there; ``Open`` and ``Through`` absorb. A
+    ``PEC Wall`` face waveguide ports stand across, whole, absorbs as the port does.
     """
 
     def test_ends_is_a_wall_and_air_and_through_absorb(self):
-        settings = mesh_settings(PaddingYMin="Ends", PaddingYMax="Ends")
+        settings = mesh_settings(BoundaryYMin="PEC Wall", BoundaryYMax="PEC Wall")
         problem = document.problem(model(settings=settings).Objects[0])
-        # Through on x, Ends on y, Air on z.
+        # Through on x, PEC Wall on y, Open on z.
         assert problem.boundary == ("PML_8", "PML_8", "PEC", "PEC", "PML_8", "PML_8")
 
     def test_mur_absorbs_on_the_faces_pml_would(self):
         """How a face absorbs is the solver's; which faces absorb is not."""
-        settings = mesh_settings(PaddingYMin="Ends", PaddingYMax="Ends")
+        settings = mesh_settings(BoundaryYMin="PEC Wall", BoundaryYMax="PEC Wall")
         problem = document.problem(
             model(settings=settings, simulation=simulation(Absorber="Mur")).Objects[0]
         )
@@ -6084,7 +6425,12 @@ class TestTheFacesFollowThePadding:
         message = str(refused.value)
         assert "'WG1' stands on the ZMin face" in message, message
         assert "leaves 23 mm^2 of its 46.01 mm^2 uncovered" in message, message
-        assert "PaddingZMin is Ends" in message, message
+        assert "BoundaryZMin is PEC Wall" in message, message
+        assert (
+            "Draw the guide as the air inside it alone, so the PEC Wall faces are its walls "
+            "and the port covers its end face, or set BoundaryZMin to Through on"
+        ) in message, message
+        assert "and move the port to a plane inside the guide" in message, message
 
     def test_ports_filling_a_face_between_them_leave_it_open(self):
         """Two guides side by side, each with its own port, cover the face they
@@ -6107,23 +6453,24 @@ class TestALumpedPortInAFaceOfTheDomain:
             document.problem(model(port=lumped_port(1, trace(), ground())).Objects[0])
         message = str(refused.value)
         assert "lumped port 'Lumped1' lies in the XMin face" in message, message
-        assert "PaddingXMin is Through" in message, message
+        assert "BoundaryXMin is Through" in message, message
         assert "runs on" in message, message
+        assert "Set BoundaryXMin to Open, or draw the port inside the structure" in message
 
     def test_in_an_ends_face_it_is_refused_by_name(self):
         """A perfect wall across the element shorts it."""
-        settings = mesh_settings(PaddingXMin="Ends")
+        settings = mesh_settings(BoundaryXMin="PEC Wall")
         with pytest.raises(document.TranslationError) as refused:
             document.problem(
                 model(settings=settings, port=lumped_port(1, trace(), ground())).Objects[0]
             )
         message = str(refused.value)
-        assert "PaddingXMin is Ends" in message, message
+        assert "BoundaryXMin is PEC Wall" in message, message
         assert "shorts it" in message, message
-        assert "Set PaddingXMin to Air" in message, message
+        assert "Set BoundaryXMin to Open, or draw the port inside the structure" in message
 
     def test_behind_an_air_face_it_stands_in_the_room_the_air_leaves(self):
-        settings = mesh_settings(PaddingXMin="Air", PaddingXMax="Air")
+        settings = mesh_settings(BoundaryXMin="Open", BoundaryXMax="Open")
         problem = document.problem(
             model(settings=settings, port=lumped_port(1, trace(), ground())).Objects[0]
         )
@@ -6135,20 +6482,23 @@ class TestAPortFedInAWall:
     Only waveguide ports standing across a whole face open it."""
 
     def test_a_microstrip_fed_on_an_ends_face_is_refused_by_name(self):
-        settings = mesh_settings(PaddingXMin="Ends")
+        settings = mesh_settings(BoundaryXMin="PEC Wall")
         port = microstrip_port(1, trace(), ground(), FeedOffset=0.0)
         with pytest.raises(document.TranslationError) as refused:
             document.problem(model(settings=settings, port=port).Objects[0])
         message = str(refused.value)
         assert "microstrip port 'Port1' lies in the XMin face" in message, message
-        assert "PaddingXMin is Ends" in message, message
+        assert "BoundaryXMin is PEC Wall" in message, message
         assert "shorts it" in message, message
-        assert "FeedOffset" in message, message
+        assert (
+            "Set BoundaryXMin to Through or Open, or raise FeedOffset on the port so the feed "
+            "stands inside the structure"
+        ) in message, message
 
     def test_a_microstrip_fed_inside_the_structure_is_not_in_the_face(self):
         """The wall behind a feed a little way in is a short circuit the line
         ends on, which is a device somebody can mean."""
-        settings = mesh_settings(PaddingXMin="Ends")
+        settings = mesh_settings(BoundaryXMin="PEC Wall")
         port = microstrip_port(1, trace(), ground(), FeedOffset=2.0)
         problem = document.problem(model(settings=settings, port=port).Objects[0])
         assert problem.boundary[0] == "PEC"
@@ -6175,7 +6525,7 @@ class TestTheWallStandsWhereTheDrawingEnds:
     stand beyond a wall face, whatever the opposite face of the axis does."""
 
     def test_a_wall_across_from_an_absorbing_face_stands_on_the_drawing(self):
-        settings = mesh_settings(PaddingXMax="Ends")
+        settings = mesh_settings(BoundaryXMax="PEC Wall")
         problem = document.problem(model(settings=settings).Objects[0])
         assert problem.boundary[:2] == ("PML_8", "PEC")
         assert float(problem.grid.x[-1]) == pytest.approx(LENGTH / 2, abs=0.0)
@@ -6195,8 +6545,9 @@ class TestWhatAWaveguidePortDemandsOfItsFaces:
             document.problem(waveguide_model(inset=10.0).Objects[0])
         message = str(refused.value)
         assert "waveguide port 'WG1' stands inside the guide" in message, message
-        assert "the face behind it, ZMin, is Ends" in message, message
-        assert "PaddingZMin to Through" in message, message
+        assert "the face behind it, ZMin, is PEC Wall" in message, message
+        assert "Set BoundaryZMin to Through on" in message, message
+        assert "or move the port onto the guide's end face" in message, message
 
     def test_mur_on_a_face_a_waveguide_port_opens_is_refused_by_name(self):
         """The port's source lies on the face, and openEMS holds a Mur face
@@ -6261,8 +6612,9 @@ class TestAnAbsorberIsAskedOfWhereOneIs:
 
     def test_a_face_that_absorbs_needs_a_depth(self):
         doc = model(simulation=simulation(PMLCells=0))
-        with pytest.raises(document.TranslationError, match="PMLCells is 0"):
+        with pytest.raises(document.TranslationError, match="PMLCells is 0") as raised:
             document.problem(doc.Objects[0])
+        assert "Set PMLCells to 1 or more; 8 is the usual depth" in str(raised.value)
 
 
 # ---------------------------------------------------------------------------
@@ -6396,11 +6748,16 @@ class TestTwoMaterialsInOneSpace:
         and nothing would then say whether the two overlap."""
         insert = block("Insert", *self.INSERT)
         insert.Shape.broken = True
-        with pytest.raises(properties.TranslationError, match="'Insert' is not a valid solid"):
+        with pytest.raises(
+            properties.TranslationError, match="'Insert' is not a valid solid"
+        ) as said:
             self._translate(
                 (dielectric("Laminate", 2.2), block("Board", *self.BOARD)),
                 (dielectric("Ceramic", 10.0), insert),
             )
+        assert str(said.value).endswith(
+            ". Repair the shape (Part > Check geometry), or cut one out of the other"
+        )
 
     def test_bodies_sharing_a_face_are_taken(self):
         """A stackup and a part set flush into a pocket share faces and no
@@ -6566,7 +6923,7 @@ class TestTwoMaterialsInOneSpace:
                     binding("PadBinding", perfect("PEC"), block("Pad", *self.BOARD)),
                     binding(
                         "ViaBinding",
-                        perfect("Copper", MaterialType="ConductingSheet", Conductivity=5.8e7),
+                        perfect("Copper", MaterialType="Conducting Sheet", Conductivity=5.8e7),
                         block("Via", *self.INSERT),
                     ),
                 ],
@@ -6686,7 +7043,12 @@ class TestTheMediumFillsUndrawnRoom:
         assert [one.name for one in problem.materials].count("FR4") == 1
 
     def test_a_medium_conducting_past_where_the_layer_switches_off_is_refused(self):
-        with pytest.raises(document.TranslationError, match="Set the solver's Absorber to Mur"):
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape(
+                "Set the solver's Absorber to Mur, or link a medium that conducts less"
+            ),
+        ):
             self.translated(ptfe(Conductivity=2e3))
 
     def test_and_taken_where_the_absorber_is_mur(self):
@@ -6729,3 +7091,62 @@ class TestTheMediumFillsUndrawnRoom:
         vacuum = document.grid_inputs_digest(model(settings=stated).Objects[0])
         filled = model(settings=mesh_settings(Clearance=10.0, Medium=fr4())).Objects[0]
         assert document.grid_inputs_digest(filled) != vacuum
+
+
+class TestWhatAShapeHoldsBesideItsSolids:
+    """A face belonging to none of a shape's solids is a sheet drawn in among
+    them, and the translation refuses the mix by name."""
+
+    class Face:
+        def isSame(self, other):
+            return other is self
+
+        def hashCode(self):
+            return 0
+
+    def shape(self, solids, faces):
+        return SimpleNamespace(Solids=solids, Faces=faces)
+
+    def test_solids_sharing_the_face_they_were_split_along_hold_every_face(self):
+        """A box sliced in two lists the cut face once and each half holds it."""
+        cut, left, right = (
+            self.Face(),
+            [self.Face() for _ in range(5)],
+            [self.Face() for _ in range(5)],
+        )
+        halves = [
+            SimpleNamespace(Faces=[*left, cut]),
+            SimpleNamespace(Faces=[*right, cut]),
+        ]
+        assert drawn.outside(self.shape(halves, [*left, *right, cut]), halves) == []
+
+    def test_a_sheet_beside_one_solid_is_refused_as_what_was_drawn(self):
+        """One solid and a sheet are refused for the mix, as two solids and a
+        sheet are, and not as a surface left open."""
+        own, sheet = [self.Face() for _ in range(6)], self.Face()
+        solid = SimpleNamespace(Faces=own)
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape(
+                "a solid and 1 face outside it, so it is part volume and part surface. Bind "
+                "them separately, or fuse them into one shape"
+            ),
+        ):
+            geometry._boxes_of(self.shape([solid], [*own, sheet]), "Block")
+
+    def test_a_sheet_beside_solids_split_apart_is_refused(self):
+        """The halves of a sliced box hold one face between them, so a count of
+        the compound's faces against theirs comes out one short and a sheet
+        drawn beside them would go uncounted."""
+        cut, left, right, sheet = (
+            self.Face(),
+            [self.Face() for _ in range(5)],
+            [self.Face() for _ in range(5)],
+            self.Face(),
+        )
+        halves = [
+            SimpleNamespace(Faces=[*left, cut]),
+            SimpleNamespace(Faces=[*right, cut]),
+        ]
+        with pytest.raises(document.TranslationError, match="2 solids and 1 face outside them"):
+            geometry._boxes_of(self.shape(halves, [*left, *right, cut, sheet]), "Sliced")

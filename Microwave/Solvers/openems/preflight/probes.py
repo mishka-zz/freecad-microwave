@@ -144,12 +144,11 @@ def _check_probes_clear_of_the_feed(problem: Problem) -> list[Finding]:
                 Finding(
                     WARN,
                     port.name,
-                    f"its measurement plane is {separation:.4g} from its feed, "
-                    f"which is {separation / wavelength:.3f} of a wavelength at "
-                    f"{problem.frequency.start / 1e9:.3g} GHz. The feed's "
-                    f"near field has not decayed there, and the impedance will "
-                    f"read high. Increase the port's length, or move the "
-                    f"measurement shift away from the feed shift",
+                    f"its measurement plane is {separation:.4g} mm from its feed, "
+                    f"{separation / wavelength:.3f} of a wavelength at "
+                    f"{problem.frequency.start / 1e9:.3g} GHz, so the feed's near "
+                    "field makes the impedance read high. Raise MeasurementDistance "
+                    "on the port",
                 )
             )
     return findings + _check_probes_clear_of_the_bore(problem)
@@ -185,13 +184,13 @@ def _check_probes_clear_of_the_bore(problem: Problem) -> list[Finding]:
             Finding(
                 WARN,
                 port.name,
-                f"its measurement plane is {separation:.4g} from its feed, and "
-                f"the mean circumference of its bore is {circumference:.4g}. A "
-                f"mode that is not TEM is cut off below about that length and "
-                f"decays over it, so some of what the probes difference there "
-                f"is not the line's own wave and the impedance will read high. "
-                f"Increase the port's length, or move the measurement shift "
-                f"away from the feed shift",
+                # A mode that is not TEM is cut off below about the mean
+                # circumference and decays over that length, so the probes read
+                # some of it beside the line's own wave.
+                f"its measurement plane is {separation:.4g} mm from its feed, less "
+                f"than the {circumference:.4g} mm mean circumference of its bore, so "
+                "higher-order modes from the feed make the impedance read high. "
+                "Raise MeasurementDistance on the port",
             )
         )
     return findings
@@ -241,12 +240,12 @@ def _check_probes(problem: Problem) -> list[Finding]:
                     WARN,
                     port.name,
                     f"the grid is uneven at its measurement plane: the cells "
-                    f"either side are {below:.4g} and {above:.4g} "
-                    f"({asymmetry * 100:.1f}% apart), which puts "
+                    f"either side are {below:.4g} and {above:.4g} mm "
+                    f"({asymmetry * 100:.1f}% apart), which adds "
                     f"{asymmetry * np.pi / _CELLS_PER_WAVELENGTH_ASSUMED * 100:.3f}% "
-                    f"of Z0 into the extracted impedance for every unit of "
-                    f"reflection there, at "
-                    f"{_CELLS_PER_WAVELENGTH_ASSUMED:g} cells per guide wavelength",
+                    "of Z0 to the impedance per unit of reflection there, "
+                    f"assuming {_CELLS_PER_WAVELENGTH_ASSUMED:g} cells per guide "
+                    "wavelength",
                 )
             )
     return findings

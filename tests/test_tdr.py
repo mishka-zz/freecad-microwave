@@ -14,6 +14,7 @@ No solver and no FreeCAD. The derivation reads an
 network assembled by hand exercises every line of it.
 """
 
+import re
 from dataclasses import replace
 
 import numpy as np
@@ -182,7 +183,7 @@ def stepped(impedances, points=POINTS, fmax=FMAX, nepers_per_m=0.0):
     return _two_port(network)
 
 
-def stubbed(stub_lengths, points=POINTS, fmax=FMAX, z0=50.0):
+def stubbed(stub_lengths, points=POINTS, fmax=FMAX, z0=50.0, fmin=None):
     """A line with open stubs shunted along it, one velocity throughout.
 
     Each stub is a transmission zero, and a structure's phase runs backwards
@@ -193,7 +194,7 @@ def stubbed(stub_lengths, points=POINTS, fmax=FMAX, z0=50.0):
     ``stub_lengths`` are in metres and there is a :data:`SECTION` of line before
     each stub and after the last.
     """
-    frequency = _frequency(points, fmax)
+    frequency = _frequency(points, fmax, fmin)
     media = _media(frequency, z0)
     network = media.line(SECTION, unit="m")
     for length in stub_lengths:
@@ -320,6 +321,10 @@ class TestTheInventedBandIsBounded:
             tdr.step_response(default_band, 1)
 
         monkeypatch.setattr(tdr, "INVENTED_BINS", float("inf"))
+        # What is invented also rings past the record's end, which is refused
+        # on its own account.
+        monkeypatch.setattr(tdr, "RINGING", float("inf"))
+        monkeypatch.setattr(tdr, "HARMONIC", 1.0)
         withheld = plateau(tdr.step_response(default_band, 1), 25.0, 35.0)
         assert withheld != pytest.approx(75.0, rel=0.01)
         assert np.isfinite(withheld), "and it arrives as a number, not as a blank"
@@ -335,9 +340,24 @@ class TestTheInventedBandIsBounded:
             tdr.step_response(self.at(1e9, points=501), 1)
         # The suggestion has to be the sweep the transform actually wants, so it
         # is read back out of the message and run.
-        suggested = float(str(refused.value).rsplit("start at about ", 1)[1].split(" GHz")[0]) * 1e9
-        trace = tdr.step_response(self.at(suggested, points=501), 1)
+        said = str(refused.value).split("needs a sweep from ", 1)[1]
+        start = float(said.split(" GHz")[0]) * 1e9
+        stop = float(said.split(" to ")[1].split(" GHz")[0]) * 1e9
+        points = int(said.split(" in ")[1].split(" points")[0])
+        trace = tdr.step_response(self.at(start, points=points, fmax=stop), 1)
         assert plateau(trace, 25.0, 35.0) == pytest.approx(75.0, rel=0.01)
+
+    def test_the_sweep_it_names_keeps_the_step(self):
+        """The step sets how long a record the sweep holds, so a sweep keeping
+        the point count instead would hold a shorter one."""
+        with pytest.raises(ResultError) as refused:
+            tdr.step_response(self.at(1e9, points=501), 1)
+        said = str(refused.value).split("needs a sweep from ", 1)[1]
+        start = float(said.split(" GHz")[0]) * 1e9
+        stop = float(said.split(" to ")[1].split(" GHz")[0]) * 1e9
+        points = int(said.split(" in ")[1].split(" points")[0])
+        assert start == pytest.approx((10e9 - 1e9) / 500, rel=1e-3)
+        assert stop >= 10e9 and stop - start == pytest.approx((points - 1) * start, rel=1e-3)
 
     @pytest.mark.parametrize("shape", ("log", "jittered"))
     def test_a_sweep_that_is_not_linear_is_refused_rather_than_resampled(self, shape):
@@ -351,12 +371,12 @@ class TestTheInventedBandIsBounded:
             if shape == "log"
             else np.sort(even * (1 + 0.4 * np.sin(np.arange(110))))
         )
-        with pytest.raises(ResultError, match="evenly spaced whatever they are"):
+        with pytest.raises(ResultError, match="needs a linear sweep"):
             tdr.step_response(reflected(at_frequencies(f, [50.0, 75.0, 50.0])), 1)
 
     def test_a_sweep_that_descends_is_refused(self):
         result = self.bins(1)
-        with pytest.raises(ResultError, match="do not ascend"):
+        with pytest.raises(ResultError, match="do not rise"):
             tdr.step_response(
                 SParameters(
                     frequency=result.frequency[::-1],
@@ -379,7 +399,7 @@ class TestTheInventedBandIsBounded:
             measured_impedance=result.measured_impedance[:1],
             driven=result.driven,
         )
-        with pytest.raises(ResultError, match="more than 1 frequency point"):
+        with pytest.raises(ResultError, match="holds 1 frequency point"):
             tdr.step_response(one, 1)
 
 
@@ -527,10 +547,11 @@ class TestAPortReferencedToWhatItMeasured:
         """Constant is not the condition - real is. An impedance read off a
         reflection has nowhere to put an imaginary part, so a reference that
         carries one is moved like any other."""
+        # A constant reactance is not a causal network, so the trace itself
+        # holds a response before the reference plane; the reference is asked
+        # for alone.
         result = reflected(line(self.SECTIONS), reference=50.0 + 3.0j)
-        trace = tdr.step_response(result, 1)
-        assert trace.reference == 50.0
-        assert trace.reference_measured
+        assert tdr._reference_of(result, 1, None) == (50.0, True)
 
 
 class TestWhatItRefuses:
@@ -571,7 +592,15 @@ class TestWhatItRefuses:
         than to change what it is referenced to."""
         result = reflected(line([50.0, 75.0, 50.0]))
         assert 2 in result.self_referenced and 2 in result.unmeasured
-        with pytest.raises(ResultError, match="nobody drove it") as refused:
+        with pytest.raises(
+            ResultError,
+            match=re.escape(
+                "the port was not driven, so its reflection holds no numbers. Set "
+                "Driven to true on port 2 and run again, or, if the device is "
+                "mirror-symmetric, set the study's Symmetry to Mirror and run again"
+            )
+            + "$",
+        ) as refused:
             tdr.step_response(result, 2)
         assert "own measured impedance" not in str(refused.value)
 
@@ -626,7 +655,9 @@ class TestVelocity:
         """A fold shows as a delay too small for the length, which is a speed
         nothing travels at. Nothing in the phase itself gives it away: it stays
         as straight as an honest one, so the check has to be physical."""
-        with pytest.raises(ResultError, match="not a speed"):
+        with pytest.raises(
+            ResultError, match=r"not a physical speed, .*\. Sweep the band with more points$"
+        ):
             tdr.velocity(
                 through(sections=sections, points=points), 2, 1, separation=sections * SECTION
             )
@@ -886,3 +917,283 @@ class TestDistance:
         along = 1e3 * tdr.distance(trace, V)
         rising = along[np.nanargmax(np.gradient(trace.impedance, along))]
         assert rising == pytest.approx(1e3 * SECTION, abs=1e3 * V / (2 * FMAX))
+
+
+def edge_rise(trace):
+    """The 10-90% rise of the first edge in ``trace``'s reflection, read off the
+    samples: from where it first passes a tenth of its final height to where it
+    first passes nine tenths."""
+    after = trace.time >= 0
+    time = trace.time[after]
+    reflection = np.real(trace.reflection[after])
+    final = reflection[-1]
+    share = reflection / final
+    return float(time[np.argmax(share >= 0.9)] - time[np.argmax(share >= 0.1)])
+
+
+def shorted(points=POINTS, fmax=FMAX, sections=1):
+    """A short at the far end of ``sections`` sections: one edge from nothing
+    to -1."""
+    return reflected(line([50.0] * sections, load="short", points=points, fmax=fmax))
+
+
+class TestTheRiseTimeIsStated:
+    """The rise time a trace states is the one it is drawn at, and one edge
+    gives every band the same one."""
+
+    @pytest.mark.parametrize("fmax", (5e9, 20e9))
+    def test_a_short_rises_in_the_time_the_trace_states(self, fmax):
+        trace = tdr.step_response(shorted(fmax=fmax), 1, spectrum=1 << 14)
+        assert edge_rise(trace) == pytest.approx(trace.rise, rel=0.02)
+
+    def test_the_fastest_is_one_step_past_the_band(self):
+        result = shorted()
+        step = FMAX / POINTS
+        assert tdr.fastest(result) == pytest.approx(FMAX + step, rel=1e-12)
+        assert tdr.step_response(result, 1).edge == tdr.fastest(result)
+
+    def test_each_window_states_its_own_rise_time(self):
+        assert tdr.rise_time(1e9, "blackman") > tdr.rise_time(1e9, "hamming")
+        trace = tdr.step_response(shorted(), 1, window="blackman", spectrum=1 << 14)
+        assert edge_rise(trace) == pytest.approx(trace.rise, rel=0.02)
+
+    def test_a_rise_time_and_its_edge_are_one_number(self):
+        assert tdr.rise_time(tdr.edge_for(91e-12)) == pytest.approx(91e-12, rel=1e-12)
+
+    def test_one_edge_draws_bands_of_different_steps_at_one_rise_time(self):
+        narrow = shorted(points=60, fmax=8e9)
+        wide = shorted(points=300, fmax=20e9)
+        at = min(tdr.fastest(narrow), tdr.fastest(wide))
+        traces = [tdr.step_response(r, 1, edge=at, spectrum=1 << 14) for r in (narrow, wide)]
+        assert traces[0].rise == traces[1].rise
+        assert edge_rise(traces[1]) == pytest.approx(edge_rise(traces[0]), rel=0.02)
+
+    def test_each_band_left_to_itself_rises_at_its_own(self):
+        """What the shared edge is for: without it the two above differ."""
+        traces = [
+            tdr.step_response(r, 1, spectrum=1 << 14)
+            for r in (shorted(points=60, fmax=8e9), shorted(points=300, fmax=20e9))
+        ]
+        assert edge_rise(traces[0]) > 2 * edge_rise(traces[1])
+
+    def test_an_edge_past_the_band_is_refused(self):
+        result = shorted()
+        with pytest.raises(ResultError, match="at the fastest"):
+            tdr.step_response(result, 1, edge=1.5 * tdr.fastest(result))
+
+    def test_a_slower_edge_reads_less_of_the_band_and_rises_slower(self):
+        result = shorted()
+        slow = tdr.step_response(result, 1, edge=tdr.fastest(result) / 4, spectrum=1 << 14)
+        assert edge_rise(slow) == pytest.approx(4 * tdr.rise_time(tdr.fastest(result)), rel=0.03)
+
+
+class TestTheTaper:
+    @pytest.mark.parametrize("window", tuple(tdr.WINDOWS))
+    def test_each_is_the_right_half_of_the_window_scipy_names(self, window):
+        from scipy.signal import get_window
+
+        points = 201
+        frequency = np.arange(points) * 1e7
+        edge = points * 1e7
+        assert tdr.taper(frequency, edge, window) == pytest.approx(
+            get_window(window, 2 * points)[points:], abs=1e-12
+        )
+
+    def test_nothing_at_or_past_the_edge_is_read(self):
+        assert tdr.taper(np.array([1.0, 2.0, 3.0]), 2.0).tolist()[1:] == [0.0, 0.0]
+
+    def test_a_band_tapered_to_its_own_edge_is_the_trace_scikit_rf_draws(self):
+        """So the trace every chart drew before an edge could be chosen is the
+        one drawn now, to the rounding, and no gate reading it moves."""
+        result = reflected(line([50.0, 75.0, 50.0]))
+        network = tdr._one_port(result, 1, 50.0).extrapolate_to_dc(kind="linear")
+        _, expected = network.step_response(window="hamming", pad=tdr.SPECTRUM - len(network))
+        trace = tdr.step_response(result, 1)
+        assert trace.reflection == pytest.approx(np.ravel(expected), abs=1e-12)
+
+
+class TestARecordTooShortIsRefused:
+    def test_a_reflection_lost_in_rounding_is_not_read_as_ringing(self):
+        """A share of rounding says nothing about when a response ends."""
+        result = reflected(line([50.0]))
+        noise = np.random.default_rng(1).standard_normal(result.s.shape[0]) * 1e-18
+        s = result.s.copy()
+        s[:, 0, 0] = noise
+        tdr.step_response(
+            SParameters(
+                frequency=result.frequency,
+                s=s,
+                port_numbers=result.port_numbers,
+                reference=result.reference,
+                measured_impedance=result.measured_impedance,
+                driven=result.driven,
+            ),
+            1,
+        )
+
+    def test_the_step_it_names_holds_a_ring_one_halving_does_not(self):
+        """A ring the record's own decay rate says two halvings hold, and one
+        does not."""
+        stubs = [0.01, 0.0101, 0.0102]
+        with pytest.raises(ResultError) as refused:
+            tdr.step_response(stubbed(stubs, points=40), 1)
+        named = float(str(refused.value).split("A step of ")[-1].split(" MHz")[0]) * 1e6
+        assert named == pytest.approx(FMAX / 40 / 2)
+        points = int(np.ceil(FMAX / named))
+        tdr.step_response(stubbed(stubs, points=points, fmax=points * named), 1)
+        half = int(np.ceil(FMAX / (2 * named)))
+        with pytest.raises(ResultError, match="drawn on the trace"):
+            tdr.step_response(stubbed(stubs, points=half, fmax=half * 2 * named), 1)
+
+    def test_a_ringing_structure_on_a_coarse_step_is_refused(self):
+        with pytest.raises(ResultError, match="drawn on the trace"):
+            tdr.step_response(stubbed([0.01, 0.015], points=30), 1)
+
+    def test_the_step_it_names_holds_the_ring(self):
+        with pytest.raises(ResultError) as refused:
+            tdr.step_response(stubbed([0.01, 0.015], points=30), 1)
+        named = float(str(refused.value).split("A step of ")[-1].split(" MHz")[0]) * 1e6
+        points = int(np.ceil(FMAX / named))
+        trace = tdr.step_response(stubbed([0.01, 0.015], points=points, fmax=points * named), 1)
+        assert trace.rise > 0
+
+    def test_a_reflection_at_the_end_of_the_record_is_refused(self):
+        """A line whose far end returns just before the record ends: its skirt
+        is already folding onto the start."""
+        record = 2 * SECTION * 50 / V
+        points = int(round(FMAX * record / 0.95))
+        long = reflected(line([75.0] * 50, points=points, fmax=FMAX))
+        with pytest.raises(ResultError, match="drawn on the trace") as refused:
+            tdr.step_response(long, 1)
+        # Nothing comes back between the plane and the far end, so no rate of
+        # dying away can be read and no step is named.
+        assert "not dying away inside the record" in str(refused.value)
+
+    @pytest.mark.parametrize(
+        ("sections", "points"),
+        (
+            ([50.0], 60),
+            ([50.0], 110),
+            ([50.0], 400),
+            ([50.0, 75.0, 50.0], 110),
+            ([50.0, 75.0, 50.0], 400),
+        ),
+    )
+    @pytest.mark.parametrize("load", ("open", "short", "match"))
+    def test_the_window_alone_never_trips_it(self, sections, load, points):
+        """The bar sits above the window's own sidelobes, so a structure that
+        has finished well inside its record is drawn whatever it ends in."""
+        tdr.step_response(reflected(line(sections, load=load, points=points)), 1)
+
+
+class TestTheGridIsHarmonic:
+    """A band whose first point is not a whole number of steps above DC is
+    moved onto one that is by interpolation, and a narrow feature comes back
+    lower than it was solved."""
+
+    def test_a_first_point_between_steps_is_refused(self):
+        step = FMAX / POINTS
+        result = reflected(line([50.0, 75.0, 50.0], fmin=2.5 * step, fmax=FMAX + 1.5 * step))
+        with pytest.raises(ResultError, match="not a whole number of steps"):
+            tdr.step_response(result, 1)
+
+    def test_the_sweep_it_names_is_accepted_and_keeps_the_step(self):
+        step = FMAX / POINTS
+        result = reflected(line([50.0, 75.0, 50.0], fmin=2.5 * step, fmax=FMAX + 1.5 * step))
+        with pytest.raises(ResultError) as refused:
+            tdr.step_response(result, 1)
+        said = str(refused.value).split("needs a sweep from ", 1)[1]
+        start = float(said.split(" GHz")[0]) * 1e9
+        stop = float(said.split(" to ")[1].split(" GHz")[0]) * 1e9
+        points = int(said.split(" in ")[1].split(" points")[0])
+        assert start == pytest.approx(step, rel=1e-3)
+        tdr.step_response(reflected(line([50.0], fmin=start, fmax=stop, points=points)), 1)
+
+    def test_a_first_point_a_hair_off_a_step_is_drawn(self):
+        """A round start, a round stop and a round point count leave the first
+        point a hair off a whole step, and that moves nothing a reader sees."""
+        result = reflected(line([50.0, 75.0, 50.0], fmin=10e6, fmax=20e9, points=2001))
+        tdr.step_response(result, 1)
+
+    def test_the_most_steps_it_admits_are_admitted(self):
+        """The bar compared against a quotient that rounding lands a hair above."""
+        step = 10e9 / 69
+        frequency = step * (tdr.INVENTED_BINS + np.arange(69))
+        assert frequency[0] / np.median(np.diff(frequency)) > tdr.INVENTED_BINS
+        result = reflected(at_frequencies(frequency, [50.0, 75.0, 50.0]))
+        tdr.step_response(result, 1)
+
+
+class TestTooSlowAnEdge:
+    def test_an_edge_reading_too_few_points_is_refused_by_name(self):
+        result = shorted()
+        with pytest.raises(ResultError, match=f"fewer than {tdr.FEWEST} points"):
+            tdr.step_response(result, 1, edge=tdr.slowest(result))
+
+    def test_an_edge_holding_just_enough_points_is_admitted(self):
+        result = shorted()
+        _, step = tdr._grid(result.frequency)
+        tdr.step_response(result, 1, edge=(tdr.FEWEST - 0.5) * step)
+
+    def test_the_slowest_edge_admitted_still_rises_as_it_says(self):
+        # A short far enough down the line that an edge this slow has risen
+        # from nothing by the time it reaches it.
+        result = shorted(points=400, sections=25)
+        trace = tdr.step_response(result, 1, edge=1.01 * tdr.slowest(result), spectrum=1 << 14)
+        assert edge_rise(trace) == pytest.approx(trace.rise, rel=0.02)
+
+
+class TestALongSweep:
+    def test_it_is_drawn_with_enough_samples_to_rise_as_it_says(self):
+        """Padding in proportion to the band keeps the drawn edge as fast as
+        the one stated, however many points the sweep holds."""
+        trace = tdr.step_response(shorted(points=2000, fmax=20e9), 1)
+        assert edge_rise(trace) == pytest.approx(trace.rise, rel=0.02)
+
+
+class TestWhatIsNotAnInput:
+    def test_an_edge_that_is_not_a_frequency_is_refused(self):
+        for edge in (0.0, -1e9, float("nan")):
+            with pytest.raises(ValueError, match="above zero"):
+                tdr.step_response(shorted(), 1, edge=edge)
+
+    def test_a_frequency_that_is_not_a_number_is_refused(self):
+        result = shorted()
+        frequency = result.frequency.copy()
+        frequency[3] = np.nan
+        with pytest.raises(ResultError, match="not numbers"):
+            tdr.step_response(_at(result, frequency), 1)
+        with pytest.raises(ResultError, match="not numbers"):
+            tdr.fastest(_at(result, frequency))
+
+
+class TestTheBarStandsAboveAFloor:
+    def test_a_response_the_trace_holds_all_but_a_few_per_cent_of_is_drawn(self):
+        """A solve leaves a floor before the plane that a finer step does not
+        lower, so a few per cent there is drawn rather than refused."""
+        tdr.step_response(reflected(line([50.0, 75.0, 50.0], load="short", points=60)), 1)
+
+    def test_a_ring_needing_several_halvings_is_named_them(self):
+        stubs = [0.012, 0.02]
+        with pytest.raises(ResultError) as refused:
+            tdr.step_response(stubbed(stubs, points=25, fmin=2e9, fmax=26e9), 1)
+        named = float(str(refused.value).split("A step of ")[-1].split(" MHz")[0]) * 1e6
+        assert named == pytest.approx(1e9 / 4)
+        points = int(np.ceil(26e9 / named))
+        tdr.step_response(stubbed(stubs, points=points, fmax=points * named), 1)
+
+
+def test_a_reference_that_cannot_be_moved_at_a_point_is_refused_by_name():
+    result = reflected(line([50.0, 75.0, 50.0]))
+    reference = result.reference.copy()
+    reference[7, 0] = np.nan
+    broken = SParameters(
+        frequency=result.frequency,
+        s=result.s,
+        port_numbers=result.port_numbers,
+        reference=reference,
+        measured_impedance=result.measured_impedance,
+        driven=result.driven,
+    )
+    with pytest.raises(ResultError, match="cannot be renormalised to"):
+        tdr.step_response(broken, 1, reference=50.0)

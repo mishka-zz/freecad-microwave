@@ -92,9 +92,17 @@ FAULTS = [
     (dict(ElementSize=float("nan")), "has no element size set"),
     (dict(References=[]), "refines nothing"),
     (dict(References=[], Mode="Coarsen"), "coarsens nothing"),
-    (dict(Mode="Sideways"), "Mode is 'Sideways'"),
-    (dict(MinElementsAcross=-1), "MinElementsAcross is -1"),
-    (dict(Mode="Coarsen", MinElementsAcross=3), "set to Coarsen and asks for 3"),
+    (dict(Mode="Sideways"), "Mode is 'Sideways'. Set Mode to Refine or Coarsen"),
+    (
+        dict(MinElementsAcross=-1),
+        "MinElementsAcross is -1. Enter 0 to take the count from its mesh settings, "
+        "or a positive number",
+    ),
+    (
+        dict(Mode="Coarsen", MinElementsAcross=3),
+        "set to Coarsen and asks for 3 elements across, so the count would override "
+        "the coarsening. Set MinElementsAcross to 0, or set Mode to Refine",
+    ),
     (dict(References=[drawn("Nothing", None)]), "'Nothing', which has no shape"),
 ]
 
@@ -120,11 +128,43 @@ class TestBothBackendsRefuseInOneVoice:
         with pytest.raises(TranslationError) as openems:
             openems_document.problem(doc.Objects[0])
         found, body = palace_study.guide()
-        found.Group = [*found.Group, palace_study.refinement([(body, [""])], **changed)]
+        stated = palace_study.refinement([(body, [""])], **changed)
+        found.Group = [*found.Group, *palace_study.amending([stated], found.Group)]
         with pytest.raises(TranslationError) as palace:
             palace_document.problem(found)
         assert said in str(read.value)
         assert str(palace.value) == str(openems.value) == str(read.value)
+
+    @pytest.mark.parametrize(
+        ("amended", "said"),
+        [
+            (None, "'Ring' amends no mesh settings"),
+            (SimpleNamespace(Label="Board"), "'Board', which is no backend's mesh settings"),
+            (
+                SimpleNamespace(Label="Elsewhere", ElementsPerWavelength=20.0),
+                "'Elsewhere', which 'Study' does not hold",
+            ),
+        ],
+    )
+    def test_each_backend_refuses_a_region_amending_no_settings_of_the_study_alike(
+        self, amended, said
+    ):
+        doc = openems_study.model()
+        doc.Objects[0].Label = "Study"
+        trace = openems_study.part(doc, "Trace")
+        openems_study._add(doc, openems_study.refinement("Ring", trace, MeshSettings=amended))
+        with pytest.raises(TranslationError) as openems:
+            openems_document.problem(doc.Objects[0])
+        found, body = palace_study.guide()
+        found.Label = "Study"
+        found.Group = [
+            *found.Group,
+            palace_study.refinement([(body, [""])], MeshSettings=amended),
+        ]
+        with pytest.raises(TranslationError) as palace:
+            palace_document.problem(found)
+        assert str(palace.value) == str(openems.value)
+        assert said in str(openems.value)
 
     def test_each_backend_names_what_a_region_names_alike(self):
         box = SimpleNamespace(XMin=0.0, YMin=0.0, ZMin=0.0, XMax=1.0, YMax=1.0, ZMax=1.0)

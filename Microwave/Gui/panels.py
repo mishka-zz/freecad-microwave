@@ -15,9 +15,11 @@ import importlib
 from ..Objects.kinds import kind_of
 
 #: What a user is told when a panel is asked for while another is open.
+#: FreeCAD holds one task dialog for the application, so opening a second one
+#: would close the first and stop the run it holds.
 ALREADY_OPEN = (
-    "a panel is already open. Close it first - opening another would close it, "
-    "and stop whatever it is running"
+    "another task panel is open, and opening this one would close it and stop "
+    "anything it is running. Close it first"
 )
 
 #: Solver kind to the module and the class of the panel that runs it.
@@ -27,14 +29,50 @@ PANELS = {
 }
 
 
+def panel_class(solver):
+    """The class of the panel that runs ``solver``'s backend."""
+    module, name = PANELS[kind_of(solver)]
+    return getattr(importlib.import_module(module), name)
+
+
 def panel_for(analysis, solver):
     """The panel that runs ``solver``'s backend on ``analysis``."""
-    module, name = PANELS[kind_of(solver)]
-    return getattr(importlib.import_module(module), name)(analysis)
+    return panel_class(solver)(analysis)
 
 
-def open_run(title, solver):
-    """Open the panel that runs ``solver``, or say why not.
+def open_refined(title, run):
+    """Open the panel of the backend that solved ``run``, with its next run
+    solving the study again one step finer, or say why not.
+
+    The panel says what the refinement turns and what ``run`` cost, and Run
+    starts it, as Run starts any run. ``Gui/refine.py`` says what one is.
+    """
+    from ..Objects.analysis import analysis_of, solvers_in
+    from .notify import refused
+    from .refine import Unrefinable, refinement
+
+    study = analysis_of(run)
+    found = [
+        solver
+        for solver in (solvers_in(study) if study is not None else ())
+        if kind_of(solver) in PANELS and str(run.Solver) == panel_class(solver).BACKEND
+    ]
+    if not found:
+        refused(title, f"{run.Label} is not in a study that has a {run.Solver} solver")
+        return
+    steps = panel_class(found[0])
+    try:
+        refined = refinement(run, steps.REFINES, steps.OWNS)
+    except Unrefinable as error:
+        refused(title, str(error))
+        return
+    open_run(title, found[0], refined)
+
+
+def open_run(title, solver, refinement=None):
+    """Open the panel that runs ``solver``, or say why not, and return whether
+    it opened. ``refinement`` is what the panel's next run is asked, where it
+    is given.
 
     The edit is held on the solver, as FreeCAD's own FEM holds a solver's run
     panel, so which backend a panel starts is decided by which object was
@@ -57,5 +95,11 @@ def open_run(title, solver):
     gui = FreeCADGui.getDocument(solver.Document.Name)
     if FreeCADGui.Control.activeDialog() or gui.getInEdit():
         refused(title, ALREADY_OPEN)
-        return
+        return False
     gui.setEdit(solver.Name, 0)
+    if refinement is None:
+        return True
+    panel = getattr(getattr(solver.ViewObject, "Proxy", None), "panel", None)
+    if panel is not None:
+        panel.offer(refinement)
+    return True

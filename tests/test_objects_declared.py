@@ -60,10 +60,10 @@ class TestWhatDeparts:
         """FreeCAD writes an enumeration's choices into the document, so a
         choice added since is not one the saved object offers."""
         policy = createEMMeshPolicy(doc)
-        policy.PaddingXMin = ["Air", "Through"]
+        policy.BoundaryXMin = ["Open", "Through"]
         departed = departures(policy)
         assert departed.phrases == (
-            "offers Air, Through for PaddingXMin where this build offers Air, Through, Ends",
+            "offers Open, Through for BoundaryXMin where this build offers Open, Through, PEC Wall",
         )
         assert departed.stops
 
@@ -82,18 +82,18 @@ class TestWhatDeparts:
         policy = createEMMeshPolicy(doc)
         policy.removeProperty("Medium")
         policy.addProperty("App::PropertyFloat", "MaxGrowthRatio", "Mesh")
-        policy.PaddingZMax = ["Air", "Through"]
+        policy.BoundaryZMax = ["Open", "Through"]
         said = departures(policy).phrases
         assert [phrase.split()[0] for phrase in said] == ["has", "carries", "offers"]
 
     def test_an_enumeration_saved_with_its_choices_reordered_is_named_so(self, doc):
         """FreeCAD keeps an enumeration's value as an index into its choices."""
         policy = createEMMeshPolicy(doc)
-        policy.PaddingXMin = ["Ends", "Air", "Through"]
+        policy.BoundaryXMin = ["PEC Wall", "Open", "Through"]
         departed = departures(policy)
         assert departed.phrases == (
-            "orders the choices for PaddingXMin Ends, Air, Through where this build orders "
-            "them Air, Through, Ends",
+            "orders the choices for BoundaryXMin PEC Wall, Open, Through where this build orders "
+            "them Open, Through, PEC Wall",
         )
         assert departed.stops
 
@@ -212,3 +212,6 @@ class TestOneRefusal:
         said = str(refused.value)
         assert "'Mesh Policy' carries EdgeRefinement 3.0" in said
         assert "Delete Property" in said, "FreeCAD's own words for the editor's command"
+        assert said.endswith(
+            "Delete it in the property editor (right-click it, Delete Property)"
+        ), said

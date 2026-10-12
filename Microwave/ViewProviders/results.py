@@ -7,7 +7,7 @@ from . import HasDisplayMode
 class EMSParametersViewProvider(HasDisplayMode):
     """The S-matrix in the tree. An icon, and a double-click that plots it."""
 
-    ICON = "SParameters.svg"
+    ICON = "SMatrix.svg"
 
     def setupContextMenu(self, vobj, menu):
         """Right-click the result for everything it can be shown or written as.
@@ -31,20 +31,26 @@ class EMSParametersViewProvider(HasDisplayMode):
         and one entry anyway when no port can, so the user can press it and be
         told why. ``Results/tdr.py`` writes those refusals for exactly this.
 
-        The comparison is offered where the study holds a second result to
-        compare this one with, which is decided without reading either.
+        Plot S-Parameters draws this result with every other table selected in
+        the tree, on one set of axes, so a multi-selection right-clicked is the
+        set the user picked.
         """
         self._acting_on = vobj.Object
-        self._add(menu, "Plot S-parameters", self.plot_matrix)
+        self._entries(menu)
+
+    def _entries(self, menu):
+        """What the menu offers for the matrix in ``self._acting_on``, each
+        entry in the words of the command that does the same."""
+        from .. import Commands
+
+        self._add(menu, Commands.PlotSParametersCommand.TITLE, self.plot_tables)
         for number in self._impedance_ports():
             self._add(
                 menu,
-                f"Plot impedance along the line (port {number})",
+                f"{Commands.PlotImpedanceCommand.TITLE} (Port {number})",
                 self._impedance_of(number),
             )
-        if self._comparable():
-            self._add(menu, "Compare S-parameters", self.compare)
-        self._add(menu, "Export Touchstone...", self.export_touchstone)
+        self._add(menu, Commands.ExportTouchstoneCommand.TITLE, self.export_touchstone)
 
     def _add(self, menu, text, slot):
         """One menu entry, owned by the menu and connected to a slot in this module."""
@@ -53,17 +59,6 @@ class EMSParametersViewProvider(HasDisplayMode):
         action = QtGui.QAction(text, menu)
         action.triggered.connect(slot)
         menu.addAction(action)
-
-    def _comparable(self):
-        """Whether the study holding this result holds one other to compare it with."""
-        try:
-            from ..Gui.results import results_of
-            from ..Objects.analysis import analysis_of
-
-            analysis = analysis_of(self._acting_on)
-            return analysis is not None and len(results_of(analysis)) == 2
-        except Exception:
-            return False
 
     def _impedance_ports(self):
         """Port numbers to offer an impedance chart for. Never empty.
@@ -78,11 +73,10 @@ class EMSParametersViewProvider(HasDisplayMode):
         entry then reports whatever error reading it raised.
         """
         try:
-            from ..Gui.views import traceable_ports
-            from ..Objects.results import load
+            from ..Gui.views import table_of, traceable_ports
 
-            result = load(self._acting_on)
-            return traceable_ports(result) or list(result.port_numbers[:1])
+            table = table_of(self._acting_on)
+            return traceable_ports(table) or list(table.result.port_numbers[:1])
         except Exception:
             return [1]
 
@@ -105,36 +99,52 @@ class EMSParametersViewProvider(HasDisplayMode):
         """Every term of the stored matrix, in dB."""
         try:
             from ..Gui.plot_s_params import show_matrix
+            from ..Gui.results import source
             from ..Objects.results import load
 
-            show_matrix(load(self._acting_on))
+            show_matrix(
+                load(self._acting_on), source(self._acting_on), self._acting_on.Document.Name
+            )
         except Exception as error:
+            from .. import Commands
             from ..Gui.notify import refused
 
-            refused("Plot S-parameters", f"cannot plot {self._acting_on.Label!r}: {error}")
+            refused(
+                Commands.PlotSParametersCommand.TITLE,
+                f"cannot plot {self._acting_on.Label!r}: {error}",
+            )
 
     def plot_impedance(self, number, *_):
         """One port's impedance against distance along the line, or against time."""
         try:
-            from ..Gui.plot_tdr import show_trace
-            from ..Gui.views import impedance_view
+            from ..Gui.plot_tdr import show_traces
+            from ..Gui.views import table_of
 
-            show_trace(impedance_view(self._acting_on, number))
+            show_traces([table_of(self._acting_on)], number)
         except Exception as error:
+            from .. import Commands
             from ..Gui.notify import refused
 
-            refused("Plot impedance", f"cannot plot port {number}: {error}")
+            refused(Commands.PlotImpedanceCommand.TITLE, f"cannot plot port {number}: {error}")
 
-    def compare(self, *_):
-        """This result against the other backend's in its study."""
+    def plot_tables(self, *_):
+        """The tables selected in the tree on one set of axes, with this one
+        first where neither it nor its run is among them."""
         try:
-            from ..Commands import compare_s_parameters
+            import FreeCADGui
 
-            compare_s_parameters(self._acting_on.Document, [self._acting_on])
+            from ..Commands import plot_s_parameters
+            from ..Gui.results import tables_in
+
+            selection = list(FreeCADGui.Selection.getSelection())
+            if not any(table is self._acting_on for table in tables_in(selection)):
+                selection.insert(0, self._acting_on)
+            plot_s_parameters(selection)
         except Exception as error:
+            from .. import Commands
             from ..Gui.notify import refused
 
-            refused("Compare S-parameters", f"cannot compare: {error}")
+            refused(Commands.PlotSParametersCommand.TITLE, f"cannot plot: {error}")
 
     def export_touchstone(self, *_):
         """Write the object this menu was raised on.

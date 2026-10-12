@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import json
 import types
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+from Microwave.Results.sparameters import IMPEDANCE_STATED, LUMPED_RESISTANCE
 from tests.qt_recording import recording_qt, shown
 
 
@@ -42,6 +45,14 @@ def matrix(
     )
 
 
+def one_table(result, name=""):
+    """The chart of every term of ``result``, drawn as the one table picked."""
+    from Microwave.Gui.plot_s_params import overlay_chart
+    from Microwave.Results.overlay import Table
+
+    return overlay_chart([Table(result, name)])
+
+
 class TestThePlotReadsTheMatrixTheWayAnEngineerDoes:
     """The chart's arithmetic and its ordering.
 
@@ -59,9 +70,13 @@ class TestThePlotReadsTheMatrixTheWayAnEngineerDoes:
     """
 
     def db(self, **kwargs):
-        from Microwave.Gui.plot_s_params import matrix_db
-
-        return matrix_db(matrix(**kwargs))
+        """``(frequency in GHz, [(label, dB, derived), ...])`` as one table's
+        chart of every term draws them."""
+        drawn = one_table(matrix(**kwargs))
+        return drawn.series[0].x, [
+            (series.name.removesuffix(" (derived)"), series.y, series.derived)
+            for series in drawn.series
+        ]
 
     def test_the_labels_are_the_documents_port_numbers(self):
         """Ports numbered 2 and 5: a two-port carved out of a five-port must not
@@ -86,8 +101,40 @@ class TestThePlotReadsTheMatrixTheWayAnEngineerDoes:
                 magnitude, 20 * np.log10(expected[label]), atol=1e-6, err_msg=label
             )
 
-    def test_a_perfect_match_does_not_take_the_axis_to_minus_infinity(self):
-        assert np.all(np.isfinite(self.db()[1][0][1]))
+    def test_a_perfect_match_is_not_drawn_and_does_not_take_the_axis_with_it(self):
+        assert np.all(np.isnan(self.db()[1][0][1]))
+
+    def test_a_perfect_match_is_shaded_under_the_floor_and_named(self):
+        """A curve under the floor drawn along it reads as a measured -120 dB."""
+        from Microwave.Gui.plot_s_params import FLOOR_DB
+
+        drawn = one_table(matrix())
+        assert drawn.floor == FLOOR_DB
+        assert drawn.warnings == (f"Under {FLOOR_DB:g} dB at every point: S11, S22, S21, S12",)
+
+    def test_a_matrix_wholly_over_the_floor_has_none(self):
+        drawn = one_table(matrix(s=np.full((2, 2, 2), 0.5, dtype=complex)))
+        assert drawn.floor is None
+        assert drawn.warnings == ()
+
+    def test_a_curve_partly_under_the_floor_shades_it_and_names_nothing(self):
+        from Microwave.Gui.plot_s_params import FLOOR_DB, under_floor
+
+        assert under_floor([("S11", np.array([0.5, 0.0]))]) == (FLOOR_DB, "")
+
+    def test_a_magnitude_at_the_floor_is_drawn_at_it(self):
+        from Microwave.Gui.plot_s_params import _FLOOR, FLOOR_DB, db
+
+        assert float(db(np.array([_FLOOR]))[0]) == pytest.approx(FLOOR_DB, rel=0, abs=1e-12)
+
+    def test_a_derived_term_under_the_floor_is_named_as_its_legend_names_it(self):
+        drawn = one_table(matrix(driven=(1,), derived=(2,)))
+        assert any("S22 (derived)" in line for line in drawn.warnings)
+
+    def test_the_floor_is_the_floor_in_decibels(self):
+        from Microwave.Gui.plot_s_params import _FLOOR, FLOOR_DB
+
+        assert 20 * np.log10(_FLOOR) == pytest.approx(FLOOR_DB, rel=0, abs=1e-12)
 
     def test_a_one_path_measurement_draws_only_what_it_measured(self):
         """A nan column plots as a gap, which is honest but reads as a failed
@@ -140,16 +187,16 @@ class TestTheChartSaysWhatItIsReferencedTo:
     def test_the_study_heads_the_chart_and_the_basis_sits_under_it(self):
         text = self.text(title="WR-42")
         assert text.heading == "WR-42 S-parameters"
-        assert text.footnote == "Referenced to 50 ohm"
+        assert text.basis == "Referenced to 50 ohm"
 
     #: A reference that disperses, as a guide's own impedance does, which is
-    #: what leaves the footnote with no number to print. One row per frequency,
+    #: what leaves the basis with no number to print. One row per frequency,
     #: broadcast across the ports.
     GUIDE = [[470.0], [480.0]]
 
     def test_a_port_reported_against_itself_says_so(self):
         """A port referenced to itself has no number to print - for a guide the
-        impedance varies across the band - so the footnote says that instead."""
+        impedance varies across the band - so the basis says that instead."""
         assert self.text(title="WR-42", reference=self.GUIDE, self_referenced=(1, 2)) == (
             "WR-42 S-parameters",
             "Referenced to each port's own impedance",
@@ -157,7 +204,7 @@ class TestTheChartSaysWhatItIsReferencedTo:
 
     def test_one_study_in_two_bases_does_not_draw_two_identical_charts(self):
         """The whole point: same guide, same ports, two sets of curves that are
-        both right, and the footnote is the only thing that tells them apart."""
+        both right, and the basis is the only thing that tells them apart."""
         assert self.text(title="WR-42") != self.text(
             title="WR-42", reference=self.GUIDE, self_referenced=(1, 2)
         )
@@ -167,7 +214,7 @@ class TestTheChartSaysWhatItIsReferencedTo:
             "Referenced to port 1: 30 ohm, port 2: 75 ohm"
         )
 
-    def test_a_study_nobody_named_still_gets_its_footnote(self):
+    def test_a_study_nobody_named_still_gets_its_basis(self):
         """``provenance`` carries no title for a result assembled outside a sweep.
         Dropping the basis with the name would lose the half that is not obvious.
         """
@@ -203,7 +250,7 @@ class _Label:
 
 class TestTheStatusLineIsReadableOnWhateverThemeTheUserHas:
     """On a dark theme a neutral status written black puts *Idle*,
-    *Translating...*, *Solving N cells...* and every marker a run streams -
+    *Checking...*, *Solving N cells...* and every marker a run streams -
     which is where a run spends all its time - black on near-black. The three
     verdict colours are legible on both themes; only the default is wrong, and
     naming white instead would be the same mistake pointing the other way.
@@ -244,6 +291,28 @@ class TestTheStatusLineIsReadableOnWhateverThemeTheUserHas:
         assert "&lt;b&gt;" in text and "<b>" not in text
 
 
+def unresolved(picked):
+    """A stand-in for ``Gui.Selection.getCompleteSelection`` that answers only
+    the unresolved form the commands read: resolved, a pick through a link
+    names the original."""
+
+    def complete(resolve):
+        assert resolve == 0
+        return picked
+
+    return complete
+
+
+def copied_pick(doc):
+    """A face picked inside the copy a link shows: the path from the link
+    steps into the original it links."""
+    box = doc.addObject("Part::Box", "Box")
+    link = type("Link", (), {"Label": "Link", "LinkedObject": box})()
+    link.getSubObjectList = lambda path: [link, box]
+    link.Shape = box.Shape
+    return type("Sel", (), {"Object": link, "SubElementNames": ("Box.Face2",)})()
+
+
 def target_analysis(doc, monkeypatch):
     """The study every creation command files its new object into."""
     from Microwave import Commands
@@ -268,7 +337,7 @@ class TestCreatingAnObjectIsOneUndoStep:
         analysis = target_analysis(doc, monkeypatch)
         opened_when = []
 
-        def make():
+        def make(_analysis):
             opened_when.append(doc._open)
             return doc.addObject("App::FeaturePython", "Thing")
 
@@ -285,7 +354,7 @@ class TestCreatingAnObjectIsOneUndoStep:
 
         target_analysis(doc, monkeypatch)
 
-        def explode():
+        def explode(_analysis):
             raise RuntimeError("boom")
 
         with pytest.raises(RuntimeError):
@@ -369,7 +438,7 @@ class TestCreatingAnObjectIsOneUndoStep:
         printed = capsys.readouterr().out
         assert printed.startswith("WARNING: ")
         assert "cat:FR4 is already in this document as 'Prepreg'" in printed
-        assert "'FR4 (2)' is another copy" in printed
+        assert "'FR4 (2)' is another copy. Delete 'FR4 (2)' if you did not want a copy" in printed
         icon, title, text = shown(boxes)
         assert (icon, title) == (boxes.Information, "Add Material from Catalog")
         assert "another copy" in text
@@ -378,7 +447,7 @@ class TestCreatingAnObjectIsOneUndoStep:
         from Microwave import Commands
 
         monkeypatch.setattr(Commands, "_target_analysis", lambda _doc, _title: None)
-        assert Commands._add(doc, "Add Something", lambda: None) is None
+        assert Commands._add(doc, "Add Something", lambda _analysis: None) is None
         assert doc.transactions == []
 
 
@@ -393,14 +462,19 @@ class TestBindMaterialReadsWhatWasPicked:
     property editor can repair, which is how this went unnoticed.
     """
 
-    def press(self, doc, monkeypatch, *picks):
+    def press(self, doc, monkeypatch, *picks, analysis=None):
         import FreeCADGui
 
         from Microwave import Commands
 
-        analysis = target_analysis(doc, monkeypatch)
-        selection = [type("Sel", (), {"Object": obj, "SubElementNames": ()})() for obj in picks]
-        monkeypatch.setattr(FreeCADGui.Selection, "getSelectionEx", lambda: selection)
+        analysis = analysis or target_analysis(doc, monkeypatch)
+        selection = [
+            obj
+            if hasattr(obj, "SubElementNames")
+            else type("Sel", (), {"Object": obj, "SubElementNames": ()})()
+            for obj in picks
+        ]
+        monkeypatch.setattr(FreeCADGui.Selection, "getCompleteSelection", unresolved(selection))
 
         Commands.EMMaterialBindingCommand().Activated()
         return analysis.Group[-1]
@@ -416,6 +490,47 @@ class TestBindMaterialReadsWhatWasPicked:
         assert binding.Material == material
         assert binding.References == [(board, [""])]
         assert doc.transactions == [("Bind Material to Shape", "commit")]
+
+    def test_a_pick_that_reaches_the_study_it_joins_is_named_and_left_out(
+        self, doc, monkeypatch, capsys
+    ):
+        """The study the binding joins is the one the cycle runs through."""
+        from Microwave.Objects import createEMMaterial
+
+        recording_qt(monkeypatch)
+        analysis = target_analysis(doc, monkeypatch)
+        holder = doc.addObject("Part::Box", "Holder")
+        object.__setattr__(holder, "OutListRecursive", [analysis])
+        binding = self.press(doc, monkeypatch, createEMMaterial("FR4"), holder, analysis=analysis)
+
+        assert binding.References == []
+        assert "'Holder'" in capsys.readouterr().out
+
+    def test_a_pick_inside_a_copy_is_named_rather_than_unpicked(self, doc, monkeypatch, capsys):
+        from Microwave.Objects import createEMMaterial
+
+        recording_qt(monkeypatch)
+        binding = self.press(doc, monkeypatch, createEMMaterial("FR4"), copied_pick(doc))
+        printed = capsys.readouterr().out
+        assert binding.References == []
+        assert "'Box' in 'Link'" in printed
+        assert "no geometry" not in printed
+
+    def test_a_pick_left_in_another_document_is_not_bound(self, doc, monkeypatch):
+        """The selection spans every open document, and a link into another
+        is refused by FreeCAD."""
+        from Microwave.Objects import createEMMaterial
+
+        here, there = doc.addObject("Part::Box", "Here"), doc.addObject("Part::Box", "There")
+        picked = [
+            types.SimpleNamespace(
+                Object=createEMMaterial("FR4"), SubElementNames=(), DocumentName=doc.Name
+            ),
+            types.SimpleNamespace(Object=here, SubElementNames=(), DocumentName=doc.Name),
+            types.SimpleNamespace(Object=there, SubElementNames=(), DocumentName="Elsewhere"),
+        ]
+        binding = self.press(doc, monkeypatch, *picked)
+        assert binding.References == [(here, [""])]
 
     def test_what_it_could_not_fill_in_is_reported(self, doc, monkeypatch, capsys):
         """Silence is an empty binding with nothing said about why."""
@@ -440,7 +555,7 @@ class TestWhatACommandRefusesArrives:
 
         boxes, _ = recording_qt(monkeypatch)
 
-        assert Commands._add(doc, "Add Microstrip Port", lambda: None) is None
+        assert Commands._add(doc, "Add Microstrip Port", lambda _analysis: None) is None
         icon, title, text = shown(boxes)
         assert (icon, title) == (boxes.Warning, "Add Microstrip Port")
         assert "analysis" in text
@@ -449,18 +564,19 @@ class TestWhatACommandRefusesArrives:
         """Nothing is drawn and nothing changes, so the refusal is all of it."""
         from Microwave import Commands
         from Microwave.Gui import openems_mesh_preview
+        from Microwave.Objects.solver import createEMSolverOpenEMS
         from Microwave.Solvers.openems import document
 
-        target_analysis(doc, monkeypatch)
+        target_analysis(doc, monkeypatch).addObject(createEMSolverOpenEMS(doc))
         boxes, _ = recording_qt(monkeypatch)
 
         def refuse(_analysis):
             raise document.TranslationError("'Trace' is not axis-aligned")
 
         monkeypatch.setattr(openems_mesh_preview, "refresh", refuse)
-        Commands.UpdateMeshCommand().Activated()
+        Commands.MeshCommand().Activated()
 
-        assert shown(boxes) == (boxes.Warning, "Update Mesh", "'Trace' is not axis-aligned")
+        assert shown(boxes) == (boxes.Warning, "Mesh", "'Trace' is not axis-aligned")
 
     def test_a_port_made_from_an_incomplete_pick_says_what_is_missing(self, doc, monkeypatch):
         """A port from half a pick keeps its default axes and looks finished
@@ -471,30 +587,192 @@ class TestWhatACommandRefusesArrives:
 
         target_analysis(doc, monkeypatch)
         boxes, _ = recording_qt(monkeypatch)
-        monkeypatch.setattr(FreeCADGui.Selection, "getSelectionEx", lambda: [])
+        monkeypatch.setattr(FreeCADGui.Selection, "getCompleteSelection", unresolved([]))
 
         Commands.EMPortMicrostripCommand().Activated()
 
         icon, title, text = shown(boxes)
         assert (icon, title) == (boxes.Information, "Add Microstrip Port")
-        assert "GroundReference" in text
+        assert "nothing was selected for TraceEnd, Ground;" in text
 
-    def test_a_refinement_region_refining_nothing_says_so_at_once(self, doc, monkeypatch):
-        """Its own refusal arrives at the next Update Mesh, naming an object
-        added several actions ago."""
+    def test_a_port_with_a_pick_inside_a_copy_fills_nothing(self, doc, monkeypatch):
+        """The picks after it would move up a place, and the port reads which
+        face is which off the order."""
         import FreeCADGui
 
         from Microwave import Commands
 
-        target_analysis(doc, monkeypatch)
+        analysis = target_analysis(doc, monkeypatch)
         boxes, _ = recording_qt(monkeypatch)
-        monkeypatch.setattr(FreeCADGui.Selection, "getSelectionEx", lambda: [])
+        ground = doc.addObject("Part::Box", "Ground")
+        picked = [
+            copied_pick(doc),
+            types.SimpleNamespace(Object=ground, SubElementNames=("Face5",)),
+        ]
+        monkeypatch.setattr(FreeCADGui.Selection, "getCompleteSelection", unresolved(picked))
+
+        Commands.EMPortMicrostripCommand().Activated()
+
+        port = analysis.Group[-1]
+        assert not port.TraceEnd and not port.Ground
+        _, _, text = shown(boxes)
+        assert "'Box' in 'Link'" in text
+        assert "nothing was selected" not in text
+
+    def test_a_refinement_region_refining_nothing_says_so_at_once(self, doc, monkeypatch):
+        """Its own refusal arrives at the next Mesh, naming an object
+        added several actions ago."""
+        import FreeCADGui
+
+        from Microwave import Commands
+        from Microwave.Objects import createEMSolverOpenEMS, createEMYeeGrid
+
+        analysis = target_analysis(doc, monkeypatch)
+        analysis.Group = [createEMSolverOpenEMS(doc), createEMYeeGrid(doc)]
+        boxes, _ = recording_qt(monkeypatch)
+        monkeypatch.setattr(FreeCADGui.Selection, "getCompleteSelection", unresolved([]))
 
         Commands.EMMeshRegionCommand().Activated()
 
         icon, title, text = shown(boxes)
         assert (icon, title) == (boxes.Information, "Add Mesh Refinement")
         assert "References" in text
+
+
+class TestARegionAmendsTheSettingsOfOneBackend:
+    """Add Mesh Refinement links the region to one backend's mesh settings:
+    the one the selection names, or the study's only solver's."""
+
+    @staticmethod
+    def study(doc, monkeypatch):
+        from Microwave.Objects import (
+            createEMGmshMesh,
+            createEMSolverOpenEMS,
+            createEMSolverPalace,
+            createEMYeeGrid,
+        )
+
+        analysis = target_analysis(doc, monkeypatch)
+        made = {
+            "openems": createEMSolverOpenEMS(doc),
+            "grid": createEMYeeGrid(doc),
+            "palace": createEMSolverPalace(doc),
+            "gmsh": createEMGmshMesh(doc),
+        }
+        analysis.Group = list(made.values())
+        return analysis, made
+
+    @staticmethod
+    def add(monkeypatch, *selected):
+        import FreeCADGui
+
+        from Microwave import Commands
+
+        picked = [types.SimpleNamespace(Object=obj, SubElementNames=()) for obj in selected]
+        monkeypatch.setattr(FreeCADGui.Selection, "getCompleteSelection", unresolved(picked))
+        Commands.EMMeshRegionCommand().Activated()
+
+    @staticmethod
+    def regions(analysis):
+        from Microwave.Objects.kinds import kind_of
+
+        return [obj for obj in analysis.Group if kind_of(obj) == "EMMeshRegion"]
+
+    def test_a_pick_inside_a_copy_is_named_rather_than_unpicked(self, doc, monkeypatch, capsys):
+        import FreeCADGui
+
+        from Microwave import Commands
+
+        analysis, made = self.study(doc, monkeypatch)
+        recording_qt(monkeypatch)
+        picked = [
+            types.SimpleNamespace(Object=made["openems"], SubElementNames=()),
+            copied_pick(doc),
+        ]
+        monkeypatch.setattr(FreeCADGui.Selection, "getCompleteSelection", unresolved(picked))
+        Commands.EMMeshRegionCommand().Activated()
+        (region,) = self.regions(analysis)
+        printed = capsys.readouterr().out
+        assert region.References == []
+        assert "'Box' in 'Link'" in printed
+        assert "nothing was selected" not in printed
+
+    def test_a_pick_that_reaches_the_study_is_named_and_left_out(self, doc, monkeypatch, capsys):
+        """The study the region joins is the one the cycle runs through."""
+        analysis, made = self.study(doc, monkeypatch)
+        recording_qt(monkeypatch)
+        holder = doc.addObject("Part::Box", "Holder")
+        object.__setattr__(holder, "OutListRecursive", [analysis])
+        self.add(monkeypatch, made["openems"], holder)
+        (region,) = self.regions(analysis)
+        assert region.References == []
+        assert "'Holder'" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("picked", "amended"),
+        [("palace", "gmsh"), ("gmsh", "gmsh"), ("openems", "grid"), ("grid", "grid")],
+    )
+    def test_a_solver_or_its_settings_selected_names_the_settings(
+        self, doc, monkeypatch, picked, amended
+    ):
+        analysis, made = self.study(doc, monkeypatch)
+        recording_qt(monkeypatch)
+        self.add(monkeypatch, made[picked])
+        (region,) = self.regions(analysis)
+        assert region.MeshSettings is made[amended]
+
+    def test_a_region_selected_names_the_settings_it_amends(self, doc, monkeypatch):
+        analysis, made = self.study(doc, monkeypatch)
+        recording_qt(monkeypatch)
+        self.add(monkeypatch, made["palace"])
+        (first,) = self.regions(analysis)
+        self.add(monkeypatch, first)
+        assert [one.MeshSettings for one in self.regions(analysis)] == [made["gmsh"]] * 2
+
+    def test_a_mesh_selected_names_the_settings_it_was_made_from(self, doc, monkeypatch):
+        analysis, made = self.study(doc, monkeypatch)
+        recording_qt(monkeypatch)
+        mesh = types.SimpleNamespace(MeshedFrom=[made["openems"], made["grid"]], Proxy=None)
+        analysis.Group.append(mesh)
+        self.add(monkeypatch, mesh)
+        (region,) = self.regions(analysis)
+        assert region.MeshSettings is made["grid"]
+
+    def test_a_solver_of_another_study_names_nothing_here(self, doc, monkeypatch):
+        from Microwave.Objects import createEMSolverOpenEMS
+
+        analysis, made = self.study(doc, monkeypatch)
+        boxes, _ = recording_qt(monkeypatch)
+        self.add(monkeypatch, createEMSolverOpenEMS(doc))
+        icon, _, text = shown(boxes)
+        assert icon == boxes.Warning and repr(made["palace"].Label) in text
+        assert self.regions(analysis) == []
+
+    def test_two_solvers_and_nothing_naming_one_is_refused_naming_both(self, doc, monkeypatch):
+        analysis, made = self.study(doc, monkeypatch)
+        boxes, _ = recording_qt(monkeypatch)
+        self.add(monkeypatch)
+        icon, title, text = shown(boxes)
+        assert (icon, title) == (boxes.Warning, "Add Mesh Refinement")
+        assert repr(made["openems"].Label) in text and repr(made["palace"].Label) in text
+        assert self.regions(analysis) == []
+
+    def test_a_selection_naming_both_backends_is_refused(self, doc, monkeypatch):
+        analysis, made = self.study(doc, monkeypatch)
+        boxes, _ = recording_qt(monkeypatch)
+        self.add(monkeypatch, made["grid"], made["palace"])
+        icon, _, text = shown(boxes)
+        assert icon == boxes.Warning
+        assert repr(made["grid"].Label) in text and repr(made["gmsh"].Label) in text
+        assert self.regions(analysis) == []
+
+    def test_the_only_solver_names_its_settings(self, doc, monkeypatch):
+        analysis, made = self.study(doc, monkeypatch)
+        analysis.Group = [made["palace"], made["gmsh"]]
+        recording_qt(monkeypatch)
+        self.add(monkeypatch)
+        (region,) = self.regions(analysis)
+        assert region.MeshSettings is made["gmsh"]
 
     def test_a_command_with_nothing_to_add_raises_no_box(self, doc, monkeypatch):
         """A box on an ordinary success is one the user learns to dismiss."""
@@ -508,7 +786,7 @@ class TestWhatACommandRefusesArrives:
         picks = [
             type("Sel", (), {"Object": obj, "SubElementNames": ()})() for obj in (material, board)
         ]
-        monkeypatch.setattr(FreeCADGui.Selection, "getSelectionEx", lambda: picks)
+        monkeypatch.setattr(FreeCADGui.Selection, "getCompleteSelection", unresolved(picks))
         target_analysis(doc, monkeypatch)
 
         from Microwave import Commands
@@ -517,20 +795,20 @@ class TestWhatACommandRefusesArrives:
         boxes.assert_not_called()
 
 
-class TestTheRunButtonDefaultsSimDirUndoably:
-    """Pressing Run on a study whose ``SimDir`` was never set writes it.
+class TestTheRunButtonDefaultsRunDirectoryUndoably:
+    """Pressing Run on a study whose ``RunDirectory`` was never set writes it.
 
     That is a document change like any other. Untransacted, Ctrl-Z after Run
-    deletes the material created before it and leaves ``SimDir`` set. The panel
+    deletes the material created before it and leaves ``RunDirectory`` set. The panel
     needs Qt to build, so the method is called unbound against a stand-in - it touches only
-    ``solver``, ``analysis`` and ``update_simdir_label``.
+    ``solver``, ``analysis`` and ``update_rundir_label``.
     """
 
     def _panel(self, doc, solver):
         from types import SimpleNamespace
 
         analysis = SimpleNamespace(Document=doc)
-        return SimpleNamespace(solver=solver, analysis=analysis, update_simdir_label=lambda: None)
+        return SimpleNamespace(solver=solver, analysis=analysis, update_rundir_label=lambda: None)
 
     def _call(self, panel):
         from Microwave.Gui.openems_task_panel import SimulationTaskPanel
@@ -541,18 +819,18 @@ class TestTheRunButtonDefaultsSimDirUndoably:
         from types import SimpleNamespace
 
         doc.FileName = "/tmp/board.FCStd"
-        solver = SimpleNamespace(SimDir="")
+        solver = SimpleNamespace(RunDirectory="")
         directory = self._call(self._panel(doc, solver))
 
-        assert directory.endswith("board_sim")
-        assert solver.SimDir == directory
-        assert doc.transactions == [("Set Simulation Directory", "commit")]
+        assert directory.endswith("board_openems")
+        assert solver.RunDirectory == directory
+        assert doc.transactions == [("Set Run Directory", "commit")]
 
     def test_a_directory_already_set_changes_nothing(self, doc):
         from types import SimpleNamespace
 
         doc.FileName = "/tmp/board.FCStd"
-        solver = SimpleNamespace(SimDir="/somewhere/else")
+        solver = SimpleNamespace(RunDirectory="/somewhere/else")
         assert self._call(self._panel(doc, solver)) == "/somewhere/else"
         assert doc.transactions == []
 
@@ -561,7 +839,7 @@ class TestTheRunButtonDefaultsSimDirUndoably:
         from types import SimpleNamespace
 
         doc.FileName = ""
-        solver = SimpleNamespace(SimDir="")
+        solver = SimpleNamespace(RunDirectory="")
         assert self._call(self._panel(doc, solver)) is None
         assert doc.transactions == []
 
@@ -585,7 +863,7 @@ def test_the_task_panel_imports_and_still_reaches_the_adapter():
     # What the dialog draws, and what it says it drew. Both are computed outside
     # the Qt class, so a rename reaches the chart as a caught exception drawn
     # into the axes and nothing else.
-    for computed in ("matrix_db", "chart_text"):
+    for computed in ("overlay_chart", "chart_text"):
         assert hasattr(plot_s_params, computed), computed
 
 
@@ -616,6 +894,7 @@ DOCUMENT_CLASSES = [
     ("EMPortMicrostrip", "Microwave.Objects.ports"),
     ("EMPortRectWaveguide", "Microwave.Objects.ports"),
     ("EMSParameters", "Microwave.Objects.results"),
+    ("EMRun", "Microwave.Objects.runs"),
 ]
 
 
@@ -634,6 +913,7 @@ FACTORIES = [
     ("Microwave.Objects.materials", "createEMMaterialBinding", "EMMaterialBinding"),
     ("Microwave.Objects.preview", "createEMMeshPreview", "EMMeshPreview"),
     ("Microwave.Objects.results", "createEMSParameters", "EMSParameters"),
+    ("Microwave.Objects.runs", "createEMRun", "EMRun"),
     ("Microwave.Objects.ports", "createEMPortCoaxial", "EMPortCoaxial"),
     ("Microwave.Objects.ports", "createEMPortLumped", "EMPortLumped"),
     ("Microwave.Objects.ports", "createEMPortMicrostrip", "EMPortMicrostrip"),
@@ -745,6 +1025,22 @@ class TestABoundSolidTakesTheMaterialsColour:
     def test_something_that_is_not_a_colour_paints_nothing(self):
         assert self.painted((0.9, 0.1)) is None
 
+    def test_a_container_without_a_colour_of_its_own_is_left_alone(self):
+        """An App::Part's view, and a link's, carries no ShapeColor."""
+        from Microwave.ViewProviders.materials import EMMaterialBindingViewProvider
+
+        part = type("Part", (), {})()
+        part.ViewObject = type("View", (), {})()
+        binding = type("Binding", (), {})()
+        binding.Material = type("Material", (), {"Color": (0.9, 0.1, 0.2)})()
+        binding.References = [(part, "")]
+        view = type("View", (), {"Object": binding})()
+
+        EMMaterialBindingViewProvider.update_colors(
+            EMMaterialBindingViewProvider.__new__(EMMaterialBindingViewProvider), view
+        )
+        assert not hasattr(part.ViewObject, "ShapeColor")
+
 
 class TestAMaterialRepaintsItsOwnDocument:
     """Which document a recoloured material sweeps for the bindings that use it.
@@ -795,10 +1091,10 @@ class TestAMaterialRepaintsItsOwnDocument:
 class _Restorable:
     """Just enough of a document object: a name, a proxy, and a view object.
 
-    It answers ``addProperty`` and ``setEditorMode`` because every real document
-    object does, and a restore hook that fills in a property added since the
-    file was written calls them. What each added property was declared as is
-    kept in ``added``. Guarding against their absence in the code
+    It answers ``addProperty``, ``setEditorMode`` and ``setPropertyStatus``
+    because every real document object does, and a restore hook that fills in a
+    property added since the file was written calls them. What each added
+    property was declared as is kept in ``added``. Guarding against their absence in the code
     would be guarding against a document object that does not exist.
     """
 
@@ -813,6 +1109,10 @@ class _Restorable:
         return self
 
     def setEditorMode(self, name, mode):
+        pass
+
+    def setPropertyStatus(self, name, status):
+        # A restore hook marks a property it added as moving no cell.
         pass
 
     def isDerivedFrom(self, kind):
@@ -1151,7 +1451,7 @@ class TestAPreviewRestoredWithoutItsGridProperties:
     """FreeCAD restores the properties an object had, and does not reconcile a
     restored object against the class it belongs to. A preview whose file was
     written without the grid properties therefore comes back without them, and
-    the write in ``refresh`` would raise straight through Update Mesh."""
+    the write in ``refresh`` would raise straight through Mesh."""
 
     def _restored(self):
         from Microwave.Objects import preview as preview_objects
@@ -1169,7 +1469,7 @@ class TestAPreviewRestoredWithoutItsGridProperties:
 
     def test_and_the_grid_can_then_be_written(self, doc):
         """The failure this prevents is not a preview that will not redraw. It
-        is Update Mesh raising on the write, on every document that already
+        is Mesh raising on the write, on every document that already
         carries a preview."""
         obj, preview_objects = self._restored()
         obj.Proxy.onDocumentRestored(obj)
@@ -1265,7 +1565,7 @@ class TestADisplayPropertyRedrawsWithoutAButton:
         assert drawn == [preview]
 
     def test_a_property_that_is_not_a_display_property_does_not(self, doc, monkeypatch):
-        """Meshing costs seconds on a real board, so it waits for Update Mesh."""
+        """Meshing costs seconds on a real board, so it waits for Mesh."""
         preview, drawn = self._preview(monkeypatch)
         preview.Proxy.onChanged(preview, "Cells")
         assert drawn == []
@@ -1414,35 +1714,194 @@ class TestAnInjectedProviderIsAttached:
         )
 
 
-class TestNothingFakesOwnership:
-    """``claimChildren`` is presentation; ``Group`` is ownership.
+class TestTheLabelsAStudyStartsWith:
+    """Each backend's objects are named alike, the noun first and the backend
+    in brackets, and a second study holds its own under the same labels."""
 
-    Without it a freshly created refinement region sits at document root
-    because the tree asks ``claimChildren`` when it feels like asking, and
-    adding an object is not one of those moments. ``EMAnalysis`` is an
-    ``App::DocumentObjectGroupPython``, so FreeCAD nests its members itself, at
-    the moment membership changes.
+    def test_each_backend_s_objects_are_named_alike(self, doc):
+        from Microwave.Objects.materials import createEMMaterialBinding
+        from Microwave.Objects.mesh import createEMGmshMesh, createEMYeeGrid
+        from Microwave.Objects.preview import createEMMeshPreview
+        from Microwave.Objects.solver import createEMSolverOpenEMS, createEMSolverPalace
 
-    Asserted as an *absence* on both providers, because that is how this
-    regresses: someone adds a helpful ``claimChildren`` and the tree starts
-    showing two parents for one object.
+        made = [
+            factory(doc).Label
+            for factory in (
+                createEMSolverOpenEMS,
+                createEMYeeGrid,
+                createEMMeshPreview,
+                createEMSolverPalace,
+                createEMGmshMesh,
+            )
+        ]
+        assert made == [
+            "Solver (openEMS)",
+            "Mesh Settings (openEMS)",
+            "Mesh (openEMS)",
+            "Solver (Palace)",
+            "Mesh Settings (Palace)",
+        ]
+        assert createEMMaterialBinding(doc=doc).Label == "Material Binding"
+        assert createEMMaterialBinding("TraceBinding", doc=doc).Label == "TraceBinding"
+
+    def test_a_kind_a_study_holds_one_of_shares_its_label_and_no_other_does(self):
+        from Microwave.Objects.kinds import classes
+
+        shared = sorted(
+            name
+            for name, cls in classes().items()
+            if getattr(cls, "allowDuplicateLabel", None) is not None
+        )
+        assert shared == [
+            "EMGmshMesh",
+            "EMMeshPolicy",
+            "EMMeshPreview",
+            "EMSolverOpenEMS",
+            "EMSolverPalace",
+            "EMYeeGrid",
+        ]
+
+
+class TestAMeshFreeCADDrawsIsGivenItsView:
+    def test_a_document_written_without_one_gets_it_on_restore(self):
+        """A document written without the interface carries no view of ours
+        for the mesh, and the sweep on activation gives it one."""
+        from Microwave.ViewProviders import restore_view_providers
+        from Microwave.ViewProviders.fem_mesh import EMFemMeshViewProvider
+
+        signalled = []
+        view = types.SimpleNamespace(Proxy=None, signalChangeIcon=lambda: signalled.append(1))
+        mesh = types.SimpleNamespace(
+            MeshedFor="Palace", ViewObject=view, Name="Mesh", Proxy=None, Label="Mesh (Palace)"
+        )
+        view.Object = mesh
+        assert restore_view_providers(types.SimpleNamespace(Objects=[mesh], Name="d")) == 1
+        assert isinstance(view.Proxy, EMFemMeshViewProvider) and signalled
+
+    def test_a_plain_fem_mesh_whose_view_takes_no_proxy_is_left_alone(self):
+        from Microwave.ViewProviders.fem_mesh import attach
+
+        view = types.SimpleNamespace()
+        assert attach(types.SimpleNamespace(MeshedFor="Palace", ViewObject=view)) is False
+
+    def test_its_icon_is_drawn_again_when_its_status_changes(self):
+        from Microwave.Objects.fem_mesh import STATUS, FemMeshProxy
+
+        signalled = []
+        view = types.SimpleNamespace(signalChangeIcon=lambda: signalled.append(1))
+        mesh = types.SimpleNamespace(ViewObject=view)
+        FemMeshProxy.onChanged(None, mesh, "Label")
+        assert signalled == []
+        FemMeshProxy.onChanged(None, mesh, STATUS)
+        assert signalled == [1]
+
+
+class TestTheTreeShowsEachObjectOnce:
+    """``Group`` is ownership; ``claimChildren`` is where the tree shows it.
+
+    A solver shows its mesh settings and the mesh made from them, the mesh
+    settings show the regions amending them, and the study shows the rest of
+    its group. An object a member claims
+    and the study shows as well appears twice, which is how this regresses.
+    ``tests/test_tree_nesting.py`` holds it against FreeCAD's own tree.
     """
 
-    @pytest.mark.parametrize(
-        "module, name",
-        [
-            ("Microwave.ViewProviders.analysis", "EMAnalysisViewProvider"),
-            ("Microwave.ViewProviders.solver", "EMSolverOpenEMSViewProvider"),
-        ],
-    )
-    def test_no_view_provider_claims_children(self, module, name):
-        import importlib
+    @staticmethod
+    def held(obj, *children):
+        claims = (lambda: list(children)) if children else None
+        proxy = types.SimpleNamespace(claimChildren=claims) if claims else types.SimpleNamespace()
+        obj.ViewObject = types.SimpleNamespace(Proxy=proxy)
+        return obj
 
-        provider = getattr(importlib.import_module(module), name)
-        assert not hasattr(provider, "claimChildren"), (
-            f"{name} claims children again. The analysis is a real group; a "
-            "Python claimChildren beside it is the bug"
+    def test_the_study_shows_its_group_less_what_its_members_hold(self):
+        from Microwave.ViewProviders.analysis import EMAnalysisViewProvider
+
+        named = {name: types.SimpleNamespace(Name=name) for name in ("S", "R", "M", "P")}
+        self.held(named["M"])
+        self.held(named["R"], named["M"])
+        self.held(named["S"], named["R"])
+        self.held(named["P"])
+        study = types.SimpleNamespace(Group=list(named.values()))
+        shown = EMAnalysisViewProvider.claimChildren(types.SimpleNamespace(Object=study))
+        assert [obj.Name for obj in shown] == ["S", "P"]
+
+    def test_a_solver_shows_its_own_mesh_settings_and_no_other(self, monkeypatch):
+        from Microwave.Objects import analysis
+        from Microwave.Objects.solver import EMSolverOpenEMS, EMSolverPalace
+        from Microwave.ViewProviders.solver import (
+            EMSolverOpenEMSViewProvider,
+            EMSolverPalaceViewProvider,
         )
+
+        grid = types.SimpleNamespace(Proxy=type("EMYeeGrid", (), {})())
+        gmsh = types.SimpleNamespace(Proxy=type("EMGmshMesh", (), {})())
+        drawn = types.SimpleNamespace(MeshedFrom=[grid])
+        tetrahedra = types.SimpleNamespace(MeshedFrom=[gmsh])
+        study = types.SimpleNamespace(Group=[tetrahedra, grid, drawn, gmsh])
+        monkeypatch.setattr(analysis, "analysis_of", lambda _obj: study)
+        for provider, proxy, claimed in (
+            (EMSolverOpenEMSViewProvider, EMSolverOpenEMS, [grid, drawn]),
+            (EMSolverPalaceViewProvider, EMSolverPalace, [gmsh, tetrahedra]),
+        ):
+            solver = types.SimpleNamespace(Proxy=proxy.__new__(proxy))
+            assert provider.claimChildren(types.SimpleNamespace(Object=solver)) == claimed
+
+    def test_mesh_settings_show_the_regions_amending_them(self, monkeypatch):
+        from Microwave.Objects import analysis
+        from Microwave.ViewProviders.mesh import EMYeeGridViewProvider
+
+        settings, other = object(), object()
+        amending = types.SimpleNamespace(MeshSettings=settings)
+        elsewhere = types.SimpleNamespace(MeshSettings=other)
+        made = types.SimpleNamespace(MeshedFrom=[settings])
+        filed = types.SimpleNamespace(MeshSettings=settings)
+        folder = types.SimpleNamespace(Group=[filed])
+        study = types.SimpleNamespace(Group=[made, elsewhere, amending, settings, folder])
+        monkeypatch.setattr(analysis, "analysis_of", lambda _obj: study)
+        provider = types.SimpleNamespace(Object=settings)
+        # A region filed in a group of the study stays under that group, which
+        # holds it in the tree, so it is not shown twice.
+        assert EMYeeGridViewProvider.claimChildren(provider) == [amending]
+
+    @pytest.mark.parametrize("transacting", [False, True])
+    def test_the_study_asks_on_a_change_of_its_group_an_undo_among_them(
+        self, doc, monkeypatch, transacting
+    ):
+        from Microwave.Objects import analysis
+
+        asked = []
+        monkeypatch.setattr(analysis, "renest", lambda study: asked.append(study))
+        study = analysis.createEMAnalysis(doc=doc)
+        doc.Transacting = transacting
+        try:
+            study.Proxy.onChanged(study, "Group")
+        finally:
+            del doc.Transacting
+        assert asked == [study]
+
+    def test_a_change_of_the_group_asks_each_member_that_holds_children_again(self):
+        """The tree reads a member's children again only when a property of the
+        member changes, and ``ShowInTree`` is one that changes nothing else."""
+        from Microwave.Objects.analysis import renest
+
+        class View:
+            def __init__(self, proxy):
+                self.Proxy, self.written = proxy, []
+
+            def __setattr__(self, name, value):
+                if name == "ShowInTree":
+                    self.written.append(value)
+                object.__setattr__(self, name, value)
+
+        holding = View(types.SimpleNamespace(claimChildren=lambda: []))
+        plain = View(types.SimpleNamespace())
+        holding.ShowInTree = plain.ShowInTree = True
+        holding.written.clear(), plain.written.clear()
+        study = types.SimpleNamespace(
+            Group=[types.SimpleNamespace(ViewObject=view) for view in (holding, plain)]
+        )
+        renest(study)
+        assert holding.written == [True] and plain.written == []
 
     def test_the_solver_has_no_mesh_policy_link(self):
         """Mesh policy is neutral, so the study owns it, not the backend.
@@ -1480,6 +1939,16 @@ class TestTheToolbarsAndTheMenuAgree:
 
         return [name for _, commands in TOOLBARS for name in commands]
 
+    def test_the_materials_toolbar_offers_a_blank_material_beside_the_catalog(self):
+        from Microwave.Commands import TOOLBARS
+
+        (materials,) = [commands for name, commands in TOOLBARS if name == "Microwave Materials"]
+        assert list(materials) == [
+            "Microwave_MaterialFromCatalog",
+            "Microwave_Material",
+            "Microwave_MaterialBinding",
+        ]
+
     def test_registration_is_exactly_the_table_and_nothing_else(self):
         """Two separate lists here could disagree.
 
@@ -1490,7 +1959,7 @@ class TestTheToolbarsAndTheMenuAgree:
         """
         from Microwave.Commands import COMMANDS
 
-        assert self.registered() == {name for name, _, _ in COMMANDS}
+        assert self.registered() == {name for name, *_ in COMMANDS}
 
     def test_a_withheld_command_is_reachable_from_nowhere(self):
         """A command not ready to be used has to be absent from all three
@@ -1503,9 +1972,9 @@ class TestTheToolbarsAndTheMenuAgree:
         """
         from Microwave.Commands import COMMANDS, WITHHELD, menu
 
-        withheld = {name for name, _, _ in WITHHELD}
+        withheld = {name for name, *_ in WITHHELD}
         assert withheld, "nothing is withheld, so this is asserting nothing"
-        assert withheld.isdisjoint({name for name, _, _ in COMMANDS})
+        assert withheld.isdisjoint({name for name, *_ in COMMANDS})
         assert withheld.isdisjoint(self.registered())
         assert withheld.isdisjoint(self.on_toolbars())
         assert withheld.isdisjoint(menu())
@@ -1515,10 +1984,27 @@ class TestTheToolbarsAndTheMenuAgree:
         class that rots, and this one is three lines from being offered again."""
         from Microwave.Commands import WITHHELD
 
-        for _, command, _ in WITHHELD:
+        for _, command, *_ in WITHHELD:
             resources = command().GetResources()
             assert resources["MenuText"]
             assert resources["ToolTip"]
+
+    def test_every_command_is_named_in_title_case(self):
+        """As FreeCAD names its own: each word capitalised but an article, a
+        conjunction or a short preposition after the first, and a name that
+        carries capitals of its own, a program's, as it is written."""
+        from Microwave.Commands import COMMANDS
+
+        minor = {"a", "an", "the", "and", "or", "to", "of", "in", "on", "at", "by", "for"}
+        minor |= {"from", "along"}
+        names = [command().GetResources()["MenuText"] for _, command, *_ in COMMANDS]
+        # A name with capitals of its own is among them, so the last clause is read.
+        assert any(word != word.lower() != word.capitalize() for n in names for word in n.split())
+        for name in names:
+            first, *rest = name.split()
+            assert first[0].isupper(), name
+            for word in rest:
+                assert word[0].isupper() or word in minor or word != word.lower(), name
 
     def test_no_command_is_listed_twice(self):
         names = self.on_toolbars()
@@ -1528,16 +2014,35 @@ class TestTheToolbarsAndTheMenuAgree:
         """The grouping is derived rather than four literal tuples, and is now
         derived, so it is code and needs asserting. Put every command on one
         toolbar and nothing else here notices."""
-        from Microwave.Commands import COMMANDS, TOOLBARS
+        from Microwave.Commands import BOTH, COMMANDS, TOOLBAR, TOOLBARS
 
         placed = {name: group for group, names in TOOLBARS for name in names}
-        assert placed == {name: group for name, _, group in COMMANDS}
+        assert placed == {
+            name: group for name, _, group, where in COMMANDS if where in (BOTH, TOOLBAR)
+        }
 
-    def test_the_menu_holds_the_same_commands_in_the_same_order(self):
+    def test_the_menu_holds_its_commands_in_table_order(self):
         """Grouped the same way, so the menu and the toolbars teach one layout."""
-        from Microwave.Commands import menu
+        from Microwave.Commands import BOTH, COMMANDS, MENU, menu
 
-        assert [name for name in menu() if name != "Separator"] == self.on_toolbars()
+        assert [name for name in menu() if name != "Separator"] == [
+            name for name, _, _, where in COMMANDS if where in (BOTH, MENU)
+        ]
+
+    def test_every_command_is_reached_from_somewhere(self):
+        """A toolbar, the menu, or the Add Solver button."""
+        from Microwave.Commands import ADD_SOLVER, COMMANDS, menu
+
+        reached = set(self.on_toolbars()) | set(menu()) | set(ADD_SOLVER)
+        assert {name for name, *_ in COMMANDS} <= reached
+
+    def test_the_add_solver_button_offers_each_backend_and_the_menu_names_each(self):
+        from Microwave.Commands import ADD_SOLVER, AddSolverCommand, menu
+
+        assert ADD_SOLVER == ("Microwave_SolverOpenEMS", "Microwave_SolverPalace")
+        assert AddSolverCommand().GetCommands() == ADD_SOLVER
+        assert set(ADD_SOLVER) <= set(menu())
+        assert not set(ADD_SOLVER) & set(self.on_toolbars())
 
     def test_the_menu_separates_the_groups_without_trailing_ones(self):
         from Microwave.Commands import TOOLBARS, menu
@@ -1561,10 +2066,19 @@ class TestNothingIsPressableWithoutADocument:
     FreeCAD and every button raised on ``FreeCAD.ActiveDocument`` being ``None``
     several frames inside our code.
 
-    Deliberately only "a document is open". A missing *analysis* is explained by
-    name where it matters, and a sentence saying what to do beats a button that
-    went grey without saying anything.
+    A missing *analysis* is explained by name where it matters, and a sentence
+    saying what to do beats a button that went grey without saying anything. A
+    command that acts on what is picked in the tree is greyed while nothing it
+    acts on is picked, and its tooltip says what to pick.
     """
+
+    #: The commands that act on the tables or runs picked in the tree.
+    ON_A_PICK = (
+        "Microwave_ExportTouchstone",
+        "Microwave_PlotImpedance",
+        "Microwave_PlotSParameters",
+        "Microwave_ShowRunLog",
+    )
 
     def commands(self):
         from unittest.mock import MagicMock
@@ -1584,9 +2098,12 @@ class TestNothingIsPressableWithoutADocument:
         live = sorted(name for name, command in self.commands().items() if command.IsActive())
         assert not live, f"pressable in an empty FreeCAD: {live}"
 
-    def test_every_command_is_alive_with_one(self):
+    def test_every_command_is_alive_with_one_but_those_acting_on_a_pick(self, monkeypatch):
+        from Microwave import Commands
+
+        monkeypatch.setattr(Commands, "_selected", lambda: [])
         dead = sorted(name for name, command in self.commands().items() if not command.IsActive())
-        assert not dead, f"unreachable with a document open: {dead}"
+        assert dead == list(self.ON_A_PICK), f"unreachable with a document open: {dead}"
 
 
 class TestTheIconSet:
@@ -1693,31 +2210,63 @@ class TestTheIconSet:
         assert not missing, f"no icon on disk, so FreeCAD draws a generic one: {missing}"
         assert len(set(paths.values())) == len(paths), f"two backends share a picture: {paths}"
 
-    def test_the_stale_badge_follows_the_value_the_document_writes(self):
+    def test_what_a_run_or_a_mesh_makes_wears_no_command_s_icon(self):
+        """An object shares its icon only with the command that makes it. A
+        run, its matrix, the mesh settings and the meshes are made by no
+        command of their own, so a command's icon on one reads as a button in
+        the tree."""
+        from Microwave.Commands import COMMANDS
+        from Microwave.ViewProviders import icon, provider_class
+        from Microwave.ViewProviders.fem_mesh import EMFemMeshViewProvider
+
+        commands = {command().GetResources()["Pixmap"] for _, command, *_ in COMMANDS}
+        made = {
+            kind: icon(provider_class(kind).ICON)
+            for kind in ("EMRun", "EMSParameters", "EMMeshPreview", "EMYeeGrid", "EMGmshMesh")
+        }
+        made["Palace mesh"] = icon(EMFemMeshViewProvider.ICON)
+        assert all(made.values()), made
+        assert not {kind: path for kind, path in made.items() if path in commands}
+
+    @pytest.mark.parametrize(
+        "module, name",
+        [
+            ("Microwave.ViewProviders.preview", "EMMeshPreviewViewProvider"),
+            ("Microwave.ViewProviders.fem_mesh", "EMFemMeshViewProvider"),
+        ],
+    )
+    def test_the_stale_overlay_follows_the_value_the_document_writes(self, module, name):
         """The provider reads the status the document layer declares, not a copy.
 
-        ``Objects/preview.py`` declares what ``Status`` may hold and is the only
-        place that writes it. A provider comparing against its own literal keeps
-        passing while the tree stops going amber: the picture is still on disk
-        and still named, so every other test in this class is satisfied. That is
-        this class's drift one level in, at the condition rather than at the
-        filename.
+        ``Objects/preview.py`` declares what ``Status`` may hold. A provider
+        comparing against its own literal keeps passing while the tree stops
+        marking a stale mesh: the overlay is still on disk and still named, so
+        every other test in this class is satisfied.
         """
+        import importlib
+
         from Microwave.Objects.preview import CURRENT, OUT_OF_DATE
-        from Microwave.ViewProviders.preview import EMMeshPreviewViewProvider
 
-        def drawn(status):
-            provider = types.SimpleNamespace(Object=types.SimpleNamespace(Status=status))
-            return EMMeshPreviewViewProvider.getIcon(provider)
+        provider = getattr(importlib.import_module(module), name)
 
-        assert drawn(OUT_OF_DATE).endswith("MeshPreviewStale.svg"), (
-            "a preview the document called out of date draws the plain grid, so "
-            "the badge the mesher sets is invisible in the tree"
-        )
-        assert drawn(CURRENT).endswith("MeshPreview.svg"), (
-            "a preview that matches its drawing draws the badge, so the tree "
-            "asks for a remesh that is not needed"
-        )
+        def overlaid(status):
+            held = types.SimpleNamespace(Object=types.SimpleNamespace(Status=status))
+            return list(provider.getOverlayIcons(held).values())
+
+        [stale] = overlaid(OUT_OF_DATE)
+        assert stale.endswith("OverlayOutOfDate.svg")
+        assert overlaid(CURRENT) == [], "a mesh that matches its study asks for a remesh"
+
+    def test_both_meshes_carry_the_overlay_in_the_corner_freecad_leaves_free(self):
+        """FreeCAD's tree puts recompute and error at the top right, hidden and
+        frozen at the top left, and an external link at the bottom right."""
+        import FreeCADGui
+
+        from Microwave.Objects.preview import OUT_OF_DATE
+        from Microwave.ViewProviders import out_of_date
+
+        held = types.SimpleNamespace(Status=OUT_OF_DATE)
+        assert list(out_of_date(held)) == [FreeCADGui.IconPosition.BottomLeft]
 
     def test_they_are_well_formed_svg(self):
         import xml.etree.ElementTree as ElementTree
@@ -1763,6 +2312,7 @@ class TestEveryObjectMayBeShown:
         # only binds objects that have no Shape. EMMeshPreviewViewProvider is
         # absent for the same reason.
         ("results", "EMSParametersViewProvider"),
+        ("runs", "EMRunViewProvider"),
     ]
 
     @staticmethod
@@ -1846,9 +2396,14 @@ class TestTheExportCommand:
     """
 
     def command(self, monkeypatch, tmp_path, chosen="picked", answered=True):
-        """The command, with Qt replaced by something that records."""
+        """The command, with Qt replaced by something that records, and the
+        tree holding the result last recorded selected, or what
+        :meth:`selecting` picked."""
         from Microwave import Commands
 
+        monkeypatch.setattr(
+            Commands, "_selected", lambda: self.__dict__.get("picked", self.__dict__["held"][-1:])
+        )
         boxes, qt = recording_qt(monkeypatch)
         # Qt's real StandardButton values. Integers rather than sentinels
         # because the command ORs them together to build the button set, and a
@@ -1869,8 +2424,9 @@ class TestTheExportCommand:
         from Microwave.Objects import createEMAnalysis
 
         analysis = createEMAnalysis(doc)
+        self.__dict__.setdefault("held", [])
         if result is not None:
-            glue.record(analysis, result)
+            self.held.append(glue.record(analysis, result))
         return analysis
 
     def test_a_whole_matrix_is_written_where_the_dialog_said(self, doc, monkeypatch, tmp_path):
@@ -1918,33 +2474,9 @@ class TestTheExportCommand:
         assert self.offered(qt).endswith(".s1p")
         assert (tmp_path / "picked.s1p").is_file()
 
-    def test_an_analysis_that_has_never_run_says_so(self, doc, monkeypatch, tmp_path):
-        """Not "cannot read a result": there is no result object at all, and
-        the fix is to run, not to look at what went wrong."""
-        self.study(doc)
-        subject, boxes, qt = self.command(monkeypatch, tmp_path)
-        subject.Activated()
-
-        assert "Run the analysis" in shown(boxes)[2]
-        qt.QFileDialog.getSaveFileName.assert_not_called()
-
-    def test_two_studies_and_no_selection_says_which_to_pick(self, doc, monkeypatch, tmp_path):
-        """A box, not a console line: the whole outcome of the press is the
-        sentence, and a report view that is off by default reads as nothing."""
-        self.study(doc, matrix())
-        self.study(doc, matrix())
-        subject, boxes, qt = self.command(monkeypatch, tmp_path)
-        subject.Activated()
-
-        assert boxes.called, "no dialog for an ambiguous study"
-        assert "2 analyses" in shown(boxes)[2]
-        qt.QFileDialog.getSaveFileName.assert_not_called()
-
     def loose_result(self, doc, ports=(1,)):
-        """A second matrix, built by hand. ``record`` overwrites, so this is the
-        only way to two of them today - and the way the "keep this result"
-        feature will make ordinary. A one-port, so the suffix says which of the
-        two was written."""
+        """A matrix standing in the study on its own, as an imported table
+        does. A one-port, so the suffix says which was written."""
         from Microwave.Objects.results import createEMSParameters, store
 
         holder = createEMSParameters(doc)
@@ -1952,20 +2484,19 @@ class TestTheExportCommand:
         return holder
 
     def selecting(self, monkeypatch, *objects):
-        from Microwave import Commands
+        self.picked = list(objects)
 
-        monkeypatch.setattr(Commands, "_selected", lambda: list(objects))
-
-    def test_a_study_holding_two_results_refuses_to_choose(self, doc, monkeypatch, tmp_path):
-        """Taking the first in group order and saying nothing exports the wrong
-        matrix from an analysis holding two, whichever one is selected."""
+    def test_it_is_greyed_until_one_table_is_selected(self, doc, monkeypatch, tmp_path):
+        """Nothing picked names no matrix, and two name two files."""
         analysis = self.study(doc, matrix())
-        analysis.addObject(self.loose_result(doc))
-        subject, boxes, qt = self.command(monkeypatch, tmp_path)
-        subject.Activated()
-
-        assert "2 sets of S-parameters" in shown(boxes)[2]
-        qt.QFileDialog.getSaveFileName.assert_not_called()
+        subject, _, _ = self.command(monkeypatch, tmp_path)
+        assert subject.IsActive()
+        self.selecting(monkeypatch)
+        assert not subject.IsActive()
+        second = self.loose_result(doc)
+        analysis.addObject(second)
+        self.selecting(monkeypatch, self.held[0], second)
+        assert not subject.IsActive()
 
     def test_the_selected_result_is_the_one_written(self, doc, monkeypatch, tmp_path):
         """The one-port is second in group order, so first-match writes .s2p."""
@@ -2178,7 +2709,7 @@ class TestTheRightClickEntry:
 
         boxes, _ = recording_qt(monkeypatch)
 
-        def boom(_matrix):
+        def boom(_matrix, _source="", _document=""):
             raise RuntimeError("no module named 'matplotlib'")
 
         monkeypatch.setattr(results, "load", lambda _obj: matrix())
@@ -2188,7 +2719,7 @@ class TestTheRightClickEntry:
 
         assert self.provider().doubleClicked(vobj) is True
         icon, title, text = shown(boxes)
-        assert (icon, title) == (boxes.Warning, "Plot S-parameters")
+        assert (icon, title) == (boxes.Warning, "Plot S-Parameters")
         assert "matplotlib" in text
 
 
@@ -2209,7 +2740,9 @@ class TestDoubleClickingTheSolverOutsideAStudy:
         assert EMSolverOpenEMSViewProvider(MagicMock()).doubleClicked(vobj) is True
         icon, title, text = shown(boxes)
         assert (icon, title) == (boxes.Warning, "Run Simulation")
-        assert "'openEMS'" in text and "Drag it into one" in text
+        assert text == (
+            "'openEMS' is not in a study, so there is nothing to run. Drag it into an EM Analysis"
+        )
 
 
 class TestTheOverwriteTheDialogCannotSee:
@@ -2223,8 +2756,9 @@ class TestTheOverwriteTheDialogCannotSee:
     """
 
     def run_with(self, doc, monkeypatch, tmp_path, typed, answer=None):
-        subject, boxes, qt = TestTheExportCommand().command(monkeypatch, tmp_path)
-        TestTheExportCommand().study(doc, matrix())
+        export = TestTheExportCommand()
+        export.study(doc, matrix())
+        subject, boxes, qt = export.command(monkeypatch, tmp_path)
         qt.QFileDialog.getSaveFileName.return_value = (str(tmp_path / typed), "")
         if answer is not None:
             boxes.question.return_value = boxes.Yes if answer else boxes.Cancel
@@ -2264,18 +2798,15 @@ class TestTheOverwriteTheDialogCannotSee:
 
 
 class TestTheSMatrixChart:
-    """What ``Gui/charts.py`` is handed for an S-matrix.
+    """What ``Gui/charts.py`` is handed for one table picked.
 
-    :func:`~Microwave.Gui.plot_s_params.matrix_db` and
-    :func:`~Microwave.Gui.plot_s_params.chart_text` are tested above for what
-    they compute; this is the assembly, and it is where the two could be joined
-    up wrongly without either of them changing.
+    The curves and :func:`~Microwave.Gui.plot_s_params.chart_text` are tested
+    above for what they compute; this is the assembly, and it is where the two
+    could be joined up wrongly without either of them changing.
     """
 
     def chart(self, **kwargs):
-        from Microwave.Gui.plot_s_params import chart
-
-        return chart(matrix(**kwargs))
+        return one_table(matrix(**kwargs))
 
     def test_one_series_per_measured_term(self):
         drawn = self.chart()
@@ -2295,12 +2826,54 @@ class TestTheSMatrixChart:
 
     def test_the_heading_and_the_basis_are_carried_through(self):
         drawn = self.chart(title="WR-42")
-        assert (drawn.heading, drawn.footnote) == ("WR-42 S-parameters", "Referenced to 50 ohm")
+        assert (drawn.heading, drawn.notes) == ("WR-42 S-parameters", ("Referenced to 50 ohm",))
 
-    def test_a_frequency_chart_offers_no_choice_of_axis(self):
-        """S-parameters are a function of frequency and of nothing else. A
-        selector would be a widget asking a question with one answer."""
-        assert self.chart().choices == ()
+    def test_one_table_offers_every_term_first_and_nothing_to_difference(self):
+        """Every term at once is what one matrix is read as, and a table is
+        differenced against another, which one table does not have."""
+        from Microwave.Gui.plot_s_params import EVERY, EVERY_TERM
+
+        selectors = self.chart().selectors
+        assert [selector.label for selector in selectors] == ["Quantity", "Term"]
+        term = selectors[1]
+        assert term.choices[0] == (EVERY_TERM, EVERY) and term.chosen == EVERY
+        assert [text for text, _ in term.choices[1:]] == ["S11", "S22", "S21", "S12"]
+
+    def test_a_term_chosen_draws_that_term_alone_under_its_name(self):
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+
+        drawn = overlay_chart([Table(matrix(), "Run 1 (openEMS)")], chosen=(2, 1))
+        assert [series.name for series in drawn.series] == ["S21, Run 1 (openEMS)"]
+        assert drawn.heading == "S21: Run 1 (openEMS)"
+
+    def test_one_table_is_differenced_against_nothing(self):
+        """A difference asked of one table is no difference, and the chart
+        says nothing about how one would be drawn."""
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results import overlay
+        from Microwave.Results.overlay import Table
+
+        whole = matrix(s=np.full((2, 2, 2), 0.5, dtype=complex))
+        drawn = overlay_chart([Table(whole, "R1")], overlay.DB, (2, 1), against=0)
+        assert [series.name for series in drawn.series] == ["S21, R1"]
+        phase = overlay_chart([Table(whole, "R1")], overlay.PHASE, (2, 1), against=0)
+        assert phase.warnings == ()
+
+    def test_every_term_is_said_how_it_was_drawn_once(self):
+        from Microwave.Gui.plot_s_params import EVERY, overlay_chart
+        from Microwave.Results import overlay
+        from Microwave.Results.overlay import Table
+
+        whole = matrix(frequency=np.linspace(1e9, 2e9, 11), s=np.full((11, 2, 2), 0.5))
+        notes = overlay_chart([Table(whole, "R1")], overlay.DELAY, EVERY).notes
+        assert len(notes) == len(set(notes))
+        assert sum(note.startswith("Group delay is the slope") for note in notes) == 1
+
+    def test_the_heading_names_the_table_after_the_study(self):
+        assert one_table(matrix(title="WR-42"), "Run 1 (openEMS)").heading == (
+            "WR-42 S-parameters, Run 1 (openEMS)"
+        )
 
 
 class _Action:
@@ -2336,12 +2909,15 @@ class TestWhatTheRightClickOffers:
     anything that would refuse when pressed."""
 
     def provider(self, monkeypatch, ports=(1, 2)):
+        from Microwave.Gui import results as glue
         from Microwave.Gui import views
         from Microwave.Objects import results
         from Microwave.ViewProviders.results import EMSParametersViewProvider
 
         monkeypatch.setattr(results, "load", lambda _obj: matrix())
-        monkeypatch.setattr(views, "traceable_ports", lambda _matrix: list(ports))
+        monkeypatch.setattr(glue, "run_of", lambda _obj: None)
+        monkeypatch.setattr(glue, "source", lambda _obj: "S-Parameters")
+        monkeypatch.setattr(views, "traceable_ports", lambda _table: list(ports))
         return EMSParametersViewProvider(MagicMock())
 
     def texts(self, monkeypatch, **kwargs):
@@ -2351,14 +2927,14 @@ class TestWhatTheRightClickOffers:
 
     def test_the_matrix_can_be_drawn_and_written_from_the_object_itself(self, monkeypatch):
         texts = self.texts(monkeypatch)
-        assert texts[0] == "Plot S-parameters"
+        assert texts[0] == "Plot S-Parameters"
         assert texts[-1] == "Export Touchstone..."
 
     def test_one_impedance_entry_per_port_that_has_a_trace(self, monkeypatch):
         texts = self.texts(monkeypatch)
-        assert [text for text in texts if "impedance" in text] == [
-            "Plot impedance along the line (port 1)",
-            "Plot impedance along the line (port 2)",
+        assert [text for text in texts if "Impedance" in text] == [
+            "Plot Impedance along the Line (Port 1)",
+            "Plot Impedance along the Line (Port 2)",
         ]
 
     def test_a_matrix_no_port_can_be_traced_from_still_offers_one(self, monkeypatch):
@@ -2366,19 +2942,22 @@ class TestWhatTheRightClickOffers:
         starting well above DC, a port nobody drove, a reference that is not a
         real constant - all three are ordinary states, and a menu that goes
         quiet on them cannot be asked about any of them."""
-        offered = [text for text in self.texts(monkeypatch, ports=()) if "impedance" in text]
-        assert offered == ["Plot impedance along the line (port 1)"]
+        offered = [text for text in self.texts(monkeypatch, ports=()) if "Impedance" in text]
+        assert offered == ["Plot Impedance along the Line (Port 1)"]
 
     def test_that_entry_reports_the_transforms_own_refusal(self, monkeypatch):
         """End to end on the case that prompted it: a bandpass swept from 1 GHz
         with a 6.25 MHz step, where everything below the first point would be
         invented. Only the stored matrix is supplied; the message has to survive
         the whole route from ``Results/tdr.py`` to the box on its own."""
-        from Microwave.Gui import views
+        from Microwave.Gui import results
+        from Microwave.Objects import results as stored
         from Microwave.ViewProviders.results import EMSParametersViewProvider
 
         bandpass = matrix(frequency=np.linspace(1e9, 3.5e9, 401))
-        monkeypatch.setattr(views, "load", lambda _obj: bandpass)
+        monkeypatch.setattr(stored, "load", lambda _obj: bandpass)
+        monkeypatch.setattr(results, "run_of", lambda _obj: None)
+        monkeypatch.setattr(results, "source", lambda _obj: "S-Parameters")
         boxes, _ = recording_qt(monkeypatch)
 
         subject = EMSParametersViewProvider(MagicMock())
@@ -2386,7 +2965,7 @@ class TestWhatTheRightClickOffers:
         subject.plot_impedance(1)
 
         _, title, text = shown(boxes)
-        assert title == "Plot impedance"
+        assert title == "Plot Impedance along the Line"
         assert "160 steps above DC" in text
         assert "invented rather than measured" in text
 
@@ -2405,8 +2984,8 @@ class TestWhatTheRightClickOffers:
         monkeypatch.setattr(results, "load", boom)
         subject.setupContextMenu(MagicMock(), menu)
         assert [action.text for action in actions] == [
-            "Plot S-parameters",
-            "Plot impedance along the line (port 1)",
+            "Plot S-Parameters",
+            "Plot Impedance along the Line (Port 1)",
             "Export Touchstone...",
         ]
 
@@ -2416,16 +2995,40 @@ class TestWhatTheRightClickOffers:
         from Microwave.Gui import plot_tdr, views
 
         drawn = []
-        monkeypatch.setattr(views, "impedance_view", lambda _holder, port: port)
-        monkeypatch.setattr(plot_tdr, "show_trace", drawn.append)
+        monkeypatch.setattr(views, "table_of", lambda holder: holder)
+        monkeypatch.setattr(plot_tdr, "show_traces", lambda _tables, port: drawn.append(port))
 
         actions, menu = recording_actions(monkeypatch)
         self.provider(monkeypatch).setupContextMenu(MagicMock(), menu)
         for action in actions:
-            if "impedance" in action.text:
+            if "Impedance" in action.text:
                 action.slot()
 
         assert drawn == [1, 2]
+
+    def test_its_plot_entry_draws_the_tables_picked_with_it_first_where_unpicked(self, monkeypatch):
+        """Qt keeps a multi-selection on right-click, so the entry draws what is
+        picked, and the result clicked is among it whether picked or not."""
+        import sys
+
+        from Microwave import Commands
+        from Microwave.Gui import results as glue
+
+        drawn = []
+        monkeypatch.setattr(Commands, "plot_s_parameters", lambda picked: drawn.append(picked))
+        monkeypatch.setattr(glue, "tables_in", lambda selection: list(selection))
+        gui = MagicMock()
+        monkeypatch.setitem(sys.modules, "FreeCADGui", gui)
+        subject = self.provider(monkeypatch)
+        actions, menu = recording_actions(monkeypatch)
+        vobj = MagicMock()
+        subject.setupContextMenu(vobj, menu)
+        [entry] = [action for action in actions if action.text == "Plot S-Parameters"]
+        gui.Selection.getSelection.return_value = ["another"]
+        entry.slot()
+        gui.Selection.getSelection.return_value = ["another", vobj.Object]
+        entry.slot()
+        assert drawn == [[vobj.Object, "another"], ["another", vobj.Object]]
 
     def test_a_chart_that_cannot_be_drawn_is_reported_rather_than_raised(self, monkeypatch):
         """A traceback out of a context-menu slot goes nowhere a user looks."""
@@ -2437,14 +3040,14 @@ class TestWhatTheRightClickOffers:
 
         boxes, _ = recording_qt(monkeypatch)
 
-        def boom(_holder, _port):
+        def boom(_holder):
             raise RuntimeError("no module named 'matplotlib'")
 
-        monkeypatch.setattr(views, "impedance_view", boom)
+        monkeypatch.setattr(views, "table_of", boom)
         subject.plot_impedance(2)  # must not raise
 
         icon, title, text = shown(boxes)
-        assert (icon, title) == (boxes.Warning, "Plot impedance")
+        assert (icon, title) == (boxes.Warning, "Plot Impedance along the Line")
         assert "port 2" in text and "matplotlib" in text
 
 
@@ -2454,121 +3057,125 @@ class TestTheResultsToolbar:
     def group_of(self, wanted):
         from Microwave.Commands import COMMANDS
 
-        return next(group for name, _, group in COMMANDS if name == wanted)
+        return next(group for name, _, group, _ in COMMANDS if name == wanted)
 
-    def test_both_charts_and_the_export_sit_together(self):
+    def test_both_charts_the_export_and_the_log_sit_together_on_the_toolbar(self):
         """A result leaving the document belongs with the results, not beside
         the buttons that set a study up."""
+        from Microwave.Commands import BOTH, COMMANDS
+
+        placed = {name: where for name, _, _, where in COMMANDS}
         for name in (
             "Microwave_PlotSParameters",
             "Microwave_PlotImpedance",
             "Microwave_ExportTouchstone",
+            "Microwave_ShowRunLog",
         ):
             assert self.group_of(name) == "Microwave Results"
+            assert placed[name] == BOTH, name
 
-    def test_setting_a_study_up_is_a_different_group(self):
-        for name in ("Microwave_Analysis", "Microwave_Run"):
-            assert self.group_of(name) == "Microwave"
+    def test_setting_a_study_up_and_solving_it_are_different_groups(self):
+        assert self.group_of("Microwave_Analysis") == "Microwave"
+        for name in ("Microwave_Run", "Microwave_RefineRun"):
+            assert self.group_of(name) == "Microwave Solve"
 
 
-class TestTheResultCommandsActOnTheStudyInHand:
-    """Both charts reach the same matrix the export does, so a study with two
-    results, or none, is one conversation and not three."""
+class TestTheResultCommandsActOnTheSelection:
+    """Each chart, the export and the log act on the tables picked in the tree,
+    and are greyed while nothing picked is one."""
 
     def command(self, which):
         from Microwave import Commands
 
         return getattr(Commands, which)()
 
-    def aimed_at(self, monkeypatch, holder):
-        from Microwave.Gui import results as results_glue
+    def picking(self, monkeypatch, *picked):
+        """The tree holding ``picked``, each of them a table named as a chart
+        names it."""
+        from Microwave import Commands
+        from Microwave.Gui import results as glue
 
-        monkeypatch.setattr(results_glue, "result_in_hand", lambda _doc, _sel: holder)
-
-    def refusing(self, monkeypatch, message):
-        from Microwave.Gui import results as results_glue
-
-        def boom(_doc, _sel):
-            raise results_glue.NoResult(message)
-
-        monkeypatch.setattr(results_glue, "result_in_hand", boom)
+        monkeypatch.setattr(Commands, "_selected", lambda: list(picked))
+        monkeypatch.setattr(glue, "tables_in", lambda selection: list(selection))
+        monkeypatch.setattr(glue, "overlaid", lambda selection: [f"{s} named" for s in selection])
 
     @pytest.mark.parametrize(
-        ("which", "title"),
+        "which",
         [
-            ("PlotSParametersCommand", "Plot S-parameters"),
-            ("PlotImpedanceCommand", "Plot impedance"),
+            "PlotSParametersCommand",
+            "PlotImpedanceCommand",
+            "ExportTouchstoneCommand",
+            "ShowRunLogCommand",
         ],
     )
-    def test_a_study_with_nothing_to_draw_says_so_by_name(self, which, title, monkeypatch):
-        """Not "cannot read a result" about the wrong object: the study has
-        nothing in it yet, and the fix is to run it."""
-        boxes, _ = recording_qt(monkeypatch)
-        self.refusing(monkeypatch, "'Study' has no S-parameters yet. Run the analysis first")
+    def test_nothing_picked_greys_it_and_a_table_picked_does_not(self, which, doc, monkeypatch):
+        from Microwave import Commands
+        from Microwave.Gui import results as glue
 
-        self.command(which).Activated()
+        self.picking(monkeypatch)
+        monkeypatch.setattr(Commands, "_runs_picked", lambda: [])
+        assert not self.command(which).IsActive()
+        self.picking(monkeypatch, "run 1")
+        monkeypatch.setattr(Commands, "_runs_picked", lambda: ["run 1"])
+        monkeypatch.setattr(glue, "tables_in", lambda selection: list(selection))
+        assert self.command(which).IsActive()
 
-        _, shown_title, text = shown(boxes)
-        assert shown_title == title
-        assert "Run the analysis first" in text
-
-    def test_the_s_matrix_button_draws_the_matrix_it_was_given(self, monkeypatch):
+    def test_the_s_parameter_button_draws_each_table_picked(self, monkeypatch):
         from Microwave.Gui import plot_s_params
-        from Microwave.Objects import results
 
         drawn = []
-        wanted = matrix(title="Board A")
-        self.aimed_at(monkeypatch, "the-holder")
-        monkeypatch.setattr(
-            results, "load", lambda holder: wanted if holder == "the-holder" else None
-        )
-        monkeypatch.setattr(plot_s_params, "show_matrix", drawn.append)
+        self.picking(monkeypatch, "run 1", "run 2", "imported")
+        monkeypatch.setattr(plot_s_params, "show_overlay", lambda tables: drawn.append(tables))
 
         self.command("PlotSParametersCommand").Activated()
-        assert drawn == [wanted]
+        assert drawn == [["run 1 named", "run 2 named", "imported named"]]
 
-    def test_the_impedance_button_takes_the_lowest_port_that_has_a_trace(self, monkeypatch):
-        """A two-port study drawn from the far port would be a different chart,
-        and one nobody asked for."""
-        from Microwave.Gui import plot_tdr, views
-        from Microwave.Objects import results
+    def test_one_table_picked_is_traced_alone(self, monkeypatch):
+        """The port is the chart's to choose, from what every table offers."""
+        from Microwave.Gui import plot_tdr
 
-        asked = []
-        self.aimed_at(monkeypatch, "the-holder")
-        monkeypatch.setattr(results, "load", lambda _holder: matrix())
-        monkeypatch.setattr(views, "traceable_ports", lambda _result: [2, 3])
-        monkeypatch.setattr(views, "impedance_view", lambda _holder, port: asked.append(port))
-        monkeypatch.setattr(plot_tdr, "show_trace", lambda _view: None)
+        drawn = []
+        self.picking(monkeypatch, "run 1")
+        monkeypatch.setattr(plot_tdr, "show_traces", lambda tables: drawn.append(tables))
 
         self.command("PlotImpedanceCommand").Activated()
-        assert asked == [2]
+        assert drawn == [["run 1 named"]]
 
-    def test_it_falls_back_to_the_first_port_so_the_refusal_is_reached(self, monkeypatch):
+    def test_several_tables_selected_are_traced_together(self, monkeypatch):
+        """Runs picked in the tree are traced on one set of axes, named as the
+        S-parameter chart names them."""
+        from Microwave.Gui import plot_tdr
+
+        drawn = []
+        self.picking(monkeypatch, "run 1", "run 2")
+        monkeypatch.setattr(plot_tdr, "show_traces", lambda tables: drawn.append(tables))
+
+        self.command("PlotImpedanceCommand").Activated()
+        assert drawn == [["run 1 named", "run 2 named"]]
+
+    def test_a_refusal_reaches_the_user(self, monkeypatch):
         """A button that does nothing when pressed teaches nothing. Where no
-        port can be traced the chart still runs, and what the user gets is the
+        port can be traced the chart raises, and what the user gets is the
         sentence saying what to change."""
         boxes, _ = recording_qt(monkeypatch)
-        from Microwave.Gui import views
-        from Microwave.Objects import results
+        from Microwave.Gui import plot_tdr
 
-        self.aimed_at(monkeypatch, "the-holder")
-        monkeypatch.setattr(results, "load", lambda _holder: matrix(port_numbers=(4, 5)))
-        monkeypatch.setattr(views, "traceable_ports", lambda _result: [])
+        self.picking(monkeypatch, "run 1")
 
-        def refuse(_holder, port):
-            raise ValueError(f"nothing doing at port {port}")
+        def refuse(_tables):
+            raise ValueError("nothing doing at port 4")
 
-        monkeypatch.setattr(views, "impedance_view", refuse)
+        monkeypatch.setattr(plot_tdr, "show_traces", refuse)
 
         self.command("PlotImpedanceCommand").Activated()
 
         _, title, text = shown(boxes)
-        assert title == "Plot impedance"
+        assert title == "Plot Impedance along the Line"
         assert "nothing doing at port 4" in text
 
 
 class TestTheBadgeAfterAMeshIsDrawn:
-    """What *Update Mesh* leaves on the status line, as a value.
+    """What *Mesh* leaves on the status line, as a value.
 
     A grid can be under-resolved in two ways that the report keeps apart because
     they are found differently - a region the grid barely spans, and a layer
@@ -2595,7 +3202,7 @@ class TestTheBadgeAfterAMeshIsDrawn:
     def test_a_barely_resolved_region_is_amber(self):
         text, colour = self.verdict(unresolved=2)
         assert colour == "orange"
-        assert "2 reading(s)" in text
+        assert text == "2 feature(s) barely resolved by the mesh - see the log"
 
     def test_a_layer_the_grid_undercounted_is_the_same_verdict(self):
         """Read off a chord rather than off a region, and a badge that ignored
@@ -2606,10 +3213,10 @@ class TestTheBadgeAfterAMeshIsDrawn:
         chord is one face of one, and a bent board carries several."""
         text, colour = self.verdict(undercounted=1)
         assert colour == "orange"
-        assert "1 reading(s)" in text
+        assert "1 feature(s)" in text
 
     def test_and_the_two_are_counted_together(self):
-        assert self.verdict(unresolved=2, undercounted=3)[0].startswith("5 reading(s)")
+        assert self.verdict(unresolved=2, undercounted=3)[0].startswith("5 feature(s)")
 
     def test_a_grid_nobody_meant_is_amber_and_says_which_thing_it_is(self):
         text, colour = self.verdict(oversized="this grid is 9.9 GiB")
@@ -2631,59 +3238,310 @@ def two_answers(doc, second=None):
     return analysis
 
 
-class TestComparingTwoAnswers:
-    """Two backends' matrices of one study, drawn term by term with their
-    difference, from the toolbar and from the result itself."""
+class TestTwoAnswersOnOneChart:
+    """Two matrices of one study drawn on one set of axes, one term at a time,
+    each differenced against the other where it is chosen, and what a run says
+    of the other backend's as it is filed."""
 
-    def compared(self, doc):
+    def drawn(self, doc, chosen=(2, 1), against=0, second=None):
         from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
 
-        two_answers(doc)
-        return glue.comparison(doc)
+        analysis = two_answers(doc, second=second)
+        return overlay_chart(
+            glue.overlaid(glue.results_of(analysis)), chosen=chosen, against=against
+        )
 
     def test_a_term_is_drawn_from_both_and_as_their_difference(self, doc):
-        from Microwave.Gui.plot_s_params import comparison_chart
-
-        drawn = comparison_chart(self.compared(doc), (2, 1))
+        drawn = self.drawn(doc)
         assert [series.name for series in drawn.series] == [
-            "S21 (openEMS)",
-            "S21 (Palace)",
-            "|S21 (openEMS) - S21 (Palace)|",
+            "S21, Run 1 (openEMS)",
+            "S21, Run 2 (Palace)",
+            "|S21 difference|, Run 2 (Palace) against Run 1 (openEMS)",
         ]
         assert drawn.series[2].y == pytest.approx(20 * np.log10([0.18, 0.18]), rel=1e-12)
 
-    def test_the_selector_offers_every_term_and_redraws_the_one_chosen(self, doc):
-        from Microwave.Gui.plot_s_params import comparison_chart
+    def test_no_difference_is_drawn_until_a_table_is_chosen(self, doc):
+        drawn = self.drawn(doc, against=None)
+        assert [series.name for series in drawn.series] == [
+            "S21, Run 1 (openEMS)",
+            "S21, Run 2 (Palace)",
+        ]
+        assert drawn.selectors[2].label == "Difference against"
 
-        comparison = self.compared(doc)
-        drawn = comparison_chart(comparison, (1, 1))
-        assert [text for text, _ in drawn.choices] == ["S11", "S12", "S21", "S22"]
-        assert drawn.chosen == (1, 1)
-        assert comparison_chart(comparison, [1, 2]).heading == "S12: openEMS and Palace"
+    def test_the_notes_say_how_far_apart_the_two_stand_at_worst(self, doc):
+        notes = self.drawn(doc).notes
+        assert (
+            "S21 of Run 2 (Palace) differs from Run 1 (openEMS) by at most 0.18 (-14.9 dB) "
+            "at 1 GHz, where |S21| is 0.9 in Run 1 (openEMS) and 0.72 in Run 2 (Palace)"
+        ) in notes
 
-    def test_the_footnote_is_what_the_filing_said_of_that_term(self, doc):
-        from Microwave.Gui.plot_s_params import comparison_chart
-
-        comparison = self.compared(doc)
-        term = next(found for found in comparison.terms if found.name == "S21")
-        assert comparison_chart(comparison, (2, 1)).footnote == comparison.line(term)
-
-    def test_the_footnote_says_which_port_was_turned_and_in_what(self, doc):
-        from Microwave.Gui import results as glue
-        from Microwave.Gui.plot_s_params import comparison_chart
+    def test_the_notes_say_which_port_was_turned_and_in_what(self, doc):
         from Microwave.Results.compared import SIGN_BY_RULE
 
         s = np.zeros((2, 2, 2), dtype=complex)
         s[:, 1, 0] = s[:, 0, 1] = -0.9
         turned = matrix(s=s)
         turned.provenance[SIGN_BY_RULE] = [2]
-        two_answers(doc, second=turned)
-        footnote = comparison_chart(glue.comparison(doc), (2, 1)).footnote
-        assert footnote.startswith("S21 differs by at most 0 at ")
-        assert footnote.endswith(
-            "port 2 of what Palace solved was turned half a cycle, because "
-            "Palace chose the sign of the mode there by a rule of its own"
+        notes = self.drawn(doc, second=turned).notes
+        assert (
+            "S21 of Run 2 (Palace) is turned half a cycle, because a solver chose the sign "
+            "of the mode at port 2 by a rule of its own"
+        ) in notes
+        assert any(
+            note.startswith("S21 of Run 2 (Palace) differs from Run 1 (openEMS) by at most 0 at ")
+            for note in notes
         )
+
+    @staticmethod
+    def one_path(frequency):
+        """A table of a run that drove port 1 alone, so port 2 stays at the
+        impedance measured on its line, which moves across the band."""
+        s = np.full((frequency.size, 2, 2), 0.5, dtype=complex)
+        s[:, :, 1] = np.nan
+        reference = np.full((frequency.size, 2), 50.0 + 0j)
+        reference[:, 1] = np.linspace(45.0, 55.0, frequency.size)
+        result = matrix(frequency=frequency, s=s, driven=(1,), self_referenced=(2,))
+        return replace(result, reference=reference)
+
+    def test_two_answers_on_different_bases_are_differenced_and_named(self):
+        """The low-pass solved on openEMS driving port 1 alone against Palace
+        holding each lumped port at its resistance."""
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+
+        frequency = np.linspace(1e9, 3e9, 5)
+        palace = matrix(
+            frequency=frequency,
+            s=np.full((5, 2, 2), 0.4, dtype=complex),
+            self_referenced=(1, 2),
+        )
+        palace.provenance[IMPEDANCE_STATED] = {"1": LUMPED_RESISTANCE, "2": LUMPED_RESISTANCE}
+        tables = [
+            Table(self.one_path(frequency), "Run 1 (openEMS)"),
+            Table(palace, "Run 2 (Palace)"),
+        ]
+        drawn = overlay_chart(tables, chosen=(2, 1), against=0)
+        assert drawn.series[-1].name == "|S21 difference|, Run 2 (Palace) against Run 1 (openEMS)"
+        np.testing.assert_allclose(drawn.series[-1].y, 20 * np.log10(0.1), rtol=1e-12)
+        assert drawn.warnings == ("Different bases: port 2 is not driven in Run 1 (openEMS)",)
+        assert not any(line.startswith("No difference") for line in drawn.warnings)
+
+    @pytest.mark.parametrize(("palace", "warned"), [(0.4, False), (0.495, True)])
+    def test_what_a_column_read_alone_can_be_off_by_is_said_beside_the_difference(
+        self, palace, warned
+    ):
+        """On the Details tab always, and as a warning where it is not under
+        the largest difference."""
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+        from Microwave.Results.sparameters import SENT_BACK
+
+        frequency = np.linspace(1e9, 3e9, 5)
+        one_path = self.one_path(frequency)
+        one_path.provenance[SENT_BACK] = {"1": {"bound": 0.01, "frequency": 2e9, "port": 2}}
+        tables = [
+            Table(one_path, "Run 1 (openEMS)"),
+            Table(matrix(frequency=frequency, s=np.full((5, 2, 2), palace)), "Run 2 (Palace)"),
+        ]
+        drawn = overlay_chart(tables, chosen=(2, 1), against=0)
+        assert (
+            "A term of Run 1 (openEMS) driven from port 1 can be off by up to about 0.01 "
+            "(-40.0 dB) at 2 GHz: port 2, not driven, sent back part of what reached it"
+        ) in drawn.notes
+        said = "Run 1 (openEMS) can be off by as much as the difference: port 2 was not driven"
+        assert (said in drawn.warnings) is warned
+
+    def test_a_bound_equal_to_the_difference_is_a_warning(self):
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+        from Microwave.Results.sparameters import SENT_BACK
+
+        frequency = np.linspace(1e9, 3e9, 5)
+        one_path = self.one_path(frequency)
+        one_path.provenance[SENT_BACK] = {"1": {"bound": 0.25, "frequency": 2e9, "port": 2}}
+        tables = [
+            Table(one_path, "Run 1 (openEMS)"),
+            Table(matrix(frequency=frequency, s=np.full((5, 2, 2), 0.25)), "Run 2 (Palace)"),
+        ]
+        warnings = overlay_chart(tables, chosen=(2, 1), against=0).warnings
+        assert any("can be off by as much as the difference" in line for line in warnings)
+
+    def test_a_base_read_alone_is_said_once_under_every_difference(self):
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+        from Microwave.Results.sparameters import SENT_BACK
+
+        frequency = np.linspace(1e9, 3e9, 5)
+        one_path = self.one_path(frequency)
+        one_path.provenance[SENT_BACK] = {"1": {"bound": 0.01, "frequency": 2e9, "port": 2}}
+        tables = [
+            Table(one_path, "Run 1 (openEMS)"),
+            *(
+                Table(matrix(frequency=frequency, s=np.full((5, 2, 2), 0.4)), name)
+                for name in ("Run 2 (Palace)", "Run 3 (Palace)")
+            ),
+        ]
+        notes = overlay_chart(tables, chosen=(2, 1), against=0).notes
+        assert sum(note.startswith("A term of Run 1 (openEMS)") for note in notes) == 1
+
+    def test_a_basis_shared_by_each_difference_is_said_once(self):
+        """Two runs differenced against one that drove port 1 alone: each
+        difference holds the same change of reference."""
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+
+        frequency = np.linspace(1e9, 3e9, 5)
+        tables = [
+            Table(self.one_path(frequency), "Run 1 (openEMS)"),
+            *(
+                Table(matrix(frequency=frequency, s=np.full((5, 2, 2), 0.4)), name)
+                for name in ("Run 2 (Palace)", "Run 3 (Palace)")
+            ),
+        ]
+        drawn = overlay_chart(tables, chosen=(2, 1), against=0)
+        assert sum("difference" in series.name for series in drawn.series) == 2
+        assert drawn.warnings == ("Different bases: port 2 is not driven in Run 1 (openEMS)",)
+
+    def test_a_pair_not_differenced_is_not_said_to_hold_another_drawing(self, doc):
+        """The drawings differ, and the difference that would hold that change
+        is not taken, so the Details tab says it and the warnings do not."""
+        from Microwave.Results.compared import DRAWING
+
+        other = matrix(port_numbers=(1, 3))
+        other.provenance[DRAWING] = "another drawing"
+        drawn = self.drawn(doc, second=other, chosen=(1, 1))
+        assert not any("different drawings" in line for line in drawn.warnings)
+        assert any("different drawings" in note for note in drawn.notes)
+
+    def test_a_refusal_shared_by_each_difference_is_said_once(self):
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+
+        frequency = np.linspace(1e9, 3e9, 5)
+        tables = [
+            Table(self.one_path(frequency), "Run 1 (openEMS)"),
+            *(
+                Table(matrix(frequency=frequency, s=np.full((5, 2, 2), 0.4)), name)
+                for name in ("Run 2 (Palace)", "Run 3 (Palace)")
+            ),
+        ]
+        warnings = overlay_chart(tables, chosen=(2, 2), against=0).warnings
+        assert warnings.count("No difference: Run 1 (openEMS) did not measure S22") == 1
+
+    def test_a_term_one_answer_did_not_measure_is_drawn_from_the_other_alone(self):
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+
+        frequency = np.linspace(1e9, 3e9, 5)
+        tables = [
+            Table(self.one_path(frequency), "Run 1 (openEMS)"),
+            Table(matrix(frequency=frequency, s=np.full((5, 2, 2), 0.4)), "Run 2 (Palace)"),
+        ]
+        drawn = overlay_chart(tables, chosen=(2, 2), against=0)
+        assert [series.name for series in drawn.series] == ["S22, Run 2 (Palace)"]
+        assert "No difference: Run 1 (openEMS) did not measure S22" in drawn.warnings
+        assert "Run 1 (openEMS) holds no value of it" in drawn.warnings
+
+    def test_two_answers_of_different_ports_are_drawn_and_not_differenced(self, doc):
+        drawn = self.drawn(doc, second=matrix(port_numbers=(1, 3)), chosen=(1, 1))
+        assert len(drawn.series) == 2
+        assert (
+            "No difference: Run 1 (openEMS) and Run 2 (Palace) hold different ports"
+            in drawn.warnings
+        )
+
+    def test_two_answers_of_different_drawings_are_drawn_and_said_to_be(self, doc):
+        """A model changed between the two would read as two solvers
+        disagreeing, so the chart says so rather than refusing the pair."""
+        from Microwave.Results.compared import DRAWING
+
+        moved = matrix(s=0.5 * np.ones((2, 2, 2)))
+        moved.provenance[DRAWING] = "another drawing"
+        drawn = self.drawn(doc, second=moved)
+        assert len(drawn.series) == 3
+        assert (
+            "Different bases: Run 1 (openEMS) and Run 2 (Palace) were solved from different "
+            "drawings"
+        ) in drawn.warnings
+        assert not any("different drawings" in note for note in drawn.notes)
+
+    def test_several_tables_are_offered_a_term_at_a_time(self, doc):
+        from Microwave.Gui.plot_s_params import EVERY
+
+        [_, term, _] = self.drawn(doc).selectors
+        assert EVERY not in [value for _, value in term.choices]
+
+    def test_a_table_that_does_not_say_its_drawing_is_not_said_to_differ_in_it(self, doc):
+        """An imported table, or one stored by an earlier build, records no
+        drawing, and nothing is known of whether it differs."""
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.compared import DRAWING
+        from Microwave.Results.overlay import Table
+
+        analysis = two_answers(doc)
+        [run] = glue.overlaid(glue.results_of(analysis)[:1])
+        assert run.result.provenance.get(DRAWING)
+        loose = Table(matrix(s=0.5 * np.ones((2, 2, 2))), "imported")
+        notes = overlay_chart([run, loose], chosen=(2, 1), against=0).notes
+        assert not any("different drawings" in note for note in notes)
+
+    def test_different_drawings_are_said_with_no_difference_drawn(self, doc):
+        """The chart opens with no difference, and two runs of different
+        drawings read as two solvers disagreeing on the curves alone."""
+        from Microwave.Results.compared import DRAWING
+
+        moved = matrix(s=0.5 * np.ones((2, 2, 2)))
+        moved.provenance[DRAWING] = "another drawing"
+        said = (
+            "Run 2 (Palace) and Run 1 (openEMS) were solved from different drawings: the "
+            "geometry, a material, a port or what lies beyond the structure changed between "
+            "them"
+        )
+        undifferenced = self.drawn(doc, second=moved, against=None)
+        assert said in undifferenced.notes
+        assert undifferenced.warnings == ()
+
+    def test_a_difference_with_no_frequency_holding_both_is_refused(self):
+        """Each table holds a number only where the other holds none."""
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+
+        a = matrix(frequency=(1e9, 2e9, 3e9), s=np.full((3, 2, 2), 0.5, dtype=complex))
+        b = matrix(frequency=(1e9, 2e9, 3e9), s=np.full((3, 2, 2), 0.4, dtype=complex))
+        a.s[::2] = np.nan
+        b.s[1::2] = np.nan
+        drawn = overlay_chart([Table(a, "A"), Table(b, "B")], chosen=(2, 1), against=0)
+        assert [series.name for series in drawn.series] == ["S21, A", "S21, B"]
+        assert "No difference: A and B share no frequency holding S21" in drawn.warnings
+
+    def test_two_answers_of_one_drawing_are_not_said_to_differ_in_it(self, doc):
+        assert not any("different drawings" in note for note in self.drawn(doc).notes)
+
+    def test_a_side_of_the_domain_walled_between_two_runs_is_drawn_and_named(self, doc):
+        """Two runs of one backend, the second with the air below the ground
+        replaced by a wall: the ordinary design comparison."""
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Objects import createEMAnalysis
+
+        analysis = createEMAnalysis(doc)
+        [policy] = [obj for obj in analysis.Group if obj.Name.startswith("EMMeshPolicy")]
+        for padding in ("Open", "PEC Wall"):
+            policy.BoundaryZMin = padding
+            result = matrix(s=np.full((2, 2, 2), 0.5 if padding == "Open" else 0.4, dtype=complex))
+            result.provenance["solver"] = "Palace"
+            glue.record(analysis, result)
+        drawn = overlay_chart(glue.overlaid(glue.results_of(analysis)), chosen=(2, 1), against=0)
+        assert len(drawn.series) == 3
+        assert any(
+            line.startswith("Different bases: ") and line.endswith("from different drawings")
+            for line in drawn.warnings
+        )
+        column = next(heading for heading in drawn.table.columns if "BoundaryZMin" in heading)
+        index = drawn.table.columns.index(column)
+        assert [row[index] for row in drawn.table.rows] == ["Open", "PEC Wall"]
 
     def test_a_result_filed_without_a_drawing_is_filed_with_the_studys_now(self, doc):
         from Microwave.Gui import results as glue
@@ -2707,45 +3565,19 @@ class TestComparingTwoAnswers:
         monkeypatch.setattr(glue, "load", damaged)
         mine = matrix()
         mine.provenance["solver"] = "Palace"
-        assert glue.beside(analysis, mine) == ["Not compared with what openEMS solved: truncated"]
+        assert glue.beside(analysis, mine) == ["Not compared with Run 1 (openEMS): truncated"]
 
-    def test_a_study_holding_one_answer_is_refused_saying_what_it_takes(self, doc):
+    def test_a_run_landing_beside_another_drawings_runs_says_so(self, doc):
         from Microwave.Gui import results as glue
-        from Microwave.Objects import createEMAnalysis
-
-        glue.record(createEMAnalysis(doc), matrix())
-        with pytest.raises(
-            glue.NoResult, match="holds one set of S-parameters, and a comparison takes two"
-        ):
-            glue.comparison(doc)
-
-    def test_the_command_refuses_two_answers_of_different_ports_by_name(self, doc, monkeypatch):
-        from Microwave import Commands
-
-        two_answers(doc, second=matrix(port_numbers=(1, 3)))
-        boxes, _ = recording_qt(monkeypatch)
-        Commands.compare_s_parameters(doc)
-        _, title, text = shown(boxes)
-        assert title == "Compare S-parameters"
-        assert "ports 1 and 2" in text and "ports 1 and 3" in text
-
-    def test_the_result_offers_a_comparison_only_beside_a_second(self, doc, monkeypatch):
-        from Microwave.Gui import results as glue
-        from Microwave.ViewProviders.results import EMSParametersViewProvider
+        from Microwave.Results.compared import DRAWING
 
         analysis = two_answers(doc)
-        first, _ = glue.results_of(analysis)
-        actions, menu = recording_actions(monkeypatch)
-        vobj = MagicMock()
-        vobj.Object = first
-        EMSParametersViewProvider(MagicMock()).setupContextMenu(vobj, menu)
-        assert "Compare S-parameters" in [action.text for action in actions]
-
-        alone = one_answer(doc, matrix())
-        actions, menu = recording_actions(monkeypatch)
-        vobj.Object = glue.results_of(alone)[0]
-        EMSParametersViewProvider(MagicMock()).setupContextMenu(vobj, menu)
-        assert "Compare S-parameters" not in [action.text for action in actions]
+        mine = matrix()
+        mine.provenance.update({"solver": "Palace", DRAWING: "another drawing"})
+        assert glue.beside(analysis, mine) == [
+            "Not compared with Run 1 (openEMS): no openEMS run was solved from the same "
+            "drawing as this one"
+        ]
 
 
 def one_answer(doc, result):
@@ -2756,3 +3588,716 @@ def one_answer(doc, result):
     analysis = createEMAnalysis(doc)
     glue.record(analysis, result)
     return analysis
+
+
+class TestOverlayingTables:
+    """Any term of two or more tables on one set of axes, from the tree."""
+
+    def kept(self, doc):
+        """A study keeping two openEMS runs and a Palace one, the second openEMS
+        run of a substrate whose permittivity was edited between them."""
+        from Microwave.Gui import results as glue
+        from Microwave.Objects import createEMAnalysis
+        from Microwave.Objects.materials import createEMMaterial, createEMMaterialBinding
+
+        analysis = createEMAnalysis(doc)
+        material = createEMMaterial(doc=doc)
+        material.Label = "FR4"
+        binding = createEMMaterialBinding(doc=doc)
+        binding.Material = material
+        analysis.addObject(binding)
+        s = np.zeros((2, 2, 2), dtype=complex)
+        s[:, 1, 0] = s[:, 0, 1] = 0.9
+        held = []
+        for solver, factor in (("openEMS", 1.0), ("Palace", 0.8), ("openEMS", 0.5)):
+            if len(held) == 2:
+                material.Permittivity = 4.6
+            result = matrix(s=factor * s)
+            result.provenance["solver"] = solver
+            held.append(glue.record(analysis, result))
+        return analysis, held
+
+    def test_a_term_under_the_floor_is_shaded_and_each_curve_of_it_named(self, doc):
+        """Every run of the study is matched perfectly at port 1."""
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import FLOOR_DB, overlay_chart
+
+        _, held = self.kept(doc)
+        drawn = overlay_chart(glue.overlaid(held), chosen=(1, 1), against=0)
+        assert drawn.floor == FLOOR_DB
+        assert all(np.all(np.isnan(series.y)) for series in drawn.series)
+        [under] = [line for line in drawn.warnings if line.startswith(f"Under {FLOOR_DB:g} dB")]
+        assert "at every point: S11, Run 1 (openEMS)" in under
+        assert "|S11 difference|, Run 3 (openEMS) against Run 1 (openEMS)" in under
+
+    def test_a_difference_not_taken_is_said_on_the_chart(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        analysis, held = self.kept(doc)
+        apart = matrix(frequency=(5e9, 6e9))
+        apart.provenance["solver"] = "openEMS"
+        held.append(glue.record(analysis, apart))
+        drawn = overlay_chart(glue.overlaid([held[0], held[-1]]), chosen=(2, 1), against=0)
+        assert [line for line in drawn.warnings if line.startswith("No difference: ")]
+        assert not any("No difference" in note for note in drawn.notes)
+
+    def test_a_phase_unwrapping_cannot_judge_is_said_on_the_chart(self, doc):
+        """Three gigahertz apart, a delay of a ninth of a nanosecond turns a third
+        of a turn between two samples."""
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Objects import createEMAnalysis
+        from Microwave.Results import overlay
+
+        analysis = createEMAnalysis(doc)
+        frequency = np.linspace(1e9, 10e9, 4)
+        s = np.zeros((4, 2, 2), dtype=complex)
+        s[:, 1, 0] = s[:, 0, 1] = np.exp(-2j * np.pi * frequency / 9e9)
+        held = []
+        for solver in ("openEMS", "Palace"):
+            result = matrix(frequency=frequency, s=s)
+            result.provenance["solver"] = solver
+            held.append(glue.record(analysis, result))
+        drawn = overlay_chart(glue.overlaid(held), overlay.PHASE, (2, 1))
+        assert any("more than 90 degrees" in line for line in drawn.warnings)
+        assert not any("more than 90 degrees" in note for note in drawn.notes)
+
+    def test_a_term_over_the_floor_has_none(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        _, held = self.kept(doc)
+        drawn = overlay_chart(glue.overlaid(held), chosen=(2, 1), against=0)
+        assert drawn.floor is None
+        assert not any(line.startswith("Under ") for line in drawn.warnings)
+
+    def test_nothing_picked_that_is_a_table_is_refused_saying_how_to_select(self, doc):
+        from Microwave.Gui import results as glue
+
+        analysis, _ = self.kept(doc)
+        with pytest.raises(
+            glue.NoResult, match="The selection holds no run or S-parameters. Select the runs"
+        ):
+            glue.overlaid([analysis])
+
+    def test_one_table_picked_is_drawn(self, doc):
+        from Microwave.Gui import results as glue
+
+        _, held = self.kept(doc)
+        assert [table.name for table in glue.overlaid(held[:1])] == ["Run 1 (openEMS)"]
+
+    def test_a_run_picked_with_its_matrix_is_one_table(self, doc):
+        from Microwave.Gui import results as glue
+
+        _, held = self.kept(doc)
+        assert len(glue.overlaid([glue.run_of(held[0]), held[0]])) == 1
+
+    def test_a_run_or_its_matrix_picked_draws_the_run(self, doc):
+        from Microwave.Gui import results as glue
+
+        _, held = self.kept(doc)
+        tables = glue.overlaid([glue.run_of(held[0]), held[2]])
+        assert [table.name for table in tables] == ["Run 1 (openEMS)", "Run 3 (openEMS)"]
+
+    def test_tables_of_two_studies_carry_each_studys_label(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Objects import createEMAnalysis
+
+        _, held = self.kept(doc)
+        other = createEMAnalysis(doc)
+        other.Label = "Other"
+        theirs = matrix()
+        theirs.provenance["solver"] = "openEMS"
+        theirs = glue.record(other, theirs)
+        names = [table.name for table in glue.overlaid([held[0], theirs])]
+        assert names == ["Run 1 (openEMS), EM Analysis", "Run 4 (openEMS), Other"]
+
+    def test_each_table_is_a_trace_named_by_its_source(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        _, held = self.kept(doc)
+        drawn = overlay_chart(glue.overlaid(held), chosen=(2, 1))
+        before, after = (f"FR4 Permittivity {value:g}" for value in (1.0, 4.6))
+        assert [series.name for series in drawn.series] == [
+            f"S21, Run 1 (openEMS), {before}",
+            f"S21, Run 2 (Palace), {before}",
+            f"S21, Run 3 (openEMS), {after}",
+        ]
+        assert [selector.label for selector in drawn.selectors] == [
+            "Quantity",
+            "Term",
+            "Difference against",
+        ]
+
+    def test_a_basis_every_table_shares_is_said_once_in_the_notes(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        _, held = self.kept(doc)
+        notes = overlay_chart(glue.overlaid(held), chosen=(2, 1)).notes
+        assert notes[0] == (
+            "Each table referenced to 50 ohm; 2 points from 1 GHz to 2 GHz, step 1 GHz"
+        )
+        assert sum("referenced to" in note or " step " in note for note in notes) == 1
+
+    def test_the_table_under_it_gives_each_run_its_figure_marked_by_its_curve(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        _, held = self.kept(doc)
+        drawn = overlay_chart(glue.overlaid(held), chosen=(2, 1))
+        assert drawn.table.columns == ("Table", "FR4 Permittivity")
+        assert [row[0] for row in drawn.table.rows] == [
+            "Run 1 (openEMS)",
+            "Run 2 (Palace)",
+            "Run 3 (openEMS)",
+        ]
+        figures = [row[1] for row in drawn.table.rows]
+        assert figures[0] == figures[1] != figures[2]
+        assert [drawn.series[index].name.split(", ")[1] for index in drawn.table.series] == [
+            row[0] for row in drawn.table.rows
+        ]
+
+    def test_tables_on_two_grids_carry_each_grid_in_the_table(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        analysis, held = self.kept(doc)
+        finer = matrix(frequency=(1e9, 1.5e9, 2e9))
+        finer.provenance["solver"] = "openEMS"
+        held.append(glue.record(analysis, finer))
+        drawn = overlay_chart(glue.overlaid([held[2], held[3]]), chosen=(2, 1))
+        assert drawn.table.columns == ("Table", "Grid")
+        first, second = (row[1] for row in drawn.table.rows)
+        assert first != second
+        assert drawn.notes[0] == "Each table referenced to 50 ohm"
+        assert drawn.notes[-1] == "Every run had the same settings"
+
+    def test_a_table_that_is_no_run_beside_a_run_is_not_said_asked_the_same(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Objects.results import createEMSParameters, store
+
+        _, held = self.kept(doc)
+        alone = createEMSParameters(doc)
+        store(alone, matrix())
+        drawn = overlay_chart(glue.overlaid([held[0], alone]), chosen=(2, 1))
+        assert drawn.table is None
+        assert not any("had the same settings" in note for note in drawn.notes)
+
+    def test_runs_of_two_studies_are_not_compared_value_by_value(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Objects import createEMAnalysis
+
+        _, held = self.kept(doc)
+        theirs = matrix()
+        theirs.provenance["solver"] = "openEMS"
+        other = glue.record(createEMAnalysis(doc), theirs)
+        drawn = overlay_chart(glue.overlaid([held[0], other]), chosen=(2, 1))
+        assert drawn.table is None
+        assert drawn.notes[-1] == (
+            "The runs belong to more than one study, so their settings are not compared"
+        )
+
+    def test_studies_of_one_name_in_two_documents_are_two_studies(self, doc):
+        """A study is named within its document, so the first study of every
+        document carries the same name and is still a study of its own."""
+        import dataclasses
+
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        _, held = self.kept(doc)
+        mine, theirs = glue.overlaid([held[0], held[2]])
+        theirs = dataclasses.replace(theirs, document=f"{mine.document}Copy")
+        drawn = overlay_chart((mine, theirs), chosen=(2, 1))
+        assert drawn.table is None
+        assert drawn.notes[-1] == (
+            "The runs belong to more than one study, so their settings are not compared"
+        )
+
+    def test_a_row_whose_table_draws_no_curve_is_marked_by_none(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        analysis, held = self.kept(doc)
+        one = matrix(port_numbers=(1,))
+        one.provenance["solver"] = "openEMS"
+        held.insert(1, glue.record(analysis, one))
+        drawn = overlay_chart(glue.overlaid(held), chosen=(2, 1))
+        assert drawn.table.series == (0, None, 1, 2)
+        assert [drawn.series[index].name.split(", ")[1] for index in (0, 1, 2)] == [
+            drawn.table.rows[row][0] for row in (0, 2, 3)
+        ]
+
+    def test_what_no_figure_says_is_in_the_row_of_the_run_it_is_of(self):
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results.overlay import Table
+        from tests.test_results_snapshots import solid, study
+
+        def placed(x):
+            return study(
+                solid("Stub", placed={"position": [x, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0]})
+            )
+
+        tables = [
+            Table(matrix(), f"R{index}", placed(x)) for index, x in enumerate((0.0, 0.0, 1.0))
+        ]
+        drawn = overlay_chart(tables, chosen=(2, 1))
+        assert drawn.table.columns == ("Table", "Changed from R0")
+        assert [row[1] for row in drawn.table.rows] == ["", "", "Stub moved +1 mm along X"]
+
+    def test_a_run_holding_an_empty_value_is_not_marked_as_holding_none(self):
+        from Microwave.Gui.plot_s_params import UNHELD, overlay_chart
+        from Microwave.Results.overlay import Table
+        from tests.test_results_snapshots import solved_on
+
+        asked = [solved_on("openEMS", steps=30000), solved_on("Palace", 2), solved_on("Palace", 3)]
+        asked[1]["members"][-1]["Order"] = ""
+        tables = [Table(matrix(), f"R{index}", said) for index, said in enumerate(asked)]
+        drawn = overlay_chart(tables, chosen=(2, 1))
+        assert [row[1] for row in drawn.table.rows] == [UNHELD, "", "3"]
+
+    def test_runs_asked_the_same_have_no_table_and_say_so(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        _, held = self.kept(doc)
+        drawn = overlay_chart(glue.overlaid(held[:2]), chosen=(2, 1))
+        assert drawn.table is None
+        assert drawn.notes[-1] == "Every run had the same settings"
+
+    def test_the_difference_is_drawn_against_the_table_chosen_in_db_alone(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results import overlay
+
+        _, held = self.kept(doc)
+        tables = glue.overlaid(held)
+        drawn = overlay_chart(tables, chosen=(2, 1), against=0)
+        apart = [series for series in drawn.series if "difference" in series.name]
+        assert [series.name for series in apart] == [
+            "|S21 difference|, Run 2 (Palace) against Run 1 (openEMS)",
+            "|S21 difference|, Run 3 (openEMS) against Run 1 (openEMS)",
+        ]
+        np.testing.assert_allclose(apart[0].y, 20 * np.log10(0.9 * 0.2))
+        phase = overlay_chart(tables, overlay.PHASE, (2, 1), against=0)
+        assert not any("difference" in series.name for series in phase.series)
+        assert phase.warnings == ("The difference is drawn only for Magnitude (dB)",)
+
+    def test_the_lost_share_is_chosen_by_the_column(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results import overlay
+
+        _, held = self.kept(doc)
+        drawn = overlay_chart(glue.overlaid(held), overlay.LOST, (2, 1))
+        assert drawn.selectors[1].choices == (("Driven from port 1", 1), ("Driven from port 2", 2))
+        assert drawn.series[0].name.startswith("Port 1, Run 1 (openEMS), FR4 Permittivity ")
+        np.testing.assert_allclose(drawn.series[0].y, 100 * (1 - 0.81))
+
+    def test_a_derived_column_stays_dashed(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+
+        analysis, held = self.kept(doc)
+        derived = matrix(driven=(1,), derived=(2,))
+        derived.provenance["solver"] = "Palace"
+        held.append(glue.record(analysis, derived))
+        drawn = overlay_chart(glue.overlaid(held), chosen=(1, 2))
+        assert [series.derived for series in drawn.series][-1] is True
+        assert drawn.series[-1].name.endswith("(derived)")
+
+    def test_a_table_holding_no_value_of_the_quantity_is_named(self, doc):
+        """A coarse table holds no group delay across an aperture wider than
+        its band, and a curve left out silently reads as a table not drawn."""
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Results import overlay
+
+        _, held = self.kept(doc)
+        drawn = overlay_chart(glue.overlaid(held), overlay.DELAY, (2, 1))
+        assert drawn.series == ()
+        assert "Run 1 (openEMS) holds no value of it" in drawn.warnings
+
+    def test_a_runs_chart_names_the_run_in_its_heading(self, doc):
+        from Microwave.Gui import results as glue
+
+        _, held = self.kept(doc)
+        drawn = one_table(glue.load(held[2]), glue.source(held[2]))
+        assert drawn.heading.endswith(", Run 3 (openEMS)")
+
+    def test_the_command_refuses_a_pick_holding_no_table_in_a_box(self, doc, monkeypatch):
+        from Microwave import Commands
+
+        analysis, _ = self.kept(doc)
+        boxes, _ = recording_qt(monkeypatch)
+        Commands.plot_s_parameters([analysis])
+        _, title, text = shown(boxes)
+        assert title == "Plot S-Parameters"
+        assert "The selection holds no run or S-parameters" in text
+
+
+class TestARunsSnapshot:
+    """What a run keeps of what it was asked: values, not links."""
+
+    def test_every_member_a_translation_reads_is_kept_as_values(self, doc):
+        import json
+
+        from Microwave.Gui import results as glue
+        from Microwave.Objects import createEMAnalysis
+        from Microwave.Objects.materials import createEMMaterial, createEMMaterialBinding
+
+        analysis = createEMAnalysis(doc)
+        material = createEMMaterial(doc=doc)
+        material.Label = "FR4"
+        material.Permittivity = 4.3
+        binding = createEMMaterialBinding(doc=doc)
+        binding.Material = material
+        analysis.addObject(binding)
+        glue.record(analysis, matrix())
+
+        said = glue.snapshot(analysis)
+        kinds = sorted(member["kind"] for member in said["members"])
+        assert kinds == ["EMMaterialBinding", "EMMeshPolicy", "EMSolverOpenEMS", "EMYeeGrid"]
+        [kept] = [member for member in said["members"] if member["kind"] == "EMMaterialBinding"]
+        assert kept["Material"]["label"] == "FR4"
+        assert kept["Material"]["Permittivity"] == 4.3
+        assert said["study"]["FrequencyStop"] == float(analysis.FrequencyStop)
+        assert json.loads(json.dumps(said)) == said
+
+    def test_where_a_run_writes_and_what_it_starts_are_left_out(self, doc):
+        """The machine's, and they change no answer: a snapshot holding them
+        says a run was asked otherwise once a first run sets the directory."""
+        from Microwave.Gui import results as glue
+        from Microwave.Objects import createEMAnalysis
+
+        analysis = createEMAnalysis(doc)
+        [solver] = [
+            m for m in glue.snapshot(analysis)["members"] if "RunDirectory" in m or "Threads" in m
+        ]
+        assert "Threads" in solver
+        assert "RunDirectory" not in solver and "SolverPython" not in solver
+
+
+class TestARunSaysWhatChanged:
+    """What a run says it was asked otherwise than the study's run before it."""
+
+    def study(self, doc):
+        from Microwave.Objects import createEMAnalysis
+        from Microwave.Objects.materials import createEMMaterial, createEMMaterialBinding
+
+        analysis = createEMAnalysis(doc)
+        material = createEMMaterial(doc=doc)
+        material.Label = "FR4"
+        material.Permittivity = 4.3
+        binding = createEMMaterialBinding(doc=doc)
+        binding.Material = material
+        analysis.addObject(binding)
+        return analysis, material
+
+    def test_the_first_run_says_nothing(self, doc):
+        from Microwave.Gui import results as glue
+
+        analysis, _ = self.study(doc)
+        run = glue.run_of(glue.record(analysis, matrix()))
+        assert run.Label2 == "" and list(run.Changes) == []
+
+    def test_a_later_run_names_the_change_against_the_newest_before_it(self, doc):
+        from Microwave.Gui import results as glue
+
+        analysis, material = self.study(doc)
+        glue.record(analysis, matrix())
+        material.Permittivity = 4.4
+        last = glue.run_of(glue.record(analysis, matrix()))
+        material.Permittivity = 4.6
+        run = glue.run_of(glue.record(analysis, matrix()))
+        assert list(run.Changes) == ["FR4 Permittivity 4.4 -> 4.6"]
+        assert run.Label2 == f"against {last.Label}: FR4 Permittivity 4.4 -> 4.6"
+
+    def test_what_a_run_says_stays_once_the_run_before_it_is_gone(self, doc):
+        from Microwave.Gui import results as glue
+
+        analysis, material = self.study(doc)
+        before = glue.run_of(glue.record(analysis, matrix()))
+        material.Permittivity = 4.4
+        run = glue.run_of(glue.record(analysis, matrix()))
+        said = run.Label2
+        doc.removeObject(before.Name)
+        assert run.Label2 == said != ""
+
+
+class TestTheDrawingAsARunKeepsIt:
+    def test_an_expression_is_kept_by_the_value_it_binds(self, doc):
+        from Microwave.Gui.described import expressions
+
+        box = doc.addObject("Part::Box", "Box")
+        box.setExpression("Width", "Params.StubW")
+        box.setExpression(".Placement.Base.x", "Vars.X")
+        box.setExpression(".Placement.Base.y", "Vars.Y")
+        box.setExpression(".Constraints.Reach", "Vars.Reach")
+        assert expressions(box) == {
+            "Width": "Params.StubW",
+            "Placement": "Vars.X; Vars.Y",
+            "Constraints.Reach": "Vars.Reach",
+        }
+
+    def test_a_coordinate_on_an_axis_is_written_one_way_whatever_its_sign_of_zero(self):
+        from types import SimpleNamespace
+
+        from Microwave.Gui.described import measures
+
+        def shape(zero):
+            point = SimpleNamespace(x=0.3, y=zero, z=0.0)
+            return SimpleNamespace(
+                isNull=lambda: False,
+                Vertexes=[SimpleNamespace(Point=point)],
+                Solids=[],
+                Shells=[],
+                Faces=[],
+                Edges=[],
+                Area=0.0,
+                Length=-0.0,
+            )
+
+        assert json.dumps(measures(shape(-0.0))) == json.dumps(measures(shape(0.0)))
+
+    def test_a_rotation_is_kept_with_one_sign_of_its_quaternion(self):
+        from types import SimpleNamespace
+
+        from Microwave.Gui.described import _placement
+
+        def placed(*q):
+            return SimpleNamespace(
+                PropertiesList=["Placement"],
+                getPropertyStatus=lambda name: [],
+                getEditorMode=lambda name: [],
+                Placement=SimpleNamespace(
+                    Base=SimpleNamespace(x=0.0, y=0.0, z=0.0), Rotation=SimpleNamespace(Q=q)
+                ),
+            )
+
+        half = 0.5**0.5
+        assert _placement(placed(0.0, 0.0, half, half)) == _placement(
+            placed(0.0, 0.0, -half, -half)
+        )
+
+    def test_a_rotation_turned_and_turned_back_is_the_rotation_it_was(self):
+        from types import SimpleNamespace
+
+        from Microwave.Gui.described import _placed
+
+        def placed(q, x):
+            return SimpleNamespace(
+                Base=SimpleNamespace(x=x, y=0.0, z=0.0), Rotation=SimpleNamespace(Q=q)
+            )
+
+        assert _placed(placed((-1.38e-17, 0.0, 0.0, 1.0), 1e-16)) == _placed(
+            placed((0.0, 0.0, 0.0, 1.0), 0.0)
+        )
+
+    def test_a_cell_keeps_a_formula_and_not_a_quantity_typed_into_it(self):
+        from types import SimpleNamespace
+
+        from Microwave.Gui.described import _cells
+
+        held = {
+            "B1": ("=3.2 mm", 3.2, "StubW"),
+            "B2": ("=StubW * 2", 6.4, "Double"),
+            "B3": ("4.4", 4.4, ""),
+        }
+        sheet = SimpleNamespace(
+            getUsedCells=lambda: list(held),
+            get=lambda cell: held[cell][1],
+            getAlias=lambda cell: held[cell][2],
+            getContents=lambda cell: held[cell][0],
+        )
+        assert [(key, formula) for key, _, _, formula in _cells(sheet)] == [
+            ("StubW", ""),
+            ("Double", "StubW * 2"),
+            ("B3", ""),
+        ]
+
+    def test_the_studys_own_expressions_are_followed_and_a_run_is_not(self, doc):
+        from Microwave.Gui import results as glue
+        from Microwave.Objects import createEMAnalysis
+
+        analysis = createEMAnalysis(doc)
+        params = doc.addObject("App::FeaturePython", "Params")
+        held = doc.addObject("Part::Feature", "HeldByARun")
+        run = glue.run_of(glue.record(analysis, matrix()))
+        object.__setattr__(run, "OutList", [held])
+        object.__setattr__(analysis, "OutList", [params, run])
+        assert [obj["name"] for obj in glue.snapshot(analysis)["drawn"]] == ["Params"]
+
+    def test_what_the_study_reaches_is_kept_and_nothing_of_ours(self, doc):
+        from Microwave.Gui import results as glue
+
+        analysis, _ = TestARunSaysWhatChanged().study(doc)
+        board = doc.addObject("Part::Box", "Board")
+        [binding] = [m for m in analysis.Group if "Binding" in m.Name]
+        binding.References = [(board, ("",))]
+        object.__setattr__(binding, "OutList", [binding.Material, board])
+        object.__setattr__(board, "OutList", [binding])
+        said = glue.snapshot(analysis)
+        assert [obj["name"] for obj in said["drawn"]] == ["Board"]
+
+
+class TestARunInTheTree:
+    def kept(self, doc):
+        from Microwave.Gui import results as glue
+
+        analysis = doc.addObject("App::DocumentObjectGroupPython", "EMAnalysis")
+        held = glue.record(analysis, matrix())
+        return glue.run_of(held), held
+
+    def test_deleting_a_run_takes_what_it_holds_and_no_file(self, doc, tmp_path):
+        from Microwave.ViewProviders.runs import EMRunViewProvider
+
+        run, held = self.kept(doc)
+        run.Directory = str(tmp_path)
+        vobj = MagicMock()
+        vobj.Object = run
+        assert EMRunViewProvider(MagicMock()).onDelete(vobj, []) is True
+        assert doc.getObject(held.Name) is None
+        assert tmp_path.is_dir()
+
+    def test_a_double_click_draws_the_runs_matrix(self, doc, monkeypatch):
+        from Microwave.Gui import plot_s_params
+        from Microwave.ViewProviders.runs import EMRunViewProvider
+
+        run, held = self.kept(doc)
+        drawn = []
+        monkeypatch.setattr(
+            plot_s_params,
+            "show_matrix",
+            lambda result, _source="", document="": drawn.append((result, document)),
+        )
+        vobj = MagicMock()
+        vobj.Object = run
+        assert EMRunViewProvider(MagicMock()).doubleClicked(vobj) is True
+        assert [(result.port_numbers, document) for result, document in drawn] == [
+            ((1, 2), doc.Name)
+        ]
+
+    def test_a_double_click_on_a_run_holding_no_matrix_is_left_to_the_tree(self, doc):
+        """Answered True, the click would neither draw nor expand the run."""
+        from Microwave.ViewProviders.runs import EMRunViewProvider
+
+        run, held = self.kept(doc)
+        run.Group = []
+        doc.removeObject(held.Name)
+        vobj = MagicMock()
+        vobj.Object = run
+        assert EMRunViewProvider(MagicMock()).doubleClicked(vobj) is False
+
+    def test_its_menu_offers_what_its_matrix_does_and_its_log(self, doc, monkeypatch):
+        from Microwave.ViewProviders.runs import EMRunViewProvider
+
+        run, _ = self.kept(doc)
+        actions, menu = recording_actions(monkeypatch)
+        vobj = MagicMock()
+        vobj.Object = run
+        EMRunViewProvider(MagicMock()).setupContextMenu(vobj, menu)
+        texts = [action.text for action in actions]
+        assert texts[0] == "Plot S-Parameters"
+        assert texts[-1] == "Show Run Log"
+
+    def test_its_plot_entry_keeps_the_order_picked_where_the_run_is_picked(self, doc, monkeypatch):
+        """The run clicked stands for its matrix, so picking it does not move
+        it to the front of what is drawn."""
+        import sys
+
+        from Microwave import Commands
+        from Microwave.ViewProviders.runs import EMRunViewProvider
+
+        run, _ = self.kept(doc)
+        drawn = []
+        monkeypatch.setattr(Commands, "plot_s_parameters", lambda picked: drawn.append(picked))
+        gui = MagicMock()
+        monkeypatch.setitem(sys.modules, "FreeCADGui", gui)
+        actions, menu = recording_actions(monkeypatch)
+        vobj = MagicMock()
+        vobj.Object = run
+        EMRunViewProvider(MagicMock()).setupContextMenu(vobj, menu)
+        [entry] = [action for action in actions if action.text == "Plot S-Parameters"]
+        gui.Selection.getSelection.return_value = ["another", run]
+        entry.slot()
+        assert drawn == [["another", run]]
+
+    def test_each_entry_reads_as_the_command_that_does_the_same(self, doc, monkeypatch):
+        """The run's menu and its matrix's, in one: an entry worded otherwise
+        than its command is two names for one action."""
+        import re
+
+        from Microwave.Commands import COMMANDS
+        from Microwave.ViewProviders.runs import EMRunViewProvider
+
+        run, _ = self.kept(doc)
+        actions, menu = recording_actions(monkeypatch)
+        vobj = MagicMock()
+        vobj.Object = run
+        EMRunViewProvider(MagicMock()).setupContextMenu(vobj, menu)
+        named = {command().GetResources()["MenuText"] for _, command, *_ in COMMANDS}
+        entries = [re.sub(r" \(Port \d+\)$", "", action.text) for action in actions]
+        assert entries and set(entries) <= named
+
+    def test_a_port_dragged_into_a_run_is_no_part_of_the_study(self, doc):
+        """A run records a solve that happened: no walk over the study reads
+        what it holds, the study's own or either adapter's."""
+        from Microwave.Objects.analysis import members
+        from Microwave.Objects.ports import createEMPortLumped
+        from Microwave.Solvers.openems import document as openems_document
+        from Microwave.Solvers.palace import document as palace_document
+
+        run, held = self.kept(doc)
+        port = createEMPortLumped(doc=doc)
+        run.addObject(port)
+        study = next(obj for obj in doc.Objects if obj.Name.startswith("EMAnalysis"))
+        for walk in (members, openems_document._members, palace_document._members):
+            found = walk(study)
+            assert any(obj is run for obj in found)
+            assert not any(obj is port or obj is held for obj in found)
+
+
+class TestAChartCarriesTheIconOfTheCommandThatDrewIt:
+    """A chart's tab and its window carry the icon of the command that drew it,
+    and not the application's. ``tests/test_chart_icon_drawn.py`` holds what Qt
+    shows of it."""
+
+    @pytest.fixture
+    def marked(self, monkeypatch):
+        from Microwave.Gui import charts
+
+        found = []
+        monkeypatch.setattr(charts, "render", lambda *args, icon="", **kw: found.append(icon))
+        return found
+
+    @staticmethod
+    def pixmap(command):
+        import os
+
+        return os.path.basename(command().GetResources()["Pixmap"])
+
+    def test_each_chart_is_marked_as_its_command_is(self, marked):
+        from Microwave import Commands
+        from Microwave.Gui import plot_s_params, plot_tdr
+        from Microwave.Results.overlay import Table
+        from tests.test_plot_tdr import imported
+        from tests.test_tdr import line, reflected
+
+        result = matrix()
+        plot_s_params.show_matrix(result)
+        plot_s_params.show_overlay([Table(result, "R1"), Table(result, "R2")], chosen=(2, 1))
+        plot_tdr.show_traces([imported(reflected(line([50.0, 75.0, 50.0])))])
+        assert marked == [
+            self.pixmap(command)
+            for command in (
+                Commands.PlotSParametersCommand,
+                Commands.PlotSParametersCommand,
+                Commands.PlotImpedanceCommand,
+            )
+        ]

@@ -32,7 +32,7 @@ VACUUM_PERMITTIVITY = units.VACUUM_PERMITTIVITY
 _MATERIAL_KINDS = {
     "Dielectric": "dielectric",
     "PEC": "pec",
-    "ConductingSheet": "conducting_sheet",
+    "Conducting Sheet": "conducting_sheet",
 }
 
 
@@ -49,7 +49,7 @@ def _material(obj: Any, center_hz: float) -> Material:
     That is openEMS' own convention, and it is an approximation: a fixed kappa
     gives a loss tangent that falls as 1/f, so the model is exact at band centre
     and drifts either side of it. Wideband accuracy needs a dispersive fit, so
-    ``FrequencyDependentDielectric`` is refused rather than flattened without a
+    ``Frequency Dependent Dielectric`` is refused rather than flattened without a
     word.
 
     A dielectric's conductivity travels in the envelope's ``conductivity``
@@ -70,11 +70,12 @@ def _material(obj: Any, center_hz: float) -> Material:
     declared = str(obj.MaterialType)
     kind = _MATERIAL_KINDS.get(declared)
     if kind is None:
+        # A dispersive material needs a fitted Debye or Lorentz pole set, and
+        # this adapter writes none.
         raise TranslationError(
-            f"material {_label(obj)!r}: {declared!r} is not supported by the "
-            "openEMS adapter. A dispersive material needs a fitted Debye or "
-            "Lorentz pole set, which this adapter does not write; use a "
-            "Dielectric with the loss tangent at your band centre instead"
+            f"material {_label(obj)!r}: MaterialType {declared!r} is dispersive, and "
+            "openEMS does not solve a dispersive material here. Set MaterialType to "
+            "Dielectric, with the loss tangent at the band centre"
         )
 
     at_band = solved(obj, center_hz)
@@ -83,11 +84,10 @@ def _material(obj: Any, center_hz: float) -> Material:
     # Checked here because this is the last place the value exists. Below this
     # it becomes kappa, and `> 0` sends anything else down the lossless branch
     # as a clean 0.0, which every guard downstream then passes.
+    # A negative loss is a material that supplies energy.
     if not math.isfinite(loss_tangent) or loss_tangent < 0:
         raise TranslationError(
-            f"{_label(obj)!r}: loss tangent is {loss_tangent:g}. It must be a "
-            "finite number and cannot be negative, which would be a material "
-            "that supplies energy. Use 0 for a lossless dielectric"
+            f"{_label(obj)!r}: loss tangent is {loss_tangent:g}. Enter a finite value of 0 or more"
         )
     # Only a dielectric's loss tangent becomes anything. A conductor's loss is
     # its conductivity and its thickness, so a loss tangent on one reaches
@@ -95,10 +95,9 @@ def _material(obj: Any, center_hz: float) -> Material:
     # is a silent no-op, whatever it would have meant.
     if loss_tangent > 0 and kind != "dielectric":
         raise TranslationError(
-            f"{_label(obj)!r}: a {declared} carries a loss tangent of "
-            f"{loss_tangent:g}. openEMS takes a conductor's loss from its "
-            "conductivity and thickness, so this number would reach nothing. "
-            "Clear it, or make this a Dielectric"
+            f"{_label(obj)!r}: a {declared} carries a loss tangent of {loss_tangent:g}, "
+            "which openEMS ignores, since a conductor takes its loss from Conductivity "
+            "and Thickness. Set it to 0, or set MaterialType to Dielectric"
         )
     kappa = 0.0
     if kind == "dielectric" and loss_tangent > 0:
@@ -108,18 +107,18 @@ def _material(obj: Any, center_hz: float) -> Material:
     # A dielectric's conductivity is a loss held fixed across the band, which is
     # what openEMS' own conductivity is, so it goes over unconverted, beside
     # whatever a loss tangent became. A perfect conductor has none to take.
+    # A negative conductivity is a material that supplies energy.
     conductivity = float(obj.Conductivity)
     if not math.isfinite(conductivity) or conductivity < 0:
         raise TranslationError(
-            f"{_label(obj)!r}: conductivity is {conductivity:g} S/m. It must be a finite "
-            "number and cannot be negative, which would be a material that supplies "
-            "energy. Use 0 for none"
+            f"{_label(obj)!r}: conductivity is {conductivity:g} S/m. Enter a finite value "
+            "of 0 or more"
         )
     if kind == "pec" and conductivity > 0:
         raise TranslationError(
-            f"{_label(obj)!r}: a PEC carries a conductivity of {conductivity:g} S/m. "
-            "openEMS takes a perfect conductor as having no loss, so this number would "
-            "reach nothing. Set it to 0, or make this a ConductingSheet"
+            f"{_label(obj)!r}: a PEC carries a conductivity of {conductivity:g} S/m, which "
+            "openEMS ignores, since a perfect conductor has no loss. Set it to 0, or set "
+            "MaterialType to Conducting Sheet"
         )
     if kind == "dielectric" and conductivity > 0:
         kind = "lossy_dielectric"
@@ -174,6 +173,5 @@ def check_no_two_fill_one_space(
     check_one_fills_each_space(
         filled,
         alike,
-        "openEMS fills the space they share with one of them, by an order nobody "
-        "stated, and the answer does not say which",
+        "openEMS fills the shared space with one of them, and which one is not defined",
     )

@@ -1,5 +1,5 @@
-<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-  <rect x="8" y="8" width="48" height="48" rx="9" fill="none"
-        stroke="#37474f" stroke-width="5"/>
-  <path d="M26 20 L46 32 L26 44 Z" fill="#e8833a"/>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Solver (openEMS): the solver frame, with the backend letter E drawn as a path. -->
+  <rect x="8" y="8" width="48" height="48" rx="9" fill="none" stroke="#607d8b" stroke-width="5"/>
+  <path d="M41 19 H24 V45 H41 M24 32 H37" stroke="#e8833a" stroke-width="7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

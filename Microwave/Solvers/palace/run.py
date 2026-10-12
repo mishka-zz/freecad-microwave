@@ -86,6 +86,7 @@ __all__ = [
     "validate",
     "version",
     "warnings",
+    "ranks",
 ]
 
 #: What the program is called, and what to set to point at one somewhere else.
@@ -279,8 +280,8 @@ def find_solver(explicit: str | Path | None = None) -> Path:
         if os.access(path, os.X_OK) and path.is_file():
             return path.absolute()
         raise SolverNotFound(
-            f"the configured Palace, {path}, is not a program that can be run. "
-            f"Point it at the {BINARY} launcher, or leave it blank to search"
+            f"SolverPath {path} is not a program that can be run. Point SolverPath at the "
+            f"{BINARY} launcher, or leave it blank to search"
         )
 
     tried = []
@@ -298,7 +299,7 @@ def find_solver(explicit: str | Path | None = None) -> Path:
     detail = "\n  ".join(tried) if tried else "nothing to try"
     raise SolverNotFound(
         f"Palace was not found. Put {BINARY} on the path, or set ${BINARY_ENV_VAR} "
-        f"to the binary.\nTried:\n  {detail}"
+        f"to the launcher.\nTried:\n  {detail}"
     )
 
 
@@ -320,29 +321,33 @@ def find_launcher(explicit: str | Path | None = None) -> Path:
         path = Path(explicit)
         if not (os.access(path, os.X_OK) and path.is_file()):
             raise SolverNotFound(
-                f"the configured MPI launcher, {path}, is not a program that can be run. "
-                f"Point MPILauncher at the {MPI_LAUNCHER} of the MPI Palace was built with, "
-                "or leave it blank to search PATH"
+                f"MPILauncher {path} is not a program that can be run. Point MPILauncher at "
+                f"the {MPI_LAUNCHER} of the MPI Palace was built with, or leave it blank to "
+                "search PATH"
             )
     else:
         searched = os.environ.get("PATH", os.defpath)
         found = shutil.which(MPI_LAUNCHER, path=searched)
         if found is None:
+            # The PATH itself is not quoted. FreeCAD puts each of its Mod
+            # directories on it, so the directories that matter would arrive
+            # under a screen of ones that do not.
             raise SolverNotFound(
-                f"Palace starts its processes with {MPI_LAUNCHER}, and there is no "
-                f"{MPI_LAUNCHER} on the PATH searched: {searched}. On macOS a FreeCAD "
-                "started from Finder or the Dock is given the system's PATH alone. Set "
-                f"MPILauncher on the Palace solver to the {MPI_LAUNCHER} of the MPI Palace was "
-                f"built with, or start FreeCAD from a shell that finds {MPI_LAUNCHER}"
+                f"{MPI_LAUNCHER} is not on the PATH FreeCAD was started with, so Palace "
+                "cannot start its processes. On macOS, FreeCAD started from Finder or the "
+                f"Dock does not get a shell's PATH. Set MPILauncher on the Palace solver to "
+                f"the {MPI_LAUNCHER} of the MPI Palace was built with, or start FreeCAD from "
+                f"a shell that finds {MPI_LAUNCHER}"
             )
         path = Path(found)
     path = path.absolute()
+    # Palace's launcher splits the path it is given at spaces and reads the
+    # pattern characters as a pattern.
     if any(character.isspace() or character in _PATTERN for character in str(path)):
         raise SolverNotFound(
-            f"the MPI launcher {path} has a space or one of {_PATTERN} in its path, and "
-            "Palace's launcher splits the path it is given at spaces and reads those as "
-            "a pattern. Link it from a path without them, and set MPILauncher on the "
-            "Palace solver to that"
+            f"the MPI launcher path {path} holds a space or a pattern character "
+            f"({_PATTERN}), which Palace's launcher cannot take. Link the launcher from a "
+            "path without them, and set MPILauncher on the Palace solver to that link"
         )
     return path
 
@@ -383,11 +388,9 @@ def version(binary: str | Path) -> str:
         if line.startswith("Palace version:"):
             return line.strip()
     if stopped:
-        raise SolverUnsupported(
-            f"{binary} was asked its version and had not answered in {VERSION_TIMEOUT:g} s"
-        )
+        raise SolverUnsupported(f"{binary} did not state its version within {VERSION_TIMEOUT:g} s")
     raise SolverUnsupported(
-        f"{binary} was asked its version and did not state one. It said: "
+        f"{binary} did not state its version. It printed: "
         + (" | ".join(line.strip() for line in said.splitlines() if line.strip()) or "nothing")
     )
 
@@ -457,20 +460,19 @@ def supported(binary: str | Path) -> str:
     line = version(binary)
     floor = ".".join(str(part) for part in FLOOR)
     found = VERSION.search(line)
+    # Palace states the release tag git found when it was built, a commit
+    # where git found no tag, and UNKNOWN where it found no git.
     if found is None:
         raise SolverUnsupported(
-            f"{binary} states {line!r}, which names no release. This workbench runs Palace "
-            f"{floor} or later and cannot tell whether this one is. Palace states the release "
-            "tag git found when it was built, and a build where git found none states a "
-            "commit or UNKNOWN"
+            f"{binary} states {line!r}, which names no release, so the workbench cannot "
+            f"tell whether it is Palace {floor} or later. A Palace built outside a tagged "
+            "git checkout states a commit or UNKNOWN"
         )
+    # Why an older release is refused is :data:`FLOOR`'s comment.
     if tuple(int(part) for part in found.groups()) < FLOOR:
         raise SolverUnsupported(
-            f"{binary} states {line!r}, and this workbench runs Palace {floor} or later. "
-            "Where a wave port's face crosses more than one material or meets metal of "
-            "finite conductivity, an older Palace reflects part of the port's own mode or "
-            "leaves power out of the matrix. A build between two releases states the "
-            "release before it"
+            f"{binary} states {line!r}, and the workbench runs Palace {floor} or later. A "
+            "build between two releases states the release before it"
         )
     return line
 
@@ -489,14 +491,29 @@ def validate(config: str | Path, solver: str | Path | None = None) -> str:
     return _started(["--serial", "--dry-run", Path(config).name], config, solver, None, None)
 
 
+#: The process count that asks for the machine's share of ranks, which
+#: :func:`ranks` reads when the run is made.
+MACHINE = 0
+
+
 def ranks(processes: int) -> int:
-    """``processes``, refused where it is not a count a run can be made on.
+    """How many ranks a run asking for ``processes`` is made on: the count it
+    names, or for :data:`MACHINE` half the logical processors this process may
+    run on, and at least one. A negative count is refused.
+
+    Half, because Open MPI refuses more ranks than it counts slots, it counts a
+    slot to a core, and a core carries one or two logical processors on the
+    machines Palace is built for. The count is read when the run is made, so a
+    document solved on another machine is solved on that machine's cores.
 
     Its own function because a caller that has a whole run to prepare wants the
     answer before it prepares any of it, and the rule is stated once.
     """
-    if processes <= 0:
-        raise ValueError(f"a run is on at least one process, and this one asks for {processes}")
+    if processes < 0:
+        raise ValueError(f"Processes is {processes}. Enter 0, or a count of at least one process")
+    if processes == MACHINE:
+        counted = getattr(os, "process_cpu_count", os.cpu_count)()
+        return max(1, (counted or 1) // 2)
     return processes
 
 
@@ -571,7 +588,7 @@ HARMLESS = (
     Harmless(
         "Linear solver did not converge",
         "the solve that stopped short is the one behind Palace's error estimate, "
-        "which no answer here is read from",
+        "which the results do not use",
         before=f"PCG solver did NOT converge in {ESTIMATOR_ITERATIONS} iterations",
     ),
     # The disagreement is found on the first solve whose factored terms are not
@@ -579,8 +596,7 @@ HARMLESS = (
     # (``palace/models/romoperator.cpp``, ``SolvePROM``).
     Harmless(
         "Factored online A2",
-        "Palace assembles the frequency-dependent boundary terms in full from "
-        "that solve on, which is the exact way",
+        "Palace assembles the frequency-dependent boundary terms in full from that solve on",
     ),
     # Only the surface impedance conditions read which boundary attributes were
     # split (``palace/models/surfaceimpedanceoperator.cpp``,
@@ -629,14 +645,13 @@ class Printed:
 UNSOUND = (
     # MC64 finds no perfect matching over the stored entries
     # (``SRC/double/dldperm_dist.c``, ``dldperm_dist``), and ``pdgssvx`` goes on
-    # with the rows as they are. Palace's GMRES stops on the residual of the
-    # preconditioned system, so a singular factor does not stop it.
+    # with the rows as they are: the matrix is singular whatever its values.
+    # Palace's GMRES stops on the residual of the preconditioned system, so a
+    # singular factor does not stop it.
     Printed(
         "SuperLU",
         re.compile(r"MC64 detects singularity \.\. The last \d+ permutations:"),
-        "It found the matrix of a linear solve structurally singular, which is "
-        "singular whatever its values, and went on without reordering its rows. "
-        "The linear solver judges convergence on the preconditioned system, so it "
+        "It found the matrix of a linear solve structurally singular, so the solve "
         "can converge on a wrong answer.",
     ),
     # ``hypre_Memcpy`` and ``hypre_Memset`` skip the operation on a null pointer
@@ -713,23 +728,23 @@ def complaints(said: str) -> list[str]:
         for line in said.splitlines()
         if (match := FROM_OUTSIDE.search(line))
     ]
+    # The workbench starts Palace without $PETSC_OPTIONS or $PETSC_OPTIONS_YAML
+    # and with petscrc files turned off, so an option from outside was set
+    # between it and Palace: by the launcher in SolverPath, or by a file the
+    # launcher's shell reads as it starts, which $BASH_ENV names.
     if outside:
         found.append(
-            "PETSc held options this workbench does not write: "
+            "PETSc read options the workbench does not set: "
             + ", ".join(outside)
-            + ". An option PETSc reads changes how the port modes are solved. The "
-            "workbench starts Palace without $PETSC_OPTIONS or $PETSC_OPTIONS_YAML "
-            "and with petscrc files turned off, so something between it and Palace "
-            "set them: the launcher in SolverPath, or a file the launcher's shell "
-            "reads as it starts, which $BASH_ENV names"
+            + ". They change how the port modes are solved. Remove them from the launcher "
+            "in SolverPath, or from the file $BASH_ENV names"
         )
     for line in said.splitlines():
         removed = REMOVED.search(line)
         if removed:
             found.append(
-                f"{removed.group(1)} elements were taken out of the mesh before the solve, "
-                "their domain attribute being one no material named, so the region they "
-                "filled is not in the model that was solved"
+                f"Palace removed {removed.group(1)} mesh elements that no material fills, "
+                "so the region they filled is missing from the model solved"
             )
     return found
 
@@ -851,7 +866,7 @@ def _signalled(code: int) -> list[str]:
         return []
     if code < 0:
         return [f"Palace's launcher was ended by signal {number} ({name})"]
-    return [f"status {code} is how a process ended by signal {number} ({name}) exits"]
+    return [f"exit status {code} means a process was ended by signal {number} ({name})"]
 
 
 def _until_blank(lines: Sequence[str], start: int) -> Iterator[str]:
@@ -878,15 +893,22 @@ def _started(
             process = stack.enter_context(_launched([str(binary), *arguments], config))
         except OSError as error:
             raise SolverFailed(f"Palace could not be started as {binary}: {error}") from error
-        kept = []
+        kept: list[str] = []
         assert process.stdout is not None
         try:
             with cancel.watching(process, group=True):
                 for line in process.stdout:
+                    # What Palace prints is relayed between two blank lines,
+                    # which set it apart from what is said about the run
+                    # either side.
+                    if on_output is not None and not kept:
+                        on_output("")
                     kept.append(line.rstrip("\n"))
                     if on_output is not None:
                         on_output(kept[-1])
                 code = process.wait()
+                if on_output is not None and kept:
+                    on_output("")
         finally:
             # However this ends - read to the end, stopped, or a caller's
             # callback raising - nothing of the run may go on holding the cores
@@ -907,7 +929,9 @@ def _started(
         raise SolverFailed(f"Palace exited with code {code}", [*complaints(said), *told], said)
     wrong = complaints(said)
     if wrong:
-        raise SolverFailed("Palace finished and said the answer cannot be taken", wrong, said)
+        raise SolverFailed(
+            "Palace finished, and its log says the results cannot be used", wrong, said
+        )
     return said
 
 

@@ -13,9 +13,13 @@ nothing drawn over it, which part of a side of the box nothing drawn stands on,
 where the drawing's own points reach, and how far the bound the box is built on
 stands off the body it was taken round. Both adapters ask it which body of the
 medium's own material closes a gap too thin to mesh, and have it grow that body
-over the gap. The port object draws a waveguide or microstrip port's planes with
-the same rectangle; it draws a lumped port as a thin box over the same span,
-because a box is what it draws for every other port kind.
+over the gap. Both ask it which edges and points of a bound shape belong to none
+of its faces.
+The port object draws a waveguide or microstrip port's planes with
+the same rectangle; it draws a lumped port as a thin box over the same span. The Palace adapter
+also asks which free edges of a sheet of metal face each other across it, and
+how far apart they stand. The port commands ask how far a guide runs on from a
+cross-section drawn apart from it.
 
 This module sits at the package root for the reason :mod:`Microwave.portbox`
 gives: ``Objects/__init__`` imports FreeCAD, and an adapter has to be importable
@@ -27,8 +31,9 @@ importing the module reaches nothing.
 
 from __future__ import annotations
 
+import itertools
 import math
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple
 
 from .portbox import AXIS_NAMES, DIMENSIONS, FLATNESS
@@ -43,16 +48,23 @@ __all__ = [
     "filling",
     "left_over",
     "meets",
+    "middle",
     "on",
     "reached",
     "rectangle",
     "parted",
     "Room",
     "rooms",
+    "runs",
     "sealed",
     "slips",
     "SLIP",
     "extent",
+    "COPLANAR",
+    "facing",
+    "FACING",
+    "SAMPLES",
+    "SHARES",
     "grown",
     "joined",
     "segment",
@@ -64,6 +76,9 @@ __all__ = [
     "touching",
     "Unmeasured",
     "uncovered",
+    "loose",
+    "outside",
+    "stray",
 ]
 
 #: The thinnest region the CAD kernel holds as geometry, in millimetres:
@@ -624,8 +639,48 @@ def loose(shape: Any) -> list[Any]:
     """The faces of ``shape`` belonging to none of its solids and none of its
     closed shells: surfaces bounding no volume."""
     solids = list(getattr(shape, "Solids", None) or ())
-    held = _faces_of([*solids, *_unowned(shape, solids)])
+    return outside(shape, [*solids, *_unowned(shape, solids)])
+
+
+def outside(shape: Any, parts: Sequence[Any]) -> list[Any]:
+    """The faces of ``shape`` that are faces of none of ``parts``.
+
+    Each face is looked for among the parts' own, which a count of faces
+    against theirs does not answer: solids split apart share the faces they
+    were split along, and a compound lists a shared face once, measured on
+    FreeCAD 1.1.1 with a box sliced in two by BOPTools.
+    """
+    held = _faces_of(parts)
     return [face for face in getattr(shape, "Faces", None) or () if not _among(face, held)]
+
+
+def stray(shape: Any) -> tuple[list[Any], list[Any]]:
+    """The edges of ``shape`` belonging to none of its faces and none of its
+    solids, and the vertices belonging to none of its faces, solids or edges:
+    what was drawn on its own beside an area or a volume, as a sketch's edges
+    and a point are. A point or a line that a fragment of a face or of a solid
+    leaves inside it is that face's or that solid's, measured on FreeCAD 1.1.1.
+
+    Each is looked for among the faces', the solids' or the edges' own, as
+    :func:`outside` looks for a face. A face made from a sketch is bounded by
+    copies of the sketch's edges, measured on FreeCAD 1.1.1, so the sketch's
+    edges are stray even where they lie on the face's boundary.
+    """
+    edges = list(getattr(shape, "Edges", None) or ())
+    holders = [*(getattr(shape, "Faces", None) or ()), *(getattr(shape, "Solids", None) or ())]
+    points = getattr(shape, "Vertexes", None) or ()
+    return _apart(edges, holders, "Edges"), _apart(points, [*holders, *edges], "Vertexes")
+
+
+def _apart(members: Sequence[Any], holders: Sequence[Any], kind: str) -> list[Any]:
+    """The ``members`` that are none of the ``kind`` of any of ``holders``."""
+    if not members:
+        return []
+    held: dict[int, list[Any]] = {}
+    for holder in holders:
+        for part in getattr(holder, kind, None) or ():
+            held.setdefault(part.hashCode(), []).append(part)
+    return [member for member in members if not _among(member, held)]
 
 
 def _unowned(shape: Any, solids: Sequence[Any]) -> list[Any]:
@@ -673,8 +728,9 @@ def _faces_of(shapes: Sequence[Any]) -> dict[int, list[Any]]:
 
 
 def _among(face: Any, faces: Mapping[int, Sequence[Any]]) -> bool:
-    """Whether ``face`` is one of ``faces`` (:func:`_faces_of`). Two distinct
-    faces may share a hash, so :meth:`~Part.Shape.isSame` decides."""
+    """Whether ``face`` is one of ``faces``, grouped by their hash as
+    :func:`_faces_of` groups them. Two distinct shapes may share a hash, so
+    :meth:`~Part.Shape.isSame` decides."""
     return any(face.isSame(other) for other in faces.get(face.hashCode(), ()))
 
 
@@ -704,6 +760,48 @@ def box(lower: Sequence[float], upper: Sequence[float]) -> Any:
 
     spans = [high - low for low, high in zip(lower, upper, strict=True)]
     return Part.makeBox(*spans, FreeCAD.Vector(*lower))
+
+
+def runs(face: Any, whole: Any, axis: int) -> tuple[float, float]:
+    """How far ``whole`` runs on from ``face`` along ``axis``: below the face's
+    plane, and above it.
+
+    What runs on is the part of ``whole`` standing in the face's footprint and
+    reaching back to its plane, so a guide bent away from the axis, or turned
+    back past a short arm, is measured along the arm the face stands across
+    rather than across its whole box. Pieces the common returns butted end to
+    end are fused into one first, so a guide drawn as boxes in a row runs as
+    one. Nothing in the footprint at the plane runs nowhere.
+    """
+    near, far = bound(face), bound(whole)
+    lower = [far.XMin, far.YMin, far.ZMin]
+    upper = [far.XMax, far.YMax, far.ZMax]
+    across = (
+        [near.XMin, near.YMin, near.ZMin],
+        [near.XMax, near.YMax, near.ZMax],
+    )
+    at = (across[0][axis] + across[1][axis]) / 2.0
+    reached = []
+    for start, stop in ((lower[axis], at), (at, upper[axis])):
+        if stop - start <= FLATNESS:
+            reached.append(0.0)
+            continue
+        low, high = list(across[0]), list(across[1])
+        low[axis], high[axis] = start, stop
+        met = whole.common(box(low, high)).Solids
+        if len(met) > 1:
+            met = met[0].fuse(met[1:]).removeSplitter().Solids
+        lengths = [0.0]
+        for solid in met:
+            span = bound(solid)
+            ends = (
+                (span.XMin, span.YMin, span.ZMin)[axis],
+                (span.XMax, span.YMax, span.ZMax)[axis],
+            )
+            if min(abs(end - at) for end in ends) <= FLATNESS:
+                lengths.append(ends[1] - ends[0])
+        reached.append(max(lengths))
+    return reached[0], reached[1]
 
 
 def left_over(lower: Sequence[float], upper: Sequence[float], shapes: Sequence[Any]) -> list[Any]:
@@ -1032,14 +1130,14 @@ def grown(shape: Any, taken: Sequence[Room]) -> Any:
     fused = shape.fuse([room.solid for room in taken]).removeSplitter()
     volume = abs(float(shape.Volume)) + sum(room.volume for room in taken)
     if not fused.isValid():
-        raise ValueError("The kernel's fuse of the body and the room is not a valid shape")
+        raise ValueError("FreeCAD could not fuse the body and the room into a valid shape")
     if abs(abs(float(fused.Volume)) - volume) > FLATNESS * float(fused.Area):
         raise ValueError(
-            f"The kernel's fuse of the body and the room holds {abs(float(fused.Volume)):.6g} "
+            f"FreeCAD's fuse of the body and the room holds {abs(float(fused.Volume)):.6g} "
             f"mm^3 where the two hold {volume:.6g} mm^3"
         )
     if len(fused.Solids) > len(shape.Solids):
-        raise ValueError("The kernel's fuse of the body and the room comes apart in pieces")
+        raise ValueError("FreeCAD's fuse of the body and the room comes apart in pieces")
     return fused
 
 
@@ -1103,3 +1201,397 @@ def bare(faces: Sequence[Any], covers: Sequence[Any]) -> float:
     if not covers:
         return float(sum(face.Area for face in faces))
     return float(sum(face.cut(list(covers)).Area for face in faces))
+
+
+#: How far from square to each of two edges the line across between them may
+#: lean, as the cosine of the angle it makes, for the two to face each other
+#: across what lies between them. Half a right angle: two sides of a strip
+#: stand square to it, and two sides meeting at a corner of the sheet do not.
+FACING = math.cos(math.pi / 4.0)
+
+#: How far off the plane of one edge's sheet the other edge may stand, as a
+#: share of the distance between the two, for the two to stand in one sheet
+#: where they lie on different faces. A gap between two coplanar pieces of
+#: metal is across the sheet; two layers a substrate apart are not.
+COPLANAR = 1e-3
+
+#: How many points along an edge are asked where it runs.
+SAMPLES = 16
+
+#: How far, in radians, a curved edge's direction may turn between two of the
+#: points it is asked at where it is cut into pieces: a quarter of a right
+#: angle, so each cut stands within that of where the turn reaches its mark.
+STEP = math.pi / 8.0
+
+#: Where across the stretch two edges both cover the line between them is
+#: taken from, as shares of that stretch: its middle first, then a pair on each
+#: side of it set by the golden ratio, so no row of evenly spaced holes stands
+#: on every one.
+_GOLDEN = (1.0 + math.sqrt(5.0)) / 2.0
+SHARES = (
+    0.5,
+    0.5 - 0.5 / _GOLDEN,
+    0.5 + 0.5 / _GOLDEN,
+    0.5 - 0.5 / _GOLDEN**2,
+    0.5 + 0.5 / _GOLDEN**2,
+)
+
+
+class _Free(NamedTuple):
+    """A piece of a free edge, the face holding it, the box round it, points
+    along it and the parameters they stand at, the direction it runs at its
+    middle, and which free edge it is a piece of."""
+
+    edge: Any
+    face: Any
+    box: Any
+    points: list[Any]
+    params: list[float]
+    along: Any
+    whole: int
+
+
+def facing(
+    faces: Sequence[Any],
+    reach: float,
+    others: Sequence[Any] = (),
+    mirrors: Sequence[Any] = (),
+    walls: tuple[Sequence[float], Sequence[float]] | None = None,
+) -> list[tuple[Any, float]]:
+    """Each free edge of a sheet that faces another free edge of it nearer than
+    ``reach``, across the sheet or across a gap in it, with how far off the
+    nearest such edge stands, in millimetres.
+
+    The faces are fused first, which glues the edges two of them hold apart and
+    splits one that another covers only in part, as the mesher's fragmenting
+    does. A free edge is one the faces hold once and no seam: an edge two faces
+    share is inside the sheet, and so is a seam, where a face meets itself. A
+    free edge of no length, such as a cone's apex, is no edge. A curved free
+    edge is taken in pieces each turning through about a right angle, and two
+    pieces of one edge face nothing of each other. An edge lying along any of
+    ``others`` - other metal - over its whole length is no free edge either,
+    since the room does not turn round it there.
+
+    Two edges face each other where all of these hold: they run side by side,
+    each covering some of the stretch the other covers along its own direction;
+    a line across the stretch both cover, from one of :data:`SHARES` of it,
+    stands within :data:`FACING` of square to each, the two lie on one face or
+    each stands in the plane of the other's within :data:`COPLANAR`, and that
+    line touches no other free edge on its way. The two sides of a strip and of
+    a slot face each other, and so do the sides of a strip and a ground beside
+    it in one plane. Two pieces of one straight edge do not, and neither do
+    neighbouring pieces of a curve, the side of a wide section and the side of a
+    narrow one stepping in from it, two sides meeting at a corner, two layers of
+    metal a substrate apart, nor two sides of an outline joined by a third that
+    the line would run along. Two edges that touch stand nowhere apart and face
+    nothing, so a sheet whose sides meet at a point, or whose outline is one
+    closed edge, faces nothing there. A section shorter than it is wide is
+    narrow along its length, and its two ends face each other.
+
+    ``mirrors`` are flat faces the model is reflected in. An edge lying along
+    one is no edge, and an edge faces its own reflection where the two would
+    face each other as above and the line between them crosses the mirror.
+    ``walls`` are the least and the greatest corner of the box the model ends
+    on, and an edge lying along a side of it is no edge either.
+    """
+    import FreeCAD
+    import Part
+
+    if len(faces) > 1:
+        faces = faces[0].fuse(list(faces[1:])).Faces
+    held = [(edge, face) for face in faces for edge in face.Edges]
+    alike: dict[int, list[Any]] = {}
+    for edge, _ in held:
+        alike.setdefault(edge.hashCode(), []).append(edge)
+    sides = []
+    if walls is not None:
+        lower, upper = walls
+        drawn_sides = (
+            rectangle(at, axis, lower, upper)
+            for axis in range(DIMENSIONS)
+            if upper[axis] - lower[axis] > FLATNESS
+            for at in (lower[axis], upper[axis])
+        )
+        sides = [side for side in drawn_sides if side is not None]
+    planes = [mirror for mirror in mirrors if _named(mirror, "Surface") == "Plane"]
+    stops = [(stop, bound(stop)) for stop in (*others, *mirrors, *sides)]
+    edges: list[Any] = []
+    free: list[_Free] = []
+    for edge, face in held:
+        if edge.isSeam(face) or sum(edge.isSame(one) for one in alike[edge.hashCode()]) != 1:
+            continue
+        if edge.Length <= FLATNESS:
+            continue
+        box = bound(edge)
+        points = edge.discretize(Number=SAMPLES)
+        if any(
+            _box_gap(box, around) <= FLATNESS
+            and all(Part.Vertex(point).distToShape(stop)[0] <= FLATNESS for point in points)
+            for stop, around in stops
+        ):
+            continue
+        for piece in _pieces(edge):
+            params = _spread(piece.FirstParameter, piece.LastParameter, SAMPLES)
+            free.append(
+                _Free(
+                    piece,
+                    face,
+                    bound(piece),
+                    [piece.valueAt(at) for at in params],
+                    params,
+                    piece.tangentAt((piece.FirstParameter + piece.LastParameter) / 2.0).normalize(),
+                    len(edges),
+                )
+            )
+        edges.append(edge)
+    nearest: dict[int, float] = {}
+
+    def found(key: int, distance: float) -> None:
+        nearest[key] = min(nearest.get(key, distance), distance)
+
+    for index, one in enumerate(free):
+        for at in range(index + 1, len(free)):
+            other = free[at]
+            if (
+                one.whole == other.whole
+                or _box_gap(one.box, other.box) >= reach
+                or not _side_by_side(one, other)
+            ):
+                continue
+            distance = one.edge.distToShape(other.edge)[0]
+            if not FLATNESS < distance < reach:
+                continue
+            between = _near(free, (index, at), one.box, other.box)
+            if all(
+                any(
+                    _square(near.edge, here, there)
+                    and _square(far.edge, there, here)
+                    and _in_one_sheet(near.face, far.face, here, there, distance)
+                    and _clear(here, there, between)
+                    for here, there in _across(near, far)
+                )
+                for near, far in ((one, other), (other, one))
+            ):
+                found(one.whole, distance)
+                found(other.whole, distance)
+        for mirror in planes:
+            base, normal = mirror.Surface.Position, mirror.Surface.Axis
+            unit = FreeCAD.Vector(normal).normalize()
+            image = _Free(
+                one.edge.mirror(base, normal),
+                one.face.mirror(base, normal),
+                None,
+                [_reflected(point, base, unit) for point in one.points],
+                one.params,
+                one.along - unit * (2.0 * one.along.dot(unit)),
+                one.whole,
+            )
+            if not _side_by_side(one, image):
+                continue
+            distance = one.edge.distToShape(image.edge)[0]
+            if not FLATNESS < distance < reach:
+                continue
+            between = _near(free, (index,), one.box, bound(image.edge))
+            if any(
+                _square(one.edge, here, there)
+                and _in_one_sheet(one.face, image.face, here, there, distance)
+                and Part.Vertex((here + there) * 0.5).distToShape(mirror)[0]
+                <= COPLANAR * distance + FLATNESS
+                and _clear(here, there, between)
+                for here, there in _across(one, image)
+            ):
+                found(one.whole, distance)
+    return [(edges[key], float(distance)) for key, distance in sorted(nearest.items())]
+
+
+def middle(edge: Any) -> Any:
+    """The point halfway along an edge's parameter, as a vertex."""
+    import Part
+
+    return Part.Vertex(edge.valueAt((edge.FirstParameter + edge.LastParameter) / 2.0))
+
+
+def _reflected(point: Any, base: Any, unit: Any) -> Any:
+    """``point`` reflected in the plane through ``base`` square to ``unit``."""
+    return point - unit * (2.0 * (point - base).dot(unit))
+
+
+def _pieces(edge: Any) -> list[Any]:
+    """A curved edge cut where its direction has turned through each right
+    angle, and cut again halfway between those cuts: two sets of pieces, each
+    piece turning through about a right angle, so that each point of the edge
+    stands near the middle of one piece or another. A direction along a piece is
+    one along all of it, where a circle has none."""
+    import Part
+
+    if _named(edge, "Curve") == "Line":
+        return [edge]
+    walked = _turning(edge)
+    quarter = math.pi / 2.0
+    if walked[-1][1] <= quarter:
+        return [edge]
+    first, last = edge.FirstParameter, edge.LastParameter
+    pieces: list[Any] = []
+    for offset in (0.0, quarter / 2.0):
+        cuts = [first]
+        mark = offset or quarter
+        for at, turned in walked:
+            if turned >= mark and first < at < last:
+                cuts.append(at)
+                mark += quarter
+        cuts.append(last)
+        pieces.extend(Part.Edge(edge.Curve, low, high) for low, high in itertools.pairwise(cuts))
+    return [piece for piece in pieces if piece.Length > FLATNESS]
+
+
+def _turning(edge: Any) -> list[tuple[float, float]]:
+    """Parameters along an edge, each with how far its direction has turned
+    from the start, in radians: :data:`SAMPLES` of them spread evenly, and more
+    between two of those wherever the direction turns through more than
+    :data:`STEP` between them and they stand more than :data:`FLATNESS` apart.
+    A corner is closed in on to that distance and counted whole."""
+    spread = _spread(edge.FirstParameter, edge.LastParameter, SAMPLES)
+    pending = [(at, edge.tangentAt(at).normalize()) for at in reversed(spread)]
+    start = pending.pop()
+    walked = [(start[0], 0.0)]
+    here = start
+    while pending:
+        there = pending[-1]
+        turn = math.acos(max(-1.0, min(1.0, here[1].dot(there[1]))))
+        apart = (edge.valueAt(there[0]) - edge.valueAt(here[0])).Length
+        if turn > STEP and apart > FLATNESS:
+            half = (here[0] + there[0]) / 2.0
+            pending.append((half, edge.tangentAt(half).normalize()))
+            continue
+        walked.append((there[0], walked[-1][1] + turn))
+        here = pending.pop()
+    return walked
+
+
+def _spread(first: float, last: float, count: int) -> list[float]:
+    """``count`` parameters evenly spread from ``first`` to ``last``."""
+    return [first + (last - first) * index / (count - 1) for index in range(count)]
+
+
+def _across(one: _Free, other: _Free) -> Iterator[tuple[Any, Any]]:
+    """A point on each of two pieces of edges that run side by side, the line
+    between them crossing the stretch both cover at each of :data:`SHARES` of
+    it: the point of one piece standing there along its direction, and the point
+    of the other nearest it. The line is taken across the stretch rather than
+    between the two pieces' nearest points, which may stand at an end of it,
+    where the line between them runs along whatever edge closes it."""
+    import Part
+
+    spans = [[point.dot(one.along) for point in free.points] for free in (one, other)]
+    low = max(min(span) for span in spans)
+    high = min(max(span) for span in spans)
+    for share in SHARES:
+        here = _along(one, low + share * (high - low))
+        yield here, Part.Vertex(here).distToShape(other.edge)[1][0][1]
+
+
+def _along(free: _Free, at: float) -> Any:
+    """The point of a piece of a free edge standing ``at`` along the direction
+    it runs at its middle: between the two of its points either side of that,
+    narrowed by halves to within :data:`FLATNESS`. A piece turns through about a
+    right angle at most, so it runs on along that direction from its first
+    point to its last and stands at each place once."""
+    edge = free.edge
+    heights = [point.dot(free.along) - at for point in free.points]
+    index = next(k for k in range(len(heights) - 1) if heights[k] * heights[k + 1] <= 0.0)
+    low, high = free.params[index], free.params[index + 1]
+    while (edge.valueAt(high) - edge.valueAt(low)).Length > FLATNESS:
+        half = (low + high) / 2.0
+        if edge.valueAt(half).dot(free.along) < at:
+            low = half
+        else:
+            high = half
+    return edge.valueAt((low + high) / 2.0)
+
+
+def _side_by_side(one: _Free, other: _Free) -> bool:
+    """Whether each of two edges covers some of the stretch the other covers
+    along its own direction: two sides of a strip do, two pieces of one line and
+    a side and the step it runs on from do not."""
+    for along in (one.along, other.along):
+        spans = [[point.dot(along) for point in free.points] for free in (one, other)]
+        if min(max(span) for span in spans) - max(min(span) for span in spans) <= FLATNESS:
+            return False
+    return True
+
+
+def _square(edge: Any, point: Any, toward: Any) -> bool:
+    """Whether the line from ``point`` on ``edge`` to ``toward`` stands within
+    :data:`FACING` of square to the edge there."""
+    tangent = edge.tangentAt(edge.Curve.parameter(point)).normalize()
+    return abs(tangent.dot((toward - point).normalize())) <= FACING
+
+
+def _in_one_sheet(face: Any, other: Any, here: Any, there: Any, distance: float) -> bool:
+    """Whether two points on two faces stand in one sheet: the faces are one,
+    or each point stands on the other's surface within :data:`COPLANAR` of the
+    distance between them."""
+    if face.isSame(other):
+        return True
+    near = COPLANAR * distance + FLATNESS
+    return _off(face, there) <= near and _off(other, here) <= near
+
+
+def _off(face: Any, point: Any) -> float:
+    """How far ``point`` stands from the surface ``face`` lies on, extended
+    past the face."""
+    surface = face.Surface
+    return float((surface.value(*surface.parameter(point)) - point).Length)
+
+
+def _clear(here: Any, there: Any, near: Sequence[_Free]) -> bool:
+    """Whether the line across between two edges touches none of the free
+    edges ``near`` it between its ends: a line running along a third side of the
+    outline joins two sides that meet it rather than face each other."""
+    import FreeCAD
+    import Part
+
+    span = there - here
+    # Its ends stand a thousandth of its length in from the two edges it joins,
+    # so touching those is not touching another.
+    trim = span * 1e-3
+    start, stop = here + trim, there - trim
+    line = Part.LineSegment(start, stop).toShape()
+    box = FreeCAD.BoundBox()
+    box.add(start)
+    box.add(stop)
+    return not any(
+        _box_gap(box, piece.box) <= FLATNESS and line.distToShape(piece.edge)[0] <= FLATNESS
+        for piece in near
+    )
+
+
+def _near(free: Sequence[_Free], ends: Sequence[int], *boxes: Any) -> list[_Free]:
+    """The pieces of ``free`` but those at ``ends`` whose boxes meet the box
+    round ``boxes``: the only ones a line between those can touch."""
+    import FreeCAD
+
+    around = FreeCAD.BoundBox()
+    for box in boxes:
+        around.add(box)
+    return [
+        piece
+        for index, piece in enumerate(free)
+        if index not in ends and _box_gap(piece.box, around) <= FLATNESS
+    ]
+
+
+def _box_gap(one: Any, other: Any) -> float:
+    """How far apart two bounding boxes stand, in millimetres, and nothing where
+    they meet."""
+    return math.sqrt(
+        sum(
+            max(
+                getattr(other, low) - getattr(one, high),
+                getattr(one, low) - getattr(other, high),
+                0.0,
+            )
+            ** 2
+            for low, high in (("XMin", "XMax"), ("YMin", "YMax"), ("ZMin", "ZMax"))
+        )
+    )

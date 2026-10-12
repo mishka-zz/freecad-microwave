@@ -3,7 +3,7 @@
 
 """One drawing, one outside: each face of the domain is the same on both backends.
 
-What lies beyond a face is the mesh policy's ``Padding``, and both backends read
+What lies beyond a face is the mesh policy's ``Boundary``, and both backends read
 it. So where both take a drawing, each face carries one condition on both - a
 wall, an absorber, a magnetic wall - and a wall stands at the same coordinate on
 both, which is where the drawing ends. Where openEMS cannot answer the drawing
@@ -119,6 +119,11 @@ NOT_UNIFORM = {
     "part_before_the_reference_plane": "the guide changes along X at 'Part",
     "iris_before_the_reference_plane": "the guide changes along X at 'Iris",
     "referred_past_the_far_end": "between the face and 60 mm in",
+    # The housing is the guide's wall bound to the wrong material, which the
+    # refusal names.
+    "housing_bound_to_a_dielectric": (
+        "is 'Air'. If it is the guide's wall, bind it to a PEC material."
+    ),
 }
 
 
@@ -129,7 +134,7 @@ APART = {
     # openEMS reads the port a few cells in whatever the reference plane, so
     # a part inside that is refused there and says what moves it.
     "part_within_the_probe_depth": (
-        "whatever ReferenceDepth says, so move what changes the guide more than",
+        "whatever ReferenceDepth says. Move what changes the guide more than",
         None,
     ),
     # The widening on Palace; on openEMS the port does not cover the face.
@@ -178,11 +183,17 @@ APART = {
     # and Palace refuses as a sheet it would solve as a wall; copper does not.
     "resistive_roof_over_a_pocket": ("opens into 'Pocket'", "lets through up to"),
     "copper_roof_over_a_pocket": (None, None),
+    # A pocket bound with the guide's own air: openEMS names the pocket, Palace
+    # the binding the port's face lies in, which is no wall to put right.
+    "pocket_in_the_guide_binding": (
+        "'Pocket' is 'Vacuum'. If it is the guide's wall",
+        "opens into 'GuideAirBinding'",
+    ),
     # A sheet across the guide on the grid line openEMS reads the port on is a
     # discontinuity on that plane; the far end of the sweep is exempt only where
     # it is the reference plane.
     "iris_on_the_probe_plane": (
-        "whatever ReferenceDepth says, so move what changes the guide more than",
+        "whatever ReferenceDepth says. Move what changes the guide more than",
         None,
     ),
     # The same bodies uncut: each backend names the cut to make.
@@ -204,14 +215,14 @@ APART = {
     # sheet bounds no volume, and neither backend reads which one was meant.
     "block_drawn_as_its_surface_beside_a_sheet": (
         "part volume and part surface",
-        "part volume and part surface",
+        "and also faces that bound no volume",
     ),
     # The same pipe without its roof, standing on a floor the domain walls and
     # open above: openEMS says the side above opens onto its vacuum, and Palace
     # refuses a waveguide port in a study open to free space before that.
     "pipe_missing_its_roof": (
-        "at z = 4.3 mm opens onto the vacuum openEMS fills undrawn room with",
-        "is a waveguide port, and 'Mesh Policy' opens",
+        "at z = 4.3 mm opens onto the vacuum that fills undrawn room",
+        "is a waveguide port, and 'Mesh Policy' sets",
     ),
 }
 
@@ -259,6 +270,27 @@ def test_both_backends_refuse_a_guide_not_uniform_to_its_reference_plane(cases, 
     for backend in ("openEMS", "Palace"):
         said = case[backend].get("refused", "")
         assert why in said, (backend, said)
+
+
+def test_a_guide_widening_inside_its_own_body_is_not_told_to_bind_it_to_metal(cases):
+    """The widening is the body the port's face lies on, drawn wider, and its
+    material is right."""
+    said = cases["widening_before_the_reference_plane"]["Palace"]["refused"]
+    assert "opens into 'AirBinding'" in said
+    assert "PEC material" not in said
+
+
+def test_a_pocket_behind_a_sheet_that_lets_the_wave_through_is_not_told_to_be_metal(cases):
+    """The sheet over the pocket's mouth is the guide's wall there, and it is
+    what lets the wave out."""
+    said = cases["resistive_roof_over_a_pocket"]["openEMS"]["refused"]
+    assert "opens into 'Pocket'" in said
+    assert "PEC material" not in said
+
+
+def test_the_binding_a_port_lies_in_is_not_told_to_be_metal(cases):
+    said = cases["pocket_in_the_guide_binding"]["Palace"]["refused"]
+    assert "PEC material" not in said
 
 
 @pytest.mark.parametrize("name", AGREED)

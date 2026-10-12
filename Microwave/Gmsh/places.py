@@ -101,7 +101,7 @@ from .vocabulary import (
     transition,
 )
 
-__all__ = ["Resolved", "edges", "install", "reached", "resolve"]
+__all__ = ["Resolved", "edges", "install", "reached", "resolve", "OTHER_SOURCES"]
 
 #: Which list of a ``Distance`` field holds entities of each dimension.
 DISTANCE_LISTS = {0: "PointsList", 1: "CurvesList", 2: "SurfacesList"}

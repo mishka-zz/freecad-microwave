@@ -401,9 +401,8 @@ def said(provenance: Mapping[str, Any]) -> str | None:
         value = -float(below["share"])
         lines.append(
             f"the waveguide ports give out {percent(value)} more power than was driven in "
-            f"at {_ghz(below['frequency'])}, which no passive model does. The ports read "
-            f"the waves wrong, and the column this run measures is off by at least "
-            f"{_error(below)}, taken over its terms together. A change in the "
+            f"at {_ghz(below['frequency'])}, so they misread the waves and this run's "
+            f"column of the S-matrix is off by at least {_error(below)}. A change in the "
             "guide near a port leaves a field there that the port reads with its mode. "
             "Draw the port farther from what changes the guide"
         )
@@ -412,13 +411,12 @@ def said(provenance: Mapping[str, Any]) -> str | None:
         lines.append(
             f"the waveguide ports account for {percent(value)} less power than was "
             f"driven in at {_ghz(above['frequency'])}, in a model that dissipates nothing "
-            "and lets power out only through the ports' guides. Either the ports read "
-            "the waves wrong, and the column this run measures is off by at least "
-            f"{_error(above)}, taken over its terms together, or a mode besides a "
-            "port's own propagates in its guide and carries power into the absorber. Draw "
-            "the port farther from what changes the guide, or end the band below where a "
-            "second mode propagates in the ports' guides. A port in a mode other than its "
-            "guide's lowest always has the lowest beside it"
+            "and lets power out only through the ports' guides. Either the ports misread "
+            "the waves and this run's column of the S-matrix is off by at least "
+            f"{_error(above)}, or a second mode propagates in a port's guide and carries "
+            "power into the absorber. Draw the port farther from what changes the guide, "
+            "or end the band below where a second mode propagates in the ports' guides. "
+            "A port driven in a higher mode always has the lowest mode beside it"
         )
     return ". ".join(lines) if lines else None
 

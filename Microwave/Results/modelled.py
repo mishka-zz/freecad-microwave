@@ -69,7 +69,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-__all__ = ["apart", "brief", "outside", "said"]
+__all__ = ["apart", "brief", "outside", "said", "medium"]
 
 #: A record, as the provenance holds one.
 Record = Mapping[str, Any]
@@ -201,8 +201,8 @@ def _short(record: Record) -> str:
 
 
 def brief(records: Iterable[Record]) -> str:
-    """Every material's record in one clause, for the line under a chart that
-    says how the loss was held. Empty for none."""
+    """Every material's record in one clause, for a chart's basis, which says
+    how the loss was held. Empty for none."""
     return "; ".join(
         f"{record['material']!r} {_short(record)}" for record in records if _loss(record)
     )
@@ -228,8 +228,9 @@ def apart(
 ) -> list[str]:
     """One line for each material two runs modelled differently.
 
-    :param mine_by: and ``theirs_by``: what solved each, as its provenance names
-        it, which is how the line tells the reader which is which.
+    :param mine_by: and ``theirs_by``: what each is called - its run, or its
+        backend where it is no run - which is how the line tells the reader
+        which is which.
 
     A material is compared by every record either run holds of it, since
     FreeCAD can be set to let two materials share a label. A material only one

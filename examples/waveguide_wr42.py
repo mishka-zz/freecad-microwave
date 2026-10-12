@@ -26,6 +26,9 @@ nothing in the drawing says which way the port faces, and each is set here and
 checked by nobody. Reversed, the run finishes and reports a plausible matrix
 with the phase inverted.
 
+Its study carries an openEMS and a Palace solver, and either answers it as
+drawn. Select the one to run in the tree before pressing Run.
+
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
@@ -44,8 +47,11 @@ import FreeCAD
 
 from Microwave.Objects.analysis import createEMAnalysis, solver_of
 from Microwave.Objects.materials import createEMMaterial, createEMMaterialBinding
+from Microwave.Objects.mesh import createEMGmshMesh
 from Microwave.Objects.ports import PORT_IMPEDANCE, createEMPortRectWaveguide
+from Microwave.Objects.solver import createEMSolverPalace
 from Microwave.Solvers.openems import document, preflight
+from Microwave.Solvers.palace import document as palace_document
 
 # Beside this script, so the shared stamp can be imported. freecadcmd runs a
 # script without putting its directory on the path.
@@ -152,7 +158,7 @@ def markup(analysis, air, planes):
         port.Number = number
         # Both ports are driven, one run each, so the whole matrix is measured
         # rather than half of it assumed by reciprocity.
-        port.Excitation = True
+        port.Driven = True
         port.Mode = MODE
         port.PropagationAxis = axis
         port.CrossSection = (plane, ["Face1"])
@@ -167,12 +173,16 @@ def markup(analysis, air, planes):
 
 
 def study(doc):
-    """The analysis, its solver and its mesh policy, all settings applied."""
+    """The analysis, its solvers and its mesh policy, all settings applied."""
     analysis = createEMAnalysis(doc)
+    # Palace answers this study as drawn, so it carries that backend's solver and
+    # tetrahedral mesh beside openEMS', as Add Palace Solver puts them in.
+    for made in (createEMSolverPalace(doc), createEMGmshMesh(doc)):
+        analysis.addObject(made)
     analysis.Label = "WR-42 waveguide"
     analysis.FrequencyStart = FREQ_START
     analysis.FrequencyStop = FREQ_STOP
-    analysis.NumFrequencyPoints = 201
+    analysis.FrequencyPoints = 201
 
     solver_of(analysis).MaxTimesteps = 12000
 
@@ -184,10 +194,10 @@ def study(doc):
     # walls are the whole of what makes this an enclosed problem, and it is why
     # the domain must not grow sideways: air outside a wall moves the wall, and
     # the cutoff moves with it.
-    settings.PaddingXMin = "Through"
-    settings.PaddingXMax = "Through"
+    settings.BoundaryXMin = "Through"
+    settings.BoundaryXMax = "Through"
     for axis, side in (("Y", "Min"), ("Y", "Max"), ("Z", "Min"), ("Z", "Max")):
-        setattr(settings, f"Padding{axis}{side}", "Ends")
+        setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
     return analysis
 
 
@@ -204,6 +214,10 @@ def main(out):
     print(f"digest: {problem.digest()[:16]}")
     for finding in preflight.check(problem):
         print(f"  {finding}")
+
+    # Palace reads the same study, and refuses here what it cannot answer.
+    palace_document.problem(analysis)
+    print("palace: translates")
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     doc.saveAs(out)

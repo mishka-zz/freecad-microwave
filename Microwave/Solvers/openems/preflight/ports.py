@@ -42,6 +42,14 @@ from .absorber import (
 )
 from .finding import _ON_THE_GRID, REFUSE, WARN, Finding
 
+#: Each port kind as the menu names it, for a sentence the user reads.
+_NAMED = {
+    "lumped": "lumped",
+    "microstrip": "microstrip",
+    "rect_waveguide": "waveguide",
+    "coaxial": "coaxial",
+}
+
 
 def _check_lumped_excitation_beside_a_measured_line(problem: Problem) -> list[Finding]:
     """A run a lumped port drives, with a microstrip port left to measure.
@@ -76,11 +84,10 @@ def _check_lumped_excitation_beside_a_measured_line(problem: Problem) -> list[Fi
             # `.name`, as every other check spells a port. A labelled port
             # named two ways is one object counted twice.
             measured[0].name,
-            f"this run is driven by lumped port {lumped}, and a microstrip "
-            "port measured in a lumped-driven run reports a non-finite "
-            "reference impedance at every frequency on this engine. The run "
-            "will take its full time and then be refused, with no S-matrix. Drive "
-            "the microstrip port instead, or measure both ports the same way",
+            f"lumped port {lumped} drives this run, and openEMS returns a "
+            "non-finite reference impedance for a microstrip port in a "
+            "lumped-driven run, so the run gives no S-matrix. Drive the "
+            "microstrip port instead, or make both ports the same kind",
         )
     ]
 
@@ -109,15 +116,12 @@ def _check_the_launch_direction_was_read(problem: Problem) -> list[Finding]:
         Finding(
             WARN,
             port.name,
-            f"it launches along {AXIS_NAMES[port.propagation_axis]}"
-            f"{'+' if port.direction > 0 else '-'}, and the shape it is built on "
-            "does not say which side of the pick its body is on - so that "
-            "direction is as it was set and nothing has checked it. A "
-            "conductor drawn as a surface reaches this, and so does a pick "
-            "with the body on both sides of it. Turned around, the run "
-            "finishes and reports a plausible S-matrix with the phase "
-            "inverted. Check it points into the structure, or pick an end of "
-            "the conductor and draw it as a solid, so the drawing answers",
+            f"it launches along {'' if port.direction > 0 else '-'}"
+            f"{AXIS_NAMES[port.propagation_axis].upper()}, and the picked shape does not "
+            "show which side of it the body is on, so nothing has checked that "
+            "direction. Pointed the wrong way, the run returns an S-matrix with "
+            "the phase inverted. Check that PropagationAxis points into the "
+            "structure, or draw the conductor as a solid and pick its end",
         )
         for port in problem.ports
         if port.direction_unchecked
@@ -132,8 +136,8 @@ def _check_ports(problem: Problem, caps: Capabilities) -> list[Finding]:
                 Finding(
                     REFUSE,
                     port.name,
-                    f"port type {port.kind!r} is not supported; this adapter "
-                    f"handles {sorted(caps.port_types)}",
+                    f"port type {port.kind!r} is not supported by openEMS, "
+                    f"which supports {sorted(caps.port_types)}",
                 )
             )
         findings += _check_port_inside_the_grid(port, problem.grid)
@@ -187,11 +191,9 @@ def _check_the_annulus_is_resolved(port: Port, grid: MeshGrid) -> list[Finding]:
                 REFUSE,
                 port.name,
                 f"its annulus runs from radius {port.inner_radius:.4g} to "
-                f"{port.outer_radius:.4g}, and only {inside} grid line(s) fall "
-                f"across it along {AXIS_NAMES[axis]}. The port's probes and its "
-                f"excitation all live in that gap, so the run would drive "
-                f"nothing and read nothing. Refine the mesh across "
-                f"{AXIS_NAMES[axis]}",
+                f"{port.outer_radius:.4g} mm, and only {inside} grid line(s) fall "
+                f"across it along {AXIS_NAMES[axis]}, so the port drives and "
+                f"reads nothing. Refine the mesh across {AXIS_NAMES[axis]}",
             )
         )
     return findings
@@ -241,12 +243,10 @@ def _check_the_element_survives_snapping(port: Port, grid: MeshGrid) -> list[Fin
         Finding(
             REFUSE,
             port.name,
-            f"its gap spans {AXIS_NAMES[axis]}={start:.4g} to {stop:.4g}, which "
-            f"is shorter than the cell there: both ends snap to the single grid "
-            f"line at {lines[first]:.4g}. openEMS snaps a lumped element to the "
-            f"mesh and skips one whose snapped length is zero, so the resistor "
-            f"would not be laid at all and the run would return NaN. Refine the "
-            f"mesh across {AXIS_NAMES[axis]}, or widen the gap",
+            f"its gap spans {AXIS_NAMES[axis]}={start:.4g} to {stop:.4g}, shorter "
+            f"than the cell there. Both ends snap to the single grid line at "
+            f"{lines[first]:.4g}, so openEMS drops the element and the run returns "
+            f"no result. Refine the mesh across {AXIS_NAMES[axis]}, or widen the gap",
         )
     ]
 
@@ -369,15 +369,11 @@ def _check_the_element_meets_its_metal(port: Port, problem: Problem) -> list[Fin
                 REFUSE,
                 port.name,
                 f"its {AXIS_NAMES[axis]}={end:.4g} end is drawn on a conductor "
-                f"and snaps to {node:.4g}, where nothing conducts. openEMS makes "
-                f"a conductor by zeroing the Yee edges whose own sample point "
-                f"the shape holds, and neither the line this end landed on nor "
-                f"the edge running out of it into the metal is one of them - so "
-                f"the element would be laid with a live edge between it and the "
-                f"conductor, in series with the resistance this port declares. "
-                f"Re-mesh the model, which pins a line to each of a conductor's "
-                f"faces, or give the conductor enough thickness across "
-                f"{AXIS_NAMES[axis]} for the grid to hold an edge inside it",
+                f"and snaps to {node:.4g}, where nothing conducts, so a one-cell "
+                "gap sits in series with the port's resistance. Mesh the model "
+                "again, which puts a grid line on each conductor face, or give the "
+                f"conductor enough thickness across {AXIS_NAMES[axis]} for the grid "
+                "to hold a cell edge inside it",
             )
         )
     return findings
@@ -453,11 +449,10 @@ def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
                 port.name,
                 f"the guide is filled with {solid.name!r} (relative "
                 f"permittivity {material.epsilon:g}, permeability "
-                f"{material.mu:g}), and this adapter does not yet drive a "
-                f"filled waveguide port: openEMS would report the cutoff, the "
-                f"phase constant and the mode impedance as if the guide were "
-                f"empty. Model the guide empty, or use a lumped or microstrip "
-                f"port",
+                f"{material.mu:g}), and the workbench does not yet drive a filled "
+                "waveguide port on openEMS, so the cutoff, phase constant and "
+                "mode impedance would be those of an empty guide. Model the guide "
+                "empty, or use a lumped or microstrip port",
             )
         )
     medium = epsilon.get(problem.medium)
@@ -482,10 +477,10 @@ def _check_the_guide_is_empty(port: Port, problem: Problem) -> list[Finding]:
                 port.name,
                 f"the guide is filled with the study's medium {medium.name!r} (relative "
                 f"permittivity {medium.epsilon:g}, permeability {medium.mu:g}) wherever no "
-                "body is drawn in it, and this adapter does not yet drive a filled waveguide "
-                "port: openEMS would report the cutoff, the phase constant and the mode "
-                "impedance as if the guide were empty. Draw the guide's inside as a box and "
-                "bind a vacuum material to it, or use a lumped or microstrip port",
+                "body is drawn in it, and the workbench does not yet drive a filled "
+                "waveguide port on openEMS, so the cutoff, phase constant and mode "
+                "impedance would be those of an empty guide. Draw the guide's inside as a "
+                "box and bind a vacuum material to it, or use a lumped or microstrip port",
             )
         )
     return findings
@@ -543,10 +538,10 @@ def _check_the_mode_propagates(port: Port, problem: Problem) -> list[Finding]:
             Finding(
                 REFUSE,
                 port.name,
-                f"{port.mode} cuts off exactly at the band's point "
-                f"{frequency[on[0]] / 1e9:.9g} GHz, where the port's impedance has no "
-                "bound and no S-parameter can be normalised. Move the band so no "
-                "point falls on the cutoff",
+                f"{port.mode} cuts off exactly at {frequency[on[0]] / 1e9:.9g} GHz, "
+                "a point of the band, where the port impedance is infinite and no "
+                "S-parameter can be computed. Move the band so that no point falls on "
+                "the cutoff",
             )
         ]
     if not past[-1] > 0.0:
@@ -554,11 +549,10 @@ def _check_the_mode_propagates(port: Port, problem: Problem) -> list[Finding]:
             Finding(
                 REFUSE,
                 port.name,
-                f"{port.mode} cuts off at {stated} GHz in this guide, "
-                f"above the top of the band ({problem.frequency.stop / 1e9:.3g} "
-                f"GHz). Nothing would propagate: the run would take its full "
-                f"length and return an S-matrix of noise. The guide measures "
-                f"{a * MM_PER_M:.4g} x {b * MM_PER_M:.4g} mm",
+                f"{port.mode} cuts off at {stated} GHz in this "
+                f"{a * MM_PER_M:.4g} x {b * MM_PER_M:.4g} mm guide, above the top "
+                f"of the band at {problem.frequency.stop / 1e9:.3g} GHz, so no mode "
+                "propagates. Check the guide dimensions and the band",
             )
         ]
     if past[0] < 0.0:
@@ -567,10 +561,8 @@ def _check_the_mode_propagates(port: Port, problem: Problem) -> list[Finding]:
                 REFUSE,
                 port.name,
                 f"{port.mode} cuts off at {stated} GHz, inside the band, which starts "
-                f"at {problem.frequency.start / 1e9:.6g} GHz. Below the cutoff the mode "
-                "decays rather than travels, openEMS reads a port there that carries no "
-                "power, and the reflection it reports is not a number that means "
-                "anything; moved to the port's reference plane it grows further. Start "
+                f"at {problem.frequency.start / 1e9:.6g} GHz, so the port carries no "
+                "power below the cutoff and its reflection there is meaningless. Start "
                 f"the band above {stated} GHz",
             )
         ]
@@ -651,10 +643,9 @@ def _check_port_inside_the_grid(port: Port, grid: MeshGrid) -> list[Finding]:
                 Finding(
                     REFUSE,
                     port.name,
-                    f"{span}, entirely outside {runs}. openEMS clips it away "
-                    "without comment, so the port excites nothing and the run "
-                    "reports zeros after its full time. Extend the mesh to "
-                    "cover the port, or move the port onto the structure",
+                    f"{span}, entirely outside {runs}, so openEMS clips it away "
+                    "without a warning and the run returns zeros. Extend the mesh "
+                    "to cover the port, or move the port onto the structure",
                 )
             )
             continue
@@ -674,14 +665,12 @@ def _check_port_inside_the_grid(port: Port, grid: MeshGrid) -> list[Finding]:
                 Finding(
                     REFUSE,
                     port.name,
-                    f"{span}, hanging {' and '.join(past)} of {runs}. A "
-                    f"{port.kind} port is laid as that box on this axis and "
-                    "openEMS clamps a box to the grid edge rather than refusing "
-                    "it, so what is built is the part that fits and the run "
-                    "returns plausible numbers for geometry that was never "
-                    "drawn. Draw the port inside the grid, or - if the grid "
-                    "stops short because the absorber ate the domain - raise "
-                    "ElementsPerWavelength on the Yee grid or lower PMLCells",
+                    f"{span}, hanging {' and '.join(past)} of {runs}. openEMS clamps a "
+                    f"{_NAMED.get(port.kind, port.kind)} port's box to the grid edge on this axis, "
+                    "so the run returns plausible numbers for a port that was not "
+                    "drawn. Draw the port inside the grid. If the absorber leaves "
+                    "too little grid, raise ElementsPerWavelength in the openEMS mesh "
+                    "settings, or lower PMLCells",
                 )
             )
     return findings
@@ -710,18 +699,17 @@ def _check_required_lines_exist(port: Port, grid: MeshGrid) -> list[Finding]:
             gaps = np.abs(lines - position)
             if float(gaps.min()) <= _ON_THE_GRID:
                 continue
+            # openEMS discretises an excitation by walking the grid and asking
+            # what is at each coordinate, and does not move one onto the grid
+            # the way it moves a resistor or a probe.
             findings.append(
                 Finding(
                     REFUSE,
                     port.name,
                     f"it needs a grid line at {AXIS_NAMES[dim]}={position:.6g} "
-                    f"and the nearest is {float(lines[gaps.argmin()]):.6g}. "
-                    "openEMS discretises an excitation by walking the grid and "
-                    "asking what is at each coordinate, and it does not move "
-                    "one onto the grid the way it moves a resistor or a probe - "
-                    "so a plane with no line on it drives nothing, and the run "
-                    "completes having excited nothing and returning 0/0. "
-                    "Re-mesh the model, or move the port onto a line",
+                    f"and the nearest is {float(lines[gaps.argmin()]):.6g}, so the "
+                    "port drives nothing and the run returns no result. Mesh the "
+                    "model again, or move the port onto a grid line",
                 )
             )
     return findings
@@ -806,13 +794,10 @@ def _check_the_excitation_is_sampled(port: Port, grid: MeshGrid) -> list[Finding
                 port.name,
                 f"its excitation box spans {AXIS_NAMES[axis]}={low:.4g} to "
                 f"{high:.4g}, and the nearest {what} is at "
-                f"{float(samples[gaps.argmin()]):.4g}, outside it. openEMS "
-                f"samples the field at {what}s along {AXIS_NAMES[axis]} and "
-                "lays an excitation only where its box holds one. Unlike a "
-                "resistor or a probe it is moved onto no line of its own, so "
-                "this port drives nothing and the run returns 0/0 after taking "
-                f"its full time. Refine the mesh across {AXIS_NAMES[axis]}, or "
-                "add a mesh refinement region over the port",
+                f"{float(samples[gaps.argmin()]):.4g}, outside it. openEMS lays "
+                f"an excitation only where its box holds a {what}, so the port "
+                "drives nothing and the run returns no result. Refine the mesh "
+                f"across {AXIS_NAMES[axis]}, or add a Mesh Refinement over the port",
             )
         )
     return findings
@@ -846,13 +831,36 @@ def _check_port_clear_of_absorber(port: Port, grid: MeshGrid) -> list[Finding]:
     ports, so on a padded axis this check cannot fire.
     """
     dim = port.propagation_axis
+    asked = [
+        (dim, "measurement plane", port.measurement_position()),
+        (dim, "feed", port.start[dim] + port.direction * port.feed_shift),
+    ]
+    # A plane the port pins on another axis is where its excitation stands, and
+    # its probes with it. A lumped port fed from a trace's end is flat along the
+    # trace, which is not the axis its current runs on, so that plane can stand
+    # in the absorber at the board's edge with both positions above clear of it.
+    pinned = port.required_lines(driven=True)
+    asked += [
+        (other, "plane", position)
+        for other in range(DIMENSIONS)
+        if other != dim
+        for position in pinned[other]
+    ]
+    return [
+        finding
+        for on, what, position in asked
+        for finding in _in_the_absorber(port, grid, on, what, position)
+    ]
+
+
+def _in_the_absorber(
+    port: Port, grid: MeshGrid, dim: int, what: str, position: float
+) -> list[Finding]:
+    """What :func:`_check_port_clear_of_absorber` says of one position of a
+    port along the axis ``dim``, or nothing where it stands clear."""
     lines = grid[dim]
     cells = _absorber_cells(grid, dim)
     axis = AXIS_NAMES[dim]
-    positions = {
-        "measurement plane": port.measurement_position(),
-        "feed": port.start[dim] + port.direction * port.feed_shift,
-    }
 
     # An axis the absorber covers has no interior for a port to be outside of,
     # and no depth as laid to quote: the two blocks together are at least as
@@ -868,64 +876,58 @@ def _check_port_clear_of_absorber(port: Port, grid: MeshGrid) -> list[Finding]:
     # It decides which wall a position is judged against, and nothing else.
     low, high = interior if interior is not None else ((edges[0] + edges[1]) / 2,) * 2
 
-    findings = []
-    for what, position in positions.items():
-        # A plane drawn on the face the absorber begins at lies on it to within
-        # the arithmetic that placed it, which is FLATNESS and not zero.
-        if not covered and low - FLATNESS <= position <= high + FLATNESS:
-            continue
-        face = 0 if position < low else 1
-        end = "min" if face == 0 else "max"
-        beyond = (edges[0] - position) if face == 0 else (position - edges[1])
+    # A plane drawn on the face the absorber begins at lies on it to within the
+    # arithmetic that placed it, which is FLATNESS and not zero.
+    if not covered and low - FLATNESS <= position <= high + FLATNESS:
+        return []
+    face = 0 if position < low else 1
+    end = "min" if face == 0 else "max"
+    beyond = (edges[0] - position) if face == 0 else (position - edges[1])
 
-        # What to do about it, which the case decides. Moving the port further
-        # in is the answer to a plane past the edge and to one inside a block,
-        # and it is no answer at all on an axis the absorber covers: there is
-        # nowhere on that axis to move to.
-        advice = (
-            "Move it further in, or raise ElementsPerWavelength on the Yee grid "
-            "or lower PMLCells to make the absorber thinner"
+    # What to do about it, which the case decides. Moving the port further
+    # in is the answer to a plane past the edge and to one inside a block,
+    # and it is no answer at all on an axis the absorber covers: there is
+    # nowhere on that axis to move to.
+    advice = (
+        "Move the port further in, or make the absorber thinner: raise "
+        "ElementsPerWavelength in the openEMS mesh settings, or lower PMLCells"
+    )
+    if beyond > 0:
+        where = (
+            f"outside the grid, which runs {edges[0]:.4g} to {edges[1]:.4g} "
+            f"and stops {beyond:.4g} mm short of it"
         )
-        if beyond > 0:
-            where = (
-                f"outside the grid, which runs {edges[0]:.4g} to {edges[1]:.4g} "
-                f"and stops {beyond:.4g} mm short of it"
-            )
+        why = (
+            "openEMS moves it onto the nearest grid line, deep in the absorber, without a warning"
+            if port.snaps_to_the_grid() and what != "plane"
+            else f"openEMS does not move a {_NAMED.get(port.kind, port.kind)} plane onto the "
+            "grid, so the port measures nothing and the run returns no result"
+        )
+    else:
+        inside = (low - position) if face == 0 else (position - high)
+        if covered:
+            advice = "Lower PMLCells, or mesh this axis more finely"
+            where = "inside the absorber, which covers this axis end to end"
             why = (
-                "openEMS moves it onto the nearest line it has, deep in the "
-                "absorber, and reports nothing about the move"
-                if port.snaps_to_the_grid()
-                else f"openEMS does not move a {port.kind} plane onto the grid: "
-                f"with no line there it discretises nothing, and the run "
-                f"completes having measured nothing and returns 0/0"
+                "the absorber attenuates the field there, so anything measured "
+                f"in it is meaningless. The axis has {len(lines) - 1} cells, with "
+                f"{cells[0]} of absorber at its lower face and {cells[1]} at its "
+                "upper"
             )
         else:
-            inside = (low - position) if face == 0 else (position - high)
-            if covered:
-                advice = "Lower PMLCells, or mesh this axis more finely"
-                where = "inside the absorber, which covers this axis end to end"
-                why = (
-                    f"the field there is being attenuated on purpose and "
-                    f"anything measured in it is meaningless. The axis has "
-                    f"{len(lines) - 1} cells and declares {cells[0]} of absorber "
-                    f"at its lower face and {cells[1]} at its upper, so nothing on "
-                    f"it is outside the attenuating region"
-                )
-            else:
-                where = f"inside the absorber (the interior runs {low:.4g} to {high:.4g})"
-                depth = _absorber_depth(grid, dim)[face]
-                why = (
-                    f"the field there is being attenuated on purpose and "
-                    f"anything measured in it is meaningless. The absorber is "
-                    f"{cells[face]} cells and {depth:.4g} mm deep at {axis}={end}, "
-                    f"so this sits {inside:.4g} mm inside it"
-                )
-
-        findings.append(
-            Finding(
-                REFUSE,
-                port.name,
-                f"its {what} sits at {axis}={position:.4g}, {where}; {why}. {advice}",
+            where = f"inside the absorber (the interior runs {low:.4g} to {high:.4g})"
+            depth = _absorber_depth(grid, dim)[face]
+            why = (
+                "the absorber attenuates the field there, so anything measured "
+                f"in it is meaningless. The absorber is {cells[face]} cells and "
+                f"{depth:.4g} mm deep at {axis}={end}, and this sits "
+                f"{inside:.4g} mm inside it"
             )
+
+    return [
+        Finding(
+            REFUSE,
+            port.name,
+            f"its {what} sits at {axis}={position:.4g}, {where}; {why}. {advice}",
         )
-    return findings
+    ]

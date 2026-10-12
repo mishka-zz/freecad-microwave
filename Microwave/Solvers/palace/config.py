@@ -78,8 +78,9 @@ LINEAR_TOLERANCE = 1.0e-10
 #: study is open, so a closed run that is not converging is still refused at the
 #: iteration it was refused at before.
 #:
-#: Raising it changes no run that converged below it. Palace stops at the
-#: tolerance before it tests the cap (``palace/linalg/iterative.cpp:625``), and
+#: Raising it changes no run that converged below it. Palace ends the GMRES
+#: cycle on the first iteration that meets the tolerance or reaches the cap, both
+#: tested in one condition (``palace/linalg/iterative.cpp:625``), and
 #: the Krylov space's size, which is the cap where nothing else sets it
 #: (``palace/utils/iodata.cpp:503-505``), is allocated ten vectors at a time as
 #: the iterations reach it (``palace/linalg/iterative.cpp:484-514``), so the same
@@ -96,6 +97,40 @@ OPEN_LINEAR_ITERATIONS = 1000
 #: fixed at 200 (``palace/models/spaceoperator.cpp``,
 #: ``ProjectBdrCoefficientViaMassSolve``).
 ESTIMATOR_ITERATIONS = 10000
+
+
+#: The lowest element order whose multigrid smoothing this adapter sets.
+#:
+#: Palace smooths each level of its p-multigrid with a Chebyshev polynomial of
+#: order ``max(2 * order, 4)`` (``palace/utils/iodata.cpp``, ``mg_smooth_order``),
+#: and each step of it applies the operator of that level, which at order three
+#: and above is the dearest work in a solve. A smoother of the element's own
+#: order applies that operator fewer times in each iteration and still damps
+#: what the coarse level leaves, so the iterations do not grow to take back what
+#: it saves. Below this order Palace's own is four, which is not lowered.
+SMOOTHED_FROM = 3
+
+
+def smoothing(order: int) -> dict[str, int]:
+    """The smoother's order where this adapter sets it, as Palace's ``Linear``
+    block takes it, or nothing where Palace's own stands."""
+    return {"MGSmoothOrder": order} if order >= SMOOTHED_FROM else {}
+
+
+def coarse(absorbing: bool) -> dict[str, bool]:
+    """How the coarsest multigrid level is factored, as Palace's ``Linear``
+    block takes it, or nothing where Palace's own stands.
+
+    Palace factors that level exactly, by default from the sum of the
+    operator's real and imaginary parts, which drops the coupling between the
+    two (``ComplexCoarseSolve``, ``palace/linalg/ksp.cpp``). An absorbing surface
+    puts its whole term in the imaginary part, so on an open study that
+    coarse correction misses what the surface does and GMRES makes up for it in
+    iterations. The real block form of the complex operator is four times the
+    coarsest level's matrix, which is the smallest in the hierarchy. A closed
+    study keeps Palace's own.
+    """
+    return {"ComplexCoarseSolve": True} if absorbing else {}
 
 
 #: The order of the absorbing condition on the open sides of the reserved air.
@@ -146,30 +181,28 @@ class Filling:
     conductivity: float = 0.0
 
     def __post_init__(self) -> None:
+        # Each message names the material's own property, and follows the
+        # material's label where it reaches the user.
         for name, stated in (
-            ("permittivity", self.permittivity),
-            ("permeability", self.permeability),
+            ("Permittivity", self.permittivity),
+            ("Permeability", self.permeability),
         ):
             if not (math.isfinite(stated) and stated > 0):
-                raise ValueError(
-                    f"a relative {name} of {stated:g} carries no wave: it is a positive number"
-                )
+                raise ValueError(f"{name} is {stated:g}. Enter a finite value above 0")
+        # A negative loss would be a material that supplies energy.
         for name, loss, unit in (
-            ("loss tangent", self.loss_tangent, ""),
-            ("conductivity", self.conductivity, " S/m"),
+            ("LossTangent", self.loss_tangent, ""),
+            ("Conductivity", self.conductivity, " S/m"),
         ):
             if not math.isfinite(loss):
-                raise ValueError(f"a {name} of {loss:g}{unit} is not a number a loss can be")
+                raise ValueError(f"{name} is {loss:g}{unit}. Enter a finite value of 0 or more")
             if loss < 0:
-                raise ValueError(
-                    f"a {name} of {loss:g}{unit} is not a loss: a negative one would be a "
-                    "material that supplies energy"
-                )
+                raise ValueError(f"{name} is {loss:g}{unit}. Enter a finite value of 0 or more")
         if self.loss_tangent and self.conductivity:
             raise ValueError(
-                f"a loss tangent of {self.loss_tangent} and a conductivity of "
-                f"{self.conductivity} are two models of one loss, and this solver "
-                "takes one or the other"
+                f"LossTangent is {self.loss_tangent:g} and Conductivity is "
+                f"{self.conductivity:g} S/m, and Palace takes one loss model or the other. "
+                "Set one of them to 0"
             )
 
     @property
@@ -341,8 +374,9 @@ class WavePort:
         """The power through the port's face, measured leaving the model.
 
         Indexed by the port's own number, which names it in this table as it
-        does in every other: Palace numbers each kind of postprocessing apart
-        from the ports (``palace/utils/configfile.cpp:186-204``).
+        does in every other: Palace keeps each kind of postprocessing in a map of
+        its own, keyed by ``Index`` and apart from the ports
+        (``palace/utils/configfile.cpp:919-926``).
         """
         return {
             "Index": self.index,
@@ -488,14 +522,15 @@ class Adaptive:
     def __post_init__(self) -> None:
         if not 0 < self.tolerance < 1:
             raise ValueError(
-                f"the sweep tolerance is {self.tolerance}, and a relative error is "
-                "above zero and below one"
+                f"SweepTolerance is {self.tolerance:g}. Enter a value above 0 and below 1"
             )
+        # An adaptive sweep solves both ends of the band, then needs
+        # CONVERGENCE_MEMORY more inside its tolerance.
         if self.solves < FEWEST_SOLVES:
             raise ValueError(
-                f"an adaptive sweep is allowed {self.solves} full solves, and it solves "
-                f"both ends of the band and then needs {CONVERGENCE_MEMORY} more inside "
-                f"its tolerance, so it can stop no sooner than {FEWEST_SOLVES}"
+                f"SweepSolves is {self.solves}, and an adaptive sweep needs at least "
+                f"{FEWEST_SOLVES} full solves to converge. Set SweepSolves to "
+                f"{FEWEST_SOLVES} or more"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -536,13 +571,16 @@ class Sweep:
     def __post_init__(self) -> None:
         if self.start <= 0 or self.stop <= 0:
             raise ValueError(
-                f"the band runs from {self.start} Hz to {self.stop} Hz, and a "
-                "frequency-domain solve has nothing to answer at zero"
+                f"the band runs from {self.start:g} Hz to {self.stop:g} Hz. Set "
+                "FrequencyStart and FrequencyStop above 0 Hz"
             )
         if self.stop < self.start:
-            raise ValueError(f"the band ends at {self.stop} Hz and starts at {self.start} Hz")
+            raise ValueError(
+                f"the band ends at {self.stop:g} Hz, below its start at {self.start:g} Hz. "
+                "Set FrequencyStop above FrequencyStart"
+            )
         if self.points <= 0:
-            raise ValueError(f"the band is asked for at {self.points} points")
+            raise ValueError(f"FrequencyPoints is {self.points}. Enter 1 or more")
         if self.adaptive is not None and self.samples <= self.adaptive.solves:
             raise ValueError(
                 f"the band is asked for at {self.samples} points and an adaptive sweep is "
@@ -785,6 +823,8 @@ class Driven:
                     "Tol": LINEAR_TOLERANCE,
                     "MaxIts": OPEN_LINEAR_ITERATIONS if self.absorbing else LINEAR_ITERATIONS,
                     "EstimatorMaxIts": ESTIMATOR_ITERATIONS,
+                    **smoothing(self.order),
+                    **coarse(bool(self.absorbing)),
                 },
             },
         }

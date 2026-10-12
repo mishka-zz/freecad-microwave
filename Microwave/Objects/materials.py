@@ -19,7 +19,7 @@ unchanged on a machine with no catalogs installed at all.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
 import FreeCAD
@@ -32,19 +32,41 @@ if TYPE_CHECKING:
 
 class EMMaterial(ViewProviderRestored):
     def __init__(self, obj):
-        obj.addProperty("App::PropertyEnumeration", "MaterialType", "Material")
-        obj.MaterialType = ["Dielectric", "PEC", "ConductingSheet", "FrequencyDependentDielectric"]
-        obj.addProperty("App::PropertyFloat", "Permittivity", "Material")
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "MaterialType",
+            "Material",
+            "Dielectric, PEC for a perfect conductor, or Conducting Sheet for a metal"
+            " of finite Conductivity and Thickness",
+        )
+        obj.MaterialType = [
+            "Dielectric",
+            "PEC",
+            "Conducting Sheet",
+            "Frequency Dependent Dielectric",
+        ]
+        obj.addProperty("App::PropertyFloat", "Permittivity", "Material", "Relative permittivity")
         obj.Permittivity = 1.0
-        obj.addProperty("App::PropertyFloat", "Permeability", "Material")
+        obj.addProperty("App::PropertyFloat", "Permeability", "Material", "Relative permeability")
         obj.Permeability = 1.0
-        obj.addProperty("App::PropertyFloat", "Conductivity", "Material")
+        obj.addProperty(
+            "App::PropertyFloat", "Conductivity", "Material", "Conductivity, in S/m (0 = none)"
+        )
         obj.Conductivity = 0.0
-        obj.addProperty("App::PropertyFloat", "LossTangent", "Material")
+        obj.addProperty(
+            "App::PropertyFloat", "LossTangent", "Material", "Dielectric loss tangent (0 = none)"
+        )
         obj.LossTangent = 0.0
-        obj.addProperty("App::PropertyLength", "Thickness", "Material")
+        obj.addProperty(
+            "App::PropertyLength",
+            "Thickness",
+            "Material",
+            "Metal thickness of a Conducting Sheet. It sets the loss and is not drawn",
+        )
         obj.Thickness = 0.035
-        obj.addProperty("App::PropertyColor", "Color", "Material")
+        obj.addProperty(
+            "App::PropertyColor", "Color", "Material", "Colour of the shapes bound to this material"
+        )
         obj.Color = (0.8, 0.8, 0.8)
 
         # The frequency Permittivity and LossTangent are quoted at. Editable,
@@ -55,7 +77,7 @@ class EMMaterial(ViewProviderRestored):
             "App::PropertyFrequency",
             "MeasuredAt",
             "Material",
-            "Frequency the permittivity and loss tangent are quoted at (0 = unstated)",
+            "Frequency Permittivity and LossTangent are quoted at (0 = not stated)",
         )
         obj.MeasuredAt = 0.0
 
@@ -63,7 +85,7 @@ class EMMaterial(ViewProviderRestored):
         # because a second place to edit the values would skip the rule that an
         # edited material keeps what was typed. Solvers/materials.py reads it.
         for name, description in (
-            ("DispersionFrequency", "Frequencies of the catalog's measured rows"),
+            ("DispersionFrequency", "Frequency of each measured row in the catalog"),
             ("DispersionPermittivity", "Permittivity the catalog states at each row"),
             ("DispersionLossTangent", "Loss tangent the catalog states at each row"),
         ):
@@ -71,9 +93,8 @@ class EMMaterial(ViewProviderRestored):
                 "App::PropertyFloatList",
                 name,
                 "Material",
-                f"{description}. While this material's values are the catalog's, each "
-                "study solves at the row nearest its band centre; edit a value and "
-                "every study solves at the values shown",
+                f"{description}. Each study solves at the row nearest its band centre"
+                " until a value of this material is edited, and at the values shown after",
             )
             obj.setEditorMode(name, 1)
 
@@ -84,8 +105,8 @@ class EMMaterial(ViewProviderRestored):
         for name, description in (
             ("Source", "Catalog and material this came from, as catalog:material"),
             ("SourceCatalog", "Name and version of that catalog when it was picked"),
-            ("SourceDigest", "Fingerprint of the values as the catalog stated them"),
-            ("Description", "What the catalog says this material is"),
+            ("SourceDigest", "Checksum of the values as the catalog stated them"),
+            ("Description", "The catalog's description of this material"),
         ):
             obj.addProperty("App::PropertyString", name, "Provenance", description)
             obj.setEditorMode(name, 1)
@@ -104,8 +125,15 @@ class EMMaterial(ViewProviderRestored):
 
 class EMMaterialBinding(ViewProviderRestored):
     def __init__(self, obj):
-        obj.addProperty("App::PropertyLink", "Material", "Binding")
-        obj.addProperty("App::PropertyLinkSubList", "References", "Binding")
+        obj.addProperty(
+            "App::PropertyLink", "Material", "Binding", "The material References are made of"
+        )
+        obj.addProperty(
+            "App::PropertyLinkSubList",
+            "References",
+            "Binding",
+            "The bodies or faces made of Material",
+        )
         obj.Proxy = self
 
     def execute(self, obj):
@@ -137,17 +165,25 @@ def _identifier(name: str) -> str:
     return cleaned.strip("_") or "EMMaterial"
 
 
+#: What a binding made without a name of its own is called in the tree.
+BINDING_LABEL = "Material Binding"
+
+
 def createEMMaterialBinding(name: str = "EMMaterialBinding", doc: Any = None) -> Any:
     doc = doc or FreeCAD.ActiveDocument
     obj = doc.addObject("App::FeaturePython", name)
     EMMaterialBinding(obj)
+    if name == "EMMaterialBinding":
+        obj.Label = BINDING_LABEL
     from ._vp_hook import inject_view_provider
 
     inject_view_provider(obj, "EMMaterialBinding")
     return obj
 
 
-def fill_binding(binding: Any, selection: Iterable[Any]) -> list[str]:
+def fill_binding(
+    binding: Any, selection: Iterable[Any], study: Any, copies: Sequence[str] = ()
+) -> list[str]:
     """Set a binding's two links from what the user had picked. Returns the rest.
 
     The two halves of a pick are distinguishable: one of the objects is an
@@ -160,13 +196,19 @@ def fill_binding(binding: Any, selection: Iterable[Any]) -> list[str]:
     names no material and one that binds to nothing, both by name, so leaving a
     link empty costs a message and never a wrong answer. Half a binding with the
     other half to fill in is more use than no binding and an error.
+
+    ``study`` is the study the binding joins. A pick that depends on it is left
+    out of ``References`` and named, since a link to it would close a cycle.
+    ``copies`` names the picks :func:`Microwave.picks.resolved` left out, made
+    inside the copy a link shows.
     """
+    from ..picks import copy_note
     from .kinds import kind_of
-    from .mesh import references_from
+    from .mesh import cycle_note, reaching, references_from
 
     picked = [getattr(chosen, "Object", chosen) for chosen in selection]
     materials = [obj for obj in picked if kind_of(obj) == "EMMaterial"]
-    references = references_from(selection)
+    references = references_from(selection, study)
 
     notes = []
     if len(materials) == 1:
@@ -179,13 +221,17 @@ def fill_binding(binding: Any, selection: Iterable[Any]) -> list[str]:
         # not see without opening the property editor.
         named = ", ".join(repr(obj.Label) for obj in materials)
         notes.append(
-            f"{len(materials)} materials were selected ({named}); a binding carries "
-            "one, so set Material in the property editor"
+            f"{len(materials)} materials were selected ({named}), and a binding takes "
+            "one. Set Material in the property editor"
         )
 
+    if copies:
+        notes.append(copy_note(copies))
+    if cyclic := reaching(selection, study):
+        notes.append(cycle_note(cyclic))
     if references:
         binding.References = references
-    else:
+    elif not cyclic and not copies:
         notes.append("no geometry was selected; set References in the property editor")
     return notes
 

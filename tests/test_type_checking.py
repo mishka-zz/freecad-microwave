@@ -141,6 +141,7 @@ def test_the_layers_held_less_strictly_are_the_ones_written_down_here():
             {
                 "Microwave.Commands",
                 "Microwave.Gui.*",
+                "Microwave.batch",
                 "Microwave.Objects.*",
                 "Microwave.ViewProviders.*",
             }

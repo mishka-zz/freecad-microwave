@@ -57,6 +57,9 @@ __all__ = [
     "swept",
     "turned_over",
     "unfilled",
+    "bounding",
+    "holding",
+    "standing_on",
 ]
 
 
@@ -219,11 +222,12 @@ def fragment(
     return {label: sorted(pieces) for label, pieces in resolved.items()}, shapes
 
 
-#: How many points along each parameter of a face are tried in looking for one
-#: on it. The middle of a face's parameter range is not always on the face - on
-#: an annulus it is in the hole - so a grid is walked and the point nearest the
-#: middle kept.
-SAMPLES = 8
+#: How many equal steps each parameter of a face is cut into in looking for a
+#: point on it. The walk tries both ends of every step, so a side holds one point
+#: more than this, and an even count puts one at the middle. The middle of a
+#: face's parameter range is not always on the face - on an annulus it is in the
+#: hole - so the point on the face nearest the middle is kept.
+FACE_SAMPLES = 8
 
 #: How far off a face the point is stepped to ask which volume holds it, as a
 #: share of the face's own largest side, so the step follows the size of the
@@ -282,15 +286,15 @@ def _point_on(face: int) -> list[float] | None:
     """A point of the face's parameter plane that is on the face, nearest the middle."""
     low, high = gmsh.model.getParametrizationBounds(2, face)
     best: tuple[float, list[float]] | None = None
-    for i in range(SAMPLES + 1):
-        for j in range(SAMPLES + 1):
+    for i in range(FACE_SAMPLES + 1):
+        for j in range(FACE_SAMPLES + 1):
             at = [
-                low[0] + (high[0] - low[0]) * i / SAMPLES,
-                low[1] + (high[1] - low[1]) * j / SAMPLES,
+                low[0] + (high[0] - low[0]) * i / FACE_SAMPLES,
+                low[1] + (high[1] - low[1]) * j / FACE_SAMPLES,
             ]
             if not gmsh.model.isInside(2, face, at, parametric=True):
                 continue
-            off = (i - SAMPLES / 2) ** 2 + (j - SAMPLES / 2) ** 2
+            off = (i - FACE_SAMPLES / 2) ** 2 + (j - FACE_SAMPLES / 2) ** 2
             if best is None or off < best[0]:
                 best = (off, at)
     return None if best is None else best[1]
@@ -686,7 +690,7 @@ def rims(held: Iterable[int], top: int) -> dict[int, dict[int, tuple[tuple[int, 
 
 
 #: How many points along a curve :func:`bounds` reads, its two ends among them.
-SAMPLES = 9
+CURVE_SAMPLES = 9
 
 
 def bounds(
@@ -708,7 +712,9 @@ def bounds(
     found[curve] = {}
     for tag in rims[curve]:
         low, high = gmsh.model.getParametrizationBounds(curve, tag)
-        steps = [low[0] + (high[0] - low[0]) * i / (SAMPLES - 1) for i in range(SAMPLES)]
+        steps = [
+            low[0] + (high[0] - low[0]) * i / (CURVE_SAMPLES - 1) for i in range(CURVE_SAMPLES)
+        ]
         at = gmsh.model.getValue(curve, tag, steps)
         points = [at[i : i + 3] for i in range(0, len(at), 3)]
         least = tuple(min(point[axis] for point in points) for axis in range(3))

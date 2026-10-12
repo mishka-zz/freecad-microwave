@@ -159,7 +159,7 @@ def build(doc, case):
     analysis = createEMAnalysis(doc)
     analysis.Label = f"Resonator on Palace ({case})"
     analysis.FrequencyStart, analysis.FrequencyStop = BAND
-    analysis.NumFrequencyPoints = POINTS[case]
+    analysis.FrequencyPoints = POINTS[case]
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [obj for obj in analysis.Group if obj is not member]
@@ -181,7 +181,7 @@ def build(doc, case):
         made = createEMPortRectWaveguide(f"Port{number}")
         made.Label = f"Port{number}"
         made.Number = number
-        made.Excitation = True
+        made.Driven = True
         made.PropagationAxis = "X" if at == 0.0 else "-X"
         made.CrossSection = (guide, [ends[at]])
         made.ReferencedTo = PORT_IMPEDANCE
@@ -192,7 +192,7 @@ def build(doc, case):
     settings = contents(analysis).settings
     for axis in "XYZ":
         for end in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{end}", "Ends")
+            setattr(settings, f"Boundary{axis}{end}", "PEC Wall")
     doc.recompute()
     return analysis
 

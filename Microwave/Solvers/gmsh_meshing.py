@@ -302,7 +302,7 @@ def mesh(
                 )
             )
         except OSError as error:
-            raise MeshFailed(f"the mesher could not be started as {python}: {error}") from error
+            raise MeshFailed(f"Gmsh could not be started with {python}: {error}") from error
         with cancel.watching(process, group=True):
             stdout, stderr = process.communicate()
     # Before the answer is looked at. A child stopped on its way out may still
@@ -317,15 +317,15 @@ def mesh(
     if not answer.is_file():
         said = (stderr or stdout).strip()
         raise MeshFailed(
-            f"the mesher exited with code {process.returncode} and left no answer at "
-            f"{answer}. " + (said or "It said nothing about why")
+            f"Gmsh exited with code {process.returncode} and left no answer at "
+            f"{answer}. " + (said or "It printed nothing")
         )
     try:
         return from_answer(json.loads(answer.read_text(encoding="utf-8")))
     except (json.JSONDecodeError, KeyError, TypeError) as error:
         raise MeshFailed(
-            f"the mesher exited with code {process.returncode} and left {answer}, which "
-            f"is not an answer: {error}"
+            f"Gmsh exited with code {process.returncode} and left an unreadable "
+            f"answer at {answer}: {error}"
         ) from error
 
 
@@ -567,13 +567,13 @@ def find_interpreter(
         # and one that landed between candidates. A stopped search would
         # otherwise end by saying no mesher is installed.
         if cancel is not None and cancel.requested:
-            raise Cancelled("stopped while looking for the mesher's interpreter")
+            raise Cancelled("the mesh was stopped while looking for Gmsh")
         if found:
             return path
 
     detail = "\n  ".join(tried) if tried else "nothing to try"
     raise MesherNotFound(
-        "no mesher was found. Install this workbench's optional gmsh dependency "
-        "through the Addon Manager, or set "
+        "no Python that can import Gmsh was found. Install this workbench's optional gmsh "
+        "dependency through the Addon Manager, or set "
         f"${INTERPRETER_ENV_VAR} to a Python that can 'import gmsh'.\nTried:\n  {detail}"
     )

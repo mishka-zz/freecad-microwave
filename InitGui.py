@@ -30,7 +30,10 @@ def _workbench_icon():
 
 class MicrowaveWorkbench(Workbench):
     MenuText = "Microwave"
-    ToolTip = "Modern high-frequency EM simulation workbench"
+    ToolTip = (
+        "Electromagnetic design: mark up a device, run it on openEMS or Palace, "
+        "and read S-parameters back"
+    )
     # Assigned after the class body rather than in it. FreeCAD execs this file
     # with separate globals and locals, so a module-level def lands in the
     # locals while a class body resolves free names against the globals.
@@ -120,8 +123,9 @@ def _install_document_support():
     cheap. It registers a hook and an observer, imports no Qt, and leaves the
     per-provider modules to be imported inside ``inject_vp``. The observer fills
     gaps only on objects this workbench defines a proxy class for, and marks a
-    mesh this workbench put in a study, so it does nothing for every other
-    document in the session.
+    mesh this workbench put in a study, so it does nothing to the objects of
+    every other document in the session. It closes the charts drawn from any
+    document that closes.
     """
     try:
         from Microwave import Objects, ViewProviders

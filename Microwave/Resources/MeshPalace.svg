@@ -1,0 +1,4 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Mesh (Palace): an unstructured triangulation, the element Palace solves on. -->
+  <path d="M9 9 H55 V55 H9 Z M9 9 L25 26 M32 9 L25 26 M32 9 L41 30 M55 9 L41 30 M55 32 L41 30 M9 32 L25 26 M25 26 L41 30 M25 26 L30 42 M41 30 L30 42 M9 32 L30 42 M9 55 L30 42 M32 55 L30 42 M55 55 L30 42 M55 55 L41 30" stroke="#2f9e7d" stroke-width="3" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

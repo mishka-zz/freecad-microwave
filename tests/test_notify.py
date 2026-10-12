@@ -20,15 +20,15 @@ class TestARefusalGoesToBothChannels:
     """Nothing happened, so the sentence is the whole outcome of the press."""
 
     def test_the_console_keeps_it_and_the_box_delivers_it(self, qt, capsys):
-        notify.refused("Update Mesh", "'Trace' is not axis-aligned")
+        notify.refused("Mesh", "'Trace' is not axis-aligned")
 
         assert capsys.readouterr().out == "ERROR: Microwave: 'Trace' is not axis-aligned\n"
-        assert shown(qt) == (qt.Warning, "Update Mesh", "'Trace' is not axis-aligned")
+        assert shown(qt) == (qt.Warning, "Mesh", "'Trace' is not axis-aligned")
 
     def test_the_box_belongs_to_the_main_window(self, qt):
         """Nothing else holds a reference: the parent owns the box once this
         returns, and closing it is what deletes it."""
-        notify.refused("Update Mesh", "no")
+        notify.refused("Mesh", "no")
 
         qt.assert_called_once_with("the main window")
         qt.return_value.setAttribute.assert_called_once()
@@ -37,14 +37,14 @@ class TestARefusalGoesToBothChannels:
     def test_the_window_title_is_set_as_well_as_the_headline(self, qt):
         """macOS drops it, which is why the headline carries the name too.
         Everywhere else it is what the window is called."""
-        notify.refused("Update Mesh", "no")
+        notify.refused("Mesh", "no")
 
-        qt.return_value.setWindowTitle.assert_called_once_with("Update Mesh")
+        qt.return_value.setWindowTitle.assert_called_once_with("Mesh")
 
     def test_the_box_is_shown_and_not_executed(self, qt):
         """What keeps a real FreeCAD driveable without a human: the modal
         calls run an event loop until somebody presses OK."""
-        notify.refused("Update Mesh", "no")
+        notify.refused("Mesh", "no")
 
         qt.return_value.show.assert_called_once()
         qt.return_value.exec_.assert_not_called()
@@ -55,7 +55,7 @@ class TestARefusalGoesToBothChannels:
         """Building a widget with no QApplication aborts the process."""
         monkeypatch.setattr(notify, "main_window", lambda: None)
 
-        notify.refused("Update Mesh", "'Trace' is not axis-aligned")
+        notify.refused("Mesh", "'Trace' is not axis-aligned")
 
         assert "not axis-aligned" in capsys.readouterr().out
         qt.assert_not_called()

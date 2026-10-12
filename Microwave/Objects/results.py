@@ -4,7 +4,8 @@
 """The S-matrix, as something the document owns.
 
 ``EMSParameters`` is the result object for it: the N×N matrix a sweep produced,
-sitting in the analysis group beside the ports it describes.
+held in the run that solved it - see ``Objects/runs.py`` - or standing in a
+study on its own.
 
 The matrix is stored in the document, as flat lists of floats, rather than as a
 path to a file beside it. A ``.s2p`` beside the document is a dangling reference
@@ -29,12 +30,13 @@ recorded instead is the envelope digest of every run that went into the matrix,
 so the question can be answered exactly from what the object carries.
 """
 
+import base64
 import json
 
 import FreeCAD
 import numpy as np
 
-from ..Results import modelled
+from ..Results import modelled, touchstone
 from ..Results.sparameters import ResultError, SParameters
 from ._vp_hook import ViewProviderRestored
 
@@ -73,6 +75,19 @@ SUMMARY = (
 )
 
 
+#: Properties a table read from a Touchstone file carries, besides the matrix.
+#: Read-only: they say what came in, and the file is never read again.
+FILE = ("FileName", "FileDigest", "Imported", "ReadAs", "FileComments")
+
+#: The file as it came in, base64 of its bytes. A string property holds text,
+#: and saving one turns a control character into another character, so the
+#: bytes are kept in a form that survives and checked against the digest.
+EMBEDDED = "Embedded"
+
+#: What an imported table's ports are referenced to: the user's declaration.
+REFERENCED_TO = "ReferencedTo"
+
+
 class EMSParameters(ViewProviderRestored):
     """One N×N S-matrix against frequency, referenced to a stated impedance.
 
@@ -80,6 +95,8 @@ class EMSParameters(ViewProviderRestored):
     :class:`~..Results.sparameters.SParameters` and stores it through the same
     :func:`store`, and every consumer above works unchanged. Which backend it
     was is in ``Provenance``, written by the run, and :func:`backend` reads it.
+    A table read from a Touchstone file is one of these too, filled by
+    :func:`hold_file`, and names no backend.
     """
 
     def __init__(self, obj):
@@ -170,12 +187,8 @@ class EMSParameters(ViewProviderRestored):
             "Imaginary part of the impedance each port measured, flattened the same way",
         )
 
-        obj.addProperty(
-            "App::PropertyInteger", "Ports", "Result", "How many ports the matrix covers"
-        )
-        obj.addProperty(
-            "App::PropertyInteger", "Points", "Result", "How many frequency samples it holds"
-        )
+        obj.addProperty("App::PropertyInteger", "Ports", "Result", "Number of ports in the matrix")
+        obj.addProperty("App::PropertyInteger", "Points", "Result", "Number of frequency points")
         obj.addProperty(
             "App::PropertyFrequency", "FrequencyStart", "Result", "Lowest frequency in the result"
         )
@@ -195,13 +208,13 @@ class EMSParameters(ViewProviderRestored):
             "App::PropertyStringList",
             "Modelled",
             "Result",
-            "How the solver modelled each lossy material, and an outside open to free space",
+            "How the solver modelled each lossy material and each face open to free space",
         )
         obj.addProperty(
             "App::PropertyString",
             "Provenance",
             "Result",
-            "Where this matrix came from: solver, version, envelope digest, as JSON",
+            "The run that produced this matrix: solver, version and input checksum, as JSON",
         )
 
         for name in BULK:
@@ -211,8 +224,26 @@ class EMSParameters(ViewProviderRestored):
 
         obj.Proxy = self
 
+    def onChanged(self, obj, prop):
+        """Restate an imported table's reference where the user redeclared it
+        or moved its ports onto the drawing's.
+
+        Restore is left alone: the summary travels in the file with what it
+        summarises.
+        """
+        if prop not in (REFERENCED_TO, "PortNumbers") or not is_imported(obj):
+            return
+        document = getattr(obj, "Document", None)
+        if document is None or getattr(document, "Restoring", False):
+            return
+        try:
+            obj.Reference = load(obj).reference_description()
+        except ResultError:
+            obj.Reference = ""
+
     def execute(self, obj):
-        """Nothing. A result records a solve that already happened.
+        """Nothing. A result records a solve that already happened, or a file
+        read in.
 
         Recomputing must never look like re-solving. The numbers here cost
         minutes of FDTD, and an ``execute`` that touched them would silently
@@ -230,15 +261,6 @@ class EMSParameters(ViewProviderRestored):
 #: shows its mesh in the study. See ``Objects/fem_mesh.py``'s ``IDENTITY``.
 SOLVED_ON = "mesh"
 
-#: What a result's label gains while the study shows a mesh other than the one
-#: it was solved on, a mesh nobody recorded it against, or none.
-APART = " - not solved on the mesh shown"
-
-
-def label(solver, apart=False):
-    """What a result ``solver`` filled is called in the tree."""
-    return f"S-Parameters ({solver})" + (APART if apart else "")
-
 
 def createEMSParameters(doc=None):
     """An empty result object. :func:`store` fills it in."""
@@ -253,13 +275,88 @@ def createEMSParameters(doc=None):
     return obj
 
 
+def is_imported(obj) -> bool:
+    """Whether ``obj`` holds a table read from a file rather than solved."""
+    return hasattr(obj, EMBEDDED)
+
+
+def hold_file(obj, name: str, data: bytes, read: touchstone.Read, when: str):
+    """Fill ``obj`` with the table read from the file ``name``, whose bytes are
+    ``data``, and keep the file in it. Returns ``obj``.
+
+    The file's ports keep the file's numbers until the user moves them onto
+    the drawing's in ``PortNumbers``, which every column then follows, so none
+    is recorded as driven: every column of a file holds numbers.
+
+    :param when: the local time the file came in, with its offset from UTC.
+    """
+    for prop, kind, doc in (
+        ("FileName", "App::PropertyString", "The file this table was read from"),
+        ("FileDigest", "App::PropertyString", "SHA-256 of the file, as it came in"),
+        ("Imported", "App::PropertyString", "When the file was imported, in local time"),
+        ("ReadAs", "App::PropertyStringList", "How the file was read"),
+        ("FileComments", "App::PropertyStringList", "The comments at the head of the file"),
+    ):
+        obj.addProperty(kind, prop, "File", doc)
+    obj.addProperty("App::PropertyString", EMBEDDED, "File", "The file, base64 of its bytes")
+    obj.addProperty(
+        "App::PropertyEnumeration",
+        REFERENCED_TO,
+        "File",
+        "What the file's ports are referenced to. Choose Port impedance for a file"
+        " calibrated to each line's own impedance, even where its option line states"
+        " 50 ohm",
+    )
+    setattr(obj, REFERENCED_TO, list(touchstone.DECLARATIONS))
+
+    store(obj, read.result)
+    obj.DrivenPorts = []
+    obj.SelfReferencedPorts = []
+    obj.FileName = name
+    obj.FileDigest = touchstone.digest(data)
+    obj.Imported = when
+    obj.ReadAs = list(read.said)
+    obj.FileComments = list(read.comments)
+    setattr(obj, EMBEDDED, base64.b64encode(data).decode("ascii"))
+    setattr(obj, REFERENCED_TO, read.suggested)
+    obj.Reference = load(obj).reference_description()
+
+    for prop in FILE:
+        obj.setEditorMode(prop, 1)
+    obj.setEditorMode(EMBEDDED, 2)
+    obj.setEditorMode("PortNumbers", 0)
+    obj.setDocumentationOfProperty(
+        "PortNumbers", "The port number in this document of each of the file's ports, in file order"
+    )
+    # A file records no impedance measured at a port, so these hold what it
+    # states, which is what the matrix is referenced to.
+    for prop in ("PortImpedanceReal", "PortImpedanceImag"):
+        obj.setDocumentationOfProperty(
+            prop, "The reference the file states, flattened (frequency, port)"
+        )
+    return obj
+
+
+def file_bytes(obj) -> bytes:
+    """The file ``obj`` was read from, as it came in.
+
+    :raises ResultError: what the document holds is not that file.
+    """
+    data = base64.b64decode(getattr(obj, EMBEDDED))
+    if touchstone.digest(data) != obj.FileDigest:
+        raise ResultError(
+            f"{getattr(obj, 'Label', '?')!r}: the copy of the imported file kept in the "
+            "document is damaged. Import the file again"
+        )
+    return data
+
+
 def backend(obj) -> str:
     """Which backend filled ``obj``, as its run's provenance names it, or ``""``.
 
-    A study keeps one result per backend, so that a drawing answered by two of
-    them keeps both answers. The name is read off what the run recorded rather
-    than carried beside it: the adapter that ran wrote it, it is saved with the
-    matrix, and it cannot disagree with the numbers it came with. An object
+    The name is read off what the run recorded rather than carried beside it:
+    the adapter that ran wrote it, it is saved with the matrix, and it cannot
+    disagree with the numbers it came with. An object
     whose provenance is missing or unreadable names no backend.
     """
     return str(provenance(obj).get("solver") or "")
@@ -294,10 +391,16 @@ def store(obj, result: SParameters):
     """
     for name in (*BULK, *SUMMARY):
         if not hasattr(obj, name):
+            # Export reads the bulk and the provenance, so a result missing
+            # anything else can still be written to a file before it goes.
+            keep = (
+                ""
+                if name in (*BULK, "Provenance")
+                else ". To keep it, export it with Export Touchstone first"
+            )
             raise ResultError(
-                f"{getattr(obj, 'Label', '?')!r} has no {name}: it was saved by an earlier "
-                "build, and restoring one does not add what has been added since. Delete "
-                "it, or export it to Touchstone first to keep it, and run again"
+                f"{getattr(obj, 'Label', '?')!r} has no {name}, because an earlier version "
+                f"of the workbench saved it. Delete it and run again{keep}"
             )
     frequency = np.asarray(result.frequency, dtype=float)
     scattering = np.asarray(result.s, dtype=complex)
@@ -372,7 +475,13 @@ def load(obj) -> SParameters:
     numbers = tuple(int(number) for number in obj.PortNumbers)
     if not numbers:
         raise ResultError(
-            f"{getattr(obj, 'Label', '?')!r} holds no S-matrix yet. Run the analysis to fill it"
+            f"{getattr(obj, 'Label', '?')!r} holds no S-matrix yet. Run Simulation to fill it"
+        )
+
+    if len(set(numbers)) != len(numbers) or min(numbers) < 1:
+        raise ResultError(
+            f"{getattr(obj, 'Label', '?')!r} numbers its ports {list(numbers)}. Each port "
+            "needs a different positive number"
         )
 
     points, ports = frequency.size, len(numbers)
@@ -394,7 +503,7 @@ def load(obj) -> SParameters:
     except ValueError:
         provenance = {}
 
-    return SParameters(
+    result = SParameters(
         frequency=frequency,
         s=scattering,
         port_numbers=numbers,
@@ -412,15 +521,17 @@ def load(obj) -> SParameters:
         discarded=tuple(int(i) for i in obj.DiscardedPoints),
         provenance=provenance,
     )
+    if is_imported(obj):
+        return touchstone.declared(result, str(getattr(obj, REFERENCED_TO)))
+    return result
 
 
 def _list(obj, name, expected) -> np.ndarray:
     values = np.asarray(list(getattr(obj, name)), dtype=float)
     if values.size != expected:
         raise ResultError(
-            f"{getattr(obj, 'Label', '?')!r} holds {values.size} values in "
-            f"{name}, but its {len(obj.PortNumbers)} ports over "
-            f"{len(obj.Frequency)} frequencies need {expected}. The result was "
-            "damaged; run the analysis again"
+            f"{getattr(obj, 'Label', '?')!r} is damaged: {name} holds {values.size} "
+            f"values, and {len(obj.PortNumbers)} ports at {len(obj.Frequency)} "
+            f"frequencies need {expected}. Run Simulation again"
         )
     return values

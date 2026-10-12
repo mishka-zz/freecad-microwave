@@ -88,6 +88,19 @@ def restore_view_provider(obj, kind):
     return True
 
 
+class SharesLabel:
+    """Mixin: a kind of which each study holds one under the same label.
+
+    FreeCAD keeps labels unique in a document unless the object allows a
+    duplicate (``src/App/DocumentObject.cpp``), so a second study's solver would
+    otherwise be ``Solver (openEMS)001``. A kind a study holds several of keeps
+    its labels unique, since a message names an object by its label.
+    """
+
+    def allowDuplicateLabel(self, obj):
+        return True
+
+
 class ViewProviderRestored:
     """Mixin: what a restored document object here needs putting back.
 

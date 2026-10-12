@@ -14,8 +14,8 @@ the same way. A third, where a port was given a
 line to read its voltage along, holds its power-voltage impedance. A lumped port
 states its resistance, which is in the configuration rather than in a table.
 What comes back here is the complex matrix, those powers and impedances and the
-port numbers their rows and columns stand for, and nothing else - assembling a result object
-is the neutral layer's, and this adapter never reaches it.
+port numbers their rows and columns stand for, and nothing else. This adapter
+assembles no result object: ``Gui/results.py``'s ``from_palace`` does.
 
 What Palace does with the file decides the refusals. It rewrites every table
 whole at each step and marks none of them partial, so a run stopped part way
@@ -48,6 +48,7 @@ __all__ = [
     "POWER_VOLTAGE",
     "RESISTANCE",
     "TABLE",
+    "UNREAD",
     "ResultsError",
     "Scattering",
     "modes",
@@ -77,6 +78,11 @@ POWER_VOLTAGE = (
     "the power-voltage impedance of its mode, |V|^2 / 2P with P the power the mode "
     "carries, V read along the line across its narrow side at the middle of its broad side"
 )
+
+#: Which impedance a wave port the run read no voltage at states, as the
+#: result's provenance says it: none, its S-parameters referenced to its mode
+#: all the same.
+UNREAD = "its own mode, with no voltage read to give its impedance a figure"
 
 #: What a lumped port states. Palace normalises a lumped port's incident and
 #: reflected waves to its resistance (``LumpedPortData::GetExcitationRefResistance``
@@ -159,18 +165,18 @@ class Scattering:
 def scattering(directory: str | Path, run: Driven) -> Scattering:
     """The matrix in ``directory``, read against the run that asked for it."""
     path = Path(directory) / TABLE
+    # Palace writes the table only where each excitation drives exactly one
+    # port, and says nothing where it does not.
     if not path.is_file():
-        raise ResultsError(
-            f"there is no scattering table at {path}. Palace writes one only where each "
-            "excitation drives exactly one port, and says nothing where it does not"
-        )
+        raise ResultsError(f"Palace wrote no scattering table at {path}")
 
     head, body = _table(path)
+    # Every table is rewritten whole at each step and none of them is marked
+    # partial, so a short table is a run that stopped.
     if len(body) < run.sweep.samples:
         raise ResultsError(
             f"{path} holds {len(body)} of the {run.sweep.samples} samples the band asked "
-            "for. Every table is rewritten whole at each step and none of them is marked "
-            "partial, so this is a run that stopped rather than a run that finished"
+            "for, so the run stopped before it finished"
         )
 
     driven = run.excitations
@@ -192,9 +198,9 @@ def scattering(directory: str | Path, run: Driven) -> Scattering:
         # exits cleanly. A linear solve that diverged also warns, which the log
         # is read for; this is the table read on its own terms.
         raise ResultsError(
-            f"{path} holds a term that is not a finite number at "
+            f"{path}: the solve returned no result at "
             f"{', '.join(f'{f:.6g}' for f in body[unfinished, _column(head, FREQUENCY, path)])} "
-            "GHz, so the solve there produced no answer"
+            "GHz"
         )
 
     band = body[:, _column(head, FREQUENCY, path)]
@@ -248,8 +254,8 @@ def _impedance(path: Path, run: Driven, out: tuple[int, ...], band: Any) -> Any:
         return impedance
     if not path.is_file():
         raise ResultsError(
-            f"there is no table of the ports' impedance at {path}, and the run asked for "
-            f"one at port {', '.join(str(index) for index in stated)}"
+            f"Palace wrote no table of the ports' impedance at {path}, and the run asked "
+            f"for one at port {', '.join(str(index) for index in stated)}"
         )
     head, body = _table(path)
     written = body[:, _column(head, FREQUENCY, path)]
@@ -263,8 +269,7 @@ def _impedance(path: Path, run: Driven, out: tuple[int, ...], band: Any) -> Any:
         if not np.all(np.isfinite(figure) & (figure > 0)):
             raise ResultsError(
                 f"port {index} read an impedance of {figure.tolist()} ohm along the line "
-                "across its face, and a port's impedance is positive. The line read no "
-                "voltage, which is a line that missed the face"
+                "across its face, so the line missed the face and read no voltage"
             )
         impedance[:, out.index(index)] = figure
     return impedance
@@ -279,7 +284,7 @@ def _flux(path: Path, run: Driven, out: tuple[int, ...], band: Any) -> tuple[Any
     the configuration it was given, as the scattering table's is.
     """
     if not path.is_file():
-        raise ResultsError(f"there is no table of the power through the ports at {path}")
+        raise ResultsError(f"Palace wrote no table of the power through the ports at {path}")
     head, body = _table(path)
     if len(body) < run.sweep.samples:
         raise ResultsError(
@@ -317,7 +322,7 @@ def modes(directory: str | Path) -> tuple[complex, ...]:
     order Palace wrote them."""
     path = Path(directory) / MODES_TABLE
     if not path.is_file():
-        raise ResultsError(f"the mode run left no table at {path}")
+        raise ResultsError(f"the mode run wrote no table at {path}")
     head, body = _table(path)
     real, imaginary = _column(head, _REAL, path), _column(head, _IMAGINARY, path)
     return tuple(complex(row[real], row[imaginary]) for row in body)
@@ -333,7 +338,7 @@ def _table(path: Path) -> tuple[list[str], Any]:
     try:
         body = np.array([[float(cell) for cell in row] for row in rows[1:]], dtype=float)
     except ValueError as error:
-        raise ResultsError(f"{path} carries something that is not a number: {error}") from error
+        raise ResultsError(f"{path} holds a value that is not a number: {error}") from error
     if body.size == 0:
         raise ResultsError(f"{path} holds a header and no samples")
     return head, body
@@ -344,6 +349,5 @@ def _column(head: list[str], name: str, path: Path) -> int:
         return head.index(name)
     except ValueError:
         raise ResultsError(
-            f"{path} carries no column {name!r}, so the run measured something other "
-            "than what it was asked for"
+            f"{path} has no column {name!r}, so the run did not measure what it was asked for"
         ) from None

@@ -52,9 +52,10 @@ come back sorted and the first one that leaves the material ends the run.
 That is also the surface openEMS is given. A curved body reaches the engine as a
 polyhedron, and the engine decides a cell's material by counting how many of
 these same triangles a segment crosses (``CSPrimPolyhedron::IsInside``,
-``CSXCAD/src/CSPrimPolyhedron.cpp:290-294``) - so a thickness read here is a
-thickness of the structure that gets solved rather than of the drawing it
-approximates.
+``CSXCAD/src/CSPrimPolyhedron.cpp:290-294``). So a thickness read here is one
+of the triangulation the engine is given, except on a conductor handed over as
+a triangulation, which :meth:`~.model.Problem.as_given` grows by a share of a
+cell before it is built.
 
 **A face's lattice is placed against the face's own boundary.** Every
 measurement off a surface is taken at stations laid across the rectangle the
@@ -346,7 +347,7 @@ class Body:
         whose own lengths are measured always has them, since what decides that
         is whether it arrived as a triangulation rather than as a box. They are
         what a chord is measured against, so the thickness read here is the
-        thickness of the structure that gets solved.
+        thickness of the triangulation as drawn.
     :param metal: Whether its edges carry a field singularity. A dielectric
         corner does not, so nothing is asked for one.
     :param measured: Whether this body's own lengths are read here. The mesher
@@ -776,7 +777,7 @@ def _rims(
     samples a wall. The connection criterion is not among the claims here, and
     that is the difference between this and :func:`_curvatures`. Both criteria,
     and what a hole's rim asks, are in
-    docs/internals/openems-feature-size.md#a-rim-is-not-a-cross-section.
+    docs/internals/openems-feature-size.md#rims-of-metal-drawn-as-an-area.
 
     A curve answers its curvature as a magnitude, where a face answers two
     signed principal ones. Measured on FreeCAD 1.1.1: reversing a circle and
@@ -877,7 +878,7 @@ def _element_counts(
     will ask for, which is the one exception to the rule :func:`_spacing`
     states. The demand covers the chord rather than sitting at its end the way a
     cross-section does. Why each, and what the reach costs a void or a taper,
-    are in docs/internals/openems-feature-size.md#sampled-coarsely-on-purpose.
+    are in docs/internals/openems-feature-size.md#coarse-sampling-of-dielectric-surfaces.
     """
     for number, point, step, chord, begins in _chords(
         body, across * cap, _Stations(body, cap), spend
@@ -1190,7 +1191,7 @@ def _curves(face: Any) -> bool:
     from a curvature there is a length of the shape.
 
     **What the kernel answers on such a face is a rounding rather than a zero.**
-    A cap re-fitted as a spline comes back curving by about 1e-13 per mm, and
+    A cap re-fitted as a spline comes back curving by the residue of the fit, and
     the guards below cannot see that: each is stated against the sharpest bend
     at the same sample, so where every direction is the residue of one
     computation none of them is below the others. Skipping the face is therefore

@@ -16,7 +16,7 @@ one and by that backend's own translation.
 
 import FreeCAD
 
-from ._vp_hook import ViewProviderRestored
+from ._vp_hook import SharesLabel, ViewProviderRestored
 
 #: How an openEMS face absorbs, the first being the default. The adapter states
 #: the list again, because this module imports FreeCAD and the adapter does not;
@@ -35,7 +35,16 @@ WAVEFORMS = ("Gaussian",)
 SWEEPS = ("Adaptive", "Discrete")
 
 
-class EMSolverBase(ViewProviderRestored):
+#: The groups a solver keeps what belongs to the machine a run is made on: where
+#: it writes, and which programs it starts. None of it changes an answer. The
+#: property editor lists a group's properties by name, so the directory has a
+#: group of its own rather than standing among the programs.
+OUTPUT = "Output"
+PROGRAMS = "Paths"
+MACHINE = (OUTPUT, PROGRAMS)
+
+
+class EMSolverBase(SharesLabel, ViewProviderRestored):
     """What every solver is, carrying no property at all.
 
     A property here would reach every backend, and there is nothing left for one
@@ -72,11 +81,14 @@ class EMSolverOpenEMS(EMSolverBase):
     bindings. A property belongs
     here when it is written in that vocabulary. Which face of the domain is a
     wall and which absorbs is not: it follows from what the mesh policy's
-    ``Padding`` says lies beyond each face, which every backend reads. What is
+    ``Boundary`` says lies beyond each face, which every backend reads. What is
     left here is how this one absorbs - a perfectly matched layer so many cells
     deep, or Mur's first-order condition - because "PML with 8 cells" is not a
     neutral concept.
     """
+
+    #: The kind of the mesh settings this backend reads.
+    RECIPE = "EMYeeGrid"
 
     #: What the mesher never reads. The absorber and its depth are not here:
     #: a perfectly matched layer is cells, and Mur's condition takes none.
@@ -85,7 +97,7 @@ class EMSolverOpenEMS(EMSolverBase):
     MOVES_NO_CELL = (
         "EnergyDecay",
         "MaxTimesteps",
-        "SimDir",
+        "RunDirectory",
         "SolverPython",
         "Threads",
         "TimestepFactor",
@@ -94,14 +106,13 @@ class EMSolverOpenEMS(EMSolverBase):
 
     def __init__(self, obj):
         # How every face that absorbs does it. Which faces those are is the mesh
-        # policy's Padding, and openems.policy._boundary is the rule.
+        # policy's Boundary, and openems.policy._boundary is the rule.
         obj.addProperty(
             "App::PropertyEnumeration",
             "Absorber",
             "Absorber",
-            "How each face the mesh policy leaves open absorbs: PML, a perfectly"
-            " matched layer PMLCells deep, or Mur, a first-order condition on the"
-            " face itself",
+            "How each Open face absorbs. PML: a perfectly matched layer PMLCells"
+            " deep. Mur: a first-order absorbing condition on the face",
         )
         obj.Absorber = list(ABSORBERS)
 
@@ -122,7 +133,10 @@ class EMSolverOpenEMS(EMSolverBase):
         )
         obj.Waveform = list(WAVEFORMS)
         obj.addProperty(
-            "App::PropertyInteger", "MaxTimesteps", "Solver", "Maximum number of timesteps"
+            "App::PropertyInteger",
+            "MaxTimesteps",
+            "Solver",
+            "Number of timesteps the run takes (the most it takes when EnergyDecay is not 0)",
         )
         # With EnergyDecay at 0 below, this is the run length rather than a
         # ceiling, and every step is taken. The same number is
@@ -131,14 +145,19 @@ class EMSolverOpenEMS(EMSolverBase):
         obj.MaxTimesteps = 30000
         # Zero disables energy termination. That is the only reproducible
         # setting, and openems.policy._termination says why, and why a positive
-        # level is refused.
+        # level is refused. openEMS compares the energy with the level on every
+        # pass (``openEMS/openems.cpp:1426``), and refreshes the energy it
+        # compares only once more than four seconds of wall clock have passed
+        # since it last did (``openEMS/openems.cpp:1445-1457``). A run shorter
+        # than that takes every step, and a longer one stops at a step count
+        # that depends on machine load.
         obj.addProperty(
             "App::PropertyFloat",
             "EnergyDecay",
             "Solver",
-            "Let openEMS stop early once the energy has fallen below this level under "
-            "its peak, in dB and negative: -40 is 40 dB down (0 = never). openEMS tests "
-            "the level every four seconds of wall clock, so a shorter run takes every step",
+            "Energy level below the peak at which openEMS stops early, in dB: -40 is"
+            " 40 dB down (0 = never). The stop depends on machine load, so set 0 for"
+            " reproducible results",
         )
         obj.EnergyDecay = 0.0
         # Reaches openEMS' SetTimeStepFactor, which applies it only below 1, so
@@ -152,18 +171,29 @@ class EMSolverOpenEMS(EMSolverBase):
             "App::PropertyFloat",
             "TimestepFactor",
             "Solver",
-            "Scale openEMS' own timestep for stability; 1 = leave it alone (0, 1]",
+            "Factor on openEMS' own timestep, above 0 and at most 1 (1 = openEMS'"
+            " own step). Below 1 the run is more stable, and MaxTimesteps covers less time",
         )
         obj.TimestepFactor = 1.0
-        obj.addProperty("App::PropertyInteger", "Threads", "Solver", "Number of threads (0=auto)")
+        obj.addProperty(
+            "App::PropertyInteger",
+            "Threads",
+            "Solver",
+            "Number of threads openEMS runs on (0 = auto)",
+        )
         obj.Threads = 0
 
-        # Infrastructure.
+        # Where it writes, and the program it starts.
         #
         # Every property here must reach something. A setting the user can
         # change that reaches nothing is a silent no-op. Wire it through to the
         # engine, or do not offer it.
-        obj.addProperty("App::PropertyPath", "SimDir", "Infrastructure", "Simulation directory")
+        obj.addProperty(
+            "App::PropertyPath",
+            "RunDirectory",
+            OUTPUT,
+            "Directory each run writes into (blank = beside the document, set at the first run)",
+        )
         # The interpreter that owns the openEMS bindings. It is not FreeCAD's,
         # which is why the solver runs as a subprocess. Empty means search:
         # $MICROWAVE_OPENEMS_PYTHON, this interpreter, then python3 on PATH,
@@ -171,7 +201,7 @@ class EMSolverOpenEMS(EMSolverBase):
         obj.addProperty(
             "App::PropertyString",
             "SolverPython",
-            "Infrastructure",
+            PROGRAMS,
             "Python with the openEMS bindings (blank = search)",
         )
         obj.SolverPython = ""
@@ -206,6 +236,9 @@ class EMSolverPalace(EMSolverBase):
     is ``EMGmshMesh``'s, and both objects are found in the study's Group.
     """
 
+    #: The kind of the mesh settings this backend reads.
+    RECIPE = "EMGmshMesh"
+
     #: Every property this class carries. What decides where an element goes is
     #: the drawing, the mesh policy and ``EMGmshMesh``, and what is here is how
     #: the field is written inside an element already placed - so a property
@@ -218,7 +251,7 @@ class EMSolverPalace(EMSolverBase):
         "MesherPython",
         "Order",
         "Processes",
-        "SimDir",
+        "RunDirectory",
         "SolverPath",
         "Sweep",
         "SweepSolves",
@@ -250,43 +283,49 @@ class EMSolverPalace(EMSolverBase):
             "App::PropertyEnumeration",
             "Sweep",
             "Sweep",
-            "Adaptive: solve a few frequencies in full and answer every point from a "
-            "reduced model built of them. Discrete: solve every point in full",
+            "Adaptive: solve a few frequencies in full and answer every point from a"
+            " reduced model built of them. Discrete: solve every point in full",
         )
         obj.Sweep = list(SWEEPS)
         obj.addProperty(
             "App::PropertyFloat",
             "SweepTolerance",
             "Sweep",
-            "The field error, relative to the field, an adaptive sweep's reduced model "
-            "is built to. It bounds no scattering parameter directly",
+            "Relative field error an adaptive sweep's reduced model is built to. It"
+            " does not bound the S-parameter error directly",
         )
         obj.SweepTolerance = 1e-3
         obj.addProperty(
             "App::PropertyInteger",
             "SweepSolves",
             "Sweep",
-            "The most full solves an adaptive sweep takes for each driven port. A sweep "
-            "that takes them all without converging is refused",
+            "Most full solves an adaptive sweep takes for each driven port. A sweep"
+            " that takes them all without converging is refused",
         )
         obj.SweepSolves = 20
 
         # Every property here must reach something, for the reason
-        # ``EMSolverOpenEMS`` gives above. Those below are read by the panel
-        # that runs this backend, ``Gui/palace_panel.py``, and by nothing that
+        # ``EMSolverOpenEMS`` gives above. Those below are read by the steps of a
+        # run on this backend, ``Gui/palace_steps.py``, and by nothing that
         # translates the document.
         obj.addProperty(
             "App::PropertyInteger",
             "Processes",
             "Solver",
-            "How many MPI processes Palace runs on",
+            "Number of MPI processes Palace runs on (0 = half this machine's logical processors)",
         )
-        # One, because Open MPI refuses more ranks than it counts slots on the
-        # machine, every machine has one, and a default that fails on some
-        # machine is a default nobody can rely on. A user raises it.
-        obj.Processes = 1
+        # Read when the run is made rather than when the study is, so a document
+        # sent to another machine runs on that machine's cores. Half, because
+        # Open MPI refuses more ranks than it counts cores - see
+        # ``Solvers/palace/run.py::ranks``.
+        obj.Processes = 0
 
-        obj.addProperty("App::PropertyPath", "SimDir", "Infrastructure", "Simulation directory")
+        obj.addProperty(
+            "App::PropertyPath",
+            "RunDirectory",
+            OUTPUT,
+            "Directory each run writes into (blank = beside the document, set at the first run)",
+        )
         # Palace is one program started through its own launcher, so what is
         # found is a file rather than an interpreter to prove. Empty means
         # search: $MICROWAVE_PALACE, then palace on PATH. A path given here is
@@ -294,17 +333,18 @@ class EMSolverPalace(EMSolverBase):
         obj.addProperty(
             "App::PropertyString",
             "SolverPath",
-            "Infrastructure",
+            PROGRAMS,
             "The palace launcher (blank = search)",
         )
         obj.SolverPath = ""
         # The palace launcher starts its processes through an MPI launcher it
         # looks for on PATH, and on macOS a FreeCAD started from Finder or the Dock is
-        # given the system's PATH alone. Empty means mpirun on PATH.
+        # given the system's directories and its own, and not a shell's. Empty
+        # means mpirun on PATH.
         obj.addProperty(
             "App::PropertyString",
             "MPILauncher",
-            "Infrastructure",
+            PROGRAMS,
             "The mpirun Palace starts its processes with (blank = mpirun on PATH)",
         )
         obj.MPILauncher = ""
@@ -315,7 +355,7 @@ class EMSolverPalace(EMSolverBase):
         obj.addProperty(
             "App::PropertyString",
             "MesherPython",
-            "Infrastructure",
+            PROGRAMS,
             "Python that can import gmsh (blank = search)",
         )
         obj.MesherPython = ""
@@ -331,7 +371,7 @@ def createEMSolverOpenEMS(doc=None):
 
     obj = doc.addObject("App::FeaturePython", "EMSolverOpenEMS")
     EMSolverOpenEMS(obj)
-    obj.Label = "openEMS"
+    obj.Label = "Solver (openEMS)"
 
     from ._vp_hook import inject_view_provider
 
@@ -350,7 +390,7 @@ def createEMSolverPalace(doc=None):
 
     obj = doc.addObject("App::FeaturePython", "EMSolverPalace")
     EMSolverPalace(obj)
-    obj.Label = "Palace"
+    obj.Label = "Solver (Palace)"
 
     from ._vp_hook import inject_view_provider
 

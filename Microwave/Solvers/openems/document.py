@@ -6,8 +6,8 @@
 This module is the openEMS adapter's front door. Everything upstream of it is
 solver-neutral: materials, ports and mesh policy, all expressed as document
 objects that know nothing about FDTD. Everything downstream is openEMS' own. The
-translation belongs to the adapter rather than to a shared bridge, since NEC2
-will read the same document and ask different questions of it.
+translation belongs to the adapter rather than to a shared bridge, since the
+Palace adapter reads the same document and asks different questions of it.
 
 This module finds what an analysis owns and assembles the answer. Each subject
 is translated by a module of its own, and each states what it refuses:
@@ -44,7 +44,13 @@ from .. import reference_plane
 from ..materials import check_each_links_a_material
 from ..medium import Medium, linked
 from ..medium import said as medium_said
-from ..mesh_regions import Relaxation, check_relaxations_were_used, relaxations, subject
+from ..mesh_regions import (
+    Relaxation,
+    amending,
+    check_relaxations_were_used,
+    relaxations,
+    subject,
+)
 from ..overlaps import Filled
 from ..properties import smallest_response
 from ..sheets import PASSES, lets_through
@@ -60,10 +66,9 @@ from .materials import _is_metal, _material, check_no_two_fill_one_space
 from .model import THROUGH, Frequency, Material, MeshGrid, Port, Problem, Solid, canonical
 from .plan import grid_from, plan_grid, plan_mesh, structure_bounds
 from .policy import (
-    AIR_FACE,
+    OPEN_FACE,
     _absorber_cells,
     _boundary,
-    _check_mesh_policy,
     _check_yee_grid,
     _curve_tolerance,
     _frequency,
@@ -107,9 +112,14 @@ SOLVER = "EMSolverOpenEMS"
 #: name, so the kind is what tells them apart.
 RECIPE = "EMYeeGrid"
 
+#: The kind of a run a study keeps. What a run holds records a solve that
+#: happened, and nothing in it is part of what the study asks now, so the walk
+#: over a study stops there.
+RUN = "EMRun"
+
 #: What a user presses to put the recipe in a study that has none. Named in the
-#: refusal, because a study saved before the grid became an object of its own
-#: has no other route back.
+#: refusal, because the command adds only what the study lacks and leaves what
+#: it already holds as it is.
 RECIPE_COMMAND = "Add openEMS Solver"
 
 #: Layering. Dielectrics underlay metals, and a port's own conductor (priority
@@ -157,7 +167,7 @@ def contents(analysis: Any) -> Contents:
     everything else in this module. Nothing below imports FreeCAD.
 
     Nested groups are followed. Sorting twenty ports into a subgroup is ordinary
-    housekeeping and must not drop them from the study.
+    housekeeping and must not drop them from the study. A run is not followed.
     """
     _check_is_an_analysis(analysis)
 
@@ -168,42 +178,36 @@ def contents(analysis: Any) -> Contents:
     solvers = [obj for obj in members if _kind(obj) == SOLVER]
     if not solvers:
         raise TranslationError(
-            f"{_label(analysis)!r} holds no openEMS solver, so there is nothing "
-            "to run it with. Add one to the analysis"
+            f"{_label(analysis)!r} holds no openEMS solver. Press {RECIPE_COMMAND} to add one"
         )
     if len(solvers) > 1:
         names = ", ".join(_label(obj) for obj in solvers)
         raise TranslationError(
             f"{_label(analysis)!r} holds {len(solvers)} openEMS solvers "
-            f"({names}), and nothing says which one runs. Keep one, or move the "
-            "others to their own analysis"
+            f"({names}). Keep one, or move the others to their own analysis"
         )
 
     settings = [obj for obj in members if _kind(obj) == "EMMeshPolicy"]
     if not settings:
         raise TranslationError(
-            f"{_label(analysis)!r} holds no mesh policy, so nothing says what this "
-            f"device asks of a mesh. Press {RECIPE_COMMAND} to add one"
+            f"{_label(analysis)!r} holds no mesh policy. Press {RECIPE_COMMAND} to add one"
         )
     if len(settings) > 1:
         names = ", ".join(_label(obj) for obj in settings)
         raise TranslationError(
-            f"{_label(analysis)!r} holds {len(settings)} mesh policies ({names}). "
-            "One study is meshed one way; keep one"
+            f"{_label(analysis)!r} holds {len(settings)} mesh policies ({names}). Keep one"
         )
-    _check_mesh_policy(settings[0])
 
     grids = [obj for obj in members if _kind(obj) == RECIPE]
     if not grids:
         raise TranslationError(
-            f"{_label(analysis)!r} holds no Yee grid, so nothing says how finely "
-            f"openEMS resolves it. Press {RECIPE_COMMAND} to add one"
+            f"{_label(analysis)!r} holds no openEMS mesh settings. Press {RECIPE_COMMAND} "
+            "to add them"
         )
     if len(grids) > 1:
         names = ", ".join(_label(obj) for obj in grids)
         raise TranslationError(
-            f"{_label(analysis)!r} holds {len(grids)} Yee grids ({names}), and "
-            "nothing says which one the grid is laid from. Keep one"
+            f"{_label(analysis)!r} holds {len(grids)} openEMS mesh settings ({names}). Keep one"
         )
     _check_yee_grid(grids[0])
 
@@ -214,7 +218,7 @@ def contents(analysis: Any) -> Contents:
         recipe=grids[0],
         bindings=tuple(obj for obj in members if _kind(obj) == "EMMaterialBinding"),
         ports=tuple(obj for obj in members if _kind(obj).startswith("EMPort")),
-        refinements=tuple(obj for obj in members if _kind(obj) == "EMMeshRegion"),
+        refinements=amending(analysis, members, grids[0], _kind),
     )
 
 
@@ -240,7 +244,7 @@ def _members(group: Any, seen: set[int] | None = None) -> list[Any]:
             continue
         seen.add(id(member))
         found.append(member)
-        if getattr(member, "Group", None) is not None:
+        if getattr(member, "Group", None) is not None and _kind(member) != RUN:
             found.extend(_members(member, seen))
     return found
 
@@ -249,23 +253,15 @@ def _check_is_an_analysis(analysis: Any) -> None:
     """Refuse anything but a study, by name rather than by failing on ``Group``.
 
     The solver gets its own sentence. Selecting it and pressing Run is an
-    ordinary mistake rather than a stale document: it is the object called
-    "openEMS" and it holds the run settings, while the band and the ownership of
-    ports live one level up.
+    ordinary mistake rather than a stale document: it holds the run settings,
+    while the band and the ownership of ports live one level up.
     """
     kind = _kind(analysis)
     if kind == "EMAnalysis":
         return
     if kind == SOLVER:
-        raise TranslationError(
-            f"{_label(analysis)!r} is a solver, not a study. The band, the ports "
-            "and the geometry belong to the EMAnalysis it sits in, and that is "
-            "what a run starts from"
-        )
-    raise TranslationError(
-        f"{_label(analysis)!r} is not an EM analysis, so there is no study to "
-        "read. A run starts from an EMAnalysis"
-    )
+        raise TranslationError(f"{_label(analysis)!r} is a solver, not a study")
+    raise TranslationError(f"{_label(analysis)!r} is not an EM analysis")
 
 
 def _geometry(
@@ -320,15 +316,16 @@ def _geometry(
         material_obj = getattr(binding, "Material", None)
         if material_obj is None:
             raise TranslationError(
-                f"{_label(binding)!r} has no material assigned. Pick one, or delete the binding"
+                f"{_label(binding)!r} has no material assigned. Set its Material, or "
+                "delete the binding"
             )
 
         material = _material(material_obj, center_hz)
         existing = materials.get(material.name)
         if existing is not None and existing != material:
+            # A material reaches the run under its label.
             raise TranslationError(
-                f"two materials are both labelled {material.name!r} and differ. "
-                "Labels are how bindings name materials, so they must be unique"
+                f"two different materials are both labelled {material.name!r}. Rename one"
             )
         materials[material.name] = material
 
@@ -359,8 +356,8 @@ def _geometry(
                 except drawn.Unmeasured as failed:
                     raise TranslationError(
                         f"{_element_label(obj, element)!r} is drawn as closed surfaces, and "
-                        f"the CAD kernel could not make a solid of them: {failed}. Check it "
-                        "with Part's Check geometry"
+                        f"FreeCAD could not make a solid of them: {failed}. Run Part > "
+                        "Check geometry on it"
                     ) from None
                 if volume is not None:
                     filled.append(
@@ -437,7 +434,9 @@ def _ports(found: Sequence[Any], ctx: _Context) -> tuple[Port, ...]:
             # and refusing loudly covers that, and this is what the workbench
             # will say the day a second adapter grows a port kind openEMS does
             # not have.
-            raise TranslationError(f"{_label(obj)!r}: no openEMS builder for {_kind(obj)}")
+            raise TranslationError(
+                f"{_label(obj)!r}: openEMS does not support a port of kind {_kind(obj)}"
+            )
         ports.append(builder(obj, number, ctx))
     return tuple(ports)
 
@@ -445,7 +444,7 @@ def _ports(found: Sequence[Any], ctx: _Context) -> tuple[Port, ...]:
 def _active(ports: Sequence[Any]) -> list[int]:
     """Numbers of the ports the user marked as sources, in ascending order."""
     numbers = _port_numbers(ports)
-    return sorted(number for obj, number in zip(ports, numbers) if bool(obj.Excitation))
+    return sorted(number for obj, number in zip(ports, numbers) if bool(obj.Driven))
 
 
 @dataclass(frozen=True)
@@ -500,7 +499,7 @@ def _reading(analysis: Any) -> Iterator[None]:
     """State a pick the drawing no longer places as a refusal.
 
     It wraps every route that reads a document, so a pick is refused alike on
-    Run and on Update Mesh.
+    Run and on Mesh.
     """
     try:
         yield
@@ -539,8 +538,7 @@ def _read_document(analysis: Any) -> _Translated:
 
     if not found.ports:
         raise TranslationError(
-            f"{_label(analysis)!r} has no ports, so there is nothing to "
-            "excite and nothing to measure"
+            f"{_label(analysis)!r} has no ports, so nothing is excited or measured"
         )
 
     medium = _medium(found.settings, frequency.center)
@@ -561,7 +559,7 @@ def _read_document(analysis: Any) -> _Translated:
     if medium is not None:
         _check_the_absorber_takes_the_medium(found.settings, medium, boundary)
     absorber = _absorber_cells(boundary, int(found.solver.PMLCells))
-    params = _mesh_params(found.settings, found.recipe, materials, frequency, absorber, slowing)
+    params = _mesh_params(found.recipe, materials, frequency, absorber, slowing)
 
     return _Translated(
         found=found,
@@ -612,9 +610,9 @@ def _check_the_absorber_takes_the_medium(
         return
     raise TranslationError(
         f"{_label(settings)!r}: Medium {medium.name!r} conducts {lost:.3g} S/m at the band, "
-        f"and openEMS takes a cell conducting above {PML_OFF:g} S/m for metal and switches "
-        "its perfectly matched layer off there, so the absorber would reflect. Set the "
-        "solver's Absorber to Mur, or link a medium that conducts less"
+        f"above the {PML_OFF:g} S/m at which openEMS treats a cell as metal and turns its "
+        "PML off, so the absorber reflects. Set the solver's Absorber to Mur, or link a "
+        "medium that conducts less"
     )
 
 
@@ -632,7 +630,7 @@ def _joined(read: _Translated) -> _Translated:
     with that body grown, and the run states it. A gap drawn on purpose is drawn
     as a body of its own.
 
-    Asked where a grid is laid or a run is built - Update Mesh and Run agree -
+    Asked where a grid is laid or a run is built - Mesh and Run agree -
     and not by the staleness key, which is asked on every recompute and keys
     the drawing as it stands. It asks the CAD kernel to cut every bound solid
     out of the box round the structure.
@@ -675,9 +673,8 @@ def _joined(read: _Translated) -> _Translated:
         rooms = drawn.rooms(lower, upper, held, sheets)
     except (RuntimeError, ValueError) as error:
         raise TranslationError(
-            f"the solids bound in {_label(found.settings)!r}'s study could not be cut "
-            f"from the box round them to find the room they leave: {error}. Check each with "
-            "Part's Check geometry"
+            f"FreeCAD could not cut the solids bound in {_label(found.analysis)!r} from the "
+            f"box around them: {error}. Run Part > Check geometry on each"
         ) from error
     if not rooms:
         return read
@@ -685,7 +682,7 @@ def _joined(read: _Translated) -> _Translated:
     opened = [
         face
         for face in (f"{axis}{side}" for axis in "XYZ" for side in ("Min", "Max"))
-        if str(getattr(found.settings, f"Padding{face}")) == AIR_FACE
+        if str(getattr(found.settings, f"Boundary{face}")) == OPEN_FACE
     ]
     clear = [(port.start, port.stop) for port in read.ports]
     taken: dict[str, list[drawn.Room]] = {}
@@ -694,9 +691,7 @@ def _joined(read: _Translated) -> _Translated:
         try:
             into = drawn.joined(room, held, kin, extents, clear)
         except (RuntimeError, ValueError) as error:
-            raise _slip(
-                read, room, names, f"The CAD kernel could not measure it: {error}"
-            ) from error
+            raise _slip(read, room, names, f"FreeCAD could not measure it: {error}") from error
         if into is None:
             unjoined.append(room)
         else:
@@ -751,11 +746,8 @@ def _check_a_dielectric_holds_a_volume(material: Material, regions: Sequence[Any
         if any(high - low <= FLATNESS for low, high in extents):
             raise TranslationError(
                 f"{piece.label!r} is bound to {material.name!r}, a dielectric, and is "
-                "flat, so it holds no volume for the dielectric to fill. openEMS reads "
-                "a cell's material only at its middle and a quarter of the way in from "
-                "each of its lines, so a surface is read only where it happens to lie "
-                "on one of those, and the answer would follow the grid. Bind the "
-                "material to a closed body as thick as the layer is"
+                "flat, so it holds no volume to fill. Bind the material to a closed body "
+                "as thick as the layer"
             )
 
 
@@ -773,12 +765,13 @@ def _said_joined(room: drawn.Room, into: str, across: Sequence[str]) -> str:
     """What the run states of one slip a body takes."""
     names = [repr(one) for one in (into, *across)]
     between = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+    # The room is the medium, and so is the body, so the device is the same
+    # with the gap closed into the body.
     return (
         f"The room from {_corner(room.least)} to {_corner(room.most)} mm, "
         f"{2.0 * room.volume / room.surface:.3g} mm thick between {between}, is solved as "
-        f"part of {into!r}. It is the medium, {into!r} is of the medium's own material, and "
-        "the device is the same with the gap closed into it, so no cell as thin as the gap "
-        "is laid."
+        f"part of {into!r}, which is of the medium's own material, so no cell as thin as "
+        "the gap is laid."
     )
 
 
@@ -792,9 +785,9 @@ def _slip(
     return TranslationError(
         f"{_label(read.found.settings)!r}: the room from {_corner(room.least)} to "
         f"{_corner(room.most)} mm is {2.0 * room.volume / room.surface:.3g} mm thick between "
-        f"{between}, under {drawn.SLIP:g} of the least extent of the bodies round it, so it "
-        "reads as bodies drawn to meet that miss each other. openEMS would fill it with "
-        f"{_undrawn(read)} and lay cells as thin as the gap across it"
+        f"{between}, under {drawn.SLIP:g} of the least extent of the bodies around it, so it "
+        "reads as bodies drawn to meet that miss each other, and openEMS would fill it with "
+        f"{_undrawn(read)} in cells as thin as the gap"
         + (f". {reason}" if reason else "")
         + ". Move the bodies to meet, or draw a body filling the gap and bind the material "
         "meant there to it"
@@ -839,7 +832,11 @@ def _check_the_guides_are_uniform(read: _Translated, grid: MeshGrid) -> None:
     }
     bound = [
         reference_plane.Bound(
-            solid.name, body.shape, solid.material in reflecting, solid.material in perfect
+            solid.name,
+            body.shape,
+            solid.material in reflecting,
+            solid.material in perfect,
+            solid.material,
         )
         for solid, body in zip(read.solids, read.bodies, strict=True)
     ]
@@ -858,7 +855,7 @@ def _check_the_guides_are_uniform(read: _Translated, grid: MeshGrid) -> None:
         for dim, at in walls:
             if highs[dim] - lows[dim] <= FLATNESS and abs(lows[dim] - at) <= FLATNESS:
                 return None
-        return f"the {filler} openEMS fills undrawn room with"
+        return f"the {filler} that fills undrawn room"
 
     for obj, port in zip(read.found.ports, read.ports, strict=True):
         if port.kind != "rect_waveguide":
@@ -870,9 +867,9 @@ def _check_the_guides_are_uniform(read: _Translated, grid: MeshGrid) -> None:
         if read_at >= stated:
             why = "openEMS reads the port"
             remedy = (
-                f"openEMS reads this port {read_at:.4g} mm in from its face whatever "
-                f"ReferenceDepth says, so move what changes the guide more than {read_at:.4g} "
-                "mm from the face, or refine the mesh, which brings that plane closer"
+                f"openEMS reads this port {read_at:.4g} mm in from its face, whatever "
+                f"ReferenceDepth says. Move what changes the guide more than {read_at:.4g} "
+                "mm from the face, or refine the mesh to bring that plane closer"
             )
         else:
             why = "its S-parameters are referred"
@@ -1131,8 +1128,7 @@ def _problem_of(
     active = _active(found.ports)
     if not active:
         raise TranslationError(
-            "no port has Excitation set, so nothing would drive the model. Mark "
-            "at least one port as a source"
+            "no port has Driven set, so nothing drives the model. Set Driven on at least one port"
         )
     if exciting is None:
         exciting = active[0]
@@ -1205,20 +1201,22 @@ def _report_of(read: _Translated) -> list[str]:
     lines = []
     for name, departure in read.departures:
         if departure is None:
+            # The volume FreeCAD gives the shape disagrees with which side of its
+            # surface the triangulation is on. A surface the kernel re-fits rather
+            # than evaluates carries its own volume tolerance, and that is what
+            # this reads as.
             lines.append(
-                f"{name} could not be measured against the drawing: the volume "
-                "the kernel gives the shape disagrees with which side of its "
-                "surface the triangulation is on, so no distance is stated. A "
-                "surface the kernel re-fits rather than evaluates carries its "
-                "own volume tolerance, and that is what this reads as."
+                f"{name} could not be measured against the drawing: its volume in "
+                "FreeCAD contradicts its triangulation, so no distance is stated."
             )
         elif said := departure.said_of(name):
             lines.append(said)
     if any(solid.is_sheet for solid in read.solids):
+        # What departs on a sheet is its outline, which lies in the plane its
+        # triangles cover, and a measure of lost volume cannot see it.
         lines.append(
-            "A conductor drawn as a flat outline is not covered by the figures "
-            "above: what departs on one is its outline, which lies in the plane "
-            "its triangles cover, and is not a volume this can measure."
+            "Conductors drawn as flat outlines are not included above, since their "
+            "outline departs within their own plane."
         )
     if read.medium:
         (filling,) = [one for one in read.materials if one.name == read.medium]

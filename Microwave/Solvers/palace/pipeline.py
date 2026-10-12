@@ -70,7 +70,7 @@ from .config import ABSORBING_ORDER, CONVERGENCE_MEMORY, RANK_LOSS_TANGENT, Driv
 from .problem import SPACE, Feed, Problem
 from .read import Scattering
 
-__all__ = ["Prepared", "finish", "meshed", "prepare", "solve"]
+__all__ = ["Prepared", "finish", "meshed", "prepare", "solve", "binary"]
 
 
 @dataclass(frozen=True)
@@ -79,27 +79,37 @@ class Prepared:
 
     :param problem: what the study describes.
     :param directory: where the run is written, resolved.
-    :param binary: the Palace that will answer it.
+    :param binary: the Palace that will answer it, or ``None`` where only a
+        mesh is made, which Gmsh makes with no Palace.
     :param pieces: the shapes on disk, one file apiece, as the mesher takes them.
-    :param marks: what each refinement region names, on disk as the mesher takes
-        it.
+    :param marks: what each refinement region names, and each edge of a narrow
+        sheet of metal, on disk as the mesher takes it.
     """
 
     problem: Problem
     directory: Path
-    binary: Path
+    binary: Path | None
     pieces: tuple[Piece, ...]
     marks: tuple[Mark, ...] = ()
 
 
-def prepare(analysis: Any, directory: str | Path, *, solver: str | Path | None = None) -> Prepared:
-    """Read the study, find Palace, and write its shapes into ``directory``.
+def prepare(
+    analysis: Any,
+    directory: str | Path,
+    *,
+    solver: str | Path | None = None,
+    solving: bool = True,
+) -> Prepared:
+    """Read the study, find Palace where it is to solve, and write its shapes
+    into ``directory``.
 
     The one stage that touches the document, and so the one a GUI runs on the
     thread the document belongs to. It costs a translation and one file per
     shape.
 
     :param solver: the Palace binary. Looked for where this is ``None``.
+    :param solving: whether Palace is to solve what is written. A mesh alone
+        asks for no Palace.
     :raises TranslationError: the document describes no run this backend can
         make.
     :raises run.SolverNotFound: there is no Palace to answer it.
@@ -116,7 +126,7 @@ def prepare(analysis: Any, directory: str | Path, *, solver: str | Path | None =
     # are asked before a shape is written, because the stages after this one
     # cost minutes.
     described = document.problem(analysis)
-    binary = run.find_solver(solver)
+    found = run.find_solver(solver) if solving else None
     pieces, marks = write.draw(described, where)
     # The shapes are on disk now, and the stages after this one may run on a
     # thread the kernel's objects do not belong to.
@@ -137,7 +147,14 @@ def prepare(analysis: Any, directory: str | Path, *, solver: str | Path | None =
         reserved=None if described.reserved is None else replace(described.reserved, shapes=()),
         marks=tuple(replace(mark, shape=None) for mark in described.marks),
     )
-    return Prepared(problem=bare, directory=where, binary=binary, pieces=pieces, marks=marks)
+    return Prepared(problem=bare, directory=where, binary=found, pieces=pieces, marks=marks)
+
+
+def binary(prepared: Prepared) -> Path:
+    """The Palace that solves ``prepared``, which was prepared to solve."""
+    if prepared.binary is None:
+        raise ValueError("prepared for a mesh alone, so no Palace was looked for")
+    return prepared.binary
 
 
 def _finer(asked: Demand) -> str:
@@ -148,15 +165,14 @@ def _finer(asked: Demand) -> str:
     remedy here makes the elements finer where the part curves or narrows.
     """
     turn = (
-        f"raise ElementsPerTurn on the Gmsh mesh from {asked.per_turn:g}"
+        f"raise ElementsPerTurn in the Palace mesh settings from {asked.per_turn:g}"
         if asked.per_turn
-        else "set ElementsPerTurn on the Gmsh mesh above zero"
+        else "set ElementsPerTurn in the Palace mesh settings above zero"
     )
     return (
-        "Where the drawing curves or narrows tighter than the elements laid there, "
-        f"{turn}, set MinElementSize on the mesh policy below the floor of "
-        f"{asked.finest:.4g} mm, or lay a Mesh Refinement there with an "
-        "ElementSize near its smallest radius or width"
+        f"Where the drawing curves or narrows tightly, {turn}, set MinElementSize in the "
+        f"Palace mesh settings below {asked.finest:.4g} mm, or lay a Mesh Refinement on that part "
+        "with an ElementSize near its smallest radius or width"
     )
 
 
@@ -239,7 +255,8 @@ def finish(
     :param launcher: the MPI launcher Palace starts its processes with, as
         ``run.find_launcher`` answers it. Palace's launcher looks for one where
         this is ``None``.
-    :param processes: how many ranks Palace is given.
+    :param processes: how many ranks Palace is given, or ``run.MACHINE`` for the
+        machine's share, as :func:`run.ranks` reads it.
     :param on_output: called with each line Palace prints while it works, after
         what this stage says about the run it is making - among it a warning for
         each lumped element both of whose ends lie on the region's boundary, and
@@ -250,8 +267,9 @@ def finish(
         likeliest to be wrong - a warning past ``Solvers/properties.WANTED`` of the
         smallest response the study reads, or where that solve failed - and with
         what the matrix leaves unaccounted for from each
-        driven port - a warning past
-        ``balance.BAR``, and the matrix returned either way - and in an open
+        driven port - a warning past ``balance.BAR``, and in a run through
+        lumped ports only of more power than went in, and the matrix returned
+        either way - and in an open
         study with an estimate of how far the open surface moved each driven
         column.
     :raises TranslationError: a port stands inside the model, metal stands on a
@@ -284,10 +302,11 @@ def finish(
 
     said: list[str] = []
     if driven.ranks_can_disagree:
+        # See ``config.Driven.ranks_can_disagree``.
         said.append(
-            f"Each lossless material is given a loss tangent of {RANK_LOSS_TANGENT:g}. "
-            "Palace can hang on more than one process where metal of finite conductivity "
-            "meets a wave port and no material on the port's face is lossy."
+            f"Each lossless material is given a loss tangent of {RANK_LOSS_TANGENT:g}, so "
+            "Palace does not hang on more than one process where metal of finite "
+            "conductivity meets a wave port"
         )
     if driven.conducting and prepared.problem.wall in mesh.labels:
         said.append(f"The rest of the boundary, {prepared.problem.wall!r}, is a perfect conductor")
@@ -326,7 +345,7 @@ def finish(
     log = run.solve(
         config,
         processes,
-        solver=prepared.binary,
+        solver=binary(prepared),
         on_output=on_output,
         cancel=cancel,
         launcher=launcher,
@@ -346,9 +365,8 @@ def finish(
     # before the solve, and by the time one exists the band is paid for, so the
     # matrix is returned and the figure stands beside it.
     if on_output is not None:
-        lumped = {feed.number for feed in prepared.problem.lumped}
         for shortfall in balance.shortfalls(answer):
-            on_output(balance.said(shortfall, labels, lumped=lumped))
+            on_output(balance.said(shortfall, labels))
         reserved = prepared.problem.opened
         if reserved is not None:
             slant = policy.slanted(policy.steepest(reserved))
@@ -387,7 +405,7 @@ def _checked(
     config, results = write.configure_checked(checking, prepared.directory)
     shutil.rmtree(results, ignore_errors=True)
     try:
-        run.solve(config, processes, solver=prepared.binary, cancel=cancel, launcher=launcher)
+        run.solve(config, processes, solver=binary(prepared), cancel=cancel, launcher=launcher)
         full = read.scattering(results, checking)
     except (run.SolverFailed, read.ResultsError) as error:
         return [*lines, f"{balance.WARNING}{reduced.unchecked(error)}"]
@@ -408,9 +426,9 @@ def _swept(driven: Driven, said: str, labels: Mapping[int, str]) -> list[str]:
     sampled = run.sampled(said)
     if len(sampled) != len(driven.excitations):
         raise run.SolverFailed(
-            f"Palace said how its adaptive sweep sampled {len(sampled)} of the "
-            f"{len(driven.excitations)} driven ports, so the model's error at the others "
-            "is not known",
+            f"Palace reported the adaptive sweep for {len(sampled)} of the "
+            f"{len(driven.excitations)} driven ports, so the reduced model's error at the "
+            "others is unknown",
             log=said,
         )
     lines = []
@@ -418,18 +436,18 @@ def _swept(driven: Driven, said: str, labels: Mapping[int, str]) -> list[str]:
         at = ", ".join(f"{frequency / HZ_PER_GHZ:.6g}" for frequency in sorted(one.frequencies))
         if not one.converged:
             raise run.SolverFailed(
-                f"{labels[port]!r}: the adaptive sweep took all {one.solves} full solves it "
-                f"is allowed before {CONVERGENCE_MEMORY} in a row came within its tolerance "
-                f"{one.tolerance:g} of the reduced model, the last being {one.error:.2g} off "
-                "it, so the points between them are not known to that tolerance. Raise "
+                f"{labels[port]!r}: the adaptive sweep used all {one.solves} full solves "
+                f"before {CONVERGENCE_MEMORY} in a row came within its tolerance "
+                f"{one.tolerance:g} of the reduced model (the last was {one.error:.2g} off "
+                "it), so the points between them do not meet that tolerance. Raise "
                 "SweepSolves or SweepTolerance on the Palace solver, or set its Sweep to "
                 "Discrete",
                 log=said,
             )
         lines.append(
             f"{labels[port]!r}: the reduced model came within {one.tolerance:g} of the field "
-            f"after {one.solves} full solves, at {at} GHz. The tolerance is on the model "
-            "against the full solve on this mesh, and says nothing of the mesh itself"
+            f"after {one.solves} full solves, at {at} GHz. The tolerance does not cover "
+            "the error of the mesh itself"
         )
     return lines
 
@@ -452,10 +470,9 @@ def beside(problem: Problem, mesh: Mesh) -> list[str]:
         ]
         if walls:
             lines.append(
-                f"{feed.label!r}: the whole of the region's face its elements lie in, "
+                f"{feed.label!r}: the region's face its elements lie in, "
                 f"{', '.join(repr(plane) for plane in walls)}, is a magnetic wall wherever no "
-                "metal is drawn on it, rather than the wall, which would short the elements "
-                "along their sides"
+                "metal is drawn on it, so the wall does not short the elements along their sides"
             )
         for element in feed.elements:
             if mesh.labels[element.label].sits not in (INTERIOR, BOTH):
@@ -465,8 +482,8 @@ def beside(problem: Problem, mesh: Mesh) -> list[str]:
                 for side, what, distance in element.facing
             )
             lines.append(
-                f"{feed.label!r} stands inside the model, with the region on both sides of "
-                f"{element.label!r}, and what is drawn behind it is solved with it"
+                f"{feed.label!r}: {element.label!r} stands inside the model with the region on "
+                "both sides, so what is drawn behind it is solved with the port"
                 + (f": {behind}" if behind else "")
             )
     return lines
@@ -580,7 +597,7 @@ def _modes(
     )
     shutil.rmtree(answered, ignore_errors=True)
     try:
-        said = run.solve(asked, 1, solver=prepared.binary, cancel=cancel, launcher=launcher)
+        said = run.solve(asked, 1, solver=binary(prepared), cancel=cancel, launcher=launcher)
     except run.SolverFailed as failed:
         # What it printed was not shown as it arrived, and what stopped it is
         # already read out of it.
@@ -618,7 +635,8 @@ def solve(
 ) -> Scattering:
     """Run ``analysis`` on Palace in ``directory``, and read the answer back.
 
-    :param processes: how many ranks Palace is given. Stated rather than
+    :param processes: how many ranks Palace is given, or ``run.MACHINE`` for the
+        machine's share, as :func:`run.ranks` reads it. Stated rather than
         defaulted, for the reason ``config.Driven.order`` is: a figure a caller
         can edit and a default here are two copies of one setting, and the
         default is the one every caller that said nothing gets.
@@ -639,7 +657,7 @@ def solve(
     # Before the mesh, which costs minutes, and after the translation, whose
     # refusal is the user's to act on first.
     mpi = run.find_launcher(launcher)
-    said = run.supported(prepared.binary)
+    said = run.supported(binary(prepared))
     if on_output is not None:
         on_output(said)
     mesh = meshed(prepared, interpreter=interpreter, on_output=on_output, cancel=cancel)

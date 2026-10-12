@@ -39,7 +39,7 @@ KINDS = ("dielectric", "pec", "conducting_sheet")
 DOCUMENT_TYPES = {
     "dielectric": "Dielectric",
     "pec": "PEC",
-    "conducting_sheet": "ConductingSheet",
+    "conducting_sheet": "Conducting Sheet",
 }
 
 #: Lower case, digits, and separators. A slug rather than free text, because the

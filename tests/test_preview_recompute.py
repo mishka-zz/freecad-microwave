@@ -40,13 +40,13 @@ PROBE = os.path.join(os.path.dirname(__file__), "preview_recompute_probe.py")
 MOVES_NO_CELL = (
     "Display",
     "EnergyDecay",
-    "Excitation",
+    "Driven",
     "MaxTimesteps",
-    "NumFrequencyPoints",
+    "FrequencyPoints",
     "ShowSliceX",
     "ShowSliceY",
     "ShowSliceZ",
-    "SimDir",
+    "RunDirectory",
     "SliceX",
     "SliceY",
     "SliceZ",
@@ -71,7 +71,7 @@ MOVES_NO_CELL = (
 #: ``a bound solid touched`` is here rather than among the quiet cases. A touch
 #: says only that something might have moved, and the badge now believes it -
 #: the drawing is reported stale for a solid edited and put back, and what that
-#: costs is one press of Update Mesh.
+#: costs is one press of Mesh.
 MOVES_A_CELL = (
     "the Yee grid",
     "the mesh policy",

@@ -146,7 +146,7 @@ def build(doc, bindings):
     analysis = createEMAnalysis(doc)
     analysis.FrequencyStart = "22 GHz"
     analysis.FrequencyStop = "26 GHz"
-    analysis.NumFrequencyPoints = 3
+    analysis.FrequencyPoints = 3
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [obj for obj in analysis.Group if obj is not member]
@@ -186,7 +186,7 @@ def build(doc, bindings):
         port = createEMPortRectWaveguide(f"Port{number}")
         port.Label = f"Port{number}"
         port.Number = number
-        port.Excitation = number == 1
+        port.Driven = number == 1
         port.PropagationAxis = "X" if at == 0.0 else "-X"
         port.CrossSection = (guide, [ends[at]])
         port.ReferencedTo = PORT_IMPEDANCE
@@ -195,7 +195,7 @@ def build(doc, bindings):
     settings = contents(analysis).settings
     for axis in "XYZ":
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Ends")
+            setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
     doc.recompute()
     return analysis
 

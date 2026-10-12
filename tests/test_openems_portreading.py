@@ -686,7 +686,7 @@ class TestAlongTheGuide:
 
 class TestWhatIsNotRead:
     def test_a_mode_varying_across_both_walls(self):
-        with pytest.raises(NotRead, match="across both walls"):
+        with pytest.raises(NotRead, match="across both pairs of walls"):
             read(guide(), mode=(1, 1))
 
     def test_a_mode_of_more_orders_than_the_guide_has_lines_across(self):

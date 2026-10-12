@@ -15,12 +15,14 @@ from ._vp_hook import register_view_provider_injector
 from .analysis import (
     EMAnalysis,
     NoAnalysis,
+    NoSettings,
     NoSolver,
     analyses,
     analysis_of,
     createEMAnalysis,
     find_analysis,
     members,
+    settings_to_amend,
     solver_of,
     solver_to_run,
     solvers_in,
@@ -46,6 +48,8 @@ from .mesh import (
     createEMMeshPolicy,
     createEMMeshRegion,
     createEMYeeGrid,
+    cycle_note,
+    reaching,
     references_from,
 )
 from .ports import (
@@ -62,6 +66,7 @@ from .ports import (
 )
 from .preview import EMMeshPreview, createEMMeshPreview
 from .results import EMSParameters, createEMSParameters
+from .runs import EMRun, createEMRun
 from .solver import (
     EMSolverBase,
     EMSolverOpenEMS,

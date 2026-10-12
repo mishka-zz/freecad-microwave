@@ -8,12 +8,14 @@ surface until it leaves the material. This module answers that walk in one
 pass: the line's crossings with the triangles come back sorted, and the first
 one that leaves the material ends the run.
 
-**The triangles are the surface openEMS is given.** A curved body reaches the
-engine as a polyhedron, and openEMS decides a cell's material the same way -
+**The triangles are the surface as drawn.** A curved body reaches the engine
+as a polyhedron, and openEMS decides a cell's material the same way -
 ``CSPrimPolyhedron::IsInside`` counts how many of these triangles a segment
 crosses and calls an odd count inside
 (``CSXCAD/src/CSPrimPolyhedron.cpp:290-294``). So a length read here is a length
-of the solved structure rather than of the drawing it approximates.
+of the polyhedron the engine is given, except on a conductor handed over as a
+triangulation, which :meth:`~.model.Problem.as_given` grows by a share of a cell
+before it is built.
 
 **A crossing carries a sign**, which is what makes a probe unnecessary. The
 boundary is closed and consistently wound - ``surface.surface_fault`` holds
@@ -522,8 +524,7 @@ def crossings(
     ``direction`` need not be a unit vector, and ``distance`` is a distance
     either way. A direction reaching this module comes off a CAD kernel, where a
     unit normal is a habit rather than a contract, so the length is taken here
-    rather than demanded of the caller. :func:`chords_at` has normalised already
-    and loses nothing by it.
+    rather than demanded of the caller.
 
     One segment of :func:`_crossings_along`, which is where the arithmetic is, so
     the two cannot come to disagree about what a line meets. It is the door for

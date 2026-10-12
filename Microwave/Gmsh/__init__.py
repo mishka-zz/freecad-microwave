@@ -138,8 +138,8 @@ whatever is waiting for it, and that is what the split below is for.
 * :mod:`.coverage` asks what a label map says, and is the same: it takes
   numbers and returns complaints. So does :mod:`.ends`, which decides what is
   left out behind a face.
-* :mod:`.labels` and :mod:`.mesh` are the Gmsh half, and are the half to put
-  behind a process boundary.
+* :mod:`.labels`, :mod:`.places`, :mod:`.wedges` and :mod:`.mesh` import Gmsh,
+  and are the half to put behind a process boundary.
 
 ``tests/test_gmsh_mesher.py`` imports the first two in a child interpreter and
 asserts no Gmsh arrived.

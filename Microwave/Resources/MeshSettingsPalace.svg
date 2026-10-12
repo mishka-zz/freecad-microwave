@@ -1,0 +1,9 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Mesh Settings (Palace): the Palace triangulation, with sliders. -->
+  <path d="M4 4 H44 V44 H4 Z M4 4 L18 19 M24 4 L18 19 M24 4 L32 22 M44 4 L32 22 M18 19 L32 22 M4 24 L18 19 M18 19 L22 33 M32 22 L22 33 M4 24 L22 33 M4 44 L22 33 M24 44 L22 33 M44 26 L32 22"
+        stroke="#2f9e7d" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+  <rect x="27" y="33" width="34" height="28" rx="5" fill="#546e7a" stroke="#ffffff" stroke-width="2.5"/>
+  <path d="M33 42 H55 M33 52 H55" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="39" cy="42" r="4" fill="#e8833a"/>
+  <circle cx="49" cy="52" r="4" fill="#e8833a"/>
+</svg>

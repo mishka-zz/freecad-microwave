@@ -10,6 +10,8 @@ would accept. ``TestAgainstTheAdapter`` is the test that ties the two together
 - without it these are two independent opinions about the same geometry.
 """
 
+import re
+
 import pytest
 
 from Microwave.Objects import port_setup
@@ -30,7 +32,7 @@ class TestReadingOneBox:
     def test_a_sheet_traces_end_face_still_reads_as_the_end(self):
         """Copper is often drawn with no thickness at all.
 
-        ``ConductingSheet`` is a material kind, so a trace can legitimately be a
+        ``Conducting Sheet`` is a material kind, so a trace can legitimately be a
         zero-thickness sheet - and then its end face is flat along X *and* Z.
         Only the body says which of the two the wave crosses. This is the case
         the acceptance model itself uses, so a rule that took "the axis the face
@@ -40,13 +42,20 @@ class TestReadingOneBox:
         end = ((0, -1.5, 1.5), (0, 1.5, 1.5))
         assert port_setup.cross_section_axis(end, sheet, "the face") == 0
 
-    def test_a_solid_says_so_rather_than_picking_an_axis(self):
-        with pytest.raises(SetupError, match="a solid rather than a cross-section"):
+    def test_a_face_spanning_its_body_is_not_a_cross_section(self):
+        with pytest.raises(
+            SetupError,
+            match=re.escape(
+                "the trace spans every axis its body spans, so it is not a cross-section. "
+                "Select the face the wave passes through"
+            )
+            + "$",
+        ):
             port_setup.cross_section_axis(TRACE, TRACE, "the trace")
 
     def test_an_edge_says_so_too(self):
         edge = ((0, -1.5, 1.5), (0, 1.5, 1.5))
-        with pytest.raises(SetupError, match="an edge rather than a"):
+        with pytest.raises(SetupError, match="an edge, not a face. Select the face"):
             port_setup.cross_section_axis(edge, TRACE, "the pick")
 
     def test_the_inward_direction_is_where_the_metal_is(self):
@@ -56,7 +65,14 @@ class TestReadingOneBox:
 
     def test_a_face_with_metal_on_both_sides_has_no_inward_direction(self):
         trace = _shape(TRACE, {"cut": ((25, -1.5, 1.5), (25, 1.5, 1.535))})
-        with pytest.raises(SetupError, match="does not say which side of it"):
+        with pytest.raises(
+            SetupError,
+            match=re.escape(
+                "cannot be read at the face. Select an end face. If it is one, set "
+                "PropagationAxis by hand"
+            )
+            + "$",
+        ):
             port_setup.inward((trace, ["cut"]), 0, "the face")
 
     def test_a_fold_launches_into_its_own_arm_rather_than_across_its_box(self):
@@ -79,7 +95,7 @@ class TestFindingTheGap:
         assert port_setup.separating_axis(TRACE_END, GROUND, 0, "the pair") == 2
 
     def test_overlapping_everywhere_is_not_a_port(self):
-        with pytest.raises(SetupError, match="no gap between them"):
+        with pytest.raises(SetupError, match="so there is no gap to drive across"):
             port_setup.separating_axis(TRACE, TRACE, None, "the pair")
 
     def test_two_gaps_are_ambiguous_rather_than_guessed(self):
@@ -195,7 +211,7 @@ class TestFillingAPortIn:
         port = StubPort()
         assert port_setup.fill_microstrip(port, [(strip, "Face1"), (plane, "")]) == []
         assert port.TraceEnd == (strip, ["Face1"])
-        assert port.GroundReference == (plane, [""])
+        assert port.Ground == (plane, [""])
         assert port.PropagationAxis == "X"
         assert port.ExcitationAxis == "-Z"
 
@@ -210,7 +226,7 @@ class TestFillingAPortIn:
         port = StubPort()
         notes = port_setup.fill_microstrip(port, [(strip, "Face1")])
         assert port.TraceEnd == (strip, ["Face1"])
-        assert notes == ["nothing was selected for GroundReference; set it in the property editor"]
+        assert notes == ["nothing was selected for Ground; set it in the property editor"]
 
     def test_geometry_that_says_nothing_leaves_the_axes_alone(self):
         strip, plane = _shape(TRACE, {"Face1": TRACE}), _shape(GROUND)
@@ -218,7 +234,7 @@ class TestFillingAPortIn:
         notes = port_setup.fill_microstrip(port, [(strip, "Face1"), (plane, "")])
         assert port.TraceEnd == (strip, ["Face1"])
         assert port.PropagationAxis == "X"  # untouched
-        assert "a solid rather than a cross-section" in notes[0]
+        assert "spans every axis its body spans, so it is not a cross-section" in notes[0]
         assert "left at their defaults" in notes[0]
 
     def test_a_third_pick_is_reported_rather_than_dropped(self):
@@ -231,9 +247,7 @@ class TestFillingAPortIn:
         port = StubPort()
         notes = port_setup.fill_microstrip(port, [(strip, "Face1"), (plane, ""), (plane, "")])
         assert port.PropagationAxis == "X"
-        assert notes == [
-            "1 extra selection(s) ignored - this port takes 2: TraceEnd, GroundReference"
-        ]
+        assert notes == ["1 extra selection(s) ignored. This port takes 2: TraceEnd, Ground"]
 
     def test_a_face_that_cannot_be_placed_still_makes_a_port_and_says_why(self):
         """A pick shown in two places has no one position to read axes off, and
@@ -264,6 +278,19 @@ class TestFillingAPortIn:
         assert port_setup.fill_waveguide(port, [(guide, "Face5")]) == []
         assert port.CrossSection == (guide, ["Face5"])
         assert port.PropagationAxis == "Z"
+
+    @pytest.mark.parametrize("body_first", [False, True])
+    def test_a_face_of_a_solid_answers_for_itself_beside_a_body_picked(self, body_first):
+        """The solid the face belongs to says which way it runs. Another body
+        picked beside it is an extra selection, not a guide to read instead."""
+        guide = _shape(((0, 0, 0), (10.7, 4.3, 40)), {"Face5": ((0, 0, 0), (10.7, 4.3, 0))})
+        other = _shape(((20, 0, 0), (30.7, 4.3, 40)))
+        chosen = [(guide, "Face5"), (other, "")]
+        port = StubPort()
+        notes = port_setup.fill_waveguide(port, chosen[::-1] if body_first else chosen)
+        assert port.PropagationAxis == "Z"
+        assert notes == ["1 extra selection(s) ignored. This port takes 1: CrossSection"]
+        assert port.CrossSection == (guide, ["Face5"])
 
     def test_a_coaxial_port_needs_only_its_ring(self):
         line = _shape(

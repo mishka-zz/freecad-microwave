@@ -1,46 +1,264 @@
 # Changelog
 
-What changed, and what it means if you are using this. Measured figures are not
-written down here - they go stale wherever nothing re-runs them. Every build
-prints its own with `python3 -m tests.gate_report`.
+This file lists the changes in each release and what they mean for a user. It
+states no measured figures. `python3 -m tests.gate_report` prints the figures
+of the build it runs on.
 
-## Unreleased
+## Release 0.0.3 - 2026-10-12
 
-### Palace, a second backend
+This release adds Palace, a frequency-domain finite-element solver, as a second
+backend beside openEMS. A study is drawn and marked up once and solved on
+either backend, and the results of both are compared on one chart.
 
-**A study can be solved on Palace**, a frequency-domain finite-element solver,
-beside openEMS. **Add Palace Solver** adds a Palace solver and its Gmsh mesh
-settings to a study. The drawing, the materials, the ports and the band are
-marked up once and read by both backends. Each backend keeps its own result,
-labelled with its name, and **Compare S-parameters** draws both against each
-other.
+### Compatibility
 
-**The mesh is tetrahedral.** Gmsh meshes the drawing. The mesh a run solves on
-is put in the study as `Mesh (Palace)`, FreeCAD's own FEM mesh object, and is
-marked out of date when the study changes under it.
+- A document saved by 0.0.2 is not upgraded. Before a run reads a study, it
+  compares each object with an object of the same kind made by this release,
+  and refuses the study naming each object that differs. Make each named
+  object again, as
+  [A document saved by an earlier build](docs/running.md#a-document-saved-by-an-earlier-build)
+  describes. The shipped examples are rebuilt for this release.
+- An openEMS run with `RunDirectory` blank writes beside the document to
+  `<document>_openems`, as a Palace run writes to `<document>_palace`. 0.0.2
+  wrote to `<document>_sim`.
+- FreeCAD 1.0 or newer, on Python 3.11 or newer, as before.
+- Palace requires Palace 0.18.1 or newer, `mpirun`, and a Python that can
+  import `gmsh`. The README says where each is found. openEMS has the same
+  requirements as in 0.0.2.
 
-**What Palace drives.** Lumped ports and rectangular waveguide ports in TE10;
-metal drawn as a `PEC` sheet or body; a `ConductingSheet` as the surface
-impedance of its metal; lossy dielectrics. An open study reserves air round the
-structure and absorbs on its outer side. A band of many points is swept
-adaptively, and the reduced model is checked against full solves. What the
-adapter cannot express - a microstrip port, a waveguide port in an open study,
-a body bound to a `ConductingSheet` - is refused by name before any process
-starts.
+### New features
 
-**Palace 0.18.1 or later is required**, with `mpirun` and a Python that can
-import `gmsh`. The README says where each is found. The host floors are
-unchanged: FreeCAD 1.0 or newer, on Python 3.11 or newer.
+#### Palace backend
 
-**On openEMS**, a rectangular waveguide port reads its waves at the scales and
-with the mode the grid carries, and states the error of a column read alone.
-Two materials drawn over one space, and a dielectric the averaging never reads,
-are refused.
+- **Add Palace Solver** adds a Palace solver and its Gmsh mesh settings to a
+  study. The drawing, the materials, the ports and the band are read by both
+  backends.
+- Gmsh makes a tetrahedral mesh. The mesh a run solves on is kept in the study
+  as `Mesh (Palace)`, a FreeCAD FEM mesh object, and is marked out of date when
+  the study changes.
+- Palace drives lumped ports and rectangular waveguide ports in TE10. It takes
+  metal drawn as a `PEC` sheet or body, a `Conducting Sheet` as the surface
+  impedance of its metal, and lossy dielectrics. An open study reserves air
+  round the structure and absorbs on its outer surface.
+- A band of many points is swept adaptively, and the run checks the reduced
+  model against full solves.
+- The Palace solver's `Processes` sets the number of MPI processes. The
+  default, 0, uses half the machine's logical processors.
+- The adapter refuses what it cannot express, by name, before any process
+  starts: a microstrip port, a waveguide port in an open study, and a body
+  bound to a `Conducting Sheet`.
+- The shipped examples `waveguide_wr42`, `stepped_line` and both stepped
+  low-pass filters carry a Palace solver beside the openEMS one and solve on
+  each backend as shipped.
+- New acceptance gates on Palace: the WR-42 guide's phase constant and port
+  impedance, a septum's attenuation against the half-width guide, a brass
+  wall's loss against its surface resistance, a strip dipole's power balance, a
+  stripline through lumped ports, and the measured stepped-impedance low-pass
+  against its published figures.
 
-**New gates on Palace**: the WR-42 guide's phase constant and port impedance, a
-septum's attenuation against the half-width guide, a brass wall's loss against
-its surface resistance, a strip dipole's power balance, and a stripline through
-lumped ports. A run of the gates fails where one skipped for want of its engine.
+#### Run history and comparison
+
+- Each run is kept as a group of its own in the study, for example
+  `Run 3 (Palace)`, with its S-parameters, its settings, its log and its cost.
+  A new run replaces nothing. **Undo** after a run removes the run.
+- A run's `Changes` property and its description in the tree list what differs
+  from the run before it. A dimension driven from a spreadsheet or a variable
+  set is named where it is set, with the dimensions it drives:
+  `Params StubW 3.2 -> 3.4 mm (Stub Width)`. A run after a run on the other
+  backend first states the change of backend, then compares its own solver and
+  mesh settings with the last run on its own backend.
+- **Plot S-Parameters** draws any runs and imported S-parameters selected in
+  the tree on one set of axes, as magnitude in dB, phase, group delay or power
+  lost. With several tables it draws the difference against one of them and
+  marks where the difference is largest. Where two tables differ in basis - port
+  reference, driven ports, a waveguide mode against a line impedance, or the
+  drawing - the chart still draws the difference and states which basis differs.
+  Beside each difference, the chart states how far an openEMS run that did not
+  drive every port can be off.
+- A chart has three tabs. **Chart** holds the curves and the legend.
+  **Warnings**, shown only when there is something to report, lists each
+  requested curve that is not drawn or not drawn as requested. **Details** holds
+  the reference, the grid, how each quantity is computed, and a table of the
+  settings that differ between the runs drawn.
+- A magnitude below -120 dB is shaded as a region, and a term that lies
+  entirely below it is named.
+
+#### Touchstone import and export
+
+- **File > Import** reads a `.s1p` to `.s4p` file into S-parameters in the
+  selected study, or at the document's root. The object keeps the whole file,
+  its name, its digest and the import time. **File > Open** reads one into a
+  new document.
+- `ReferencedTo` declares what the file's ports are referenced to, and
+  `PortNumbers` maps the file's ports onto the drawing's. Imported S-parameters
+  are overlaid and differenced like a run.
+- **File > Export** writes the selected S-parameters or run. An imported file is
+  written back as it was read.
+
+#### Impedance along the line
+
+- **Plot Impedance along the Line** states its 10-90% rise time and offers
+  slower ones to match a sampling head or a link specification.
+- Several selected runs or tables are traced on one set of axes at one port,
+  one reference and one rise time. The band with the lowest upper frequency
+  sets the rise time.
+- The vertical axis shows impedance or reflection coefficient. The reflection
+  coefficient stays finite at an open or a short.
+- A run's trace is placed on the board by the separation of the ports it was
+  solved with. A table imported from a Touchstone file is drawn against time.
+- The chart refuses a sweep it cannot transform and names a sweep that works: a
+  record shorter than the response, a sweep that starts far above DC or between
+  two whole steps, and a waveguide port. See
+  [Time-Domain Reflectometry](docs/results.md#time-domain-reflectometry-tdr).
+
+#### Solve again one step finer
+
+- **Solve Again One Step Finer**, on the toolbar and in a run's context menu,
+  solves the run's study again on the same backend with a finer discretization.
+  On openEMS it multiplies the cells per wavelength by the square root of two
+  and extends the run length so the simulated time stays the same. On Palace it
+  raises the solver's order by one on the same mesh.
+- The study keeps its own values. The new run is filed beside the old one, and
+  its log states how far each term moved.
+
+#### Solving without the GUI
+
+- `freecadcmd microwave_solve.py -- device.FCStd` solves a document on a
+  machine with no display and saves its runs into the document. The file keeps
+  which objects are shown and the view position. The exit status reports how
+  the solve ended. A file changed during the solve is not overwritten.
+- `--refine RUN` solves a run again one step finer, and `--rundir` sets where
+  run directories are made. See [Running a study](docs/running.md).
+
+### Changes
+
+#### Tree, toolbars and commands
+
+- Both backends' objects are named and drawn alike. A study holds
+  `Solver (openEMS)` and `Solver (Palace)`. Each solver shows its
+  `Mesh Settings` and the mesh made from them, `Mesh (openEMS)` or
+  `Mesh (Palace)`. A port is labelled by its number, for example
+  `Port 1 (Lumped)`.
+- The Mesh Policy, one per study, holds what both backends share: the boundary
+  on each face of the domain, the clearance, the medium and the curve
+  tolerance. `MinElementsAcross` and `MinElementSize` moved to each backend's
+  `Mesh Settings`.
+- A **Mesh Refinement** amends one backend's mesh settings, named in its
+  `MeshSettings`, and the tree shows it under them. To refine one place on both
+  backends, add a region for each. **Add Mesh Refinement** takes the backend
+  from the selected solver, mesh settings, mesh or region, or from the study's
+  only solver.
+- A face of the domain is `Open`, `Through` or `PEC Wall`.
+- A mesh that no longer describes its study shows a clock at the bottom left of
+  its icon, on either backend.
+- Deleting a solver deletes its mesh settings, the refinements amending them
+  and its mesh in one undo step. The mesh policy, the runs and the other
+  backend's objects stay.
+- The toolbars follow the work from drawing to results: Microwave, Microwave
+  Materials, Microwave Ports, Microwave Mesh, Microwave Solve and Microwave
+  Results. **Add Solver** offers each backend from one button. **Mesh** meshes
+  on either backend and replaces **Update Mesh**.
+- Command names use Title Case, as FreeCAD's own do. A context-menu entry has
+  the name of the command it runs.
+- **Plot S-Parameters**, **Plot Impedance along the Line**, **Show Run Log** and
+  **Export Touchstone** act on the selection and are unavailable when nothing
+  suitable is selected. None of them falls back to the study's newest run.
+- A double-click on the study, or on a run that holds no S-parameters, expands
+  it. **Run Simulation** with the study selected opens the panel of its only
+  solver.
+- A chart and a run's log window close with their document.
+
+#### Messages and logs
+
+- Every refusal, pre-flight finding, log line, mesh report and tooltip names
+  the object, what is wrong and the property to set. A finding names the
+  property or the face at fault, and `EnergyDecay` is quoted in dB as entered.
+- Advice in messages now clears the message it is attached to. A large grid
+  points at `ElementsPerWavelength`. A measurement plane too near its feed
+  points at `MeasurementDistance`. An absorber that covers the structure is no
+  longer told to coarsen the mesh. A three-port is not sent to mirror symmetry.
+  A figure to enter is rounded so that entering it clears the check.
+- In each panel's log, a warning is orange and the reason a step failed is red.
+  The backend's own output is set apart by blank lines.
+- **Show Run Log**, on the Results toolbar and a run's context menu, opens the
+  log of a kept run with its warnings coloured as in the panel.
+- On openEMS with `EnergyDecay` set, the log states for each run whether it
+  took every step `MaxTimesteps` allows or the step at which it stopped.
+- **Check** on openEMS looks for a Python that can import openEMS, as **Check**
+  on Palace looks for Palace. When none is found, the panel names the solver
+  property to set.
+- Both run panels show the directory a run will write to for a saved document.
+
+#### Renamed properties
+
+| Object | 0.0.2 | 0.0.3 |
+|---|---|---|
+| Mesh Policy | `PaddingXMin` ... `PaddingZMax` | `BoundaryXMin` ... `BoundaryZMax` |
+| Mesh Policy, face values | `Air`, `Through`, `Ends` | `Open`, `Through`, `PEC Wall` |
+| EM Analysis | `NumFrequencyPoints` | `FrequencyPoints` |
+| EM Analysis | `SmallestResponse` | `ResponseFloor` |
+| Port | `Excitation` | `Driven` |
+| Microstrip port | `GroundReference` | `Ground` |
+| Solver | `SimDir` | `RunDirectory`, in group `Output` |
+| Run | `CpuSeconds` | `ProcessorSeconds`, in group `Cost` |
+| Material, `MaterialType` values | `ConductingSheet`, `FrequencyDependentDielectric` | `Conducting Sheet`, `Frequency Dependent Dielectric` |
+| Command line | `--simdir` | `--rundir` |
+
+### Fixed problems
+
+#### openEMS
+
+- A lumped port now puts a grid line on its plane whether or not it is driven.
+  A two-port with both ports driven was refused on the run driving the second,
+  and the mesh preview did not show the grid that was solved. The answers of a
+  lumped two-port can move slightly with this change.
+- A declared mirror is checked across the axis on which the two ports lie
+  furthest apart. The check read the first port's propagation axis, which for a
+  lumped port on a board is the trace's width. On Palace, **Check** and **Run**
+  log where the drawing contradicts a declared mirror.
+- A rectangular waveguide port reads its waves with the mode and the scale the
+  grid carries, and states the error of a column read alone.
+- Two materials drawn over one space, and a dielectric that the averaging never
+  reads, are refused. A hollow body with a void inside another void's bounding
+  box is no longer refused as wound backwards.
+- A lumped port whose plane lies in the absorber is refused, naming the end of
+  the axis and the depth.
+- A body sliced apart with BOPTools translates. It was refused as holding a
+  negative number of faces.
+
+#### Both backends
+
+- **Bind Material to Shape** and **Add Mesh Refinement** accept a
+  `PartDesign::Body` or an `App::Part`, picked whole or by a face. A pick whose
+  link would create a dependency cycle is left out and named.
+- A face picked through a link, a container or an array is bound where FreeCAD
+  shows it. A pick inside a copy of an object is left out and named. The port
+  commands keep the order in which faces were picked.
+- A waveguide or coaxial port on a separate face, such as a `Part::Plane` in the
+  guide, takes the guide body picked with it, in either order, and launches
+  toward the side on which the guide is longer.
+- A port that describes no geometry states the reason in its read-only `Status`
+  property and logs it once each time the reason changes.
+- A waveguide port whose guide opens into a body names the body's material.
+  If the body is the guide's wall, bind it to a PEC material.
+- A sketch or wire bound to a material is refused as edges that hold no area. A
+  sketch or point in one shape with a body or a face, and a body with a loose
+  face in one shape, are refused by name on both backends.
+- A run or a mesh no longer marks the study for recompute.
+- The command-line solve prints the traceback of a fault in the openEMS sweep.
+- Palace's refusal for a missing `mpirun` names the property to set and no
+  longer prints the whole `PATH`.
+
+### Known problems
+
+- FreeCAD can exit unexpectedly when a chart tab is closed after matplotlib's
+  **Customize** dialog was opened on it. Save the document before using
+  **Customize**.
+- On openEMS, a dielectric's `LossTangent` is modelled as a conductivity fixed
+  at the band centre, so the loss is overstated below the centre and
+  understated above it. Pre-flight warns when the band reaches more than two
+  octaves below its centre. Solve a wide band as several narrower studies, or
+  on Palace, which models the loss tangent at every frequency.
 
 ## Release 0.0.2 - 2026-09-08
 

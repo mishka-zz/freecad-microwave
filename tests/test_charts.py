@@ -19,6 +19,7 @@ returns the line. What cannot be reached without a display is the tab itself,
 and :func:`~Microwave.Gui.charts.figure` refuses when there is none.
 """
 
+from dataclasses import replace
 from unittest import mock
 
 import numpy as np
@@ -124,8 +125,8 @@ class FakeAxes:
     def set_title(self, text, **_):
         self.title = text
 
-    def set_xlim(self, left=None):
-        self.left = left
+    def set_xlim(self, left=None, right=None):
+        self.left, self.right = left, right
 
     def get_xlim(self):
         return (self.left if self.left is not None else -np.inf, np.inf)
@@ -146,6 +147,17 @@ class FakeAxes:
     def legend(self, handles, names, **style):
         self.legended = (handles, names)
         self.legend_style = style
+        self.made = FakeLegend()
+        return self.made
+
+    def axhspan(self, low, high, **style):
+        self.shaded = (low, high)
+
+    def text(self, x, y, text, **style):
+        self.said = (y, text)
+
+    def get_yaxis_transform(self):
+        return "axes across, data up"
 
     def plot(self, x, y, **kwargs):
         return self._kept("point", (x, y, kwargs))
@@ -157,6 +169,26 @@ class FakeAxes:
         artist = FakeArtist(self, kind, payload)
         self.artists.append(artist)
         return [artist] if kind == "point" else artist
+
+
+class FakeLegend:
+    """A legend: whether the layout engine is to make room for it."""
+
+    def __init__(self):
+        self.laid_out = True
+
+    def set_in_layout(self, laid_out):
+        self.laid_out = laid_out
+
+
+class FakeLabel:
+    """The details tab's text."""
+
+    def __init__(self):
+        self.shown = ""
+
+    def setText(self, text):
+        self.shown = text
 
 
 class FakeText:
@@ -183,6 +215,21 @@ class FakeText:
         self.colour = colour
 
 
+class FakeTabs:
+    """The window's tabs, as much as :mod:`~Microwave.Gui.charts` touches:
+    each tab's title and whether it is shown."""
+
+    def __init__(self):
+        self.titles = [charts.PLOT_TAB, charts.DETAILS_TAB, charts.WARNINGS_TAB.format(0)]
+        self.shown = [True, True, False]
+
+    def setTabText(self, index, title):
+        self.titles[index] = title
+
+    def setTabVisible(self, index, shown):
+        self.shown[index] = shown
+
+
 class FakeWindow:
     """``Plot.Plot``, as much of it as :mod:`~Microwave.Gui.charts` touches."""
 
@@ -199,8 +246,12 @@ class FakeWindow:
         self.series = []
         self.grid = False
         self.legend = False
+        self.legend_while_plotting = []
         self.heading = None
-        self.footnote = FakeText()
+        self.notes = FakeLabel()
+        self.warnings = FakeLabel()
+        self.tabs = FakeTabs()
+        self.warnings_tab = 2
         self.markers = []
         self.marker_artists = []
         self.mpl_toolbar = type("Toolbar", (), {"mode": ""})()
@@ -219,10 +270,17 @@ class FakeWindow:
         self.face = colour
 
     def plot(self, x, y, name=None):
+        # ``Plot.plot`` calls ``Plot.update``, which draws Mod/Plot's own
+        # legend where this flag is up.
+        self.legend_while_plotting.append(self.legend)
         line = FakeLine(x, y, name)
         self.series.append(line)
         self.axes.lines.append(line)
         return line
+
+
+#: A warning a chart carries, as the overlay says it.
+DIFFERENCE_IN_DB = "The difference is drawn only for Magnitude (dB)"
 
 
 def curve(name="S11", derived=False, points=5):
@@ -235,7 +293,8 @@ def chart(*series, **overrides):
         x_label="Frequency (GHz)",
         y_label="Magnitude (dB)",
         heading="Board A S-parameters",
-        footnote="Referenced to 50 ohm",
+        warnings=(DIFFERENCE_IN_DB,),
+        notes=("Referenced to 50 ohm",),
     )
     settings.update(overrides)
     return charts.Chart(**settings)
@@ -252,37 +311,39 @@ class TestWhatEndsUpOnTheAxes:
         cost minutes of FDTD."""
         window = FakeWindow()
         charts.draw(window, chart(curve("S11"), curve("S21", derived=True)))
-        assert window.series[0].properties == {}
-        assert window.series[1].properties == {"linestyle": "--"}
+        assert "linestyle" not in window.series[0].properties
+        assert window.series[1].properties["linestyle"] == "--"
 
-    def test_the_labels_and_both_texts_are_placed(self):
+    def test_each_curve_is_labelled_by_its_name_for_the_figure_options(self):
+        """Matplotlib's Edit Axis, Curve and Image Parameters lists curves by
+        their labels."""
+        window = FakeWindow()
+        charts.draw(window, chart(curve("S11, Run 1 (openEMS)"), curve("")))
+        assert [line.properties["label"] for line in window.series] == [
+            "S11, Run 1 (openEMS)",
+            "Magnitude (dB)",
+        ]
+
+    def test_the_labels_and_the_heading_are_placed(self):
         window = FakeWindow()
         charts.draw(window, chart(curve()))
         assert window.axes.labels == {"x": "Frequency (GHz)", "y": "Magnitude (dB)"}
-        assert window.footnote.get_text() == "Referenced to 50 ohm"
+        assert window.heading == "Board A S-parameters"
 
-    def test_the_basis_is_a_figure_text_and_not_the_axes_title(self):
+    def test_the_notes_are_on_the_details_tab_and_not_on_the_plot(self):
+        window = FakeWindow()
+        charts.draw(window, chart(curve(), notes=("Referenced to 50 ohm", "Loss: none")))
+        assert window.notes.shown == "Referenced to 50 ohm\n\nLoss: none"
+        assert "Referenced" not in window.warnings.shown
+        assert "Referenced" not in window.heading
+
+    def test_the_heading_is_a_figure_text_and_not_the_axes_title(self):
         """The axes sit right of the window's centre - the y-label and its tick
-        labels push them there - so a title on them reads visibly off-centre
-        against the heading, and further off the narrower the tab gets. It is
-        also what ``Mod/Plot``'s own Title panel edits."""
+        labels push them there - so a title on them reads visibly off-centre.
+        It is also what ``Mod/Plot``'s own Title panel edits."""
         window = FakeWindow()
         charts.draw(window, chart(curve()))
         assert window.axes.title is None
-
-    def test_the_heading_reserves_a_line_for_the_basis_under_it(self):
-        """The layout engine sizes the top margin from the heading and knows
-        nothing about a figure text, so the blank second line is what keeps the
-        two off each other."""
-        window = FakeWindow()
-        charts.draw(window, chart(curve()))
-        assert window.heading == "Board A S-parameters\n "
-
-    def test_a_chart_with_no_basis_reserves_nothing(self):
-        window = FakeWindow()
-        charts.draw(window, chart(curve(), footnote=""))
-        assert window.heading == "Board A S-parameters"
-        assert window.footnote.get_text() == ""
 
     def test_a_drawn_range_narrower_than_the_data_is_applied(self):
         """A step response keeps the window's non-causal skirt in the numbers
@@ -295,6 +356,31 @@ class TestWhatEndsUpOnTheAxes:
         window = FakeWindow()
         charts.draw(window, chart(curve()))
         assert window.axes.left is None
+
+
+class TestTheWarningsTab:
+    def test_each_warning_is_a_paragraph_and_the_title_counts_them(self):
+        window = FakeWindow()
+        charts.draw(window, chart(curve(), warnings=("one line", DIFFERENCE_IN_DB)))
+        assert window.warnings.shown == f"one line\n\n{DIFFERENCE_IN_DB}"
+        assert window.tabs.titles[2] == charts.WARNINGS_TAB.format(2)
+        assert window.tabs.shown == [True, True, True]
+
+    def test_its_title_carries_a_warning_sign(self):
+        assert charts.WARNINGS_TAB.format(1).startswith("\u26a0 ")
+
+    def test_it_is_hidden_while_it_holds_nothing(self):
+        window = FakeWindow()
+        charts.draw(window, chart(curve()))
+        charts.draw(window, chart(curve(), warnings=()))
+        assert window.warnings.shown == ""
+        assert window.tabs.shown == [True, True, False]
+
+    def test_no_warning_stands_on_the_plot(self):
+        window = FakeWindow()
+        charts.draw(window, chart(curve()))
+        assert DIFFERENCE_IN_DB not in window.heading
+        assert window.axes.title is None
 
 
 class TestTheLegend:
@@ -311,6 +397,16 @@ class TestTheLegend:
         charts.draw(window, chart(curve("S11")))
         assert window.axes.legended is None
 
+    def test_no_curve_is_drawn_with_the_flag_up(self):
+        """``Plot.plot`` updates after each curve, and an update with the flag
+        up draws Mod/Plot's own legend, large and in the layout. Left up from a
+        chart of several curves, it put one beside a single curve."""
+        window = FakeWindow()
+        charts.draw(window, chart(curve("S11"), curve("S21")))
+        window.legend_while_plotting.clear()
+        charts.draw(window, chart(curve("S11")))
+        assert window.legend_while_plotting == [False]
+
     def test_the_flag_matches_what_is_drawn(self):
         """``Plot.update`` rebuilds a legend from ``series`` whenever the flag
         is set, and every task panel and toolbar button in ``Mod/Plot`` calls
@@ -325,6 +421,84 @@ class TestTheLegend:
         assert window.legend is True
         charts.draw(window, chart(curve("S11")))
         assert window.legend is False
+
+
+class TestTheLegendCannotMoveTheAxes:
+    """The layout engine makes room for a legend wider than its axes by moving
+    the axes, so a long name would push the curves aside."""
+
+    def test_the_layout_engine_is_told_to_leave_it_out(self):
+        window = FakeWindow()
+        charts.draw(window, chart(curve("S11"), curve("S21")))
+        assert window.axes.made.laid_out is False
+
+    def test_a_name_past_the_limit_is_cut_and_says_so(self):
+        long = "S22, Run 2 (Palace), " + "Mesh Refinement ElementSize 0.2 mm, " * 3
+        window = FakeWindow()
+        charts.draw(window, chart(curve(long), curve("S21")))
+        [cut, kept] = window.axes.legended[1]
+        assert len(cut) == charts.LEGEND_LETTERS
+        assert long.startswith(cut[:-1]) and cut.endswith("\u2026")
+        assert kept == "S21"
+
+    def test_a_name_of_the_limit_is_kept_whole(self):
+        whole = "x" * charts.LEGEND_LETTERS
+        window = FakeWindow()
+        charts.draw(window, chart(curve(whole), curve("S21")))
+        assert window.axes.legended[1][0] == whole
+
+    def test_it_is_one_column_so_it_is_no_wider_than_its_longest_name(self):
+        window = FakeWindow()
+        charts.draw(window, chart(curve("S11"), curve("S21")))
+        assert window.axes.legend_style["ncol"] == 1
+
+    def test_the_curve_keeps_its_whole_name(self):
+        """Only the legend shows it cut."""
+        long = "x" * (charts.LEGEND_LETTERS + 1)
+        window = FakeWindow()
+        charts.draw(window, chart(curve(long), curve("S21")))
+        assert window.series[0].name == long
+
+
+class TestTheFloor:
+    """Nothing is drawn under a chart's floor, so the region under it is
+    shaded and named rather than left to look like empty axes."""
+
+    def drawn(self, *series):
+        window = FakeWindow()
+        charts.draw(window, chart(*series, floor=-120.0, y_unit="dB"))
+        return window.axes
+
+    def test_the_region_under_it_is_shaded_and_named(self):
+        axes = self.drawn(charts.Series(np.arange(3.0), np.array([-60.0, np.nan, -90.0]), "S11"))
+        low, high = axes.shaded
+        assert high == -120.0 and low < -120.0
+        assert axes.said == (-120.0, "under -120 dB")
+
+    def test_the_axis_reaches_from_under_it_to_over_every_curve(self):
+        axes = self.drawn(charts.Series(np.arange(3.0), np.array([-60.0, np.nan, -90.0]), "S11"))
+        assert axes.bottom == axes.shaded[0]
+        assert axes.top > -60.0
+
+    def test_the_region_shown_is_a_fifth_of_what_the_curves_stand_over_it(self):
+        series = charts.Series(np.arange(3.0), np.array([-60.0, np.nan, -90.0]), "S11")
+        axes = self.drawn(series)
+        _, highest = charts.vertical_span(chart(series), -np.inf)
+        assert -120.0 - axes.bottom == pytest.approx(0.2 * (highest + 120.0), rel=1e-12)
+
+    def test_a_chart_whose_curves_are_all_under_it_keeps_its_horizontal_range(self):
+        """Matplotlib takes no range from a curve with no number in it."""
+        axes = self.drawn(charts.Series(np.array([2.0, 3.0, 4.0]), np.full(3, np.nan), "S11"))
+        assert (axes.left, axes.right) == (2.0, 4.0)
+
+    def test_a_chart_whose_curves_are_all_under_it_still_shows_it(self):
+        axes = self.drawn(charts.Series(np.arange(3.0), np.full(3, np.nan), "S11"))
+        assert axes.bottom < -120.0 < axes.top
+
+    def test_a_chart_with_no_floor_shades_nothing(self):
+        window = FakeWindow()
+        charts.draw(window, chart(curve()))
+        assert not hasattr(window.axes, "shaded")
 
 
 class TestRedrawingReplacesRatherThanAccumulates:
@@ -365,7 +539,7 @@ class TestThereIsNowhereToDraw:
             "module",
             lambda: type("Plot", (), {"figure": staticmethod(lambda _title: None)}),
         )
-        with pytest.raises(charts.ChartUnavailable, match="no window"):
+        with pytest.raises(charts.ChartUnavailable, match="main window, and this session has none"):
             charts.figure("anything")
 
 
@@ -377,9 +551,17 @@ class FakeCombo:
         self.index = 0
         self.currentIndexChanged = self
         self.slots = []
+        self.blocked = False
 
     def addItem(self, text, value):
         self.items.append((text, value))
+
+    def clear(self):
+        self.items = []
+        self.index = 0
+
+    def blockSignals(self, blocked):
+        self.blocked = blocked
 
     def count(self):
         return len(self.items)
@@ -388,15 +570,18 @@ class FakeCombo:
         return self.items[index][1]
 
     def findData(self, value):
+        """As Qt finds it: a text by its value, and a tuple only where it is
+        the same one."""
         for index, (_, held) in enumerate(self.items):
-            if held == value:
+            if held is value or (isinstance(value, str) and held == value):
                 return index
         return -1
 
     def setCurrentIndex(self, index):
         self.index = index
-        for slot in self.slots:
-            slot(index)
+        if not self.blocked:
+            for slot in self.slots:
+                slot(index)
 
     def currentData(self):
         return self.items[self.index][1]
@@ -412,13 +597,18 @@ def recording_pyside(monkeypatch):
     import sys
     from unittest.mock import MagicMock
 
-    combo = FakeCombo()
+    combos = []
+
+    def made():
+        combos.append(FakeCombo())
+        return combos[-1]
+
     widgets = MagicMock()
-    widgets.QComboBox = lambda: combo
+    widgets.QComboBox = made
     module = MagicMock()
     module.QtWidgets = widgets
     monkeypatch.setitem(sys.modules, "PySide", module)
-    return combo
+    return combos
 
 
 class SelectableWindow(FakeWindow):
@@ -438,23 +628,20 @@ class TestTheSelector:
     """The one control this workbench adds to somebody else's window, and the
     only path that redraws a chart in place."""
 
+    AXES = charts.Selector("Horizontal axis", (("Distance", "distance"), ("Time", "time")))
+
     def built(self, monkeypatch, chosen="distance"):
-        combo = recording_pyside(monkeypatch)
+        combos = recording_pyside(monkeypatch)
         window = SelectableWindow()
         asked = []
 
         def rebuild(axis):
             asked.append(axis)
-            return chart(curve(f"on {axis}"))
+            return chart(curve(f"on {axis}"), selectors=(replace(self.AXES, chosen=axis),))
 
-        drawn = chart(
-            curve(),
-            choices=(("Distance", "distance"), ("Time", "time")),
-            choice_label="Horizontal axis:",
-            chosen=chosen,
-        )
-        charts._add_selector(window, drawn, rebuild)
-        return window, combo, asked
+        drawn = chart(curve(), selectors=(replace(self.AXES, chosen=chosen),))
+        charts._add_selectors(window, drawn, rebuild)
+        return window, combos[0], asked
 
     def test_every_choice_is_offered_with_its_value_behind_it(self, monkeypatch):
         _, combo, _ = self.built(monkeypatch)
@@ -473,6 +660,83 @@ class TestTheSelector:
         combo.setCurrentIndex(1)
         assert asked == ["time"]
         assert [line.name for line in window.series] == ["on time"]
+
+    def test_each_selector_is_offered_and_every_choice_reaches_the_caller(self, monkeypatch):
+        """A choice in one selector can change what another offers: the lost
+        share is chosen by driven port where a term is chosen by its two."""
+        combos = recording_pyside(monkeypatch)
+        window = SelectableWindow()
+        asked = []
+
+        def offered(quantity):
+            return (("S11", "S11"), ("S21", "S21")) if quantity == "dB" else (("Port 1", "1"),)
+
+        def build(quantity, term):
+            asked.append((quantity, term))
+            return chart(
+                curve(f"{term} in {quantity}"),
+                selectors=(
+                    charts.Selector("Quantity", (("dB", "dB"), ("Lost", "lost")), quantity),
+                    charts.Selector("Term", offered(quantity), term),
+                ),
+            )
+
+        charts._add_selectors(window, build("dB", "S21"), build)
+        quantity, term = combos
+        assert term.currentData() == "S21"
+        quantity.setCurrentIndex(1)
+        assert asked[-1] == ("lost", "S21")
+        assert term.items == [("Port 1", "1")]
+        term.setCurrentIndex(0)
+        assert asked[-1] == ("lost", "1")
+        assert [line.name for line in window.series] == ["1 in lost"]
+
+    def test_a_selector_is_labelled_as_the_chart_built_again_names_it(self, monkeypatch):
+        """Power lost is chosen by a column where a term is chosen by its
+        two ports, so the label over the box follows the chart."""
+        import sys
+
+        combos = recording_pyside(monkeypatch)
+        labels = []
+
+        class Label:
+            def __init__(self, text):
+                self.text = text
+                labels.append(self)
+
+            def setText(self, text):
+                self.text = text
+
+        sys.modules["PySide"].QtWidgets.QLabel = Label
+
+        def build(quantity, _chosen):
+            named = "Term" if quantity == "dB" else "Column"
+            return chart(
+                curve(quantity),
+                selectors=(
+                    charts.Selector("Quantity", (("dB", "dB"), ("Lost", "lost")), quantity),
+                    charts.Selector(named, (("1", "1"),), "1"),
+                ),
+            )
+
+        charts._add_selectors(SelectableWindow(), build("dB", "1"), build)
+        combos[0].setCurrentIndex(1)
+        assert [label.text for label in labels] == ["Quantity", "Column"]
+
+    def test_a_term_chosen_is_shown_once_the_chart_is_built_again(self, monkeypatch):
+        """A term is a tuple, and the chart built for it holds an equal tuple
+        rather than the one the box holds."""
+        combos = recording_pyside(monkeypatch)
+        window = SelectableWindow()
+
+        def build(term):
+            terms = tuple((f"S{a}{b}", (a, b)) for a, b in [(1, 1), (2, 1)])
+            return chart(curve(), selectors=(charts.Selector("Term", terms, tuple(term)),))
+
+        charts._add_selectors(window, build((1, 1)), build)
+        [term] = combos
+        term.setCurrentIndex(1)
+        assert term.currentData() == (2, 1)
 
     def test_the_bar_goes_above_the_canvas(self, monkeypatch):
         """``Mod/Plot`` lays its tab out as canvas then toolbar, so index 0 is
@@ -604,64 +868,6 @@ class TestMarkersSurviveARedraw:
         window.markers.append((1, 4))
         charts.draw(window, chart(curve("S11")))
         assert window.marker_artists == []
-
-
-class TestWhereTheBasisSits:
-    """The footnote is a figure text so that it lands on the window's centre,
-    and the price of leaving the layout engine is that its height has to be
-    found by hand."""
-
-    class Box:
-        def __init__(self, y0):
-            self.y0 = y0
-
-    class Heading:
-        def __init__(self, y0):
-            self.box = TestWhereTheBasisSits.Box(y0)
-
-        def get_window_extent(self, _renderer):
-            return self.box
-
-    def settled(self, window, heading_bottom=0.86, height=700.0):
-        window.fig._suptitle = self.Heading(heading_bottom * height)
-        window.fig.bbox = type("Bbox", (), {"height": height})()
-        window.fig.canvas = window.canvas
-        window.canvas.get_renderer = lambda: None
-        charts._settle_footnote(window)
-        return window.footnote.get_position()[1]
-
-    def test_it_is_lifted_into_the_line_the_heading_reserved(self):
-        """Above the bottom of the heading's block, not below it. The blank
-        second line *is* that bottom, so a footnote hung under it lands in the
-        axes - which is what it looked like before this was measured."""
-        window = FakeWindow()
-        charts.draw(window, chart(curve()))
-        assert self.settled(window, heading_bottom=0.86) > 0.86
-
-    def test_it_follows_the_heading_rather_than_sitting_at_a_fixed_height(self):
-        """The heading's block runs from 0.94 of the figure height at nine
-        inches down to 0.80 at three, so a constant would be inside the heading
-        at one size and in the axes at the other."""
-        window = FakeWindow()
-        charts.draw(window, chart(curve()))
-        assert self.settled(window, heading_bottom=0.94) != self.settled(
-            window, heading_bottom=0.80
-        )
-
-    def test_it_stops_asking_for_redraws_once_it_has_settled(self):
-        """It runs from a draw and asks for another, so a placement that never
-        converged would spin the event loop for as long as the tab is open."""
-        window = FakeWindow()
-        charts.draw(window, chart(curve()))
-        self.settled(window)
-        before = window.canvas.idle
-        self.settled(window)
-        assert window.canvas.idle == before
-
-    def test_a_chart_with_no_basis_places_nothing(self):
-        window = FakeWindow()
-        charts.draw(window, chart(curve(), footnote=""))
-        assert self.settled(window) == 0.0
 
 
 class TestTheVerticalRange:
@@ -806,7 +1012,6 @@ class TestTheChartFollowsTheApplication:
         assert {spine.colour for spine in window.axes.spines.values()} == {"#ffffff"}
         assert window.axes.xaxis.label.colour == "#ffffff"
         assert window.axes.yaxis.label.colour == "#ffffff"
-        assert window.footnote.colour == "#ffffff"
 
     def test_it_is_re_applied_on_every_draw(self):
         """``Axes.clear`` puts the tick and spine colours back to matplotlib's
@@ -855,6 +1060,10 @@ class TestAMarkerIsColouredLikeTheCurveItIsOn:
         charts._draw_markers(window)
         dot, label = window.marker_artists
         return dot.payload[2], label.payload[1]
+
+    def test_the_dot_is_left_out_of_the_figure_options(self):
+        dot, _ = self.placed()
+        assert dot["label"] == "_nolegend_"
 
     def test_the_dot_takes_the_curves_colour(self):
         dot, _ = self.placed(on=1)
@@ -1051,6 +1260,7 @@ class TestANewTabIsSetUpBeforeAnythingIsDrawn:
         window.fig = self.Figure()
         window.mpl_toolbar = self.Toolbar()
         monkeypatch.setattr(charts, "_theme_of_the_application", lambda: self.THEME)
+        monkeypatch.setattr(charts, "_tabs", lambda made: setattr(made, "tabbed", True))
         monkeypatch.setattr("PySide.QtGui.QColor", lambda name: name)
         monkeypatch.setattr(
             charts,
@@ -1066,14 +1276,16 @@ class TestANewTabIsSetUpBeforeAnythingIsDrawn:
         window = self.opened(monkeypatch)
         assert window.mpl_toolbar._actions["home"].text() == "Home"
 
-    def test_the_layout_engine_packs_the_heading_and_its_basis(self, monkeypatch):
+    def test_a_layout_engine_lays_the_figure_out(self, monkeypatch):
         assert self.opened(monkeypatch).fig.engine == "constrained"
 
-    def test_clicks_and_layouts_are_both_listened_for(self, monkeypatch):
-        """One places markers, the other keeps the basis line under the
-        heading. Neither has another route in."""
+    def test_clicks_are_listened_for(self, monkeypatch):
+        """They place markers, which have no other route in."""
         window = self.opened(monkeypatch)
-        assert set(window.fig.canvas.connected) == {"draw_event", "button_press_event"}
+        assert set(window.fig.canvas.connected) == {"button_press_event"}
+
+    def test_the_plot_is_put_on_tabs(self, monkeypatch):
+        assert self.opened(monkeypatch).tabbed
 
     def test_it_starts_with_no_markers_on_it(self, monkeypatch):
         assert self.opened(monkeypatch).markers == []
@@ -1096,3 +1308,57 @@ class TestANewTabIsSetUpBeforeAnythingIsDrawn:
         """It reaches for a private ``_icon``, so a matplotlib that has moved
         must cost the colour and not the chart."""
         charts._paint_toolbar(object(), charts.LIGHT)
+
+
+class TestClosingWithItsDocuments:
+    class Tab:
+        def __init__(self, gone=False):
+            self.gone, self.closed = gone, False
+
+        def parentWidget(self):
+            if self.gone:
+                raise RuntimeError("Internal C++ object (Plot) already deleted.")
+            return None
+
+        def close(self):
+            self.closed = True
+
+    def opened(self, monkeypatch, *named):
+        tabs = []
+
+        def figure(title, icon=""):
+            tabs.append(self.Tab())
+            return tabs[-1]
+
+        monkeypatch.setattr(charts, "figure", figure)
+        monkeypatch.setattr(charts, "draw", lambda window, chart: None)
+        monkeypatch.setattr(charts, "_drawn_from", [])
+        for documents in named:
+            charts.render(charts.Chart(), "a chart", documents=documents)
+        return tabs
+
+    def test_a_tab_closes_with_any_document_it_draws_from(self, monkeypatch):
+        mine, both, other = self.opened(monkeypatch, ["A"], ["A", "B"], ["B"])
+        charts.closed("A")
+        assert (mine.closed, both.closed, other.closed) == (True, True, False)
+        assert [named for _, named in charts._drawn_from] == [frozenset({"B"})]
+
+    def test_a_tab_drawn_from_no_document_is_never_held(self, monkeypatch):
+        self.opened(monkeypatch, [], [""])
+        assert charts._drawn_from == []
+
+    def test_a_tab_already_closed_is_forgotten(self, monkeypatch):
+        [tab] = self.opened(monkeypatch, ["A"])
+        tab.gone = True
+        charts.closed("B")
+        assert charts._drawn_from == []
+
+
+def test_a_chart_is_drawn_into_a_window_marked_as_asked(monkeypatch):
+    from Microwave.Gui import charts
+
+    asked = []
+    monkeypatch.setattr(charts, "figure", lambda title, icon="": asked.append((title, icon)))
+    monkeypatch.setattr(charts, "draw", lambda window, chart: None)
+    charts.render(charts.Chart(series=()), "a chart", icon="SParameters.svg")
+    assert asked == [("a chart", "SParameters.svg")]

@@ -20,7 +20,8 @@ dependency edge.
 ``build`` never raises. A port is created before it is configured, by design:
 the commands make one from whatever was selected and name what is missing. A
 half-built port has no box yet, and an empty shape reports that better than a
-traceback in the report view.
+traceback in the report view. :func:`why_not_drawn` says what is missing, and the
+port shows it in its ``Status``.
 """
 
 from __future__ import annotations
@@ -67,29 +68,88 @@ def _element(link: Any) -> Any:
     return picks.element(link[0], names[0] if names else "")
 
 
+class _NotDrawn(Exception):
+    """A port has no box, and the message says why."""
+
+
 def port_box(obj: Any) -> PortBox | None:
     """The :class:`~Microwave.portbox.PortBox` for this port, or ``None``.
 
     ``None`` whenever the port is not yet configured enough to have one, and for
     a waveguide port referred to its own face, which has no depth to draw. A
     waveguide port with a ``ReferenceDepth`` is drawn from the face it is
-    launched on to the plane it is referred to.
+    launched on to the plane it is referred to. :func:`why_not_drawn` says
+    which.
     """
-    kind = kind_of(obj)
     try:
-        if kind == "EMPortMicrostrip":
-            return _microstrip(obj)
-        if kind == "EMPortLumped":
-            return _lumped(obj)
-        if kind == "EMPortRectWaveguide":
-            return _waveguide(obj)
-        if kind == "EMPortCoaxial":
-            return _coaxial(obj)
-    except (portbox.BoxError, annulus.AnnulusError, AttributeError, IndexError, TypeError):
-        # An unfinished or contradictory port has no box. The adapter reports
-        # why, loudly, when the user runs it. The drawing layer does not.
+        return _box(obj)
+    except (
+        _NotDrawn,
+        portbox.BoxError,
+        annulus.AnnulusError,
+        AttributeError,
+        IndexError,
+        TypeError,
+    ):
         return None
+
+
+def why_not_drawn(obj: Any) -> str:
+    """Why this port has no box, or nothing where it has one or draws nothing
+    on purpose.
+
+    A pick that is not set or names nothing drawn, two axes that cannot both
+    hold, and a box the port's own lengths refuse each say so. A property
+    that cannot be read at all is a port still being built, and says nothing.
+    """
+    try:
+        _box(obj)
+    except (_NotDrawn, portbox.BoxError, annulus.AnnulusError) as error:
+        return str(error)
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    return ""
+
+
+def _box(obj: Any) -> PortBox | None:
+    kind = kind_of(obj)
+    if kind == "EMPortMicrostrip":
+        return _microstrip(obj)
+    if kind == "EMPortLumped":
+        return _lumped(obj)
+    if kind == "EMPortRectWaveguide":
+        return _waveguide(obj)
+    if kind == "EMPortCoaxial":
+        return _coaxial(obj)
     return None
+
+
+def _picked(obj: Any, name: str) -> tuple[Box, Box]:
+    """The ``(whole-body box, sub-element box)`` of the pick ``name`` holds."""
+    link = getattr(obj, name)
+    if not link or link[0] is None:
+        raise _NotDrawn(f"{name} is not picked")
+    names = [one for one in (link[1] or []) if one]
+    try:
+        picks.element(link[0], names[0] if names else "")
+    except picks.Unplaced as error:
+        raise _NotDrawn(f"{name}: {error}") from None
+    except Exception:
+        # Whatever else the kernel raises for an element it does not have is
+        # said below, in the words a missing element is said in.
+        pass
+    body, element = _linked(link)
+    if body is None or element is None:
+        what = repr(getattr(link[0], "Label", link[0])) + (f" {names[0]}" if names else "")
+        raise _NotDrawn(f"{name} names {what}, which has no shape")
+    return body, element
+
+
+def _axis_of(obj: Any, name: str) -> tuple[int, int]:
+    axis = _axis(getattr(obj, name))
+    if axis is None:
+        raise _NotDrawn(f"{name} is not set")
+    return axis
 
 
 def reference_box(obj: Any) -> PortBox | None:
@@ -119,14 +179,16 @@ def _length(quantity: Any) -> float:
 
 
 def _microstrip(obj: Any) -> PortBox | None:
-    propagation = _axis(obj.PropagationAxis)
-    excitation = _axis(obj.ExcitationAxis)
-    _, face = _linked(obj.TraceEnd)
-    _, ground = _linked(obj.GroundReference)
-    if not propagation or not excitation or face is None or ground is None:
-        return None
+    propagation = _axis_of(obj, "PropagationAxis")
+    excitation = _axis_of(obj, "ExcitationAxis")
+    _, face = _picked(obj, "TraceEnd")
+    _, ground = _picked(obj, "Ground")
     if propagation[0] == excitation[0]:
-        return None
+        # The field of a microstrip mode crosses the direction the wave runs.
+        raise _NotDrawn(
+            f"PropagationAxis and ExcitationAxis are both along "
+            f"{portbox.AXIS_NAMES[propagation[0]]}. Set them to different axes"
+        )
     return portbox.microstrip(
         face,
         ground,
@@ -141,11 +203,9 @@ def _microstrip(obj: Any) -> PortBox | None:
 
 
 def _lumped(obj: Any) -> PortBox | None:
-    excitation = _axis(obj.ExcitationAxis)
-    body, source = _linked(obj.SourceEntity)
-    _, reference = _linked(obj.ReferenceEntity)
-    if not excitation or source is None or reference is None:
-        return None
+    excitation = _axis_of(obj, "ExcitationAxis")
+    body, source = _picked(obj, "SourceEntity")
+    _, reference = _picked(obj, "ReferenceEntity")
     return portbox.lumped(
         source,
         reference,
@@ -199,10 +259,8 @@ def _outline(link: Any) -> bool:
 
 
 def _coaxial(obj: Any) -> PortBox | None:
-    propagation = _axis(obj.PropagationAxis)
-    _, face = _linked(obj.Annulus)
-    if not propagation or face is None:
-        return None
+    propagation = _axis_of(obj, "PropagationAxis")
+    _, face = _picked(obj, "Annulus")
     return portbox.coaxial(
         face,
         propagation_axis=propagation[0],
@@ -214,10 +272,10 @@ def _coaxial(obj: Any) -> PortBox | None:
 
 
 def _waveguide(obj: Any) -> PortBox | None:
-    propagation = _axis(obj.PropagationAxis)
-    _, face = _linked(obj.CrossSection)
+    propagation = _axis_of(obj, "PropagationAxis")
+    _, face = _picked(obj, "CrossSection")
     stated = _length(obj.ReferenceDepth)
-    if not propagation or face is None or stated <= 0:
+    if stated <= 0:
         return None
     return portbox.rect_waveguide(
         face,
@@ -237,10 +295,11 @@ def _waveguide(obj: Any) -> PortBox | None:
 #: traceback and leaves the port with no Shape, so the drawing layer refuses
 #: what the model layer and the solver both take.
 #:
-#: On FreeCAD 1.1.1, 1e-9 and 1e-8 raise ``ValueError``, 1e-7 raises
-#: ``OCCDomainError``, and 1.01e-7 builds. The bound is strictly above
-#: ``Precision::Confusion()``, so this sits a decade clear of it and far below
-#: any cell a model here is meshed on.
+#: ``Part.makeBox`` raises ``ValueError`` for a side below
+#: ``Precision::Confusion()`` (``src/Mod/Part/App/AppPartPy.cpp:1438-1446``), and
+#: re-raises a ``Standard_DomainError`` from OpenCascade's own box maker as
+#: ``OCCDomainError`` (``AppPartPy.cpp:1463-1464``). This sits a decade clear of
+#: that tolerance and far below any cell a model here is meshed on.
 _FLAT_BOX = 1e-6
 
 

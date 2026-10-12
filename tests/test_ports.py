@@ -140,6 +140,40 @@ class TestEveryPortArrivesNumbered:
         assert _port_numbers(made) == [1, 2]
 
 
+class TestAPortIsLabelledByItsNumber:
+    """A port's label is its index in S and its kind, as the tree shows it."""
+
+    @pytest.mark.parametrize(
+        "factory, word",
+        [
+            (createEMPortLumped, "Lumped"),
+            (createEMPortMicrostrip, "Microstrip"),
+            (createEMPortRectWaveguide, "Waveguide"),
+            (createEMPortCoaxial, "Coaxial"),
+        ],
+        ids=lambda value: getattr(value, "__name__", value),
+    )
+    def test_a_port_made_under_its_kind_s_name_is_labelled_by_its_number(self, factory, word, doc):
+        made = factory(doc=doc)
+        assert made.Label == f"Port {made.Number} ({word})"
+
+    def test_a_port_made_under_a_name_of_the_caller_s_keeps_it(self, doc):
+        assert createEMPortLumped("P1", doc=doc).Label == "P1"
+
+    def test_the_label_follows_a_number_changed(self, doc):
+        port = createEMPortLumped(doc=doc)
+        port.Number = 7
+        port.Proxy.onChanged(port, "Number")
+        assert port.Label == "Port 7 (Lumped)"
+
+    def test_a_label_the_user_typed_stays_when_the_number_changes(self, doc):
+        port = createEMPortLumped(doc=doc)
+        port.Label = "Feed"
+        port.Number = 7
+        port.Proxy.onChanged(port, "Number")
+        assert port.Label == "Feed"
+
+
 class TestOneNameForOneThing:
     """Facts stored twice, held here to one value.
 
@@ -238,7 +272,7 @@ class TestEachKindDeclaresItsOwnSurface:
     #: asserting 0 here would pin that defect as the contract.
     BASE_DEFAULTS = {
         "Number": 1,
-        "Excitation": True,
+        "Driven": True,
         "ReferenceImpedance": 50.0,
         "ReferencedTo": FIXED_IMPEDANCE,
     }
@@ -429,11 +463,23 @@ class TestNoPortPropertyIsANoOp:
     def test_the_adapter_reads_all_of_them(self, doc, make):
         obj = doc.addObject("App::FeaturePython", "Port")
         make(obj)
+        assert not self.unread(obj), (
+            f"{make.__name__} offers, and openEMS never reads: {self.unread(obj)}"
+        )
+
+    def unread(self, obj):
+        """What the user can set on ``obj`` and the adapter never reads.
+
+        PropertiesList on the stub holds exactly what addProperty was given, so
+        there are no FreeCAD built-ins to filter out. A read-only property is
+        the port's word to the user rather than a setting, and is not offered.
+        """
         read = self.read_by_the_adapter()
-        # PropertiesList on the stub holds exactly what addProperty was given,
-        # so there are no FreeCAD built-ins to filter out.
-        unread = [name for name in obj.PropertiesList if name not in read]
-        assert not unread, f"{make.__name__} offers, and openEMS never reads: {unread}"
+        return [
+            name
+            for name in obj.PropertiesList
+            if name not in read and "ReadOnly" not in obj.getEditorMode(name)
+        ]
 
     #: Zero ends the box at the measurement plane: the fixture feeds 20 mm in
     #: and measures 30 mm downstream of that, so 50. A stated length is taken
@@ -464,8 +510,7 @@ class TestNoPortPropertyIsANoOp:
         obj = doc.addObject("App::FeaturePython", "Port")
         EMPortLumped(obj)
         obj.addProperty("App::PropertyFloat", "ThoroughlyImaginary", "Lumped", "")
-        unread = [name for name in obj.PropertiesList if name not in self.read_by_the_adapter()]
-        assert unread == ["ThoroughlyImaginary"]
+        assert self.unread(obj) == ["ThoroughlyImaginary"]
 
 
 class TestTheClearanceIsWrittenIntoThePort:
@@ -540,3 +585,42 @@ class TestTheClearanceIsWrittenIntoThePort:
         EMAnalysis(second)
         second.FrequencyStart = "5.0 GHz"
         assert required_clearance(doc) == 0.0
+
+
+class TestAPortSaysWhyItIsDrawnAsNothing:
+    """A port drawn as nothing says why in ``Status``, which the property editor
+    shows whenever the port is picked, and warns once each time the reason
+    changes. ``Objects/port_shape.py`` says which reasons there are; this is the
+    port's ``execute`` carrying them."""
+
+    def executed(self, doc, monkeypatch, faces, times=1):
+        from types import SimpleNamespace
+
+        import FreeCAD
+
+        from Microwave import picks
+        from Microwave.Objects import port_shape
+
+        monkeypatch.setattr(port_shape, "build", lambda obj: SimpleNamespace(Faces=faces))
+        monkeypatch.setattr(picks, "local", lambda obj, shape: shape)
+        warned = []
+        monkeypatch.setattr(FreeCAD.Console, "PrintWarning", warned.append)
+        obj = doc.addObject("Part::FeaturePython", "Port")
+        EMPortRectWaveguide(obj)
+        for _ in range(times):
+            obj.Proxy.execute(obj)
+        return obj, warned
+
+    def test_a_port_with_no_pick_says_so_once(self, doc, monkeypatch):
+        obj, warned = self.executed(doc, monkeypatch, [], times=2)
+        assert obj.Status == "CrossSection is not picked"
+        assert warned == [f"{obj.Label} is not drawn: CrossSection is not picked\n"]
+
+    def test_a_port_that_is_drawn_says_nothing(self, doc, monkeypatch):
+        obj, warned = self.executed(doc, monkeypatch, ["face"])
+        assert (obj.Status, warned) == ("", [])
+
+    def test_the_status_is_read_only_and_moves_no_cell(self, doc, monkeypatch):
+        obj, _ = self.executed(doc, monkeypatch, [])
+        assert "ReadOnly" in obj.getEditorMode("Status")
+        assert "Output" in obj.getPropertyStatus("Status")

@@ -114,11 +114,7 @@ def load_library(
     # it to.
     for path in required:
         if not pathlib.Path(path).exists():
-            failures.append(
-                LoadFailure(
-                    str(path), "no such file or directory, so no catalog was loaded from it"
-                )
-            )
+            failures.append(LoadFailure(str(path), "no such file or directory"))
 
     for path in paths:
         # ``_files`` reads the directory, and the read can fail - a mode set by
@@ -145,9 +141,8 @@ def load_library(
                     LoadFailure(
                         str(file),
                         f"catalog id {catalog.id!r} is already loaded from "
-                        f"{existing.origin}. Two catalogs cannot share an id - "
-                        f"documents refer to materials by it. Change this file's "
-                        f"[catalog] id if both are wanted",
+                        f"{existing.origin}. To load both, change the [catalog] id "
+                        "in this file",
                     )
                 )
                 continue

@@ -92,14 +92,14 @@ def refresh(analysis):
     # excludes ``_document.mesh``, which touches nothing and can refuse, and a
     # transaction opened around a refusal is an empty one. See
     # ``Microwave/undo.py`` for what Ctrl-Z did without this.
-    with transaction(doc, "Update Mesh"):
+    with transaction(doc, "Mesh"):
         preview = find_preview(analysis)
         if preview is None:
             preview = createEMMeshPreview(doc)
             analysis.addObject(preview)
         # Stored first, then drawn from what was stored. Drawing from the plan
-        # and storing beside it would let the two part. This way every Update
-        # Mesh walks the same round trip a redraw walks.
+        # and storing beside it would let the two part. This way every Mesh
+        # walks the same round trip a redraw walks.
         set_grid(
             preview,
             (plan.lines.x, plan.lines.y, plan.lines.z),
@@ -147,8 +147,8 @@ def _drawing(preview):
     """The segments one view of this preview's own stored grid is made of.
 
     ``None`` where the preview carries no grid to draw. Both routes go through
-    here, so the picture Update Mesh draws is the picture a redraw would draw
-    from the same stored grid. On the Update Mesh route the answer is never
+    here, so the picture Mesh draws is the picture a redraw would draw
+    from the same stored grid. On the Mesh route the answer is never
     ``None``: a grid the mesher laid has just been stored, and the mesher
     refuses an axis with fewer than two positions.
     """
@@ -226,7 +226,7 @@ def _link(preview, found):
         # is how moving a port into the study or out of it reaches the badge:
         # nothing touches the preview for that, and no property announces it.
         # See Objects/analysis.py::_the_meshed_membership_moved. Rebuilt here
-        # and nowhere else, which is why an object added after an Update Mesh
+        # and nowhere else, which is why an object added after a Mesh
         # is invisible to the graph until the next one.
         # The Yee grid belongs here for the reason a refinement region does.
         # Every cell size comes off it, and a recipe that is not linked never
@@ -279,14 +279,14 @@ def redraw(preview):
     # This is the other caller of set_segments, and it rewrites the same
     # Shape. Untransacted, one change of Display replaces the whole drawing
     # with no undo entry, so Ctrl-Z reaches past it and removes the entire
-    # Update Mesh step, leaving Display where the user just put it. FreeCAD's
+    # Mesh step, leaving Display where the user just put it. FreeCAD's
     # own AutoTransaction covers an edit made through the property editor.
     # Nothing covers one made from a macro or the Python console.
     # A preview already touched stays so. A recompute of the objects it was
     # meshed from alone leaves that mark, and it is then all that carries the
     # change to the next full recompute and to the panel.
     pending = "Touched" in preview.State
-    with transaction(doc, "Redraw Mesh Preview"):
+    with transaction(doc, "Redraw Mesh"):
         set_segments(preview, segments)
         if not pending:
             _untouch(preview)
@@ -316,7 +316,7 @@ def staleness(analysis):
 
     So an edit undone is still reported. A solid nudged and put back leaves
     the badge stale, and this takes the badge at its word rather than
-    re-deriving. That costs one press of Update Mesh.
+    re-deriving. That costs one press of Mesh.
 
     Nothing here writes the badge. Healing it from the key would put a document
     write on opening a panel, and would turn a correct verdict into a wrong one
@@ -328,22 +328,22 @@ def staleness(analysis):
     """
     preview = find_preview(analysis)
     if preview is None:
-        return "no mesh preview yet"
+        return "no mesh yet"
     if not preview.Digest:
-        return "the preview was never built"
+        return "the mesh was never built"
     if str(preview.Status) != _preview_objects.CURRENT:
-        return "the model has changed since the preview was built"
+        return "the model has changed since the mesh was made"
 
     if awaits_recompute(preview):
-        return "the model has changed since the preview was built"
+        return "the model has changed since the mesh was made"
 
     try:
         current = _document.grid_inputs_digest(analysis)
     except Exception:
-        return "the document no longer translates, so the preview cannot be checked"
+        return "the study has errors, so the mesh cannot be checked. Press Check to see them"
 
     if current != preview.Digest:
-        return "the model has changed since the preview was built"
+        return "the model has changed since the mesh was made"
     return CURRENT
 
 

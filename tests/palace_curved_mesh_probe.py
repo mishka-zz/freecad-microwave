@@ -18,7 +18,8 @@ PEC stands through the slab at the same two radii; a round rod of the
 dielectric lies along it, open. The closed rod stands clear of every side, a
 block in a far corner holding the sides off. A line inside a body of PEC in the
 slab carries a Mesh Refinement, which the kernel fails to cut. The torus is
-drawn again with no elements asked round a turn. Palace is never started. A
+drawn again with no elements asked round a turn and nothing laid at the edges
+of metal. Palace is never started. A
 machine with no Gmsh records that and translates every drawing.
 
 ``manifest.json`` names what was written and is written last, so its existence
@@ -196,7 +197,7 @@ def study(doc, drawing):
     analysis = createEMAnalysis(doc)
     analysis.FrequencyStart = "2.5 GHz"
     analysis.FrequencyStop = "3.5 GHz"
-    analysis.NumFrequencyPoints = 3
+    analysis.FrequencyPoints = 3
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [one for one in analysis.Group if one is not member]
@@ -222,19 +223,24 @@ def study(doc, drawing):
         analysis.addObject(binding)
     if refined is not None:
         target, size = refined
-        region = createEMMeshRegion(doc)
+        recipe = next(obj for obj in analysis.Group if kind_of(obj) == "EMGmshMesh")
+        region = createEMMeshRegion(doc, recipe)
         region.References = [(made[target], [""])]
         region.ElementSize = size
         analysis.addObject(region)
     settings = contents(analysis).settings
     settings.Clearance = 2.0
     for face in FACES:
-        setattr(settings, f"Padding{face}", "Ends" if face in ends else "Air")
+        setattr(settings, f"Boundary{face}", "PEC Wall" if face in ends else "Open")
     recipe = contents(analysis).recipe
     recipe.ElementsPerWavelength = 6.0
     recipe.ElementsPerTurn = per_turn
+    if not per_turn:
+        # Sized by the wavelength alone: nothing is laid at the sheets' edges or
+        # across them either, which would size the tube round them finer.
+        recipe.EdgeRefinement = 1.0
     port = createEMPortLumped("Feed")
-    port.Label, port.Number, port.Excitation = "Feed", 1, True
+    port.Label, port.Number, port.Driven = "Feed", 1, True
     port.Resistance, port.ReferencedTo, port.ExcitationAxis = 50.0, PORT_IMPEDANCE, "X"
     port.SourceEntity = (made["Left"], [edge_at(made["Left"].Shape, l1)])
     port.ReferenceEntity = (made["Right"], [edge_at(made["Right"].Shape, r0)])

@@ -3,11 +3,11 @@
 
 """What a label map says about the drawing it came from.
 
-Every question here is asked of the same map, in the dimensions the profile
-asked for and in no others: the dimension being filled, and the one below it.
-Stated that way they are one piece of code and nobody's in particular - the
-dimension below a volume is a face, and the dimension below a closed surface is
-a curve. A closed surface has no curve bounding one face, so a caller that named
+Every question here that reads a map is asked of the same map, in the
+dimensions the profile asked for and in no others: the dimension being filled,
+and the one below it. Stated that way they are one piece of code and nobody's in
+particular - the dimension below a volume is a face, and the dimension below a
+closed surface is a curve. A closed surface has no curve bounding one face, so a caller that named
 nothing there is asked nothing; one that named a label for what the model ends
 against is told there is no such place.
 
@@ -21,6 +21,9 @@ answers all of them at once. One means the model ends there, more than one
 means inside it, and none means nothing in the mesh would lie on it. Which
 entities it bounds answers the one question the count cannot: whether what is
 filled holds together, or comes apart where nothing below it joins two parts.
+
+:func:`asked` and the checks it calls read no map. They say whether a request
+can be answered at all, before anything is meshed.
 
 Nothing here imports Gmsh. What it is given is a map, what bounds what and a
 request, and what it answers is a word or a complaint.
@@ -50,6 +53,7 @@ from .vocabulary import (
 )
 
 __all__ = [
+    "ENTITIES",
     "apart",
     "asked",
     "complaints",
@@ -75,6 +79,9 @@ __all__ = [
 #: word a complaint about a drawing that comes apart has to say.
 JOINS = {1: "point", 2: "curve", 3: "face"}
 
+#: What an entity of each dimension is, as a complaint names it.
+ENTITIES = {0: "point", 1: "curve", 2: "face", 3: "volume"}
+
 
 def _unwritable(label: str, written: str) -> str:
     """What the format being written cannot carry about this label, or ``""``.
@@ -92,18 +99,21 @@ def _unwritable(label: str, written: str) -> str:
     """
     if not label:
         return "is empty, and a group with no name cannot be looked up"
+    # A writer keeps only so many bytes of a name, and cuts a name at a
+    # character it cannot carry or writes the character as something else. Two
+    # labels alike that far arrive as one, or as none.
     keeps = FORMATS[written].name_length
     carried_as = len(label.encode())
     if carried_as > keeps:
         return (
-            f"takes {carried_as} bytes, which is longer than the {keeps} {written} keeps "
-            f"of a group name, so two labels alike that far arrive as one, or as none"
+            f"is {carried_as} bytes long, over the {keeps} bytes a {written} file keeps of "
+            "a group name. Shorten it"
         )
     carried = sorted(set(label) & set(FORMATS[written].forbids))
     if carried:
         return (
-            f"carries {carried}, which {written} cuts the name at or writes as something "
-            f"else, so two labels can arrive as one"
+            f"contains {', '.join(repr(one) for one in carried)}, which a {written} file "
+            "cannot carry in a group name. Rename it"
         )
     return ""
 
@@ -558,7 +568,7 @@ def complaints(
     bare = sorted(every - {tag for dim, tag in claimed if dim == top})
     if bare:
         said.append(
-            f"no label covers everything of dimension {top}, and these are left over: "
+            f"no label covers every {ENTITIES[top]}, and these are left over: "
             + _listed(top, bare, place)
         )
 
@@ -566,8 +576,8 @@ def complaints(
     if not remainder:
         if left:
             said.append(
-                f"the model ends at these and no label claims them, at dimension "
-                f"{top - 1}: " + _listed(top - 1, left, place)
+                f"the model ends at these {ENTITIES[top - 1]}s and no label claims them: "
+                + _listed(top - 1, left, place)
             )
     elif wrong := _unwritable(remainder, written):
         said.append(f"the remainder label {remainder!r} {wrong}")
@@ -603,7 +613,7 @@ def complaints(
         nowhere = sorted(tag for _, tag in entities if tag not in bounds)
         if nowhere:
             said.append(
-                f"the label {label} holds pieces that bound nothing of dimension {top}, "
+                f"the label {label} holds {ENTITIES[top - 1]}s that bound no {ENTITIES[top]}, "
                 f"so no element of the mesh would lie on them: " + _listed(top - 1, nowhere, place)
             )
 
@@ -840,8 +850,7 @@ def unsettled(
     and the contest is what it is already told about.
     """
     said = [
-        f"the labels {', '.join(who)} all claim one piece of the drawing, at dimension "
-        f"{entity[0]}: "
+        f"the labels {', '.join(who)} all claim one {ENTITIES[entity[0]]} of the drawing: "
         + _listed(entity[0], [entity[1]], place)
         + f", and {_standing(who, labels)}"
         for entity, who in stuck
@@ -879,14 +888,15 @@ def uncut(
         outer = claimed.get((top, holding), [])
         drawn = claimed.get((top, standing), [])
         inner = [label for label in drawn if label not in outer] or drawn
+        # A face of the body bounds it alone and stands inside the region, so the
+        # mesh would end there. The kernel leaves a small body standing free
+        # this way.
         said.append(
             f"a body drawn for {', '.join(inner) or 'no label'} stands inside the region "
             f"drawn for {', '.join(outer) or 'no label'}, at "
             + place.get((top, standing), f"the piece numbered {standing}")
-            + ", and the kernel did not cut it out: a face of it bounds the body alone and "
-            "stands inside the region, so it would read as where the model ends. The kernel "
-            "leaves a small body standing free this way. Remove it, or draw it at the size it "
-            "was meant to have"
+            + ", and Gmsh did not cut it out, so its faces would read as where the model "
+            "ends. Remove it, or draw it at the size it was meant to have"
         )
     return said
 
@@ -909,9 +919,8 @@ def wound(
     return [
         f"the solid drawn for {label} at "
         + place.get(entity, f"the shape numbered {entity[1]}")
-        + " is wound inside out: its faces point inward, so the fragmenting reads it as "
-        "everything except the space it appears to take. Rebuild it from a shape that "
-        "is not reversed"
+        + " is wound inside out: its faces point inward, so Gmsh reads it as all the space "
+        "outside it. Rebuild it from a shape that is not reversed"
         for label, entity in drawn
         if entity in wrong
     ]
@@ -945,14 +954,15 @@ def turned(
         own = claimed.get(entity, [])
         near = {(entity[0], other) for on in sides.values() if entity[1] in on for other in on}
         round_it = sorted({label for other in near for label in claimed.get(other, [])} - set(own))
+        # The kernel returns the region whole beside the piece, so the region
+        # overlaps what stands there instead of meeting it. It does this round a
+        # small body standing inside a part, and round small bodies that touch.
         said.append(
-            f"the kernel failed to cut the region drawn for {', '.join(own) or 'no label'} at "
+            f"Gmsh failed to cut the region drawn for {', '.join(own) or 'no label'} at "
             + place.get(entity, f"the piece numbered {entity[1]}")
             + (f", round what was drawn for {', '.join(round_it)}" if round_it else "")
-            + ": it returned the region whole beside a piece turned inside out there, so "
-            "the region overlaps what stands there instead of meeting it. The kernel does "
-            "this round a small body standing inside a part, and round small bodies that "
-            "touch. Remove the small body, or draw it at the size it was meant to have"
+            + ": it left a piece turned inside out there, so the region overlaps what "
+            "stands there. Remove the small body, or draw it at the size it was meant to have"
         )
     return said
 
@@ -1034,8 +1044,7 @@ def apart(
         where = f", at {place[index]}" if index < len(place) else ""
         described.append(f"the part drawn as {', '.join(names) or 'nothing'}{where}")
     return [
-        f"what is filled has to be one region, and no {JOINS[top]} joins these parts of it - "
+        f"the model has to be one region, and no {JOINS[top]} joins these parts of it: "
         + "; ".join(described)
-        + f". Bodies meant to meet have to share a {JOINS[top]}, and the kernel joins "
-        f"two of them only closer than its own tolerance"
+        + f". Make bodies meant to meet share a {JOINS[top]}"
     ]

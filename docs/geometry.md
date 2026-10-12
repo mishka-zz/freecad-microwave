@@ -63,9 +63,9 @@ underlying solid volume remains unaffected.
 ### Joining conductors
 
 When connecting conductors (such as a stub attached to a transmission
-line), place them edge-to-edge rather than overlapping them.
+line), place them edge to edge.
 
-OpenEMS models overlapping metal solids as a single continuous conductor.
+openEMS models overlapping metal solids as a single continuous conductor.
 However, overlapping planar sketches can produce area discrepancies during
 decomposition into rectilinear boxes, causing translation errors.
 
@@ -81,7 +81,7 @@ solver representation:
    axis-aligned planes are partitioned into rectangular boxes.
 3. **Triangulated surfaces**: Curved, rotated, or irregular shapes that
    cannot be represented by rectangular boxes are triangulated and exported
-   as polyhedral surfaces. OpenEMS determines point containment by testing
+   as polyhedral surfaces. openEMS determines point containment by testing
    against these surface triangles.
 
 Triangulated surfaces consist of planar facets forming chords across curved
@@ -127,7 +127,7 @@ artificial thickness. Inspect geometry warnings to ensure closed solids are
 properly closed in CAD.
 
 On Palace a sheet bound to `PEC` carries the perfect conductor where it is
-drawn, and is given no thickness. A sheet bound to a `ConductingSheet` carries
+drawn, and is given no thickness. A sheet bound to a `Conducting Sheet` carries
 its metal's surface impedance on each of its faces.
 
 ## A dielectric drawn as a closed surface is the volume inside it
@@ -148,6 +148,7 @@ shapes that cannot be represented in openEMS:
 |---|---|---|
 | Flat in two axes | A 1D line or 0D point enclosing no area | Assign width/thickness |
 | Mixed volume and surface | A single object containing both volumes - solids or closed surfaces - and loose faces | Separate into distinct objects or knit into a closed solid |
+| Edges or points beside an area | A single object holding faces or solids and, beside them, edges belonging to none of its faces or points belonging to none of its edges - a sketch or a point put in one container or compound with a body | Hide the object that draws them, or remove it from the compound |
 | Inverted normal (inside out) | A solid whose surface normals point inward | Reverse face normals |
 | Self-pinching surface | Two lobes of a single volume touching at a single vertex | Merge lobes or split into separate solids |
 | Dielectric surface | A dielectric bound to a face, or to a shape that encloses no volume | Model the dielectric as a solid with explicit thickness |
@@ -173,11 +174,10 @@ that would otherwise produce plausible-looking but invalid results.
 This section describes openEMS. On Palace the mesh follows the drawn surface,
 and no offset is applied.
 
-OpenEMS determines electrical conductivity at grid edges by point-sampling
+openEMS determines electrical conductivity at grid edges by point-sampling
 material at discrete sample points (`Operator::CalcPEC_Range`). On curved
 conductor boundaries, point-sampling results in an effective electrical
-boundary that sits inside the drawn CAD surface by approximately half a
-cell on average.
+boundary that sits inside the drawn CAD surface by a fraction of a cell.
 
 To compensate for this systematic discretization offset, the adapter expands
 curved conductor surfaces outward by half a Yee cell (`0.5 * cell_size`)
@@ -217,14 +217,14 @@ along the Z axis, reducing the FDTD timestep.
 To avoid this computational overhead:
 1. Model traces and ground planes as zero-thickness planar sheets
    (`Part::Plane` or face bindings).
-2. Assign a `ConductingSheet` material, specifying electrical conductivity
+2. Assign a `Conducting Sheet` material, specifying electrical conductivity
    and copper foil thickness as material properties.
 
 For thick conductors where vertical sidewall capacitance is critical,
 model the conductor as a 3D solid (`Part::Box`) and assign `PEC` material.
-OpenEMS applies surface impedance loss only to 2D planar elements; solid
+openEMS applies surface impedance loss only to 2D planar elements; solid
 conductor volumes are treated as lossless PEC. On Palace a body bound to a
-`ConductingSheet` is refused, and a body bound to `PEC` leaves the region, with
+`Conducting Sheet` is refused, and a body bound to `PEC` leaves the region, with
 its faces carrying the conductor.
 
 Port attachment depends on the chosen model:
@@ -247,7 +247,7 @@ extensions are sufficient, increase their dimensions and re-run the
 simulation; if S-parameters do not change, the margins are adequate.
 
 Air buffers between the physical device and absorbing boundaries are added
-automatically, by the policy's `Padding` and `Clearance`, and filled with its
+automatically, by the policy's `Boundary` and `Clearance`, and filled with its
 `Medium`. Do not model air volumes explicitly.
 
 ## Overlaps
@@ -258,8 +258,8 @@ solved. Draw a part standing in a board with the board cut round it
 (`Part > Boolean > Cut`), so that no two bodies share a volume. The message says
 which body stands inside which, and which to cut out of which.
 
-Metal is the exception. A metal body fills the space it is drawn in, above
-every dielectric, so a via or a post drawn through an uncut board is taken on
+A metal body is not refused for an overlap. It fills the space it is drawn in,
+above every dielectric, so a via or a post drawn through an uncut board is taken on
 both backends.
 
 Only an overlap thicker than about one nanometre counts, and a thick part of
@@ -297,22 +297,85 @@ On Palace:
 
 ## Geometry on Palace
 
-Palace refuses these by name:
+This section states what Palace takes of a drawing and what it refuses by
+name.
 
-- A region in more than one piece. Bodies meant to meet have to share a face.
-- A part of the region no port stands on, such as the inside of a skin of
-  metal drawn as a surface.
-- A metal sheet reaching outside the region.
-- A body bound to a `ConductingSheet`.
-- A binding of metal holding both bodies and sheets, and an object bound whole
-  by two bindings.
-- A body that an `Ends` or a `Through` side touches only where the body curves
-  away from it.
-- An open study drawn flat along an axis with neither face across that axis
-  set to `Air`.
+### The region
 
-[Running a study](running.md#execution-model) states each rule, what the
-refusal names, and what to change.
+The region the field lives in has to be one piece. Bodies meant to meet have
+to share a face. The CAD kernel joins two bodies only closer than its own
+tolerance, so two bodies left a hair apart, or touching only along an edge or
+at a point, are two regions, and the wall closes each one off. **Mesh** and
+**Run** refuse such a drawing before any element is built. The refusal names
+the material bindings drawn over each part, a box around each part, and how
+close each part comes to another and where.
+
+A region that is one piece can still be cut into parts by its own conditions.
+No field crosses a sheet of metal here, so a skin of metal closed round a space
+leaves that space a problem of its own. **Mesh** and **Run** refuse a part no
+port stands on: it would be meshed and solved and no number would be reported
+on it. The refusal names what closes the part and a box around it. A metal post
+drawn as its own surface is the usual way to reach it: bind the post's body
+instead, as below.
+
+### Metal
+
+Metal is a sheet bound to a `PEC` material: a `Part::Plane`, any shape made of
+faces and no solid, or faces picked off a body. It carries a perfect conductor
+where it is drawn, on a face of the region or inside the region with the region
+on both sides of it, as a septum or an iris stands in a guide. A sheet reaching
+outside the region is refused, and the refusal says where the part outside is.
+
+Metal can also be a body bound to `PEC`, drawn inside the region or across it.
+The mesh takes the body out of the region, and the faces it leaves carry the
+perfect conductor. Draw a post, a thick septum or a rod as a body overlapping
+whatever it stands in. The body keeps every part of the
+region it overlaps, so a part of a port face or a sheet drawn inside the body
+goes with it, and **Mesh** and **Run** state each such part and where it was. A
+lumped port element drawn partly inside a body is refused instead, because the
+resistor left would not be the one drawn. One binding holds either bodies or
+sheets, not both, and an object bound whole by two bindings is refused. A body
+bound to a `Conducting Sheet` is refused: this solver models a metal of finite
+conductivity as a sheet only.
+
+A shape holding edges or points beside its faces or its body is refused by
+name, whatever material it is bound to: a sketch put in one compound with a
+body, or a visible sketch or point in a container holding one. An edge or a
+point holds no material and carries no condition. Hide it in its container, or
+take it out of the compound.
+
+### Where the drawing meets a side of the box
+
+The box round the structure (see "What a study reserves" under
+[Open studies on Palace](meshing.md#open-studies-on-palace)) is
+built on a bound that encloses each shape, and that bound stands off a curved
+face the CAD kernel does not bound exactly. On a side where the domain ends on
+the structure, the adapter reads the room only up to the drawing's own points,
+so a gap or a groove opening onto that side is read as if the box stood on the
+drawing. The thin room between those points and the box is left out, and
+the log names it. Each `Open` side beside it stops where the drawing reaches.
+
+A body that a `PEC Wall` or a `Through` side touches only where the body curves
+away from it is refused: a sphere or a cylinder lying against the side, a
+spline bulge at its crown. A `PEC Wall` side stands where the drawing reaches,
+so it touches a curved extreme at a point or along a line. The room between the
+two closes to nothing there, and the mesh would lay elements of vanishing
+thickness in it. The message names the binding, the side and the point. A body
+that meets the side at an angle is taken, such as a tilted cylinder at the rim
+of its end. So is a body standing on the side over an area, such as a block
+with filleted edges on its flat face. Set a `PEC Wall` side to `Open`, or end
+the drawing on a flat face at that side: draw the housing or a block of the
+medium there, or give the body a flat where it meets the side. A `Through` side
+carries a lumped port's plane, so give the body a flat there, or move it clear
+of the side.
+
+In a closed study where metal encloses all the room the drawing leaves, the
+domain is the bound bodies alone. Every face of them that meets nothing drawn
+is a perfect conductor.
+
+An open study drawn flat along an axis with neither face across that axis set
+to `Open` is refused: see
+[Open studies on Palace](meshing.md#open-studies-on-palace).
 
 ## Sanity
 

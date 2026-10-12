@@ -202,10 +202,10 @@ class SizingRegion:
     :param lower: Minimum corner, ``(x, y, z)``.
     :param upper: Maximum corner.
     :param size: Target cell size inside the box.
-    :param min_lines: Fewest cells across the box, or 0 to use the global
-        ``min_lines``. Per region because one global integer cannot give a
+    :param min_lines: Fewest cells across the box, or 0 to use the Yee grid's
+        ``min_lines``. Per region because the grid's one count cannot give a
         50 um bond layer and a 1.6 mm core different counts, nor give a
-        conductor one at all. The global count is dielectrics only.
+        conductor one at all. The grid's count is dielectrics only.
     :param label: Free text carried into error messages, naming the object the
         user drew.
     """
@@ -303,11 +303,12 @@ class MeshParams:
         default and is what the document layer builds. It is policy rather than a
         constant because it is a choice, and a choice that cannot be turned off
         cannot be measured against its absence.
-    :param min_cell: Hard floor on cell size. Constraints closer together than
-        this are snapped together. Defaults to ``metal_res / 1000``, which is
-        far below anything meshing wants. It catches coincident anchors rather
-        than shaping the grid, and a floor tight enough to influence cell sizes
-        would merge geometry the user drew apart. It protects the timestep
+    :param min_cell: Hard floor on cell size. Two anchors closer together than
+        this are refused, and a preferred line closer than this to a kept one is
+        dropped. Defaults to ``metal_res / 1000``, which is far below anything
+        meshing wants. It catches coincident anchors rather than shaping the
+        grid, and a floor tight enough to influence cell sizes would refuse
+        geometry the user drew apart. It protects the timestep
         rather than the grid: the FDTD step is set by the smallest cell
         anywhere, so one sliver is paid for over the whole domain. See
         :mod:`~.mesh`.
@@ -334,7 +335,10 @@ class MeshParams:
         if len(self.max_ratio) != DIMENSIONS:
             raise MeshError("max_ratio must have one entry per dimension")
         if any(ratio <= 1.0 for ratio in self.max_ratio):
-            raise MeshError("max_ratio must be > 1; a ratio of 1 forbids grading")
+            raise MeshError(
+                f"MaxGrowthRatio is {min(self.max_ratio):g}, so cells cannot grade. "
+                "Enter a value above 1"
+            )
         if self.min_lines < 1:
             raise MeshError("min_lines must be >= 1")
         if not 0.0 <= self.edge_line_inside < 1.0:

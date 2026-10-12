@@ -30,9 +30,9 @@ def classes() -> Mapping[str, type]:
     is fixed at import time. Read-only, the cache handing every caller the one
     mapping.
     """
-    from . import _vp_hook, analysis, materials, mesh, ports, preview, results, solver
+    from . import _vp_hook, analysis, materials, mesh, ports, preview, results, runs, solver
 
-    modules = (analysis, materials, mesh, ports, preview, results, solver)
+    modules = (analysis, materials, mesh, ports, preview, results, runs, solver)
     found: dict[str, type] = {}
     for module in modules:
         for name, value in vars(module).items():

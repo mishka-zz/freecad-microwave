@@ -79,15 +79,15 @@ geometric condition being enforced:
    This directional formulation ensures rotation invariance: rotating the edge
    in space produces consistent cell sizes regardless of grid alignment.
 
-   The criterion is stated over a plane rather than over a named pair of
-   directions, and the difference is not cosmetic. A demand written per face
-   normal bounds each normal and leaves the direction between the two faces
-   free: at a right angle that direction costs the ordinary diagonal price,
-   and on a nearly closed blade it is unbounded. Two drawings of one wedge
-   differing only by a rotation would then mesh several times apart, and
-   furthest apart where the singularity is strongest.
+   The criterion is stated over the whole plane orthogonal to the edge. A
+   demand written per face normal bounds each normal and leaves the direction
+   between the two faces unbounded. At a right angle that direction needs the
+   diagonal cell size, and on a nearly closed blade it needs an arbitrarily
+   small one. Two drawings of one wedge that differ only by a rotation would
+   then mesh to different line counts, and differ most where the singularity
+   is strongest.
 
-These three criteria form a hierarchy: satisfying the connection criterion guarantees
+These criteria form a hierarchy: satisfying the connection criterion guarantees
 that the edge criterion holds for any tangent $\boldsymbol{\tau}$, which in turn
 guarantees that separation holds along any normal orthogonal to the edge.
 
@@ -112,20 +112,19 @@ Using Lagrange multipliers:
 - **Edge constraint** ($\max_{\mathbf{u} \cdot \boldsymbol{\tau} = 0} \sum_i |u_i| h_i \le t$):
   Evaluating the maximum over the orthogonal circle yields the closed form:
   $$\max_{\mathbf{u} \cdot \boldsymbol{\tau} = 0} \sum_i |u_i| h_i = \sqrt{\sum_i h_i^2 - \min_{\mathbf{s} \in \{-1, 1\}^3} \left( \sum_i s_i h_i |\tau_i| \right)^2}$$
-  The constraint is a family, one separation per direction on the circle, so the
-  multiplier route would need the active directions and those move with the
-  tangent. The mesher fixes the shape of the answer instead and buys feasibility
-  with one scalar. It states the separation profile against the largest share
+  The constraint is a family, one separation per direction on the circle. A
+  Lagrange solution would need the active directions, and those move with the
+  tangent. The mesher therefore fixes the shape of the answer and scales it by
+  one factor. It states the separation profile against the largest share
   $|u_i|$ the circle reaches on each axis, $c_i = \sqrt{1 - \tau_i^2}$, giving
   $g_i = 1 / \sqrt{c_i}$, and scales $g$ until the maximum above equals $t$.
 
-  The scale follows from the criterion: any profile is feasible once scaled, and
-  tightness is what the criterion asks for. The profile is a judgement. This one
-  was chosen by pricing candidates against the numerically optimal line count
-  over random tangents, which it tracks to within a few percent. For an
-  axis-aligned edge the criterion is connection in the plane and the allocation
-  is exact: $t / \sqrt{2}$ on the two transverse axes, leaving the tangent axis
-  unconstrained.
+  Any profile is feasible once scaled, and the criterion sets the scale. The
+  profile is chosen by judgement and is not optimal. A numerical optimisation
+  of the line count over the axes, for the same tangent, can use fewer lines,
+  and no feasible profile uses fewer than that optimum. For an axis-aligned edge the criterion
+  is connection in the plane and the allocation is exact: $t / \sqrt{2}$ on the
+  two transverse axes, leaving the tangent axis unconstrained.
 
 ### Formulation continuity
 

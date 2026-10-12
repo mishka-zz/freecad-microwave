@@ -863,7 +863,7 @@ def _check(
     bare = labels.unfilled(profile.top)
     if bare:
         said.append(
-            f"Gmsh left these regions of dimension {profile.top} with no element in them: "
+            f"Gmsh left these {coverage.ENTITIES[profile.top]}s with no element in them: "
             + ", ".join(
                 f"{tag} of {labels.holding(profile.top, tag)} at "
                 f"{place.get((profile.top, tag), 'an unplaced piece')}"
@@ -882,10 +882,11 @@ def _turned_over(dimensions: Sequence[int]) -> list[str]:
     if not found:
         return []
     return [
-        "Gmsh returned elements with no shape or turned inside out, which lie "
-        "partly outside the drawing, in "
+        "Gmsh returned flat or inside-out elements, which lie partly outside the "
+        "drawing, in "
         + "; in ".join(
-            f"{name!r} at {where}, where the worst is {figure:.3g}" for name, figure, where in found
+            f"{name!r} at {where}, where the worst quality is {figure:.3g}"
+            for name, figure, where in found
         )
     ]
 
@@ -927,7 +928,7 @@ def _generate(demand: Demand, profile: Profile, ours: bool) -> None:
         where = labels.stopped_at()
         said = [f"Gmsh stopped: {stopped}"]
         if where:
-            said.append("It stopped at " + "; ".join(where))
+            said.append("it stopped at " + "; ".join(where))
         raise Unmeshed(said, _told(ours)) from stopped
     if not (profile.curved and profile.element_order > 1):
         return

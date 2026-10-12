@@ -8,6 +8,8 @@ port they answer differently about is one whose picture is not what the solver
 gets. So the question is asked in one module, and these are its rules.
 """
 
+import types
+
 import pytest
 
 from Microwave import picks
@@ -242,6 +244,43 @@ class Placed(Obj):
         self.Parents = list(parents)
 
 
+class Node:
+    """A document object along a selection's path."""
+
+    def __init__(self, label, **attributes):
+        self.Label = label
+        self.__dict__.update(attributes)
+
+
+class Pose:
+    """A placement, recording what it was composed of."""
+
+    def __init__(self, *parts):
+        self.parts = parts
+
+    def inverse(self):
+        return Pose("less", *self.parts)
+
+    def multiply(self, other):
+        return Pose(*self.parts, *other.parts)
+
+    def toMatrix(self):
+        return self.parts
+
+
+class Mover(Shape):
+    """A shape that hands back ``moved`` for any transformation."""
+
+    def __init__(self, moved):
+        super().__init__()
+        self._moved = moved
+        self.matrix = None
+
+    def transformGeometry(self, matrix):
+        self.matrix = matrix
+        return self._moved
+
+
 class TestWhereAShapeIsShown:
     """An object's ``Shape`` is in the coordinates of the container it stands in,
     so the shape is asked of the top container along the path down to it."""
@@ -269,6 +308,7 @@ class TestWhereAShapeIsShown:
         ) as said:
             picks.placed(Placed(Shape(), (one, "Septum."), (other, "Septum.")))
         assert "Assembly.Septum." in str(said.value) and "Group.Septum." in str(said.value)
+        assert str(said.value).endswith(", so its place is ambiguous. Keep it in one")
 
     def test_two_roots_sharing_a_label_are_two_places(self):
         one, other = (
@@ -305,3 +345,130 @@ class TestWhereAShapeIsShown:
         pick = (Placed(Shape(Edge2=Element(area=True)), (root, "Septum.")), ["Edge2"])
         assert picks.shapes(pick) == [face]
         assert picks.is_outline(pick)
+
+    def test_an_element_of_a_link_array_stands_where_the_array_puts_it(self):
+        """The array lists it among its own elements, so the path from the array
+        to it is its place rather than a copy."""
+        shown = Shape()
+        element = Placed(Shape(), label="Array_i0")
+        array = Node("Array", LinkedObject=object(), ElementList=[element])
+        root = Root("Assembly", **{"Array.Array_i0.": shown})
+        root.getSubObjectList = lambda path: [root, array, element]
+        element.Parents = [(root, "Array.Array_i0.")]
+        assert picks.placed(element) is shown
+
+    def test_a_container_is_its_own_shape_moved_by_the_containers_above_it(self):
+        """A container answers no shape along a path that ends at it, measured
+        under 1.1.1, so its own is moved by the placement the path accumulates
+        less its own."""
+        moved = Shape()
+        own = Mover(moved)
+        inner = Placed(own, label="Inner")
+        inner.Placement = Pose("own")
+        root = Root("Outer", **{"Inner.": None})
+        root.getSubObject = lambda path, retType=0: Pose("path") if retType == 3 else None
+        inner.Parents = [(root, "Inner.")]
+        assert picks.placed(inner) is moved
+        assert own.matrix == ("path", "less", "own")
+
+    def test_the_original_a_link_shows_is_not_placed_by_the_link(self):
+        own = Shape()
+        septum = Placed(own)
+        link = Node("Link", LinkedObject=septum)
+        root = Root("Assembly", **{"Link.Septum.": Shape()})
+        root.getSubObjectList = lambda path: [root, link, septum]
+        septum.Parents = [(root, "Link.Septum.")]
+        assert picks.placed(septum) is own
+
+
+class Top(Node):
+    """The object a pick was made through, answering each path with the chain
+    of objects down it."""
+
+    def __init__(self, label, chains, **attributes):
+        super().__init__(label, **attributes)
+        self._chains = chains
+
+    def getSubObjectList(self, path):
+        return [self, *self._chains[path]]
+
+
+def entry(obj, *names):
+    return picks.Selected(obj, tuple(names))
+
+
+class TestWhatAPickNames:
+    """``Gui.Selection.getCompleteSelection(0)`` keeps each pick on the object
+    it was made through, with the path down to what it picked, one entry to a
+    pick in the order picked."""
+
+    def test_a_pick_through_a_container_lands_on_the_object_it_reaches(self):
+        box = Node("Box")
+        part = Top("Assembly", {"Box.Face2": [box]})
+        assert picks.resolved([entry(part, "Box.Face2")]) == ([entry(box, "Face2")], [])
+
+    def test_a_pick_inside_the_copy_a_link_shows_is_named_and_left_out(self):
+        """It would name the original, where it was drawn, not the copy picked."""
+        box = Node("Box")
+        link = Top("Link", {"Box.Face2": [box]}, LinkedObject=Node("Assembly"))
+        assert picks.resolved([entry(link, "Box.Face2")]) == ([], ["'Box' in 'Link'"])
+
+    def test_a_pick_on_a_link_itself_stays_on_the_link(self):
+        link = Top("Link", {"Face2": []}, LinkedObject=Node("Box"))
+        assert picks.resolved([entry(link, "Face2")]) == ([entry(link, "Face2")], [])
+
+    def test_a_pick_on_an_element_of_a_link_array_lands_on_the_element(self):
+        element = Node("Array_i0")
+        array = Top("Array", {"0.Face2": [element]}, LinkedObject=Node("Box"))
+        array.ElementList = [element]
+        assert picks.resolved([entry(array, "0.Face2")]) == ([entry(element, "Face2")], [])
+
+    def test_the_element_is_the_name_at_the_end_of_the_path(self):
+        """A body answers a face with its history before the name, measured
+        under 1.1.1."""
+        body = Top("Body", {";Face2;:H832,F;:H833:8,F.Face2": []})
+        picked = picks.resolved([entry(body, ";Face2;:H832,F;:H833:8,F.Face2")])
+        assert picked == ([entry(body, "Face2")], [])
+
+    def test_a_whole_object_is_picked_with_no_names(self):
+        box = Node("Box")
+        assert picks.resolved([entry(box)]) == ([entry(box)], [])
+
+    def test_picks_through_one_container_keep_their_place_among_the_others(self):
+        """A port reads its source and its reference off the order."""
+        a, b, c = Node("A"), Node("B"), Node("C")
+        part = Top("Assembly", {"A.Face6": [a], "B.Face5": [b]})
+        picked = picks.resolved([entry(part, "A.Face6"), entry(c, "Face6"), entry(part, "B.Face5")])
+        assert picked == ([entry(a, "Face6"), entry(c, "Face6"), entry(b, "Face5")], [])
+
+    def test_one_original_picked_twice_inside_a_copy_is_named_once(self):
+        box = Node("Box")
+        array = Top("Array", {"Box.Face1": [box], "Box.Face2": [box]}, LinkedObject=box)
+        _, copies = picks.resolved([entry(array, "Box.Face1"), entry(array, "Box.Face2")])
+        assert picks.copy_note(copies).count("'Box' in 'Array'") == 1
+        assert picks.copy_note(copies).endswith(". Pick the original, or the link itself")
+
+    def test_a_pick_in_another_document_is_not_kept(self):
+        """The selection spans every open document, and a link cannot reach
+        into another."""
+        here, there = Node("Box"), Node("Other")
+        made = [
+            types.SimpleNamespace(Object=here, SubElementNames=(), DocumentName="Board"),
+            types.SimpleNamespace(Object=there, SubElementNames=(), DocumentName="Elsewhere"),
+        ]
+        assert picks.resolved(made, "Board") == ([entry(here)], [])
+
+    def test_a_path_that_cannot_be_listed_is_kept_whole(self):
+        """Read as the element at its end it would name another face; kept
+        whole, :func:`picks.element` refuses it by name."""
+        part = Node("Assembly")
+        assert picks.resolved([entry(part, "Box.Face2")]) == ([entry(part, "Box.Face2")], [])
+
+    def test_picks_interleaved_across_objects_keep_the_order_they_were_made_in(self):
+        """A lumped port takes the first two: a source on A, then a reference
+        on C, though A was picked again after."""
+        a, c = Node("A"), Node("C")
+        part = Top("Assembly", {"A.Face6": [a], "A.Face5": [a]})
+        made = [entry(part, "A.Face6"), entry(c, "Face5"), entry(part, "A.Face5")]
+        expected = [entry(a, "Face6"), entry(c, "Face5"), entry(a, "Face5")]
+        assert picks.resolved(made) == (expected, [])

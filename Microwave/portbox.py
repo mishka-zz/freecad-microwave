@@ -3,9 +3,9 @@
 
 """Where a port's box is, and where its two planes sit inside it.
 
-The openEMS adapter builds its envelope from this module, and the document
-object draws its own shape from it. Both read one answer, so the envelope and
-the drawing cannot disagree. The box is drawn so that the user sees what the
+Each adapter builds its ports from this module, and the document object draws
+its own shape from it. All of them read one answer, so what a backend is given
+and the drawing cannot disagree. The box is drawn so that the user sees what the
 solver gets.
 
 This module is at the package root rather than under ``Objects``, for a
@@ -237,18 +237,16 @@ def clearance(frequency: float) -> float:
 
 def length_of(stated: float, fallback: float, subject: str) -> float:
     """The port's extent: what was asked for, or what the geometry offers."""
+    # A negative length puts the port's far face behind its near one, which
+    # reverses the port rather than shortening it.
     if stated < 0:
-        raise BoxError(
-            f"{subject}: Length is {stated}. A negative length would put the "
-            "port's far face behind its near one, which reverses the port "
-            "rather than shortening it"
-        )
+        raise BoxError(f"{subject}: Length is {stated:g} mm. Enter a length of 0 mm or more")
     if stated > 0:
         return stated
     if fallback <= FLATNESS:
         raise BoxError(
-            f"{subject}: Length is unset and the geometry it sits on has no "
-            "extent to fall back on. Set Length explicitly"
+            f"{subject}: Length is 0 and the picked geometry has no extent to take "
+            "it from. Set Length"
         )
     return fallback
 
@@ -319,7 +317,7 @@ def microstrip(
         raise BoxError(
             f"{subject}: the ground reference is at "
             f"{AXIS_NAMES[excitation_axis]}={ground_plane:.4g} and the trace at "
-            f"{trace_plane:.4g}, so the field points the other way. Use "
+            f"{trace_plane:.4g}, so the field points the other way. Set ExcitationAxis to "
             f"{'' if measured > 0 else '-'}{AXIS_NAMES[excitation_axis]}"
         )
 
@@ -356,33 +354,31 @@ def _line_length(
     """
     if feed_offset < 0:
         raise BoxError(
-            f"{subject}: FeedOffset is {feed_offset:g}. It is measured inward "
-            "from the face you picked, so a negative value puts the source "
-            "outside the structure"
+            f"{subject}: FeedOffset is {feed_offset:g} mm, so the source sits outside "
+            "the structure. Enter an offset of 0 mm or more, measured inward from the "
+            "picked face"
         )
+    # The port reads its impedance from three probes downstream of the source,
+    # clear of the source's near field.
     if measurement_distance <= 0:
         raise BoxError(
-            f"{subject}: MeasurementDistance is {measurement_distance:g}, so "
-            "the probes would sit on the source. This port measures its own "
-            "impedance from three probes downstream of the source, clear of "
-            f"its near field - set MeasurementDistance to about {CLEARANCE:g} "
-            "wavelengths"
+            f"{subject}: MeasurementDistance is {measurement_distance:g} mm, so the "
+            "probes would sit on the source. Enter a positive distance, about "
+            f"{CLEARANCE:g} of a free-space wavelength at the bottom of the band"
         )
     measurement = feed_offset + measurement_distance
+    # A negative length puts the port's far face behind its near one, which
+    # reverses the port rather than shortening it.
     if stated_length < 0:
-        raise BoxError(
-            f"{subject}: Length is {stated_length:g}. A negative length would "
-            "put the port's far face behind its near one, which reverses the "
-            "port rather than shortening it"
-        )
+        raise BoxError(f"{subject}: Length is {stated_length:g} mm. Enter a length of 0 mm or more")
     if stated_length == 0:
         return measurement, measurement
     if stated_length < measurement:
         raise BoxError(
-            f"{subject}: Length is {stated_length:g} mm, but the measurement "
-            f"plane sits {measurement:g} mm in (FeedOffset {feed_offset:g} plus "
+            f"{subject}: Length is {stated_length:g} mm and the measurement plane "
+            f"sits {measurement:g} mm in (FeedOffset {feed_offset:g} plus "
             f"MeasurementDistance {measurement_distance:g}), so the box would "
-            "stop short of it. Leave Length at 0 to end the box there"
+            "stop short of it. Set Length to 0 to end the box there"
         )
     return stated_length, measurement
 
@@ -494,13 +490,14 @@ def lumped(
     for dim in transverse:
         low = max(source[0][dim], reference[0][dim])
         high = min(source[1][dim], reference[1][dim])
+        # A lumped port drives between two conductors facing each other.
         if high < low - FLATNESS:
             raise BoxError(
                 f"{subject}: SourceEntity and ReferenceEntity do not overlap "
-                f"along {AXIS_NAMES[dim]} - one spans {source[0][dim]:.9g} to "
-                f"{source[1][dim]:.9g} and the other {reference[0][dim]:.9g} to "
-                f"{reference[1][dim]:.9g}. A lumped port drives between two "
-                "conductors facing each other"
+                f"along {AXIS_NAMES[dim]}: one spans {source[0][dim]:.9g} to "
+                f"{source[1][dim]:.9g} mm and the other {reference[0][dim]:.9g} to "
+                f"{reference[1][dim]:.9g} mm. Pick a ReferenceEntity that faces "
+                "SourceEntity across the gap"
             )
         # The comparison is against the tolerance and not against zero, and the
         # result is then clamped, because these two numbers come from different
@@ -516,9 +513,9 @@ def lumped(
     if abs(start[excitation_axis] - stop[excitation_axis]) <= FLATNESS:
         raise BoxError(
             f"{subject}: SourceEntity and ReferenceEntity are both at "
-            f"{AXIS_NAMES[excitation_axis]}={start[excitation_axis]:.4g}. A "
-            "lumped port drives a voltage across a gap; along the excitation "
-            "axis there is none"
+            f"{AXIS_NAMES[excitation_axis]}={start[excitation_axis]:.4g}, so there is no "
+            "gap along ExcitationAxis to drive across. Pick a ReferenceEntity that faces "
+            "SourceEntity across the gap"
         )
 
     # A lumped port is a circuit element rather than a transmission line, so it
@@ -530,10 +527,9 @@ def lumped(
     propagation_axis = max(transverse, key=lambda d: stop[d] - start[d])
     if stop[propagation_axis] - start[propagation_axis] <= FLATNESS:
         raise BoxError(
-            f"{subject}: the port is a line, not a box - where the two "
-            f"entities overlap has extent only along "
-            f"{AXIS_NAMES[excitation_axis]}. Select faces, or edges that span "
-            "the conductor's width"
+            f"{subject}: where SourceEntity and ReferenceEntity overlap is a line along "
+            f"{AXIS_NAMES[excitation_axis]}. Select faces, or edges that span the "
+            "conductor's width"
         )
     if outline is not None:
         across = third_axis(excitation_axis, propagation_axis)

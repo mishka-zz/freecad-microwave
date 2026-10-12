@@ -67,5 +67,8 @@ class EMMaterialBindingViewProvider(HasDisplayMode):
 
         for ref, _sub in references:
             view = getattr(ref, "ViewObject", None)
-            if view is not None:
+            # The view of an App::Part, a link or a link group has no
+            # ShapeColor, measured under 1.1.1, so a binding to one leaves its
+            # colours as they are.
+            if view is not None and hasattr(view, "ShapeColor"):
                 view.ShapeColor = color

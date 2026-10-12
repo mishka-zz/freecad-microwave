@@ -156,6 +156,13 @@ class TestTheDrawingAndTheGrid:
         )
         found = mirror_warnings(line(solids=solids))
         assert any("not a mirror image about the middle" in w for w in found), found
+        assert any(
+            w.endswith(
+                "Ignore this if the difference is deliberate and the device's symmetry "
+                "does not depend on it."
+            )
+            for w in found
+        ), found
 
     def test_a_partner_of_a_different_material_does_not_count(self):
         """Copper on one side, substrate on the other, is not a mirror.
@@ -174,7 +181,8 @@ class TestTheDrawingAndTheGrid:
 
     def test_a_partner_offset_across_the_other_axes_does_not_count(self):
         """Mirrored in x, but one stub sits at +y and the other at -y. Only the
-        propagation axis is mirrored; everything else has to match outright."""
+        axis between the ports is mirrored; everything else has to match
+        outright."""
         solids = (
             Solid(material="Air", lower=(-20, -6, 0), upper=(20, 6, 3), label="Air"),
             Solid(material="Metal", lower=(-20, -6, 0), upper=(20, 6, 0), label="Ground"),
@@ -210,6 +218,30 @@ class TestTheDrawingAndTheGrid:
 
         found = mirror_warnings(problem)
         assert any("mesh lines" in w for w in found), found
+        assert any(
+            w.endswith("Check for a refinement region on one side only, or unequal air buffers.")
+            for w in found
+        ), found
+
+    def test_a_port_off_the_mirror_is_named_with_how_far(self):
+        """The drawing is mirrored and port 2 stands two millimetres in from
+        where port 1's image does."""
+        problem = line(port_overrides={2: {"start": (17.0, -1.0, 0.0), "stop": (18.0, 1.0, 3.0)}})
+        found = mirror_warnings(problem)
+        assert any(w.startswith("Port 2 stands 2 mm from where port 1's") for w in found), found
+
+    def test_a_board_is_mirrored_between_its_ports_and_not_across_its_trace(self):
+        """A lumped port at the end of a trace is given its box's wider side,
+        the trace's width, as its propagation axis. The mirror is still the
+        one between the two ports, so a stub on one side is seen."""
+        solids = (
+            Solid(material="Air", lower=(-20, -6, 0), upper=(20, 6, 3), label="Air"),
+            Solid(material="Metal", lower=(-20, -6, 0), upper=(20, 6, 0), label="Ground"),
+            Solid(material="Metal", lower=(-12, -1, 3), upper=(-8, 1, 3), label="Stub"),
+        )
+        across = {"propagation_axis": 1}
+        found = mirror_warnings(line(port_overrides={1: across, 2: across}, solids=solids))
+        assert any("not a mirror image about the middle" in w for w in found), found
 
 
 class TestWhereMirrorSymmetryDoesNotApply:

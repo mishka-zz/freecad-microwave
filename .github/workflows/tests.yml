@@ -65,7 +65,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      # Gmsh's Python module loads libgmsh, which is linked against OpenGL, X11
+      # and fontconfig. The packages below are the ones that carry those
+      # libraries, read off the NEEDED entries of libgmsh in the Linux wheel;
+      # apt passes over any the image already has. The loader names only the
+      # first library it cannot find, so a missing one hides the rest.
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y libglu1-mesa libgl1
+          libx11-6 libxext6 libxfixes3 libxrender1 libxcursor1 libxft2
+          libxinerama1 libfontconfig1 libgomp1
       - run: pip install numpy gmsh scipy pandas typing_extensions pytest
+      # A fast run skips every test of the mesher when gmsh will not load, and
+      # stays green. This step makes that a failure naming the library.
+      - run: python -c "import gmsh"
       - name: Fast suite
         run: python -m pytest -q -m "not slow"
 

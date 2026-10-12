@@ -7,9 +7,12 @@ Each command is a ``GetResources`` (icon, label, tooltip), an ``Activated`` and
 an inherited ``IsActive``. The helpers at the top of this file hold what is
 worth knowing about all of them, rather than the classes:
 
-* every command that creates one object joins the active analysis through
-  ``_add``, so a new object lands in one place across the whole workbench, and
-  ``_SolverCommand``, which creates several, does the same thing in a loop;
+* every command that creates one object finds the analysis it joins through
+  ``_target_analysis``, so a new object lands in one place across the whole
+  workbench. ``_add`` hands that analysis to what makes the object and files the
+  object there. ``_SolverCommand``, which creates several, does the same thing
+  in a loop, and Add Mesh Refinement, which asks the study which settings it
+  amends before making anything, files its region itself;
 * every one of them runs inside a transaction, because FreeCAD does not wrap a
   Python command in one and Ctrl-Z would otherwise do nothing;
 * every one of them is disabled with no document open, because FreeCAD leaves a
@@ -29,6 +32,7 @@ from Microwave import Objects
 from Microwave.Gui import notify
 from Microwave.Objects import port_setup
 from Microwave.Objects.kinds import kind_of
+from Microwave.picks import copy_note, resolved
 from Microwave.undo import transaction
 from Microwave.ViewProviders import icon as get_icon_path
 
@@ -41,6 +45,18 @@ def _selected():
         return list(FreeCADGui.Selection.getSelection())
     except Exception:  # pragma: no cover - console mode
         return []
+
+
+def _selection():
+    """What the user picked, each pick on the object that owns it, and the
+    picks made inside the copy a link shows, which ``picks.resolved`` leaves
+    out."""
+    import FreeCADGui
+
+    document = FreeCAD.ActiveDocument
+    return resolved(
+        FreeCADGui.Selection.getCompleteSelection(0), document.Name if document else None
+    )
 
 
 def _target_analysis(doc, title):
@@ -58,7 +74,8 @@ def _target_analysis(doc, title):
 
 
 def _add(doc, label, make):
-    """Create an object inside the active analysis, undoably.
+    """Create an object inside the active analysis, undoably. ``make`` is
+    handed that analysis and returns the object.
 
     FreeCAD does not wrap a Python command in a transaction. Without one, Ctrl-Z
     does nothing and the object stays. Measured on 1.1.1, UndoCount stays 0. The
@@ -72,7 +89,7 @@ def _add(doc, label, make):
     if analysis is None:
         return None
     with transaction(doc, label):
-        obj = make()
+        obj = make(analysis)
         analysis.addObject(obj)
     doc.recompute()
     return obj
@@ -102,8 +119,8 @@ class EMAnalysisCommand(_Command):
         return {
             "Pixmap": get_icon_path("Analysis.svg"),
             "MenuText": "Create EM Analysis",
-            "ToolTip": "Create a study: a frequency band, an openEMS solver, its Yee "
-            "grid and a mesh policy",
+            "ToolTip": "Create a study with a frequency band, an openEMS solver, its "
+            "mesh settings and a mesh policy",
         }
 
     def Activated(self):
@@ -118,7 +135,8 @@ class EMMaterialCommand(_Command):
         return {
             "Pixmap": get_icon_path("Material.svg"),
             "MenuText": "Create Material",
-            "ToolTip": "Create an EM Material",
+            "ToolTip": "Create a material at the document root. Bind it to shapes with "
+            "Bind Material to Shape",
         }
 
     def Activated(self):
@@ -144,9 +162,8 @@ class EMMaterialFromCatalogCommand(_Command):
         return {
             "Pixmap": get_icon_path("MaterialCatalog.svg"),
             "MenuText": "Add Material from Catalog...",
-            "ToolTip": "Pick a material from the installed catalogs. Values are "
-            "copied into the document, so the file still solves on a "
-            "machine without them",
+            "ToolTip": "Add materials from the installed catalogs. The values are "
+            "copied into the document, so the file solves without the catalogs",
         }
 
     def Activated(self):
@@ -176,9 +193,9 @@ class EMMaterialFromCatalogCommand(_Command):
                 if already:
                     notes.append(
                         f"{ref} is already in this document as "
-                        f"{', '.join(repr(label) for label in already)}; "
-                        f"{obj.Label!r} is another copy of it. Delete it if "
-                        "that was not what you meant"
+                        f"{', '.join(repr(label) for label in already)}, so "
+                        f"{obj.Label!r} is another copy. Delete {obj.Label!r} "
+                        "if you did not want a copy"
                     )
         doc.recompute()
         notify.noted("Add Material from Catalog", notes)
@@ -189,20 +206,21 @@ class EMMaterialBindingCommand(_Command):
         return {
             "Pixmap": get_icon_path("MaterialBinding.svg"),
             "MenuText": "Bind Material to Shape",
-            "ToolTip": "Give geometry a material. Select a material and the "
-            "solids or faces it is made of, in any order",
+            "ToolTip": "Bind a material to shapes. Select the material and the "
+            "solids or faces made of it, in any order",
         }
 
     def Activated(self):
-        import FreeCADGui
-
-        selection = FreeCADGui.Selection.getSelectionEx()
+        selection, copies = _selection()
         notes = []
 
-        def make():
+        def make(analysis):
+            # The study the binding joins decides which picks would close a
+            # cycle.
             binding = Objects.createEMMaterialBinding()
             notes.extend(
-                f"{binding.Label}: {note}" for note in Objects.fill_binding(binding, selection)
+                f"{binding.Label}: {note}"
+                for note in Objects.fill_binding(binding, selection, analysis, copies)
             )
             return binding
 
@@ -232,15 +250,20 @@ class _PortCommand(_Command):
         return {"Pixmap": get_icon_path(icon), "MenuText": text, "ToolTip": tip}
 
     def Activated(self):
-        import FreeCADGui
-
         _, text, _, factory, fill = self.kind
-        picks = port_setup.picks_from(FreeCADGui.Selection.getSelectionEx())
+        selection, copies = _selection()
+        picks = port_setup.picks_from(selection)
         notes = []
 
-        def make():
+        def make(_analysis):
             port = factory(doc=FreeCAD.ActiveDocument)
-            notes.extend(f"{port.Label}: {note}" for note in fill(port, picks))
+            if copies:
+                # A pick left out moves every pick after it up a place, and a
+                # port reads which face is which off that order, so it fills
+                # nothing.
+                notes.append(f"{port.Label}: {copy_note(copies)}")
+            else:
+                notes.extend(f"{port.Label}: {note}" for note in fill(port, picks))
             return port
 
         _add(FreeCAD.ActiveDocument, text, make)
@@ -276,7 +299,8 @@ class EMPortWaveguideCommand(_PortCommand):
     kind = (
         "PortWaveguide.svg",
         "Add Waveguide Port",
-        "Add a rectangular waveguide port. Select the guide's cross-section",
+        "Add a rectangular waveguide port. Select the guide's cross-section face, "
+        "and the guide's body too if that face is a separate object",
         Objects.createEMPortRectWaveguide,
         port_setup.fill_waveguide,
     )
@@ -287,7 +311,8 @@ class EMPortCoaxialCommand(_PortCommand):
         "PortCoaxial.svg",
         "Add Coaxial Port",
         "Add a coaxial port. Select the ring between the inner conductor and "
-        "the shield, at the end of the line",
+        "the shield at the end of the line, and the line's body too if the ring "
+        "is a separate object",
         Objects.createEMPortCoaxial,
         port_setup.fill_coaxial,
     )
@@ -298,75 +323,133 @@ class EMMeshRegionCommand(_Command):
         return {
             "Pixmap": get_icon_path("MeshRegion.svg"),
             "MenuText": "Add Mesh Refinement",
-            "ToolTip": "Set the element size around some geometry: finer than "
-            "the policy, or coarser where the detail does not matter",
+            "ToolTip": "Set a finer or coarser element size around geometry for one "
+            "solver. Select the geometry, and the solver if the study has two",
         }
 
     def Activated(self):
-        import FreeCADGui
-
         # A region referencing nothing refuses the next mesh by name. That is
         # right, but it is a poor way to meet a new feature, and whatever is
         # selected is almost certainly what the region is for. ElementSize
         # stays at zero, because there is no honest default without knowing the
         # model, and the refusal says which property to set.
-        selection = FreeCADGui.Selection.getSelectionEx()
-        notes = []
-
-        def make():
-            obj = Objects.createEMMeshRegion(FreeCAD.ActiveDocument)
-            references = Objects.references_from(selection)
-            if references:
-                obj.References = references
-            else:
-                # Otherwise the refusal arrives at the next mesh, naming an
-                # object added several actions ago.
-                notes.append(
-                    f"{obj.Label}: nothing was selected for References, so this "
-                    "region is aimed at nothing; pick the geometry in the property editor"
-                )
-            return obj
-
-        _add(FreeCAD.ActiveDocument, "Add Mesh Refinement", make)
-        notify.noted("Add Mesh Refinement", notes)
-
-
-class UpdateMeshCommand(_Command):
-    """Mesh the study and draw the grid, without opening the panel.
-
-    This runs the same action as the panel's button. It is on the toolbar
-    because a user inspects the meshing repeatedly while modelling, and reaching
-    it through a modal task dialog every time would make them stop doing it.
-    """
-
-    def GetResources(self):
-        return {
-            "Pixmap": get_icon_path("UpdateMesh.svg"),
-            "MenuText": "Update Mesh",
-            "ToolTip": "Mesh the study and draw the grid",
-        }
-
-    def Activated(self):
-        from Microwave.Gui import openems_mesh_preview
-        from Microwave.Solvers.openems import document
-
+        title = "Add Mesh Refinement"
         doc = FreeCAD.ActiveDocument
-        analysis = _target_analysis(doc, "Update Mesh")
+        selection, copies = _selection()
+        analysis = _target_analysis(doc, title)
         if analysis is None:
             return
         try:
+            settings = Objects.settings_to_amend(analysis, [chosen.Object for chosen in selection])
+        except Objects.NoSettings as error:
+            notify.refused(title, str(error))
+            return
+        notes = []
+
+        def make():
+            obj = Objects.createEMMeshRegion(doc, settings)
+            references = Objects.references_from(selection, analysis)
+            if copies:
+                notes.append(f"{obj.Label}: {copy_note(copies)}")
+            if cyclic := Objects.reaching(selection, analysis):
+                notes.append(f"{obj.Label}: {Objects.cycle_note(cyclic)}")
+            if references:
+                obj.References = references
+            elif not cyclic and not copies:
+                # Otherwise the refusal arrives at the next mesh, naming an
+                # object added several actions ago.
+                notes.append(
+                    f"{obj.Label}: References is empty because nothing was selected. "
+                    "Set References in the property editor"
+                )
+            return obj
+
+        with transaction(doc, title):
+            analysis.addObject(make())
+        doc.recompute()
+        notify.noted(title, notes)
+
+
+class MeshCommand(_Command):
+    """Mesh the study on one backend, as that backend's panel does.
+
+    It is on the toolbar because a user inspects the meshing repeatedly while
+    modelling. The backend is the one the selection names, then the study's
+    only one, as Run picks it. openEMS's grid is laid and drawn without a
+    panel. Gmsh meshes for Palace on the panel's worker, so Palace's panel
+    opens and meshes, and says what it made.
+    """
+
+    TITLE = "Mesh"
+
+    def GetResources(self):
+        return {
+            "Pixmap": get_icon_path("Mesh.svg"),
+            "MenuText": self.TITLE,
+            "ToolTip": "Mesh the study for its solver and show the mesh. If the study has "
+            "more than one solver, select the solver, its mesh settings or its mesh first",
+        }
+
+    def Activated(self):
+        from Microwave.Gui.panels import open_run
+
+        doc = FreeCAD.ActiveDocument
+        analysis = _target_analysis(doc, self.TITLE)
+        if analysis is None:
+            return
+        try:
+            solver = Objects.solver_to_run(analysis, _solvers_named(analysis, _selected()))
+        except Objects.NoSolver as error:
+            notify.refused(self.TITLE, str(error))
+            return
+        if kind_of(solver) != "EMSolverOpenEMS":
+            # A panel already open is not meshed through: meshing there stops
+            # whatever it is running, which the refusal says it does not.
+            if not open_run(self.TITLE, solver):
+                return
+            panel = getattr(getattr(solver.ViewObject, "Proxy", None), "panel", None)
+            if panel is not None:
+                panel.on_mesh()
+            return
+        from Microwave.Gui import openems_mesh_preview
+        from Microwave.Solvers.openems import document
+
+        try:
             _, report = openems_mesh_preview.refresh(analysis)
         except (document.TranslationError, document.MeshError) as error:
-            notify.refused("Update Mesh", str(error))
+            notify.refused(self.TITLE, str(error))
             return
         FreeCAD.Console.PrintMessage(report.summary() + "\n")
         doc.recompute()
 
 
+def _solvers_named(analysis, selection):
+    """The solvers of ``analysis`` that ``selection`` names: each solver picked,
+    and the solver whose mesh settings or mesh is picked, as the tree shows them
+    under it."""
+    named = []
+    for solver in Objects.solvers_in(analysis):
+        shown = [solver]
+        waiting = [solver]
+        while waiting:
+            claims = getattr(
+                getattr(getattr(waiting.pop(), "ViewObject", None), "Proxy", None),
+                "claimChildren",
+                None,
+            )
+            for child in claims() if claims is not None else ():
+                shown.append(child)
+                waiting.append(child)
+        if any(chosen is obj for chosen in selection for obj in shown):
+            named.append(solver)
+    return named
+
+
 class RunCommand(_Command):
     """Open the panel for the solver the study is run on.
 
-    The solver selected in the tree, then the study's only one. A study holding
+    The solver the selection names, by itself, its mesh settings or its mesh,
+    then the study's only one. A study holding
     one of each backend with neither selected is refused by name rather than
     guessed at: a run is minutes, and an answer from the backend nobody meant
     says nothing about it.
@@ -376,8 +459,8 @@ class RunCommand(_Command):
         return {
             "Pixmap": get_icon_path("Run.svg"),
             "MenuText": "Run Simulation",
-            "ToolTip": "Open the panel for the study's solver. Select the solver first "
-            "where the study holds more than one",
+            "ToolTip": "Open the run panel for the study's solver. If the study has more "
+            "than one solver, select the one to run first",
         }
 
     def Activated(self):
@@ -388,7 +471,7 @@ class RunCommand(_Command):
         if analysis is None:
             return
         try:
-            solver = Objects.solver_to_run(analysis, _selected())
+            solver = Objects.solver_to_run(analysis, _solvers_named(analysis, _selected()))
         except Objects.NoSolver as error:
             notify.refused("Run Simulation", str(error))
             return
@@ -420,7 +503,7 @@ class _SolverCommand(_Command):
         return {
             "Pixmap": get_icon_path(icon),
             "MenuText": f"Add {name} Solver",
-            "ToolTip": f"Add a {name} solver to the study, so the study can be run on {name}",
+            "ToolTip": f"Add the {name} solver and its mesh settings to the study",
         }
 
     def Activated(self):
@@ -441,8 +524,8 @@ class _SolverCommand(_Command):
             )
             notify.refused(
                 title,
-                f"{analysis.Label!r} already holds {solver.Label!r}, and a study is "
-                f"run on one {name} solver",
+                f"{analysis.Label!r} already has the {name} solver {solver.Label!r}. "
+                f"A study takes one {name} solver",
             )
             return
 
@@ -460,7 +543,13 @@ class _SolverCommand(_Command):
         # else.
         if solver_kind not in missing_kinds:
             names = ", ".join(repr(obj.Label) for obj in added)
-            notify.noted(title, [f"{title} added {names} to {analysis.Label!r}"])
+            notify.noted(
+                title,
+                [
+                    f"{analysis.Label!r} already had its {name} solver, so only these "
+                    f"were added: {names}"
+                ],
+            )
 
 
 class EMSolverOpenEMSCommand(_SolverCommand):
@@ -487,151 +576,258 @@ class EMSolverPalaceCommand(_SolverCommand):
     )
 
 
-class ExportTouchstoneCommand(_Command):
-    """Write the study's S-matrix as a Touchstone file.
+class AddSolverCommand:
+    """The solvers a study can be given, behind one toolbar button.
 
-    This is the one way a result leaves the document. The document stores a
-    matrix, and the next run overwrites it, so exporting is how a matrix is
-    kept. It also hands the numbers to everything else in the field, because
-    ``.sNp`` is the one format every simulator and VNA reads.
+    The one dropdown on the toolbars, because it is the one group that grows
+    with each backend. FreeCAD's FEM gives its solvers one button the same way
+    (``src/Mod/Fem/femcommands/commands.py``). The menu lists each.
+    """
+
+    def GetResources(self):
+        return {
+            "Pixmap": get_icon_path("SolverOpenEMS.svg"),
+            "MenuText": "Add Solver",
+            "ToolTip": "Add a solver and its mesh settings to the study",
+        }
+
+    def GetCommands(self):
+        return ADD_SOLVER
+
+    def GetDefaultCommand(self):
+        return 0
+
+    def IsActive(self):
+        return FreeCAD.ActiveDocument is not None
+
+
+class RefineRunCommand(_Command):
+    """Solve a kept run again one step finer, from the panel of its backend.
+
+    The run picked in the tree, or the run whose matrix is picked; a matrix no
+    run holds is refused. With nothing of either picked, the study's newest run
+    where every run it keeps was solved on one backend.
+    Anything else is refused naming the backends, since a refinement of a run
+    nobody meant measures nothing anyone asked.
+    """
+
+    TITLE = "Solve Again One Step Finer"
+
+    def GetResources(self):
+        return {
+            "Pixmap": get_icon_path("RefineRun.svg"),
+            "MenuText": self.TITLE,
+            "ToolTip": "Solve a run again one step finer on the same solver, and report "
+            "how far the S-parameters moved. If the study has runs from more than one "
+            "solver, select the run first",
+        }
+
+    def Activated(self):
+        from Microwave.Gui import results as glue
+        from Microwave.Gui.panels import open_refined
+
+        picked = _runs_picked()
+        if len(picked) > 1:
+            names = ", ".join(repr(run.Label) for run in picked)
+            notify.refused(self.TITLE, f"{names} are all selected. Select one run to refine")
+            return
+        alone = [table for table in _tables_picked() if glue.run_of(table) is None]
+        if alone:
+            names = ", ".join(repr(table.Label) for table in alone)
+            notify.refused(
+                self.TITLE,
+                f"{names} did not come from a run of a study, so there is no solve to "
+                "repeat. Select a run",
+            )
+            return
+        if not picked:
+            analysis = _target_analysis(FreeCAD.ActiveDocument, self.TITLE)
+            if analysis is None:
+                return
+            runs = list(glue.runs_of(analysis))
+            backends = sorted({str(run.Solver) for run in runs})
+            if not runs:
+                notify.refused(
+                    self.TITLE,
+                    f"{analysis.Label!r} has no run to refine. Run the study first",
+                )
+                return
+            if len(backends) > 1:
+                notify.refused(
+                    self.TITLE,
+                    f"{analysis.Label!r} has runs from {', '.join(backends)}. "
+                    "Select the run to refine in the tree",
+                )
+                return
+            picked = runs[-1:]
+        open_refined(self.TITLE, picked[0])
+
+
+def _runs_picked():
+    """The runs picked in the tree, each once: a run, or the run holding a
+    picked matrix, in the order picked."""
+    from Microwave.Gui import results as glue
+    from Microwave.Objects.runs import is_run
+
+    picked = []
+    for chosen in _selected():
+        run = chosen if is_run(chosen) else glue.run_of(chosen)
+        if run is not None and not any(run is held for held in picked):
+            picked.append(run)
+    return picked
+
+
+class ShowRunLogCommand(_Command):
+    """Show what a kept run said while it ran, in a window of its own.
+
+    Each run picked in the tree, or the run whose matrix is picked. Greyed
+    while nothing picked is a run or a run's matrix.
+    """
+
+    TITLE = "Show Run Log"
+
+    def GetResources(self):
+        return {
+            "Pixmap": get_icon_path("RunLog.svg"),
+            "MenuText": self.TITLE,
+            "ToolTip": "Show the log of each selected run. "
+            "Select a run or its S-parameters in the tree first",
+        }
+
+    def IsActive(self):
+        return super().IsActive() and bool(_runs_picked())
+
+    def Activated(self):
+        from Microwave.Gui.run_panel import show_log
+
+        for run in _runs_picked():
+            show_log(run)
+
+
+class ExportTouchstoneCommand(_Command):
+    """Write the S-matrix picked in the tree as a Touchstone file. Greyed unless
+    one table is picked: a run, or S-parameters.
+
+    This is the one way a result leaves the document, and it hands the numbers
+    to everything else in the field, because ``.sNp`` is the one format every
+    simulator and VNA reads.
 
     ``Gui.results.touchstone_export`` makes all the judgements, and it imports
     no Qt. What is left here is a message box, a file dialog and a write.
     """
 
+    TITLE = "Export Touchstone..."
+
     def GetResources(self):
         return {
             "Pixmap": get_icon_path("ExportTouchstone.svg"),
-            "MenuText": "Export Touchstone",
-            "ToolTip": "Write this study's S-parameters as a Touchstone (.sNp) file",
+            "MenuText": self.TITLE,
+            "ToolTip": "Write the selected run's S-parameters as a Touchstone (.sNp) file. "
+            "Select one run or its S-parameters in the tree first",
         }
 
+    def IsActive(self):
+        return super().IsActive() and len(_tables_picked()) == 1
+
     def Activated(self):
-        parent = notify.main_window()
-        holder = _result_or_complain("Export Touchstone")
-        if holder is not None:
-            export_touchstone(holder, parent)
+        picked = _tables_picked()
+        if len(picked) == 1:
+            export_touchstone(picked[0], notify.main_window())
 
 
-def _result_or_complain(title: str):
-    """The stored matrix this command was aimed at, or ``None`` having said why.
+def _tables_picked():
+    """The S-parameter tables picked in the tree, each once: a matrix, or the
+    matrix of a run, in the order picked."""
+    from Microwave.Gui import results as glue
 
-    Something can go wrong before any result is read: the study has nothing to
-    act on, or it holds more than one matrix with no way to tell which was
-    meant. Neither of those is a refusal from the chart or the export, and
-    reporting either is better than reporting "cannot read a result" about the
-    wrong object.
-    """
-    from Microwave.Gui import results as results_glue
-
-    try:
-        return results_glue.result_in_hand(FreeCAD.ActiveDocument, _selected())
-    except (Objects.NoAnalysis, results_glue.NoResult) as error:
-        notify.refused(title, str(error))
-        return None
+    return glue.tables_in(_selected())
 
 
 class PlotSParametersCommand(_Command):
-    """Draw the study's S-matrix.
+    """Draw the runs and S-parameters picked in the tree on one set of axes.
 
-    This opens the same chart as the result's own double-click, from the toolbar
-    instead. A user who has just pressed Run is already looking at the toolbar,
-    and a result they have not yet found in the tree can still be reached there.
+    One table draws every term it measured, and several draw one term each with
+    a table to difference against, as ``Gui/plot_s_params.py`` builds them.
+    Greyed while nothing picked is a table: a run, or S-parameters.
     """
+
+    TITLE = "Plot S-Parameters"
 
     def GetResources(self):
         return {
             "Pixmap": get_icon_path("SParameters.svg"),
-            "MenuText": "Plot S-parameters",
-            "ToolTip": "Draw every measured term of this study's S-matrix, in dB",
+            "MenuText": self.TITLE,
+            "ToolTip": "Plot the selected runs and S-parameters on one chart. "
+            "Select them in the tree first, with Ctrl held for several",
         }
 
-    def Activated(self):
-        from Microwave.Gui.plot_s_params import show_matrix
-        from Microwave.Objects.results import load
-
-        holder = _result_or_complain("Plot S-parameters")
-        if holder is None:
-            return
-        try:
-            show_matrix(load(holder))
-        except Exception as error:
-            notify.refused("Plot S-parameters", f"cannot plot {_label(holder)}: {error}")
-
-
-class CompareSParametersCommand(_Command):
-    """Draw the study's two S-matrices from two backends against each other.
-
-    Each term is drawn from both, with the magnitude of their difference on the
-    same axis, and the chart says how far apart the two stand at worst. Two
-    results selected are taken as they are, and otherwise the study must hold
-    two.
-    """
-
-    def GetResources(self):
-        return {
-            "Pixmap": get_icon_path("CompareSParameters.svg"),
-            "MenuText": "Compare S-parameters",
-            "ToolTip": "Draw this study's S-parameters from two solvers against each other",
-        }
+    def IsActive(self):
+        return super().IsActive() and bool(_tables_picked())
 
     def Activated(self):
-        compare_s_parameters(FreeCAD.ActiveDocument, _selected())
+        plot_s_parameters(_selected())
 
 
-def compare_s_parameters(document, selection=()):
-    """Compare two results and draw them, or say why they cannot be."""
+def plot_s_parameters(selection):
+    """Draw the tables ``selection`` names on one set of axes, or say why not."""
     from Microwave.Gui import results as results_glue
-    from Microwave.Gui.plot_s_params import show_comparison
-    from Microwave.Results.compared import Incomparable
+    from Microwave.Gui.plot_s_params import show_overlay
 
     try:
-        show_comparison(results_glue.comparison(document, selection))
-    except (Objects.NoAnalysis, results_glue.NoResult, Incomparable) as error:
-        notify.refused("Compare S-parameters", str(error))
+        show_overlay(results_glue.overlaid(selection))
+    except results_glue.NoResult as error:
+        notify.refused(PlotSParametersCommand.TITLE, str(error))
     except Exception as error:
-        notify.refused("Compare S-parameters", f"cannot compare: {error}")
+        notify.refused(PlotSParametersCommand.TITLE, f"cannot plot: {error}")
 
 
 class PlotImpedanceCommand(_Command):
-    """Draw impedance along the line, from one port's reflection.
+    """Draw impedance along the line, from a port's reflection.
 
-    The port is the lowest one that can produce a trace, so the ordinary
-    two-port study needs no choice made before the chart appears. Where no port
-    can, this uses the lowest anyway and the refusal says what to change. A
-    button that does nothing when pressed tells the user nothing. Every port a
-    study offers is on the result's own right-click menu.
+    Each table selected in the tree on one set of axes at one port and one rise
+    time. The port is the lowest one every table can produce a trace at, so the
+    ordinary two-port study needs no choice made before the chart appears, and
+    the chart offers the others. Where no port can, the refusal says what to
+    change. Greyed while nothing picked is a table.
     """
+
+    TITLE = "Plot Impedance along the Line"
 
     def GetResources(self):
         return {
             "Pixmap": get_icon_path("Impedance.svg"),
-            "MenuText": "Plot impedance along the line",
-            "ToolTip": "Draw impedance against distance or time, from a port's reflection",
+            "MenuText": self.TITLE,
+            "ToolTip": (
+                "Plot impedance against distance or time, from a port's reflection. "
+                "Select runs or S-parameters in the tree first"
+            ),
         }
 
+    def IsActive(self):
+        return super().IsActive() and bool(_tables_picked())
+
     def Activated(self):
-        from Microwave.Gui.plot_tdr import show_trace
-        from Microwave.Gui.views import impedance_view, traceable_ports
-        from Microwave.Objects.results import load
-
-        holder = _result_or_complain("Plot impedance")
-        if holder is None:
-            return
-        try:
-            result = load(holder)
-            ports = traceable_ports(result) or list(result.port_numbers[:1])
-            show_trace(impedance_view(holder, ports[0]))
-        except Exception as error:
-            notify.refused("Plot impedance", f"cannot plot {_label(holder)}: {error}")
+        plot_impedance(_selected())
 
 
-def _label(obj) -> str:
-    return str(getattr(obj, "Label", None) or getattr(obj, "Name", "the result"))
+def plot_impedance(selection):
+    """Draw the step response of the tables ``selection`` names, or say why not."""
+    from Microwave.Gui import results as results_glue
+    from Microwave.Gui.plot_tdr import show_traces
+
+    try:
+        show_traces(results_glue.overlaid(selection))
+    except results_glue.NoResult as error:
+        notify.refused(PlotImpedanceCommand.TITLE, str(error))
+    except Exception as error:
+        notify.refused(PlotImpedanceCommand.TITLE, f"cannot plot: {error}")
 
 
-def export_touchstone(holder, parent=None):
+def export_touchstone(holder, parent=None, chosen=None):
     """Write one ``EMSParameters`` object to a Touchstone file, asking as needed.
+
+    ``chosen`` is the file FreeCAD's own export dialog was given, where File >
+    Export asked for one, and the command asks for none of its own.
 
     This takes the result object rather than the analysis, so the tree's
     right-click entry can hand over the thing that was clicked. Re-deriving it
@@ -663,14 +859,15 @@ def export_touchstone(holder, parent=None):
         if answer != QtWidgets.QMessageBox.Yes:
             return
 
-    document = getattr(holder, "Document", None)
-    start = os.path.join(_start_directory(document), export.stem + export.suffix)
-    chosen, _ = QtWidgets.QFileDialog.getSaveFileName(
-        parent,
-        "Export Touchstone",
-        start,
-        f"Touchstone (*{export.suffix});;All files (*)",
-    )
+    if chosen is None:
+        document = getattr(holder, "Document", None)
+        start = os.path.join(_start_directory(document), export.stem + export.suffix)
+        chosen, _ = QtWidgets.QFileDialog.getSaveFileName(
+            parent,
+            "Export Touchstone",
+            start,
+            f"Touchstone (*{export.suffix});;All files (*)",
+        )
     if not chosen:
         return
 
@@ -678,12 +875,12 @@ def export_touchstone(holder, parent=None):
     # the suffix moves that to a different file, the prompt asked about the
     # wrong one, and this check is the only thing between an unrelated file and
     # a silent overwrite.
-    target = export.result.touchstone_path(chosen)
+    target = export.target(chosen)
     if str(target) != str(chosen) and target.exists():
         answer = QtWidgets.QMessageBox.question(
             parent,
             "Export Touchstone",
-            f"This will be written as {target.name}, which already exists.\n\nOverwrite it?",
+            f"The file will be saved as {target.name}, which already exists.\n\nOverwrite it?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
             QtWidgets.QMessageBox.Cancel,
         )
@@ -691,7 +888,7 @@ def export_touchstone(holder, parent=None):
             return
 
     try:
-        written = export.result.write_touchstone(chosen, per_point=export.per_point)
+        written = export.write(chosen)
     except Exception as error:
         notify.refused("Export Touchstone", f"could not write the file: {error}")
         return
@@ -709,31 +906,41 @@ def _start_directory(doc) -> str:
     return os.path.dirname(path) if path else os.path.expanduser("~")
 
 
-#: Every command: the id FreeCAD knows it by, the class, and the toolbar it sits
-#: on. Registration, the toolbars and the menu all read this one table.
+#: Where a command is reached: a toolbar button and a menu entry, a menu entry
+#: alone, or a toolbar button alone.
+BOTH, MENU, TOOLBAR = "both", "menu", "toolbar"
+
+#: Every command: the id FreeCAD knows it by, the class, the group it sits in,
+#: and where it is reached. Registration, the toolbars and the menu all read
+#: this one table.
 #:
 #: Typing the id twice - once to register, once in a toolbar tuple - admits a
 #: command that is registered and reachable from nowhere, or on a toolbar and
 #: registered nowhere. One table makes both states impossible to write down,
 #: rather than leaving them for a test to catch.
 COMMANDS = (
-    ("Microwave_Analysis", EMAnalysisCommand, "Microwave"),
-    ("Microwave_SolverOpenEMS", EMSolverOpenEMSCommand, "Microwave"),
-    ("Microwave_SolverPalace", EMSolverPalaceCommand, "Microwave"),
-    ("Microwave_Run", RunCommand, "Microwave"),
-    ("Microwave_PlotSParameters", PlotSParametersCommand, "Microwave Results"),
-    ("Microwave_CompareSParameters", CompareSParametersCommand, "Microwave Results"),
-    ("Microwave_PlotImpedance", PlotImpedanceCommand, "Microwave Results"),
-    ("Microwave_ExportTouchstone", ExportTouchstoneCommand, "Microwave Results"),
-    ("Microwave_MaterialFromCatalog", EMMaterialFromCatalogCommand, "Microwave Materials"),
-    ("Microwave_Material", EMMaterialCommand, "Microwave Materials"),
-    ("Microwave_MaterialBinding", EMMaterialBindingCommand, "Microwave Materials"),
-    ("Microwave_PortMicrostrip", EMPortMicrostripCommand, "Microwave Ports"),
-    ("Microwave_PortLumped", EMPortLumpedCommand, "Microwave Ports"),
-    ("Microwave_PortWaveguide", EMPortWaveguideCommand, "Microwave Ports"),
-    ("Microwave_MeshRegion", EMMeshRegionCommand, "Microwave Mesh"),
-    ("Microwave_UpdateMesh", UpdateMeshCommand, "Microwave Mesh"),
+    ("Microwave_Analysis", EMAnalysisCommand, "Microwave", BOTH),
+    ("Microwave_AddSolver", AddSolverCommand, "Microwave", TOOLBAR),
+    ("Microwave_SolverOpenEMS", EMSolverOpenEMSCommand, "Microwave", MENU),
+    ("Microwave_SolverPalace", EMSolverPalaceCommand, "Microwave", MENU),
+    ("Microwave_MaterialFromCatalog", EMMaterialFromCatalogCommand, "Microwave Materials", BOTH),
+    ("Microwave_Material", EMMaterialCommand, "Microwave Materials", BOTH),
+    ("Microwave_MaterialBinding", EMMaterialBindingCommand, "Microwave Materials", BOTH),
+    ("Microwave_PortMicrostrip", EMPortMicrostripCommand, "Microwave Ports", BOTH),
+    ("Microwave_PortLumped", EMPortLumpedCommand, "Microwave Ports", BOTH),
+    ("Microwave_PortWaveguide", EMPortWaveguideCommand, "Microwave Ports", BOTH),
+    ("Microwave_MeshRegion", EMMeshRegionCommand, "Microwave Mesh", BOTH),
+    ("Microwave_Mesh", MeshCommand, "Microwave Mesh", BOTH),
+    ("Microwave_Run", RunCommand, "Microwave Solve", BOTH),
+    ("Microwave_RefineRun", RefineRunCommand, "Microwave Solve", BOTH),
+    ("Microwave_PlotSParameters", PlotSParametersCommand, "Microwave Results", BOTH),
+    ("Microwave_PlotImpedance", PlotImpedanceCommand, "Microwave Results", BOTH),
+    ("Microwave_ExportTouchstone", ExportTouchstoneCommand, "Microwave Results", BOTH),
+    ("Microwave_ShowRunLog", ShowRunLogCommand, "Microwave Results", BOTH),
 )
+
+#: The commands behind the Add Solver button, in table order: one per backend.
+ADD_SOLVER = tuple(name for name, command, *_ in COMMANDS if issubclass(command, _SolverCommand))
 
 #: Commands that exist and are deliberately not registered, in the same shape as
 #: :data:`COMMANDS` so one can be moved between the two.
@@ -744,42 +951,48 @@ COMMANDS = (
 #: reaches the toolbars or the menu, which both read ``COMMANDS`` alone. The
 #: document object, its view provider and the adapter's support for it all stay,
 #: so a document that holds one still opens and still solves.
-WITHHELD = (("Microwave_PortCoaxial", EMPortCoaxialCommand, "Microwave Ports"),)
+WITHHELD = (("Microwave_PortCoaxial", EMPortCoaxialCommand, "Microwave Ports", BOTH),)
+
+
+def _grouped(reached):
+    """The commands reached where ``reached`` says, by group in table order."""
+    groups: dict[str, list[str]] = {}
+    for name, _, group, where in COMMANDS:
+        if where in reached:
+            groups.setdefault(group, []).append(name)
+    return tuple((group, tuple(names)) for group, names in groups.items())
 
 
 def _toolbars():
-    """One toolbar per group, in table order, every command its own button.
+    """One toolbar per group, in table order, every command its own button
+    except the solvers.
 
-    There are few enough commands that they all fit, and a visible button is
-    easier to find than one behind a dropdown. A dropdown shows whichever
-    command was used last, so the others stop existing until a user goes
-    looking. FreeCAD makes each of these a separate dockable toolbar the user
-    can move or hide, and Assembly, CAM and BIM all split themselves this way.
+    A visible button is easier to find than one behind a dropdown, which shows
+    whichever command was used last. The solvers are the exception: they are
+    the one group that grows with each backend, and each is pressed once per
+    study. FreeCAD makes each toolbar a separate dockable one the user can move
+    or hide, and Assembly, CAM, BIM and FEM all split themselves this way.
 
-    The study toolbar holds both ends of the workflow: create and Run.
-    Everything a finished run produces is on Microwave Results, and the next
-    output goes there too. Touchstone export sits there with the charts,
-    because it takes a result out of the document rather than setting one up.
+    The groups follow what is done to a study in order: made and given its
+    solvers, its materials and ports, meshed, solved, and read.
+    Touchstone export sits with the charts, because it takes a result out of
+    the document rather than setting one up.
     """
-    groups: dict[str, list[str]] = {}
-    for name, _, group in COMMANDS:
-        groups.setdefault(group, []).append(name)
-    return tuple((group, tuple(names)) for group, names in groups.items())
+    return _grouped((BOTH, TOOLBAR))
 
 
 TOOLBARS = _toolbars()
 
 
 def menu():
-    """The same commands, in the same groups, as one flat menu.
+    """The same groups as one flat menu, each solver an entry of its own.
 
     The menu uses separators rather than submenus, so the whole workbench is
-    readable in one glance. The toolbars are flat for the same reason. FreeCAD
-    spells a separator as the literal string in the command list, and CAM's menu
-    is built this way.
+    readable in one glance. FreeCAD spells a separator as the literal string in
+    the command list, and CAM's menu is built this way.
     """
     entries: list[str] = []
-    for _, commands in TOOLBARS:
+    for _, commands in _grouped((BOTH, MENU)):
         if entries:
             entries.append("Separator")
         entries.extend(commands)
@@ -789,5 +1002,5 @@ def menu():
 def register_commands():
     import FreeCADGui
 
-    for name, command, _ in COMMANDS:
+    for name, command, *_ in COMMANDS:
         FreeCADGui.addCommand(name, command())

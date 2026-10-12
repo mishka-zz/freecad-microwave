@@ -89,13 +89,13 @@ def test_a_face_reflecting_past_the_bar_is_refused_before_the_band(run_manifest)
 def test_a_filling_that_hides_the_guides_mode_is_refused_saying_so(run_manifest):
     case = run_manifest["conducting"]
     assert not case["solved"], "the band was solved"
-    assert "A lossy filling can also hide the guide's own mode" in case["said"], case["said"]
+    assert "A lossy filling can also hide the guide's mode" in case["said"], case["said"]
 
 
 def test_a_face_reflecting_under_the_bar_is_solved_and_states_it(run_manifest):
     case = run_manifest["board"]
     assert case["solved"] and not case["said"], case["said"]
-    assert case["carried"] and all("its face reflects" in line for line in case["carried"])
+    assert case["carried"] and all("face reflects about" in line for line in case["carried"])
     bottom = carried(case, 1, "bottom")
     print(f"\nWR-42 filled, loss tangent 0.02, on Palace: port 1 reflects {reflected(bottom):.3g}")
     assert 4 * reflected(bottom) <= BAR

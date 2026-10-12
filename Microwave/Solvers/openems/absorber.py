@@ -108,8 +108,8 @@ def rough_seams(
                 continue
             if max(cell, pitch) / min(cell, pitch) > limit:
                 rough.append(
-                    f"the {_DIM_NAMES[dim]} axis {face} face lays {cell:.6g} against "
-                    f"a block of {pitch:.6g}"
+                    f"the {_DIM_NAMES[dim]} axis {face} face lays a {cell:.6g} mm cell "
+                    f"against a {pitch:.6g} mm absorber block"
                 )
     return rough
 
@@ -152,10 +152,11 @@ def inside_the_absorber(
         if upper[dim] <= lower[dim]:
             raise MeshError(
                 f"the absorber would consume the whole {_DIM_NAMES[dim]} axis: the "
-                f"structure spans {domain[0][dim]:.4g} to {domain[1][dim]:.4g} and "
+                f"structure spans {domain[0][dim]:.4g} to {domain[1][dim]:.4g} mm, and "
                 f"{cells[0]} absorber cells at its lower face and {cells[1]} at its "
-                "upper take all of it. Coarsen the mesh there, ask for fewer absorber "
-                "cells, or give the face air"
+                "upper cover all of it. Lower PMLCells on the openEMS solver, or set "
+                f"Boundary{_DIM_NAMES[dim].upper()}Min or Boundary{_DIM_NAMES[dim].upper()}Max "
+                "to Open"
             )
     return (tuple(lower), tuple(upper))  # type: ignore[return-value]
 

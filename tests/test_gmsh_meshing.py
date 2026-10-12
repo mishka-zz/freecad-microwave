@@ -366,7 +366,7 @@ class TestWhenTheChildNeverAnswers:
         way through writing it must not reach a caller as a parse error.
         """
         stand_in = answering(tmp_path, 0, says="{ this is not an answer")
-        with pytest.raises(MeshFailed, match="not an answer"):
+        with pytest.raises(MeshFailed, match="left an unreadable answer at"):
             mesh(asked(tmp_path), interpreter=stand_in)
 
     def test_the_directory_is_made_where_there_is_none(self, tmp_path):
@@ -512,6 +512,10 @@ class TestFindingAMesher:
         assert "asked-python" in said
         assert str(stated) in said
         assert INTERPRETER_ENV_VAR in said
+        assert (
+            "Install this workbench's optional gmsh dependency through the Addon Manager, "
+            f"or set ${INTERPRETER_ENV_VAR} to a Python that can 'import gmsh'."
+        ) in said
 
     def test_the_python_beside_this_one_is_a_candidate(self, monkeypatch, tmp_path):
         """Under FreeCAD the running interpreter is the application itself, and
@@ -636,7 +640,7 @@ class TestTheMeshItselfComesBack:
         assert type(raised.value) is Unmeshed
         stopped, turned = raised.value.complaints
         assert stopped.startswith("Gmsh stopped: ") and "critical value" in stopped
-        assert "turned inside out" in turned and "in 'air' at (" in turned
+        assert "inside-out elements" in turned and "in 'air' at (" in turned
 
     def test_shapes_the_kernel_could_not_cut_arrive_as_themselves(self, tmp_path):
         drawn = tuple(
@@ -878,7 +882,7 @@ class TestWhatTheMeshSaysAboutItself:
         """Under the label it asked a rim of, with the count of its edges."""
         mesh = built()
         for left, why in (
-            (5, "the room turns round no curve of 'walls' by more than half a turn: 5 in all"),
+            (5, "none of the 5 edges of 'walls' is a free or re-entrant edge"),
             (0, "'walls' holds no curve but a seam"),
         ):
             reached = dict(mesh.reached)
@@ -912,8 +916,7 @@ class TestWhatTheMeshSaysAboutItself:
             if "'rim'" in line
         ]
         assert line.endswith(
-            ". Nothing is laid at the curves of 'walls' the room turns round by no more than "
-            "half a turn: 3 in all"
+            ". Nothing is laid at the 3 edges of 'walls' that are neither free nor re-entrant"
         )
 
     def test_a_place_no_element_is_at_says_so(self):

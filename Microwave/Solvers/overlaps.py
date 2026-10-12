@@ -92,7 +92,7 @@ def _unmeasured(one: Filled, other: Filled, failed: drawn.Unmeasured) -> str:
     broken = next((body for body in (one, other) if body.shape is failed.shape), None)
     why = f"{broken.name!r} is not a valid solid" if broken is not None else str(failed)
     return (
-        f"the kernel cannot say what {one.name!r} and {other.name!r} share ({why}). "
+        f"FreeCAD cannot measure what {one.name!r} and {other.name!r} share ({why}). "
         "Repair the shape (Part > Check geometry), or cut one out of the other"
     )
 

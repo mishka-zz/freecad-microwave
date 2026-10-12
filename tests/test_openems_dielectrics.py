@@ -95,6 +95,10 @@ class TestALayerIsReadWhereAPointFallsInsideIt:
         assert "stand 0.5 mm apart" in finding.message
         assert "MinElementSize" in finding.message
         assert "thicker than 0.5 mm" in finding.message
+        assert finding.message.endswith(
+            ". Lower MinElementSize in the openEMS mesh settings below 0.2 mm, draw it "
+            "thicker than 0.5 mm, or leave it out"
+        )
 
     def test_the_thickness_it_asks_for_is_read_wherever_the_layer_stands(self):
         """The gap between the points either side of it, rounded up."""
@@ -108,6 +112,9 @@ class TestALayerIsReadWhereAPointFallsInsideIt:
         """Flat within the grid's own tolerance."""
         (finding,) = said(layer(5.0, 5.0 + thickness))
         assert "flat on the z axis" in finding.message
+        assert finding.message.endswith(
+            ". Draw it as a solid with the layer's thickness, or leave it out"
+        )
 
     def test_the_figure_it_asks_for_is_rounded_up(self):
         assert dielectrics._up(0.12341) == "0.1235"
@@ -236,7 +243,10 @@ class TestATriangulatedBodyIsAskedPointByPoint:
     def test_a_shell_whose_walls_miss_every_point_is_refused(self):
         found = said(hollow_box(5.9, 0.05))
         assert [finding.severity for finding in found] == [REFUSE]
-        assert "every one of those points near this object" in found[0].message
+        assert "falls outside it or on its surface" in found[0].message
+        assert found[0].message.endswith(
+            ". Lower MinElementSize in the openEMS mesh settings, draw it thicker, or leave it out"
+        )
 
     def test_a_solid_one_is_read(self):
         assert said(hollow_box(5.9, 2.9)) == []

@@ -155,12 +155,12 @@ def _ghz(points: Sequence[float]) -> str:
 
 
 def solving(points: Sequence[float]) -> str:
-    """What the check is about to solve, in one sentence with no full stop."""
-    return (
-        f"The band is solved again in full at {_ghz(points)} GHz, where the reduced "
-        "model's smallest term is smallest and where it stands farthest from a full "
-        "solve, to check the model there"
-    )
+    """What the check is about to solve, in one sentence with no full stop.
+
+    The points are where the reduced model's smallest term is smallest and where
+    it stands farthest from a full solve: see :func:`where`.
+    """
+    return f"Checking the reduced model with full solves at {_ghz(points)} GHz"
 
 
 def said(checked: Checked) -> str:
@@ -172,8 +172,8 @@ def said(checked: Checked) -> str:
     found = (
         f"At {_ghz(checked.points)} GHz the reduced model is off the full solve by "
         f"{checked.gap:.2g} in {term} at {checked.at / HZ_PER_GHZ:.6g} GHz, against "
-        f"the {checked.bar:.2g} {reading_down_to(checked.smallest)}. That is its error "
-        "at the points checked and not a bound over the band"
+        f"the {checked.bar:.2g} {reading_down_to(checked.smallest)}. This is its error "
+        "at the points checked, not a bound over the band"
     )
     if checked.within:
         return found
@@ -183,6 +183,6 @@ def said(checked: Checked) -> str:
 def unchecked(error: Exception) -> str:
     """Why the check says nothing of the model, in one sentence with no full stop."""
     return (
-        f"The band solved again in full to check the reduced model gave no answer, so "
-        f"the points between the full solves are not checked: {error}"
+        f"The full solves that check the reduced model gave no answer, so the points "
+        f"between the full solves are not checked: {error}"
     )

@@ -37,8 +37,8 @@ def _check_materials(problem: Problem, caps: Capabilities) -> list[Finding]:
                 Finding(
                     REFUSE,
                     material.name,
-                    f"material kind {material.kind!r} is not supported; "
-                    f"this adapter handles {sorted(caps.materials)}",
+                    f"material kind {material.kind!r} is not supported by openEMS, "
+                    f"which supports {sorted(caps.materials)}",
                 )
             )
         # openEMS builds a sheet of no thickness as a perfect conductor
@@ -49,9 +49,10 @@ def _check_materials(problem: Problem, caps: Capabilities) -> list[Finding]:
                 Finding(
                     REFUSE,
                     material.name,
-                    "a conducting sheet of zero thickness is built as a perfect "
-                    "conductor, so its conductivity reaches nothing. Give it the "
-                    "metal's thickness, or make it a PEC",
+                    f"Thickness is {material.thickness:g} mm, so openEMS builds this "
+                    "conducting sheet as a perfect conductor and ignores its "
+                    "conductivity. Enter the metal's thickness, or set MaterialType "
+                    "to PEC",
                 )
             )
     return findings
@@ -82,10 +83,11 @@ def _check_the_loss_was_measured_in_this_band(problem: Problem) -> list[Finding]
                 Finding(
                     WARN,
                     material.name,
-                    f"a conductivity of {material.kappa:.4g} S/m with no record "
-                    "of the frequency the loss tangent behind it was quoted at. "
-                    f"It is held fixed, so it is that loss tangent only at "
-                    f"{hz(centre)}; record where it was measured",
+                    "nothing records the frequency its loss tangent was measured "
+                    f"at. The {material.kappa:.4g} S/m conductivity built from it "
+                    f"is fixed, so it matches that loss tangent only at "
+                    f"{hz(centre)}. Set MeasuredAt to the frequency the loss "
+                    "tangent was measured at",
                 )
             )
             continue
@@ -95,9 +97,9 @@ def _check_the_loss_was_measured_in_this_band(problem: Problem) -> list[Finding]
                 Finding(
                     WARN,
                     material.name,
-                    f"its loss is quoted at {hz(material.measured_at)}, and this "
-                    f"study is centred at {hz(centre)}, where openEMS fixes the "
-                    "conductivity it builds from that number",
+                    f"its loss tangent is quoted at {hz(material.measured_at)}, far "
+                    f"from the band centre at {hz(centre)}, where openEMS fixes the "
+                    "conductivity built from it",
                 )
             )
     return findings
@@ -137,12 +139,12 @@ def _check_the_band_fits_one_conductivity(problem: Problem) -> list[Finding]:
     if overstated < FAR:
         return []
     message = (
-        f"a fixed conductivity is the loss tangent it was built from at "
-        f"{hz(frequency.center)} alone, and models one that goes as 1/f either "
-        f"side. This study runs down to {hz(frequency.start)}, where the "
-        f"modelled loss tangent is {overstated:.3g} times the declared one - "
-        f"and roughly half the declared one at the top of the band. Solve a "
-        f"narrower band, or split this one into studies"
+        f"its conductivity is fixed, so it matches the loss tangent it was built "
+        f"from only at {hz(frequency.center)} and models one falling as 1/f. The "
+        f"band runs down to {hz(frequency.start)}, where the modelled loss tangent "
+        f"is {overstated:.3g} times the declared one, and it is roughly half the "
+        f"declared one at the top of the band. Solve a narrower band, or split this "
+        f"one into studies"
     )
     return [
         Finding(WARN, material.name, message)
@@ -228,11 +230,10 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
                     # into one line naming every object that said them, so
                     # "both" would be false the moment a third solid shares the
                     # space.
-                    f"{occupies}, {made}. openEMS "
-                    "discretises one box in a shared space and drops the rest "
-                    "with an 'Unused primitive' warning that names only the "
-                    "material, so this says which objects it meant. Delete the "
-                    "spare, or move it if they were meant to be different",
+                    f"{occupies}, {made}. openEMS builds one of them and reports "
+                    "the other only as an 'Unused primitive' warning naming the "
+                    "material. Delete the spare, or move it if they are meant to "
+                    "be separate",
                 )
             )
             continue
@@ -243,18 +244,17 @@ def _check_coincident_solids(problem: Problem) -> list[Finding]:
         clash = (
             f"is bound to both {first.material!r} and {solid.material!r}"
             if solid.label and solid.label == first.label
-            else f"{occupies}, and the materials differ: this is "
-            f"{solid.material!r}, that is {first.material!r}"
+            else f"{occupies}, which is {first.material!r} where this is {solid.material!r}"
         )
+        # Every cell there goes to the higher priority, or to the property
+        # written first where they tie, and openEMS reports the other only as
+        # an 'Unused primitive' line naming its material.
         findings.append(
             Finding(
                 REFUSE,
                 subject,
-                f"{clash}. Every cell there goes to one of them - the higher "
-                "priority, or the one written first where they tie - so the "
-                "run would describe a structure made of that one throughout, "
-                "and say so only as an 'Unused primitive' line naming the "
-                "loser's material. Bind the geometry once",
+                f"{clash}. openEMS fills that space with a single material, so "
+                "the run solves a different structure. Bind the geometry once",
             )
         )
     return findings
@@ -281,12 +281,12 @@ def _check_a_thickness_was_invented(problem: Problem) -> list[Finding]:
         Finding(
             SUBSTITUTE,
             solid.name,
-            f"it is drawn as a surface carrying no thickness, and {solid.thickened:.4g} "
-            "mm of metal has been built off it. The field inside a conductor is "
-            "zero, so a skin and a slab solve alike and the length is free - but "
-            "a surface that was meant to close and did not looks exactly the "
-            "same here. If this one was meant as a solid, close it and give it "
-            "the thickness you drew",
+            # The field inside a conductor is zero, so a skin and a slab solve
+            # alike and the length is free. A surface that failed to close as a
+            # solid reaches this check in the same form.
+            f"it is drawn as a surface carrying no thickness, so {solid.thickened:.4g} "
+            "mm of metal is built off it, which solves the same as the surface. If "
+            "it is meant to be a solid, close it so it carries the thickness you drew",
         )
         for solid in problem.solids
         if solid.thickened and solid.material not in sheets
@@ -321,34 +321,34 @@ def _check_a_conducting_sheet_spans_a_surface(problem: Problem) -> list[Finding]
         if spanned == 2:
             continue
         if spanned < 2:
-            fault = f"it spans {spanned} of the three axes, so it has no area to carry a surface"
+            fault = f"spans {spanned} of the three axes, so it has no area"
             remedy = "Draw the conductor as the face it is meant to be"
         elif solid.thickened:
             fault = (
-                "the drawing carried no surface this could be laid flat on, so "
+                "is a surface that curves out of one plane, so "
                 f"{solid.thickened:.4g} mm of metal was built off it to close it"
             )
             remedy = (
                 "A conductor that curves out of one plane cannot carry a surface "
-                "impedance; bind it to a perfect conductor and take the answer as "
+                "impedance. Bind it to a PEC material and treat the result as "
                 "lossless"
             )
         else:
-            fault = "it is drawn with thickness on every axis"
+            fault = "is drawn with thickness on every axis"
             remedy = (
-                "Draw the conductor as a flat face - a conducting sheet carries "
-                "its thickness as a loss property rather than as geometry - or "
-                "bind it to a perfect conductor"
+                "Draw the conductor as a flat face, since a conducting sheet "
+                "carries its thickness in the material's Thickness, or bind it to "
+                "a PEC material"
             )
+        # openEMS reports the substitution only in its own output.
         findings.append(
             Finding(
                 REFUSE,
                 solid.name,
-                f"it is bound to {solid.material!r}, a conducting sheet, and "
+                f"it is bound to the conducting sheet {solid.material!r} and "
                 f"{fault}. openEMS applies its surface-impedance model only to a "
-                "shape spanning two axes; this one it would write as a perfect "
-                "conductor, discarding the conductivity and the thickness both, "
-                f"and say so only in its own output. {remedy}",
+                "face lying in a grid plane, so it solves this one as a perfect "
+                f"conductor and ignores the sheet's conductivity and thickness. {remedy}",
             )
         )
     return findings
@@ -382,12 +382,11 @@ def _check_sheet_thickness(problem: Problem) -> list[Finding]:
                 Finding(
                     REFUSE,
                     material.name,
-                    f"its modelled thickness ({material.thickness:g}) exceeds "
-                    f"the smallest cell in the grid ({smallest:g}), so it is "
-                    "not thin compared to the mesh and the surface-impedance "
-                    "model does not apply. openEMS will not refuse this - it "
-                    "clamps its fit and returns a plausible-looking wrong "
-                    "answer. Model it as a solid, or check the units",
+                    f"Thickness is {material.thickness:g} mm, more than the "
+                    f"smallest cell at the sheet ({smallest:g} mm), so the "
+                    "surface-impedance model does not apply and openEMS returns "
+                    "a wrong answer without an error. Model it as a solid, or "
+                    "check the units of Thickness",
                 )
             )
     return findings
@@ -438,9 +437,8 @@ def _check_a_sheet_standing_in_the_boundary(problem: Problem) -> list[Finding]:
                     solid.label or solid.material,
                     f"its {solid.material!r} sheet lies in the {AXIS_NAMES[dim]}{side} "
                     "boundary of the domain, where openEMS solves a conducting sheet as a "
-                    "perfect conductor and says nothing, so its conductivity reaches "
-                    "nothing. Leave air between the sheet and that side of the domain, or "
-                    "bind it to a PEC",
+                    "lossless perfect conductor without a warning. Leave air between the "
+                    "sheet and that side of the domain, or bind it to a PEC material",
                 )
             )
     return findings
@@ -520,11 +518,10 @@ def _check_sheet_fits_the_surface_impedance_model(problem: Problem) -> list[Find
                 REFUSE,
                 material.name,
                 f"at {top / 1e9:g} GHz it is {thickness / skin:.0f} skin depths "
-                f"thick, past the last coefficient set openEMS has fitted for a "
-                f"conducting sheet. It does not refuse this - it clamps to its "
-                f"last row and keeps going. The limit here is "
-                f"{limit:.3g} in grid units; model it as a solid, or lower the "
-                f"top of the band",
+                f"thick, past the range openEMS fits its conducting-sheet model "
+                f"to, so openEMS returns a wrong answer without an error. The "
+                f"largest Thickness it fits here is {limit:.3g} mm. Model it as a "
+                f"solid, or lower the top of the band",
             )
         )
     return findings

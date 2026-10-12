@@ -217,8 +217,8 @@ def voltage_across(
             if missing
         ]
         raise TranslationError(
-            f"{feed.label!r} is a guide port whose mode is turned by a line across its face, "
-            f"and the mesh does not state {' or '.join(unsaid)}. Mesh the study again"
+            f"{feed.label!r}: the mesh does not state {' or '.join(unsaid)}, which places "
+            "the line the port's voltage is read along. Mesh the study again"
         )
     if len({region.filling for region in problem.regions if region.label in label.beside}) != 1:
         return None
@@ -270,35 +270,36 @@ def check(problem: Problem, mesh: Mesh) -> None:
     if problem.opened is not None and mesh.labels[problem.opened.label].sits != FRONTIER:
         raise TranslationError(
             f"the open sides of the reserved air, {problem.opened.label!r}, stand partly inside "
-            "the model, and an absorbing condition is written where the model ends. A shape "
-            "bound to a material reaches them"
+            "the model, where no absorbing condition can stand. A shape bound to a material "
+            "reaches them"
         )
     _check_no_element_lost_part_of_itself(problem, mesh)
     for lumped in problem.lumped:
         _check_the_element_stands_between_two_conductors(lumped, problem, mesh)
     for plane in problem.planes:
         if plane.label in mesh.labels and mesh.labels[plane.label].sits == BOTH:
+            # The rest of a face an element lies in is a magnetic wall where the
+            # model ends and nothing inside it.
             raise TranslationError(
                 f"the elements of {_ports(plane.ports)} lie in a face that stands partly "
-                "inside the model and partly where it ends, and the rest of a face an "
-                "element lies in is a magnetic wall where the model ends and nothing inside "
-                "it. Draw the element on a face that lies wholly on one side"
+                "inside the model and partly on its boundary, so only part of the rest of "
+                "that face is a magnetic wall. Draw the element on a face that lies wholly "
+                "on one side"
             )
     for feed in problem.feeds:
         if mesh.labels[feed.label].sits != FRONTIER:
             raise TranslationError(
-                f"{feed.label!r} stands on a face inside the model, and a wave port is "
-                "solved as a cross-section of the boundary with the field on one side "
-                "of it. Point it at a face on the outside"
+                f"{feed.label!r} stands on a face inside the model, and a wave port needs a "
+                "face on the model's boundary. Point it at a face on the outside"
             )
         _check_the_cross_section(feed.label, problem, mesh)
     _check_no_two_ports_meet(problem, mesh)
     for sheet in problem.lossy:
         if sheet.thickness and mesh.labels[sheet.label].sits == BOTH:
             raise TranslationError(
-                f"{sheet.label!r} stands both inside the model and where it ends, and the "
-                "solver takes a thin sheet's thickness twice over where it ends. Bind the "
-                "faces on the outside and the faces inside to two bindings"
+                f"{sheet.label!r} stands both inside the model and on its boundary, where "
+                "Palace counts a thin sheet's thickness twice. Bind the faces on the "
+                "outside and the faces inside with two separate bindings"
             )
     _check_every_part_is_driven(problem, mesh)
 
@@ -320,8 +321,8 @@ def _check_no_element_lost_part_of_itself(problem: Problem, mesh: Mesh) -> None:
             raise TranslationError(
                 f"{elements[cut.label]!r} lays an element partly inside "
                 f"{', '.join(repr(name) for name in cut.by)}, at {cut.place}, and that part "
-                "leaves the mesh with the metal, so the resistor solved is not the one "
-                "drawn. Draw the element between the conductors rather than into them"
+                "is removed with the metal, so the resistor solved differs from the one "
+                "drawn. Draw the element between the conductors, not into them"
             )
 
 
@@ -358,9 +359,9 @@ def _check_every_part_is_driven(problem: Problem, mesh: Mesh) -> None:
             raise TranslationError(
                 f"the part of the region at {part.place} is closed off by "
                 f"{', '.join(repr(name) for name in closed)} and no port stands on it, so "
-                "the run would solve it and report nothing measured on it. Bind metal that "
-                "was meant to be solid to the body rather than to its skin; otherwise give "
-                "the part a port, or keep the space out of the model"
+                "nothing in it is measured. Bind metal meant to be solid to the body, not "
+                "to its skin; otherwise give the part a port, or keep the space out of the "
+                "model"
             )
 
 
@@ -397,20 +398,19 @@ def _check_the_element_stands_between_two_conductors(
             remedy = (
                 "Keep the metal off the element's sides"
                 if along - {problem.wall}
-                else "Draw the element clear of the edge of the region, whose boundary "
-                "there is the wall"
+                else "Draw the element clear of the edge of the region, where the boundary is metal"
             )
+            # Metal along a side joins the two ends the resistor drives between.
             raise TranslationError(
                 f"{feed.label!r} lays {element.label!r}, which "
-                f"{_owners(along, problem.wall)} meets along a side, and metal along the side "
-                f"of a lumped element joins the two ends it drives between and shorts it. "
-                f"{remedy}"
+                f"{_owners(along, problem.wall)} meets along a side, so the metal shorts the "
+                f"element. {remedy}"
             )
         if not ends[0] or not ends[1]:
             raise TranslationError(
                 f"{feed.label!r} lays {element.label!r}, which meets metal at "
-                f"{'neither end' if not ends[0] and not ends[1] else 'one end only'}, and a "
-                "lumped port drives from one conductor to another. Pick the conductor at "
+                f"{'neither end' if not ends[0] and not ends[1] else 'one end only'}, so the "
+                "port does not drive from one conductor to another. Pick the conductor at "
                 "each end of the gap"
             )
 
@@ -493,9 +493,8 @@ def between_the_boundary(problem: Problem, mesh: Mesh) -> list[str]:
                 continue
             said.append(
                 f"{feed.label!r} lays {element.label!r}, both of whose ends lie on the "
-                "region's boundary, which this solver makes a perfect conductor where no "
-                "metal is drawn, so the element is driven between two parts of that "
-                "boundary"
+                "region's boundary, which is a perfect conductor where no metal is drawn, so "
+                "the element is driven between two parts of that boundary"
                 + "".join(
                     f". {name!r} lies on the region's boundary at an end, and stands on the "
                     "wall there"
@@ -546,9 +545,9 @@ def _check_the_cross_section(port: str, problem: Problem, mesh: Mesh) -> None:
             )
             raise TranslationError(
                 f"{port!r} stands on a face holding metal in {len(pieces)} pieces that do "
-                f"not touch there - {'; '.join(each)} - and a guide with more than one "
-                "conductor carries a wave between them, which the solver ranks before TE10. "
-                "Join the metal to the rest at the port's face, or end it short of the face"
+                f"not touch there ({'; '.join(each)}), so Palace takes the wave between them "
+                "for the port's mode in place of TE10. Join the metal to the rest at the "
+                "port's face, or end it short of the face"
             )
 
 
@@ -576,9 +575,9 @@ def _check_no_two_ports_meet(problem: Problem, mesh: Mesh) -> None:
                 if other != feed.label:
                     raise TranslationError(
                         f"{other!r} and {feed.label!r} stand on faces that meet along a "
-                        "curve no metal holds, and the solver takes each port's face for a "
-                        "wall while it solves the other's mode. Draw the metal the guide "
-                        "has along the curve, or stand the ports apart"
+                        "curve no metal holds, so Palace solves each port's mode with a wall "
+                        "along that curve. Draw the metal the guide has along the curve, or "
+                        "stand the ports apart"
                     )
 
 

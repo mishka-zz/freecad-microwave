@@ -19,7 +19,7 @@ import os
 import pytest
 
 from .conftest import probe_manifest
-from .launches import LAUNCHES, SILENT, SURFACES, TWINS
+from .launches import GUIDES, LAUNCHES, SILENT, SURFACES, TWINS
 
 PROBE = os.path.join(os.path.dirname(__file__), "launch_probe.py")
 
@@ -29,11 +29,22 @@ def _named(name):
 
 
 @pytest.fixture(scope="session")
-def read(tmp_path_factory):
-    """Draw every conductor under a real FreeCAD once, and hand back what the
-    rule answered on each."""
+def manifest(tmp_path_factory):
+    """Draw every conductor and guide under a real FreeCAD once."""
     out = tmp_path_factory.mktemp("launches")
-    return probe_manifest(PROBE, out, "LAUNCH_OUT", key="read")
+    return probe_manifest(PROBE, out, "LAUNCH_OUT", key=None)
+
+
+@pytest.fixture(scope="session")
+def read(manifest):
+    """What the rule answered on each conductor."""
+    return manifest["read"]
+
+
+@pytest.fixture(scope="session")
+def filled(manifest):
+    """What a guide port picked on each guide was given."""
+    return manifest["filled"]
 
 
 def _answer(read, launch):
@@ -148,3 +159,24 @@ def test_and_the_kernel_actually_drew_them(read):
         "these conductors no longer draw as a surface, so the property they "
         f"carry is being skipped rather than tested: {unsewn}"
     )
+
+
+@pytest.mark.parametrize("guide", GUIDES, ids=lambda guide: guide.name)
+def test_a_cross_section_drawn_apart_launches_the_way_its_guide_runs(filled, guide):
+    """A face drawn on its own has nothing to step into, and a plane inset in
+    the guide has guide on both sides. The way the guide runs from it is read
+    off the body picked with it, in either order, and a plane that settles
+    nothing leaves the axis unset and says so."""
+    record = filled[guide.name]
+    if "unavailable" in record:
+        pytest.skip(f"{guide.name} would not draw here: {record['unavailable']}")
+    assert record["section"], f"{guide.name}: the cross-section is not the face"
+    if guide.axis is None:
+        assert record["axis"] == "unset", f"{guide.name}: {guide.why}"
+        assert record["notes"], f"{guide.name}: left unset and said nothing"
+    else:
+        assert (record["axis"], record["notes"]) == (guide.axis, []), f"{guide.name}: {guide.why}"
+
+
+def test_every_guide_was_filled(filled):
+    assert set(filled) == {guide.name for guide in GUIDES}

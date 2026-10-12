@@ -137,12 +137,10 @@ def module() -> Any:
             # would be wrong. They have it, and the copy pip would fetch is the
             # release ``_vendor/README.md`` exists to avoid.
             raise NoResultLibrary(
-                "S-parameter results need scikit-rf, and neither copy could be "
-                f"loaded. This interpreter's: {installed!r}. The one bundled with "
-                f"the workbench: {vendored!r}. A copy travels with the workbench, so "
-                "what is missing is usually something scikit-rf itself imports: "
-                "install whatever those two errors name into the Python that "
-                "runs FreeCAD."
+                "S-parameter results need scikit-rf, and neither the installed copy nor "
+                f"the bundled copy loads. Installed: {installed!r}. Bundled: "
+                f"{vendored!r}. Install the modules these errors name into the Python "
+                "that runs FreeCAD."
             ) from vendored
     return _module
 

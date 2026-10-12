@@ -16,7 +16,7 @@ common. Three kinds of word in it are read:
 * a word with two capitals and a lower-case letter, which is how a property is
   spelt - ``PMLCells`` as much as ``MaxTimesteps``;
 * a capitalised word an f-string continues with a value, such as
-  ``Padding{axis}{side}``, which has to be some property's name up to a
+  ``Boundary{axis}{side}``, which has to be some property's name up to a
   capital;
 * a snake-case word that is a property's name spelt the envelope's way.
 
@@ -81,17 +81,12 @@ FACTORIES = (
 #: Words spelt like a property that are not one, and what each is.
 NOT_PROPERTIES = {
     "BaseApp": "FreeCAD's exception module, named in a message about an exception",
-    "ConductingSheet": "a value of a material's MaterialType",
-    "EMAnalysis": "the study's class, named in a refusal about a document",
-    "EMYeeGrid": "the Yee grid's class, named in a refusal about a study",
     "FreeCAD": "the application",
     "GHz": "a unit",
     "GiB": "a unit",
     "MHz": "a unit",
     "MeshParams": "the mesher's own parameters, named in an internal invariant",
-    "NaN": "a value",
     "PETSc": "the library Palace solves port modes over, named as the user is told it",
-    "RectWGPort": "openEMS' own class, which a message about openEMS names",
     "RuntimeWarning": "Python's warning class, in a pattern the bindings' line is read by",
     "SetupFDTD": "openEMS' own function, in a pattern its line is read by",
     "UnsupportedModel": "the kind an ERROR marker carries",

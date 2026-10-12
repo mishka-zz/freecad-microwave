@@ -127,8 +127,16 @@ class DocumentObjectStub:
         super().__setattr__("Type", type)
         super().__setattr__("Name", name)
         super().__setattr__("Label", name)
+        super().__setattr__("Label2", "")
         super().__setattr__("Proxy", None)
         super().__setattr__("Document", doc)
+        #: What ``setExpression`` was told, as FreeCAD lists it: a path and the
+        #: expression's text. Nothing is evaluated.
+        super().__setattr__("ExpressionEngine", [])
+        #: What the object links to and reads, which FreeCAD derives from its
+        #: links and its expressions. Empty here: a test that rests on it states
+        #: it with ``object.__setattr__``.
+        super().__setattr__("OutList", [])
         # A freshly created object is touched, and every property write touches
         # it again. Modelled rather than ignored because "the tree says this
         # object is stale" is a thing the user reads, and a result object
@@ -141,7 +149,12 @@ class DocumentObjectStub:
         if "DocumentObjectGroup" in type:
             super().__setattr__("Group", [])
 
-        if "Part::" in type:
+        # A body and a part are containers that are geometry as well: each
+        # carries a Group and a Shape, measured under 1.1.1.
+        if type in ("PartDesign::Body", "App::Part"):
+            super().__setattr__("Group", [])
+
+        if "Part::" in type or type in ("PartDesign::Body", "App::Part"):
             super().__setattr__("Placement", MagicMock())
             super().__setattr__("Shape", MagicMock())
 
@@ -212,6 +225,9 @@ class DocumentObjectStub:
     def getDocumentationOfProperty(self, name):
         return self._documentation[name]
 
+    def setDocumentationOfProperty(self, name, documentation):
+        self._documentation[name] = documentation
+
     def setEditorMode(self, name, mode):
         # Read-only/hidden flags are display state, but a property hidden
         # because nothing reads it is part of the contract rather than
@@ -233,6 +249,9 @@ class DocumentObjectStub:
     def addObject(self, obj):
         if hasattr(self, "Group"):
             self.Group.append(obj)
+            # A group's Group is a property, and adding to it touches the
+            # group as any write does, measured under 1.1.1 on a study.
+            super().__setattr__("_touched", True)
 
     def __setattr__(self, name, value):
         if name in self._props or name in self._enums or name in self._colors:
@@ -242,6 +261,7 @@ class DocumentObjectStub:
             "Type",
             "Name",
             "Label",
+            "Label2",
             "PropertiesList",
             "_props",
             "_colors",
@@ -301,6 +321,10 @@ class DocumentObjectStub:
             held.pop(name, None)
         self._colors.discard(name)
         return True
+
+    def setExpression(self, path, text):
+        engine = [bound for bound in self.ExpressionEngine if bound[0] != path]
+        super().__setattr__("ExpressionEngine", engine + ([(path, text)] if text else []))
 
     def purgeTouched(self):
         super().__setattr__("_touched", False)
@@ -445,6 +469,9 @@ class FreeCADStub:
 
     def __init__(self):
         self._active_doc = DocumentStub()
+        #: What ``Init.py`` registered with File > Import and Export.
+        self.IMPORT_TYPES = []
+        self.EXPORT_TYPES = []
 
     @property
     def ActiveDocument(self):
@@ -461,6 +488,12 @@ class FreeCADStub:
 
     def closeDocument(self, name):
         pass
+
+    def addImportType(self, pattern, module):
+        self.IMPORT_TYPES.append((pattern, module))
+
+    def addExportType(self, pattern, module):
+        self.EXPORT_TYPES.append((pattern, module))
 
     def ParamGet(self, group):
         return self.ParameterGrp()
@@ -572,36 +605,45 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.slow)
 
 
-#: How many solves ``-m "slow and not release"`` makes.
+#: How many solves ``-m "slow and not release"`` makes, on each backend.
 #:
-#: Composed rather than observed, and this is the composition. One solve per
-#: gate, on the mesh that gate's own answer is read off - the coarsest of a
-#: sequence that refines upwards, the finest of one that coarsens down from the
-#: gate's own mesh - except the published low-pass, which is held back whole.
+#: Composed rather than observed, and this is the composition. On openEMS, one
+#: solve per gate, on the mesh that gate's own answer is read off - the coarsest
+#: of a sequence that refines upwards, the finest of one that coarsens down from
+#: the gate's own mesh - except the published low-pass, which is held back whole.
 #: Then the arrangements a gate compares that against, where the comparison *is*
 #: the assertion: the sphere's poles turned, the line along the other axis, the
 #: pillbox short, its probe doubled, its caps handed over on the grid line, the
 #: guide on its other axis, the two-port's second excitation. Then one apiece for
 #: the gates driven from a document in ``test_openems_document_translation``.
 #:
+#: On Palace, one driven run per drawing a test holds, each on the one mesh its
+#: answer is read off: the guide drawn each way it is drawn and the shipped
+#: example, the lossy guide's walls at each length its loss is read between, the
+#: septum as a sheet and as a body at each width, the stripline at each length it
+#: is taken apart at and with each pair of resistances, the dipole,
+#: and each specimen a port, sweep or loss-model test solves. The published
+#: low-pass is held back whole, as on openEMS. A Palace run also
+#: solves each wave port's modes, and an adaptive sweep a check of its model;
+#: those are parts of one run's answer and are not counted.
+#:
 #: A count of solves rather than a time, a time belonging to whichever machine
-#: measured it. Palace solves are not counted: the census wraps openEMS' own run
-#: and nothing on the other backend passes through it. What a Palace gate could
-#: not reach is held by :data:`UNREACHED` instead.
+#: measured it.
 #:
 #: **Held from both sides.** Over it, and something that solves a sequence has
-#: got into the tier. Under it on a run that collected every gate, and a gate has
+#: got into the tier. Under it on a whole run that carries every gate, and a gate has
 #: stopped reaching the engine before a commit while still reading as coverage,
 #: which is the fault this whole tier is about, one level down. Either way the
 #: run's exit status is the signal: pytest's own summary counts assertions and
-#: none of these failed.
-PRE_COMMIT_SOLVES = 25
+#: none of these failed. Each backend is held to its own figure, so a solve gained
+#: on one cannot hide a solve lost on the other.
+PRE_COMMIT_SOLVES = {"openEMS": 25, "Palace": 39}
 
 #: Every engine a test of this run could not reach, one reason for each, filled
 #: by :func:`unreachable`. A gate that skipped for want of its engine reads as a
-#: skip among many, and a Palace gate reaches its engine inside a FreeCAD
-#: subprocess the census cannot see. So a run that collected every gate is held
-#: to reaching all of them by this record, whichever backend each one solves on.
+#: skip among many, and solves nothing for the census to count. So a whole run that
+#: carries every gate is held to reaching all of them by this record, whichever
+#: backend each one solves on.
 UNREACHED: list[str] = []
 
 
@@ -618,13 +660,22 @@ def unreachable(reason: str, *, module_level: bool = False):
 
 def needed(module: str, reason: str, *, module_level: bool = False):
     """Import ``module``, or skip as :func:`unreachable` does. What
-    ``pytest.importorskip`` does, with the skip recorded."""
+    ``pytest.importorskip`` does, with the skip recorded.
+
+    A module that is installed and loads a shared library of its own raises
+    ``OSError`` where the operating system cannot load that library or one it
+    needs - Gmsh's Python module loads ``libgmsh`` through ``ctypes``. That
+    module is as unreachable as one that is not installed, and the reason says
+    which library was missing.
+    """
     import importlib
 
     try:
         return importlib.import_module(module)
     except ImportError:
         unreachable(reason, module_level=module_level)
+    except OSError as error:
+        unreachable(f"{reason}: {error}", module_level=module_level)
 
 
 #: Where a growth stops being linear and starts being quadratic, as a power of
@@ -645,7 +696,8 @@ GROWTH_WORTH_READING = 1.5
 
 @pytest.fixture(scope="session")
 def census(request):
-    """Count what the session solved, at the one call every route passes through.
+    """Count what the session solved on openEMS, at the one call every route
+    passes through.
 
     Not for a runtime - that belongs to whichever machine measured it - but for
     the size of the pre-commit tier, which is a property of the suite. ``run.run``
@@ -655,7 +707,7 @@ def census(request):
     """
     from Microwave.Solvers.openems import run
 
-    solved: list[str] = []
+    solved = _census(request.config, "openEMS")
     ran = run.run
 
     def counted(envelope, *arguments, **keywords):
@@ -663,23 +715,144 @@ def census(request):
         return ran(envelope, *arguments, **keywords)
 
     run.run = counted
-    request.config.solve_census = solved
     try:
         yield solved
     finally:
         run.run = ran
 
 
+def _census(config, backend: str) -> list[str]:
+    """The list the session's solves on ``backend`` are counted into."""
+    if not hasattr(config, "solve_census"):
+        config.solve_census = {}
+    return config.solve_census.setdefault(backend, [])
+
+
+def solved(config) -> dict[str, list[str]]:
+    """What the session has solved so far, by backend."""
+    counted = dict(getattr(config, "solve_census", {}))
+    census = getattr(config, "palace_census", None)
+    if census is not None and census.exists():
+        counted["Palace"] = runs(census.read_text().splitlines())
+    elif hasattr(config, "palace_solved"):
+        counted["Palace"] = config.palace_solved
+    return counted
+
+
+def counting(real: str, census: Path) -> str:
+    """A program standing in for Palace that writes each configuration it is
+    started on to ``census``, one path a line, and then runs ``real`` as itself.
+
+    A shell script, so it needs no interpreter of the suite's. It replaces its
+    own process with Palace's rather than starting a child, so the process number
+    and the exit status the adapter reads are Palace's.
+    """
+    import shlex
+
+    return (
+        "#!/bin/sh\n"
+        'for argument; do case "$argument" in *.json) '
+        f'printf \'%s/%s\\n\' "$PWD" "$argument" >> {shlex.quote(str(census))};; esac; done\n'
+        f'exec {shlex.quote(real)} "$@"\n'
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def palace_census(request, tmp_path_factory):
+    """Count what the session solved on Palace, where Palace is started.
+
+    A Palace gate solves inside a FreeCAD subprocess, so no call in this
+    interpreter sees its solve. What every route shares is the program: the
+    adapter starts the Palace that ``$MICROWAVE_PALACE`` names where a study
+    names none, and a subprocess inherits the variable. So the session points it
+    at :func:`counting`, standing in for the Palace discovery finds, and reads
+    what was written once the session is over.
+
+    A run the adapter makes starts Palace on its own configuration, and on one
+    more for each mode run and each check of an adaptive sweep. Those are parts
+    of one run's answer, so only the run's own configuration is counted.
+
+    The file is read when the count is asked for rather than when the session
+    ends: a run stopped early asks before its session's fixtures are torn down.
+    What it held is kept at teardown as well, for a summary asked after pytest
+    has removed it.
+
+    Where discovery finds no Palace, nothing is changed, and each test that
+    needs one says it could not reach it.
+    """
+    from Microwave.Solvers.palace import run
+
+    try:
+        real = run.find_solver()
+    except run.SolverNotFound:
+        yield
+        return
+    where = tmp_path_factory.mktemp("palace_census")
+    census = where / "solved"
+    census.touch()
+    stand_in = where / run.BINARY
+    stand_in.write_text(counting(str(real), census))
+    stand_in.chmod(0o755)
+    before = os.environ.get(run.BINARY_ENV_VAR)
+    os.environ[run.BINARY_ENV_VAR] = str(stand_in)
+    request.config.palace_census = census
+    try:
+        yield
+    finally:
+        if before is None:
+            del os.environ[run.BINARY_ENV_VAR]
+        else:
+            os.environ[run.BINARY_ENV_VAR] = before
+        # Kept, because pytest may remove the session's temporary directory
+        # before the summary asks.
+        request.config.palace_solved = runs(census.read_text().splitlines())
+
+
+def runs(started: list[str]) -> list[str]:
+    """The configurations in ``started`` that are each a run's own, the rest
+    being a mode run or the check of a sweep."""
+    from Microwave.Solvers.palace import write
+
+    return [path for path in started if Path(path).name == write.CONFIG_NAME]
+
+
 def pytest_collection_finish(session):
     """What kind of run this is, taken from what survived ``-m`` rather than from
     the command line: every way of arriving at a selection with nothing held back -
-    a marker expression, a file, a single test - is one the budget applies to,
-    and only a selection carrying every gate can be held to it from below.
+    a marker expression, a file, a single test - is one the budget applies to.
+    Only a run of the whole suite under ``-m`` that still carries every gate can
+    be held to it from below, since a test that is not a gate solves too.
     """
+    config = session.config
     gates = {path.name for path in Path(__file__).resolve().parent.glob("test_acceptance_*.py")}
-    session.config.studied = any(item.get_closest_marker("release") for item in session.items)
-    session.config.whole_tier = gates <= {item.path.name for item in session.items}
-    session.config.unreached = UNREACHED
+    config.studied = any(item.get_closest_marker("release") for item in session.items)
+    config.whole_tier = (
+        not runs_nothing(config)
+        and not narrowed(config)
+        and gates <= {item.path.name for item in session.items}
+    )
+    config.unreached = UNREACHED
+
+
+def runs_nothing(config) -> bool:
+    """Whether the run stops before any test runs, and so solves nothing."""
+    option = config.option
+    return any(getattr(option, name, False) for name in ("collectonly", "setupplan", "setuponly"))
+
+
+def narrowed(config) -> bool:
+    """Whether the run was pointed at less than the suite, by a path, a test, a
+    keyword or a deselection - anything but a marker expression."""
+    option = config.option
+    if option.keyword or option.deselect or option.ignore or getattr(option, "lf", False):
+        return True
+    here = Path(__file__).resolve().parent
+    for argument in config.args:
+        path, _, test = str(argument).partition("::")
+        reached = Path(config.invocation_params.dir, path).resolve()
+        if test or not (reached == here or reached in here.parents):
+            return True
+    return False
 
 
 def _off_budget(config) -> str:
@@ -687,28 +860,31 @@ def _off_budget(config) -> str:
     unreached = sorted(set(getattr(config, "unreached", ())))
     if unreached and getattr(config, "whole_tier", False):
         return (
-            "a run that collected every gate skipped what this machine could not "
+            "a whole run that carries every gate skipped what this machine could not "
             "reach, so it is not the run it reads as. Make each reachable, or "
             "deselect the gates that need it: " + "; ".join(unreached)
         )
-    solved = getattr(config, "solve_census", ())
-    if getattr(config, "studied", True) or not solved:
+    if getattr(config, "studied", True):
         return ""
-    made = len(solved)
-    if made > PRE_COMMIT_SOLVES:
-        return (
-            f"the pre-commit tier solved {made} times, past the {PRE_COMMIT_SOLVES} it is "
-            "composed of. Either a fixture whose solves are compared with each other is "
-            "missing from STUDY_FIXTURES, or the tier has been given work that belongs "
-            "in the release run"
-        )
-    if made < PRE_COMMIT_SOLVES and getattr(config, "whole_tier", False):
-        return (
-            f"the pre-commit tier solved {made} times where it is composed of "
-            f"{PRE_COMMIT_SOLVES}, so a gate is no longer reaching the engine before a "
-            "commit while still reading as coverage"
-        )
-    return ""
+    census = solved(config)
+    wrong = []
+    for backend, composed in PRE_COMMIT_SOLVES.items():
+        made = len(census.get(backend, ()))
+        if made > composed:
+            wrong.append(
+                f"the pre-commit tier solved {made} times on {backend}, past the "
+                f"{composed} it is composed of. Either a fixture whose solves are "
+                "compared with each other is missing from STUDY_FIXTURES or carries no "
+                "release mark, or the tier has been given work that belongs in the "
+                "release run"
+            )
+        elif made < composed and getattr(config, "whole_tier", False):
+            wrong.append(
+                f"the pre-commit tier solved {made} times on {backend} where it is "
+                f"composed of {composed}, so a gate is no longer reaching the engine "
+                "before a commit while still reading as coverage"
+            )
+    return ". ".join(wrong)
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
@@ -717,9 +893,9 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     Reported on every run that solves at all, because it is the figure the
     tiering is argued from and a remembered one would be the wrong one.
     """
-    solved = getattr(config, "solve_census", ())
-    if solved:
-        terminalreporter.write_line(f"SOLVES {len(solved)} openEMS runs")
+    for backend, made in solved(config).items():
+        if made:
+            terminalreporter.write_line(f"SOLVES {len(made)} {backend} runs")
     for reason in sorted(set(getattr(config, "unreached", ()))):
         terminalreporter.write_line(f"UNREACHED {reason}")
     wrong = _off_budget(config)

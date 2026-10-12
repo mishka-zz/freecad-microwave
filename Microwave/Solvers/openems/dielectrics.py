@@ -206,29 +206,27 @@ def _middle_first(points: np.ndarray) -> np.ndarray:
 
 def _unread(problem: Problem, pieces: Sequence[Solid], found: str) -> Finding:
     """What to tell the user about a body the averaging does not read."""
+    # openEMS reads a cell's material only at its middle and a quarter of the
+    # way in from each of its lines, and says nothing about a body none of
+    # those points falls inside.
     name = tuple(dict.fromkeys(solid.name for solid in pieces))
     if found == UNASKED:
         return Finding(
             WARN,
             name,
-            "has not been checked: its reading points and its triangles cost more "
-            "than this check spends on one object. openEMS reads a cell's material "
-            "only at its middle and a quarter of the way in from each of its lines, "
-            "and whether any of those points falls inside this object is not "
-            "established. A body none of them falls inside is solved as though it "
-            "were not drawn, and openEMS says nothing about it",
+            "it has not been checked: its triangles and the grid points around it "
+            "cost more than the check spends on one object. If no point openEMS "
+            "reads its material at falls inside it, the run solves the model "
+            "without it and gives no warning",
         )
     if found == OUTSIDE_THE_SHAPE:
         return Finding(
             REFUSE,
             name,
-            "is a dielectric none of whose points openEMS reads: it reads a cell's "
-            "material only at its middle and a quarter of the way in from each of "
-            "its lines, and every one of those points near this object falls "
-            "outside it or on its surface. The run would be solved without it, and "
-            "openEMS says nothing about it. The cells where it is drawn are coarser "
-            "than it is thin, so lower MinElementSize on the mesh policy, draw it "
-            "thicker, or leave it out",
+            "it is a dielectric thinner than the cells it lies in, so every point "
+            "openEMS reads its material at falls outside it or on its surface, and "
+            "the run solves the model without it. Lower MinElementSize in the openEMS mesh "
+            "settings, draw it thicker, or leave it out",
         )
     # The body's own extent, thinnest axis first.
     lower = [min(solid.lower[dim] for solid in pieces) for dim in range(len(AXIS_NAMES))]
@@ -240,24 +238,20 @@ def _unread(problem: Problem, pieces: Sequence[Solid], found: str) -> Finding:
         return Finding(
             REFUSE,
             name,
-            f"is flat on the {AXIS_NAMES[dim]} axis, so it holds no volume, and "
-            "openEMS reads a cell's material only at its middle and a quarter of "
-            "the way in from each of its lines. A plane is read only where it "
-            "happens to lie on one of those, so the run would be solved without "
-            "this dielectric or with it as the grid falls. Draw it as a solid of "
-            "the thickness the layer has, or leave it out",
+            f"it is flat on the {AXIS_NAMES[dim]} axis and holds no volume, so "
+            "openEMS reads it only where it happens to lie on a point it reads "
+            "material at, and whether the run includes it depends on the grid. "
+            "Draw it as a solid with the layer's thickness, or leave it out",
         )
     gap = _gap(problem.grid[dim], (low + high) / 2.0)
     return Finding(
         REFUSE,
         name,
-        f"is {thickness:.4g} mm across on the {AXIS_NAMES[dim]} axis, and openEMS "
-        "reads a cell's material only at its middle and a quarter of the way in "
-        "from each of its lines. None of those points falls inside it, so the run "
-        "would be solved without this dielectric, and openEMS says nothing about "
-        f"it. The points around it stand {_up(gap)} mm apart. Lower MinElementSize "
-        f"on the mesh policy below {thickness:.4g} mm so the mesher can put a "
-        f"cell across it, draw it thicker than {_up(gap)} mm, or leave it out",
+        f"it is {thickness:.4g} mm across on the {AXIS_NAMES[dim]} axis, and the "
+        f"points openEMS reads its material at stand {_up(gap)} mm apart there, so "
+        "none falls inside it and the run solves the model without it. Lower "
+        f"MinElementSize in the openEMS mesh settings below {thickness:.4g} mm, draw it "
+        f"thicker than {_up(gap)} mm, or leave it out",
     )
 
 

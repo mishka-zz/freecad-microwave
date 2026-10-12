@@ -5,7 +5,7 @@
 
 FreeCAD does not wrap a Python command in a transaction. One that changes the
 document without opening one cannot be undone, and Ctrl-Z then reverses whatever
-did open one, which is the edit before it. Untransacted, Update Mesh followed by
+did open one, which is the edit before it. Untransacted, Mesh followed by
 Ctrl-Z leaves the mesh on screen and deletes the material the user has just
 created. A run leaves the S-parameters and again undoes something earlier.
 
@@ -21,7 +21,10 @@ Behaviours of ``openTransaction`` worth knowing:
 * A transaction does not nest. Opening a second while one is live commits the
   first, and both land on the stack, innermost first. A caller that wraps one of
   these gets its work split into two undo steps, and nothing is corrupted.
-  Nothing does that today.
+  File > Import wraps :func:`~Microwave.Gui.file_menu.insert` in a step of its
+  own (``Application::importFrom``, ``src/Gui/Application.cpp:870-893``), which
+  is still empty when this one opens, so it leaves no entry behind (see
+  :data:`~Microwave.Gui.file_menu.IMPORTED`).
 """
 
 from __future__ import annotations

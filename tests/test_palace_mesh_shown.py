@@ -53,9 +53,11 @@ def test_every_label_comes_back_as_a_group_under_its_own_name(made):
 def test_it_is_drawn_by_freecads_own_view_provider_and_can_be_hidden(made):
     _, manifest = made
     first = manifest["first"]
-    assert first["type"] == "Fem::FemMeshObject"
+    assert first["type"] == "Fem::FemMeshObjectPython"
     assert first["label"] == "Mesh (Palace)"
     assert first["provider"] == "ViewProviderFemMesh"
+    assert first["icon"] == "MeshPalace.svg"
+    assert first["modes"], "FEM's own view provider no longer draws it"
     assert first["visible"] is True
     assert manifest["hidden"] is False
     assert manifest["shown again"] is True
@@ -103,10 +105,11 @@ def test_what_it_cost_the_file_is_printed(made):
     assert manifest["bytes"] > 0
 
 
-CURRENT = {"status": "Current", "label": "Mesh (Palace)", "says": None}
+CURRENT = {"status": "Current", "label": "Mesh (Palace)", "overlaid": [], "says": None}
 STALE = {
     "status": "Out of date",
-    "label": "Mesh (Palace) - out of date",
+    "label": "Mesh (Palace)",
+    "overlaid": ["OverlayOutOfDate.svg"],
     "says": "the model has changed since the mesh was made",
 }
 
@@ -137,24 +140,21 @@ def test_an_edit_awaiting_a_recompute_is_reported_before_the_mark_is_written(mad
     assert manifest["marks"]["body before a recompute"] == {**CURRENT, "says": STALE["says"]}
 
 
-def test_a_second_study_numbered_by_freecad_is_marked_all_the_same(made):
-    """The label the mark writes on the second study's mesh is the first
-    study's already, and FreeCAD numbers it."""
+def test_a_second_study_s_mesh_shares_the_label_and_is_marked_all_the_same(made):
+    """Each study holds one mesh for Palace, under the same label."""
     _, manifest = made
     first, then = manifest["marks"]["second study"], manifest["marks"]["second study's body"]
-    assert first["status"] == "Current" and first["label"].startswith(CURRENT["label"])
-    assert then["status"] == STALE["status"] and then["says"] == STALE["says"]
-    assert then["label"].rstrip("0123456789") == STALE["label"]
+    assert first == CURRENT
+    assert then == STALE
 
 
-def test_a_result_beside_the_mesh_it_was_solved_on_is_marked_once_that_is_deleted(made):
-    """Deleting the mesh changes what the study holds, which is when the study
-    asks again."""
+def test_a_run_beside_the_mesh_it_was_solved_on_is_left_alone_once_that_is_deleted(made):
+    """Deleting the mesh changes what the study holds, and writes no status into
+    a run's labels, which would land on every older run."""
     _, manifest = made
-    assert manifest["marks"]["result beside its mesh"] == "S-Parameters (Palace)"
-    assert manifest["marks"]["result, its mesh deleted"] == (
-        "S-Parameters (Palace) - not solved on the mesh shown"
-    )
+    labels = ["Run 1 (Palace)", "S-Parameters (run 1, Palace)"]
+    assert manifest["marks"]["run beside its mesh"] == labels
+    assert manifest["marks"]["run, its mesh deleted"] == labels
 
 
 def test_undoing_the_edit_undoes_the_mark_and_the_panel_still_asks_for_a_mesh(made):
@@ -174,8 +174,8 @@ def test_undo_and_redo_bring_each_mesh_back_with_its_own_mark(made):
     says is not asked: a redo leaves objects touched, and the panel then asks
     for a mesh until a recompute has run."""
     _, manifest = made
-    marks = [(each["status"], each["label"]) for each in manifest["trace"]]
-    current, stale = (CURRENT["status"], CURRENT["label"]), (STALE["status"], STALE["label"])
+    marks = [(each["status"], each["overlaid"]) for each in manifest["trace"]]
+    current, stale = (CURRENT["status"], CURRENT["overlaid"]), (STALE["status"], STALE["overlaid"])
     assert marks == [current, stale, current, current]
 
 

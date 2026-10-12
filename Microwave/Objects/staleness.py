@@ -5,7 +5,7 @@
 
 FreeCAD recomputes the preview whenever its dependency graph reaches it.
 Deriving the staleness key there would translate the whole document's geometry
-for an answer nobody reads: there is an Update Mesh button, and the panel
+for an answer nobody reads: there is a Mesh button, and the panel
 derives the key itself whenever it opens. So ``Objects/preview.py`` marks the
 drawing stale instead of asking, and each class that owns properties says which
 of its own move no cell, so that an edit to one of those never reaches the

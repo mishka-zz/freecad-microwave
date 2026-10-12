@@ -368,14 +368,17 @@ class TestFeatureResolution:
         assert mesh_report(uniform(count=11), [], params()).oversized is None
 
     def test_a_grid_nobody_meant_says_so_in_the_summary(self):
-        """*Update Mesh* never reaches pre-flight - it meshes, draws, and
+        """*Mesh* never reaches pre-flight - it meshes, draws, and
         prints this. So the one route on which every runaway grid was actually
         met is the one that has to carry the sentence."""
         side = round((LARGE_GRID_BYTES / BYTES_PER_CELL) ** (1 / 3)) + 2
         report = mesh_report(uniform(count=side), [], params())
 
         assert report.oversized is not None
-        assert "MaxGrowthRatio" in report.oversized
+        assert report.oversized.endswith(
+            ", so the run is long. If that is not intended, lower ElementsPerWavelength "
+            "in the openEMS mesh settings"
+        )
         assert report.oversized in report.summary()
 
     def test_a_one_cell_object_is_flagged_unresolved(self):
@@ -710,14 +713,14 @@ class TestWhatTheGridLaidAcrossAWalkedGap:
         assert row.between == pytest.approx(
             (2.0 + grading * 8.0 * math.sqrt(3.0) / 2.0) / self.straddle()
         )
-        assert "was walked every 8 mm" in report.summary()
-        assert f"held to {row.between:.4g} mm rather than 2 mm" in report.summary()
+        assert "was sampled every 8 mm" in report.summary()
+        assert f"a cell may reach {row.between:.4g} mm where 2 mm was asked for" in report.summary()
         assert report.unheld == ()
 
     def test_a_run_sampled_at_its_own_width_is_not_called_coarse(self):
         report = self.scored(self.station((2.5, 2.5, 2.5), width=2.0))
         assert report.coarsely_walked == ()
-        assert "was walked every" not in report.summary()
+        assert "was sampled every" not in report.summary()
 
     def test_a_witness_or_a_count_is_not_scored_as_a_gap(self):
         """A witness stands alone - no spacing, no family, no run to promise
@@ -743,7 +746,7 @@ class TestWhatTheGridLaidAcrossAWalkedGap:
         report = self.scored()
         assert report.gapped == ()
         assert report.unheld == ()
-        assert "walked every" not in report.summary()
+        assert "sampled every" not in report.summary()
 
     def test_a_grading_too_steep_for_the_straddle_flags_nothing(self):
         """The straddle is linearised in the slope, and MeshParams accepts a
@@ -897,8 +900,14 @@ class TestWhatCouldNotBeMeasured:
                 ("'Reflector' curving on face 3", 12, 52),
             )
         ).summary()
-        assert "  ! 'Reflector' rim curving answered none of its 12 station(s)" in text
-        assert "  ! 'Reflector' curving on face 3 answered 12 of its 64 stations" in text
+        assert (
+            "  ! 'Reflector' rim curving could not be measured at any of its 12 sample "
+            "point(s), so it sets no cell size"
+        ) in text
+        assert (
+            "  ! 'Reflector' curving on face 3 could be measured at 12 of its 64 sample points"
+            in text
+        )
 
     def test_and_a_drawing_that_answered_throughout_puts_no_row_in_the_summary(self):
         assert "answered" not in self.report(self.record(("'Pad' outline", 9, 0))).summary()

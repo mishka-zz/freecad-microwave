@@ -350,3 +350,182 @@ SILENT = (
         "a solid wound inside out, which the kernel meets as its own complement",
     ),
 )
+
+
+#: A WR-42 guide as the air inside it, in mm, and how far in from each end a
+#: port's plane stands where it is inset, as ``examples/waveguide_wr42.py`` sets
+#: its planes.
+BROAD, NARROW, LENGTH, INSET = 10.7, 4.3, 50.0, 5.0
+
+
+@dataclass(frozen=True)
+class Guide:
+    """A guide drawn as a body, a cross-section drawn as a face of its own, and
+    the propagation axis a port picked on both is given."""
+
+    name: str
+    body: Callable[[Any], Any]
+    #: Two opposite corners of the face, which is flat across one axis.
+    face: tuple[tuple[float, float, float], tuple[float, float, float]]
+    #: The axis the port is given, or ``None`` where the picks leave it unset
+    #: and say why. The answer, stated here.
+    axis: str | None
+    why: str
+    #: Whether the body is picked before the face.
+    body_first: bool = False
+    #: Whether the body is picked at all.
+    picked: bool = True
+
+
+def _along(axis, along, broad, narrow):
+    """A triple with ``along`` on ``axis`` and the guide's cross-section on the
+    two axes after it."""
+    out = [0.0, 0.0, 0.0]
+    out[axis], out[(axis + 1) % 3], out[(axis + 2) % 3] = along, broad, narrow
+    return tuple(out)
+
+
+def _straight(axis):
+    def draw(Part):
+        from FreeCAD import Vector
+
+        return Part.makeBox(*_along(axis, LENGTH, BROAD, NARROW), Vector(0, 0, 0))
+
+    return draw
+
+
+def _square_to(axis, at):
+    return (_along(axis, at, 0.0, 0.0), _along(axis, at, BROAD, NARROW))
+
+
+def _bent(Part):
+    """An L: an arm along x and an arm along y from its far end."""
+    from FreeCAD import Vector
+
+    return (
+        Part.makeBox(LENGTH, BROAD, NARROW)
+        .fuse(Part.makeBox(BROAD, LENGTH, NARROW, Vector(LENGTH - BROAD, 0, 0)))
+        .removeSplitter()
+    )
+
+
+#: How far apart the two arms of the U stand, wall to wall, in mm.
+GAP = 10.0
+
+
+def _turned_back(Part):
+    """A U: an arm along x, a bend at its far end, and a return arm running
+    back from x = 50 to x = 30, shorter than the first, so the guide's box
+    reaches past the return arm's open end."""
+    from FreeCAD import Vector
+
+    return (
+        Part.makeBox(LENGTH, BROAD, NARROW)
+        .fuse(Part.makeBox(BROAD, 2 * BROAD + GAP, NARROW, Vector(LENGTH - BROAD, 0, 0)))
+        .fuse(Part.makeBox(20, BROAD, NARROW, Vector(30, BROAD + GAP, 0)))
+        .removeSplitter()
+    )
+
+
+def _butted(Part):
+    """The straight guide along x drawn as two boxes end to end, in one shape."""
+    from FreeCAD import Vector
+
+    half = LENGTH / 2
+    return Part.Compound(
+        [
+            Part.makeBox(half, BROAD, NARROW),
+            Part.makeBox(half, BROAD, NARROW, Vector(half, 0, 0)),
+        ]
+    )
+
+
+def _walls(Part):
+    """The straight guide along x drawn as its metal walls, a millimetre thick,
+    with nothing inside them."""
+    from FreeCAD import Vector
+
+    wall = 1.0
+    outer = Part.makeBox(LENGTH, BROAD + 2 * wall, NARROW + 2 * wall, Vector(0, -wall, -wall))
+    return outer.cut(Part.makeBox(LENGTH, BROAD, NARROW))
+
+
+GUIDES = tuple(
+    Guide(
+        f"{'xyz'[axis]}_{where}",
+        _straight(axis),
+        _square_to(axis, at),
+        f"{'' if sign > 0 else '-'}{'XYZ'[axis]}",
+        f"a straight guide along {'xyz'[axis]}, its port {where}: the guide runs "
+        f"{'up' if sign > 0 else 'down'} the axis from the plane",
+    )
+    for axis in range(3)
+    for where, at, sign in (
+        ("inset_at_the_start", INSET, 1),
+        ("inset_at_the_end", LENGTH - INSET, -1),
+        ("flush_at_the_start", 0.0, 1),
+        ("flush_at_the_end", LENGTH, -1),
+    )
+) + (
+    Guide(
+        "body_picked_first",
+        _straight(0),
+        _square_to(0, LENGTH - INSET),
+        "-X",
+        "the same guide and plane picked the other way round",
+        body_first=True,
+    ),
+    Guide(
+        "bent_far_arm",
+        _bent,
+        ((LENGTH - BROAD, LENGTH - INSET, 0.0), (LENGTH, LENGTH - INSET, NARROW)),
+        "-Y",
+        "a port on the arm along y, whose guide runs back down y to the bend",
+    ),
+    Guide(
+        "turned_back_short_arm",
+        _turned_back,
+        ((35.0, BROAD + GAP, 0.0), (35.0, 2 * BROAD + GAP, NARROW)),
+        "X",
+        "a port near the open end of the short return arm: the arm runs 15 mm "
+        "up x to the bend and 5 mm down it, while the guide's box runs 35 mm down",
+    ),
+    Guide(
+        "butted_near_the_joint",
+        _butted,
+        _square_to(0, 20.0),
+        "X",
+        "a plane 5 mm short of where two boxes drawn end to end meet: the guide "
+        "runs 30 mm up x and 20 mm down it, and the box it stands in only 5 mm up",
+    ),
+    Guide(
+        "at_the_middle",
+        _straight(0),
+        _square_to(0, LENGTH / 2),
+        None,
+        "a plane with as much guide on each side, which neither end is nearer",
+    ),
+    Guide(
+        "beyond_the_guide",
+        _straight(0),
+        _square_to(0, LENGTH + INSET),
+        None,
+        "a plane standing past the guide's end, across none of it",
+    ),
+    Guide(
+        "walls_alone",
+        _walls,
+        _square_to(0, INSET),
+        None,
+        "a plane inside a guide drawn as its walls, which hold nothing where the "
+        "wave runs, so there is no body to read its way off",
+    ),
+    Guide(
+        "picked_alone",
+        _straight(0),
+        _square_to(0, INSET),
+        None,
+        "a plane picked with no body, which says nothing of which way the guide runs",
+        picked=False,
+    ),
+)

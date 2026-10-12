@@ -4,7 +4,13 @@
 import pytest
 
 from Microwave.Objects.mesh import createEMMeshPolicy, createEMYeeGrid
-from Microwave.Objects.solver import createEMSolverOpenEMS
+from Microwave.Objects.runs import COST, createEMRun
+from Microwave.Objects.solver import (
+    OUTPUT,
+    PROGRAMS,
+    createEMSolverOpenEMS,
+    createEMSolverPalace,
+)
 
 
 def solver():
@@ -19,6 +25,28 @@ def yee_grid():
     return createEMYeeGrid()
 
 
+@pytest.mark.parametrize("make", [createEMSolverOpenEMS, createEMSolverPalace])
+def test_where_a_run_writes_stands_apart_from_the_programs_it_starts(make):
+    """The property editor lists a group by name, so a directory among the
+    programs would stand between them."""
+    made = make()
+    grouped = {}
+    for name in made.PropertiesList:
+        grouped.setdefault(made.getGroupOfProperty(name), set()).add(name)
+    assert grouped[OUTPUT] == {"RunDirectory"}
+    assert "RunDirectory" not in grouped[PROGRAMS]
+    assert grouped[PROGRAMS]
+
+
+def test_what_a_run_cost_stands_together():
+    run = createEMRun(number=1, solver="openEMS")
+    assert {name for name in run.PropertiesList if run.getGroupOfProperty(name) == COST} == {
+        "WallSeconds",
+        "ProcessorSeconds",
+        "Processes",
+    }
+
+
 def test_the_solver_carries_no_neutral_property():
     """The band belongs to the study, not to a backend.
 
@@ -28,7 +56,7 @@ def test_the_solver_carries_no_neutral_property():
     somebody adding a convenience property back.
     """
     sim = solver()
-    for name in ("FrequencyStart", "FrequencyStop", "NumFrequencyPoints"):
+    for name in ("FrequencyStart", "FrequencyStop", "FrequencyPoints"):
         assert not hasattr(sim, name), f"{name} belongs on EMAnalysis"
 
 
@@ -66,8 +94,8 @@ def test_simulation_defaults():
     assert sim.TimestepFactor == 1.0
     assert sim.Threads == 0
 
-    # Infrastructure
-    assert sim.SimDir == ""  # blank means "beside the document"
+    # Output and Paths
+    assert sim.RunDirectory == ""  # blank means "beside the document"
     assert sim.SolverPython == ""  # blank means "search for the bindings"
 
 
@@ -100,7 +128,7 @@ class TestThePalaceSolver:
         load-bearing rather than tidy: a copy here is a copy that can disagree
         with the band the other backend answers, over one drawing."""
         sim = self.solver()
-        for name in ("FrequencyStart", "FrequencyStop", "NumFrequencyPoints"):
+        for name in ("FrequencyStart", "FrequencyStop", "FrequencyPoints"):
             assert not hasattr(sim, name), f"{name} belongs on EMAnalysis"
 
     def test_it_carries_nothing_of_the_other_backend_s(self):
@@ -137,18 +165,19 @@ class TestThePalaceSolver:
             "MesherPython",
             "Order",
             "Processes",
-            "SimDir",
+            "RunDirectory",
             "SolverPath",
             "Sweep",
             "SweepSolves",
             "SweepTolerance",
         }
 
-    def test_it_runs_on_one_process_unless_told_otherwise(self):
-        """Open MPI refuses more ranks than it counts slots on the machine, and
-        every machine has one. A default that fails somewhere is not one
-        anybody can rely on."""
-        assert self.solver().Processes == 1
+    def test_it_runs_on_the_machine_it_finds_unless_told_otherwise(self):
+        """A count saved in the document is one machine's, and the document is
+        solved on whichever machine opens it."""
+        from Microwave.Solvers.palace import run
+
+        assert self.solver().Processes == run.MACHINE
 
     def test_the_launchers_and_the_mesher_are_searched_for_unless_named(self):
         sim = self.solver()
@@ -202,7 +231,7 @@ def test_the_mesh_policy_defaults_to_air_padding():
     mesh = mesh_policy()
     for axis in ["X", "Y", "Z"]:
         for side in ["Min", "Max"]:
-            assert getattr(mesh, f"Padding{axis}{side}") == "Air"
+            assert getattr(mesh, f"Boundary{axis}{side}") == "Open"
     assert float(mesh.Clearance) == 0.0
 
 
@@ -223,7 +252,7 @@ def test_the_default_mesh_follows_the_rule_the_gate_measured():
     """
     from tests.test_acceptance_openems_microstrip import REFINEMENT
 
-    mesh, grid = mesh_policy(), yee_grid()
+    grid = yee_grid()
 
     assert grid.ElementsPerWavelength == pytest.approx(20.0)
     assert grid.EdgeRefinement == pytest.approx(6.0)
@@ -231,13 +260,13 @@ def test_the_default_mesh_follows_the_rule_the_gate_measured():
         "the microstrip gate solves its ladder around a refinement this grid no "
         "longer ships, so what it prints is not what a user gets"
     )
-    assert mesh.MinElementsAcross >= 9, "a thin substrate carries the whole field"
+    assert grid.MinElementsAcross >= 9, "a thin substrate carries the whole field"
     assert grid.MaxGrowthRatio > 1.0, "a ratio of 1 forbids grading"
 
 
 def test_the_floor_on_element_size_defaults_to_derived():
     """Zero is the sentinel for "work it out", not a floor of zero."""
-    assert float(mesh_policy().MinElementSize) == 0.0
+    assert float(yee_grid().MinElementSize) == 0.0
 
 
 def test_the_mesh_policy_speaks_no_solver_s_dialect():
@@ -328,7 +357,7 @@ FACES = ("XMin", "XMax", "YMin", "YMax", "ZMin", "ZMax")
 
 def test_the_solver_states_no_condition_on_any_face():
     """Which face is a wall and which absorbs follows from the mesh policy's
-    Padding, which every backend reads. Asserted as an absence, because the way
+    Boundary, which every backend reads. Asserted as an absence, because the way
     this regresses is a per-face property coming back beside the policy's and
     disagreeing with it."""
     sim = solver()
@@ -368,3 +397,18 @@ def test_an_absorber_this_adapter_does_not_build_is_refused_by_name():
 
     with pytest.raises(TranslationError, match="Absorber is 'Periodic'"):
         policy._absorbing(Saved())
+
+
+def test_each_solver_names_the_mesh_settings_and_the_kind_its_adapter_reads():
+    """The tree files a solver's mesh settings under it, and Delete takes them
+    with it, by the kind the solver names. The adapter finds them by its own
+    copy of that kind, and the solver's own kind by another. A copy that drifted
+    would leave the settings unshown, undeleted, or unread with nothing failing."""
+    from Microwave.Objects import mesh as recipes
+    from Microwave.Objects.solver import EMSolverOpenEMS, EMSolverPalace
+    from Microwave.Solvers.openems import document as fdtd
+    from Microwave.Solvers.palace import document as fem
+
+    assert (EMSolverOpenEMS.RECIPE, EMSolverPalace.RECIPE) == (fdtd.RECIPE, fem.RECIPE)
+    assert (recipes.EMYeeGrid.__name__, recipes.EMGmshMesh.__name__) == (fdtd.RECIPE, fem.RECIPE)
+    assert (EMSolverOpenEMS.__name__, EMSolverPalace.__name__) == (fdtd.SOLVER, fem.SOLVER)

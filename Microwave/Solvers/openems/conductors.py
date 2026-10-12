@@ -124,14 +124,14 @@ def _one_conductor(
             Finding(
                 WARN,
                 solid.name,
-                f"is drawn as {len(solid.faces)} triangles and covers {points} grid "
-                f"sample points, which is more than this check will spend on one "
-                f"object. Whether the grid holds it in one piece has not been "
-                f"established - openEMS joins two zeroed cell edges only where they "
-                f"share a node, so a conductor this fine can come out as islands "
-                f"that conduct nothing, and the run would complete and say nothing. "
-                f"A coarser triangulation would let it be checked: the cost is a "
-                f"triangle for every sample point, so a finer grid raises it",
+                # openEMS joins two zeroed cell edges only where they share a
+                # node, so a conductor this fine can come out as islands. The
+                # check costs a triangle for every sample point, so a finer grid
+                # raises it as well.
+                f"it has not been checked: its {len(solid.faces)} triangles over "
+                f"{points} grid sample points cost more than the check spends on one "
+                "object. If the grid splits it, the run solves disconnected pieces "
+                "without a warning. A coarser triangulation lets it be checked",
             )
         ]
 
@@ -144,7 +144,7 @@ def _one_conductor(
         # The label walk gives up on a conductor that winds further through the
         # grid than it was built to follow. That is this check running out
         # rather than the model being wrong, and the two must not read alike.
-        return [Finding(WARN, solid.name, f"has not been checked: {unsettled}")]
+        return [Finding(WARN, solid.name, f"it has not been checked: {unsettled}")]
     if found == drawn:
         return []
     if found == 0:
@@ -152,65 +152,55 @@ def _one_conductor(
             Finding(
                 WARN,
                 solid.name,
-                "is not on the grid at all: no cell edge inside it samples as metal, "
-                "so openEMS would solve this model without it and report nothing "
-                "beyond a note that a primitive went unused. The cells where it is "
-                "drawn are larger than the object",
+                # openEMS reports it only as an unused primitive.
+                "it is not on the grid at all: the cells where it is drawn are larger "
+                "than the object, so openEMS solves the model without it",
             )
         ]
     return [
         Finding(
             WARN,
             solid.name,
-            f"is drawn as {_count(drawn, 'piece')} and the grid holds it as "
+            f"it is drawn as {_count(drawn, 'piece')} and the grid holds it as "
             f"{_count(found, 'piece')}, {_SEVERED if found > drawn else _JOINED}",
         )
     ]
 
 
+# openEMS joins two zeroed cell edges only where they share a node. For a shape
+# that fills little of its own bounding box, the grid where it runs is not what
+# its material's resolution controls.
 _SEVERED = (
-    "and openEMS joins two zeroed cell edges only where they share a node, so the "
-    "parts are electrically open from each other and carry no current between "
-    "them - the run completes and the result is about a different device. The "
-    "grid is too coarse somewhere inside this object for the shape it was given. "
-    "What has to be finer is the grid where the object runs, which for a shape "
-    "that fills little of its own bounding box is not what its material "
-    "resolution controls"
+    "so the parts carry no current between them and the run solves a different "
+    "device. Refine the grid where the object runs"
 )
 
+# openEMS bonds two zeroed edges that share a node, so lumps in neighbouring
+# cells are one conductor, and the share of a cell a conductor is grown by
+# widens what counts as neighbouring.
 _JOINED = (
-    "so the metal the run has is in fewer lumps than the drawing. A gap the grid "
-    "cannot see shorts together metal the drawing keeps apart: openEMS bonds two "
-    "zeroed edges that share a node, so lumps in neighbouring cells are one "
-    "conductor, and the share of a cell a conductor is "
-    "grown by widens what counts as neighbouring. A lump small enough that no "
-    "sample point lands in it is absent from the run rather than joined to "
-    "anything. And lumps drawn overlapping are one lump of metal and no fault at "
-    "all. Refining the grid separates them: a gap spans more cells as they get "
-    "smaller and a missing lump appears, while metal drawn overlapping goes on "
-    "reading as one"
+    "so the run has fewer pieces of metal than the drawing. The grid may have "
+    "shorted pieces together across a gap narrower than a cell, or missed a piece "
+    "too small for any sample point to land in. Pieces drawn overlapping are one "
+    "piece and no fault. Refining the grid reopens a closed gap and recovers a "
+    "missing piece"
 )
 
 
+# openEMS joins two zeroed cell edges wherever they share a node, so metal in
+# neighbouring cells is one piece, and the share of a cell a curved conductor is
+# grown by widens what counts as neighbouring. Both follow the cell.
 _TOUCHING = (
-    "are drawn with a gap between them and reach openEMS with metal on a node "
-    "they share. openEMS joins two zeroed cell edges wherever they share a node, "
-    "so the run has these two as one conductor. It completes, and the S-matrix "
-    "describes a device with them shorted together. Metal in neighbouring cells "
-    "is one piece already, and the share of a cell a curved conductor is grown by "
-    "widens what counts as neighbouring. Both follow the cell, so a finer grid "
-    "across the gap separates them, and so does drawing the gap wider"
+    "they are drawn with a gap between them, but the grid closes it, so the run "
+    "solves them shorted together. Refine the grid across the gap, or draw the "
+    "gap wider"
 )
 
 _UNWEIGHED = (
-    "stand within reach of each other, and settling whether the run has them as "
-    "one conductor would cost more triangle evaluations than this check will "
-    "spend on one pair, so it has not been established. openEMS joins two zeroed "
-    "cell edges wherever they share a node, and the share of a cell a curved "
-    "conductor is grown by widens what "
-    "counts as neighbouring, so a pair like this can arrive shorted together and "
-    "the run would complete and say nothing. A coarser triangulation would let "
-    "the pair be checked"
+    "they have not been checked: they stand close enough for the grid to short "
+    "them together, and the check costs more triangle evaluations than it spends "
+    "on one pair. If they are shorted, the run solves them as one conductor "
+    "without a warning. A coarser triangulation lets the pair be checked"
 )
 
 

@@ -88,7 +88,7 @@ def test_the_adaptive_run_checks_its_model_against_full_solves_and_it_holds(swep
 
 
 def test_a_run_at_every_point_is_not_checked_again(swept):
-    assert not [line for line in swept["discrete"]["said"] if "solved again in full" in line]
+    assert not [line for line in swept["discrete"]["said"] if "Checking the reduced model" in line]
 
 
 def test_the_run_at_every_point_says_so(swept):

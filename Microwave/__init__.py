@@ -23,7 +23,7 @@ import sys
 #: envelope carries ``SCHEMA_VERSION`` instead, which is the format's version
 #: and moves when the format does. A result records this version, as
 #: ``adapter_version``. That is where a number describing the producer belongs.
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 #: Vendored pure-Python dependencies FreeCAD does not ship. See _vendor/README.md.
 VENDOR = os.path.join(os.path.dirname(__file__), "_vendor")

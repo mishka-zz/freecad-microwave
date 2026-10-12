@@ -4,7 +4,7 @@ name = "freecad-microwave"
 # they agree; nothing derives one from the other, because this file is read by
 # tooling that must not import the package and the package must not need a
 # TOML parser to know its own version.
-version = "0.0.2"
+version = "0.0.3"
 license = "LGPL-2.1-or-later"
 license-files = ["LICENSE"]
 # tomllib, which the material catalogs read, and `datetime.UTC`, which dates a
@@ -165,6 +165,7 @@ ignore_missing_imports = true
 module = [
     "Microwave.Commands",
     "Microwave.Gui.*",
+    "Microwave.batch",
     "Microwave.Objects.*",
     "Microwave.ViewProviders.*",
 ]

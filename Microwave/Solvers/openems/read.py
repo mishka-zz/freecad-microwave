@@ -4,10 +4,10 @@
 """Native output back into results. Runs in FreeCAD, on numpy and the standard
 library alone.
 
-The objects here are the adapter's side of the boundary: still openEMS-shaped,
-and no longer openEMS-dependent. Turning them into the neutral result objects,
-such as ``EMSParameters`` on an ``skrf.Network`` substrate, is the document
-layer's job. That needs skrf, which this module does not import.
+The objects here are the adapter's side of the boundary: openEMS-shaped, and
+importing no openEMS. :meth:`~..Results.sparameters.SParameters.from_runs`
+turns them into the neutral result, called from ``Gui/results.py``. That needs
+skrf, which this module does not import.
 """
 
 from __future__ import annotations
@@ -90,6 +90,22 @@ class Results:
         load. Anything comparing two results has to check this first.
         """
         return bool(self.provenance.get("reproducible", False))
+
+    @property
+    def stopped(self) -> str | None:
+        """Where a run with EnergyDecay set stopped: ``"cap"`` where it took every
+        step MaxTimesteps allows, ``"early"`` where it stopped short of them, and
+        ``None`` where EnergyDecay was not set or the run recorded no step count.
+
+        openEMS stops short on the energy criterion or on an abort, and records
+        neither, so a run that stopped early is not said to be the criterion's.
+        """
+        criterion = float(self.provenance.get("end_criteria") or 0.0)
+        steps = self.provenance.get("timesteps")
+        cap = self.provenance.get("max_timesteps")
+        if not criterion or steps is None or cap is None:
+            return None
+        return "cap" if int(steps) >= int(cap) else "early"
 
     @property
     def tail_share(self) -> dict[int, float]:

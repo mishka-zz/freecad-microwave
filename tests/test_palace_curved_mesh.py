@@ -90,7 +90,7 @@ def test_a_torus_sized_by_the_wavelength_alone_is_told_how_to_make_its_elements_
 ):
     said = run_manifest["torus_open_sized_by_wavelength_alone"].get("mesh", "")
     assert said.startswith("refused: "), said
-    assert "set ElementsPerTurn on the Gmsh mesh above zero" in said
+    assert "set ElementsPerTurn in the Palace mesh settings above zero" in said
 
 
 def test_a_line_inside_metal_a_refinement_names_is_refused_by_name_and_not_by_size(

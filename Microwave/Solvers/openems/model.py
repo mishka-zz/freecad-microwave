@@ -251,14 +251,15 @@ def _finite(
     """
     number = float(value)
     if not math.isfinite(number):
-        raise EnvelopeError(f"{what}: {number} is not a finite number")
+        raise EnvelopeError(f"{what} is {number}. Enter a finite value")
     if low is not None and (number <= low if strict else number < low):
         raise EnvelopeError(
-            f"{what}: {number:g} must be {'above' if strict else 'at least'} {low:g}"
+            f"{what} is {number:g}. Enter a value {'above' if strict else 'of at least'} {low:g}"
         )
     if high is not None and (number >= high if high_strict else number > high):
         raise EnvelopeError(
-            f"{what}: {number:g} must be {'below' if high_strict else 'at most'} {high:g}"
+            f"{what} is {number:g}. Enter a value "
+            f"{'below' if high_strict else 'of at most'} {high:g}"
         )
     return number
 
@@ -368,20 +369,20 @@ class Material:
                 f"expected one of {sorted(MATERIAL_KINDS)}"
             )
         subject = f"material {self.name!r}"
+        # openEMS cannot represent a relative permittivity below 1, and the
+        # timestep estimate would be wrong.
         if not math.isfinite(float(self.epsilon)) or self.epsilon < 1.0:
             raise EnvelopeError(
-                f"{subject}: relative permittivity {self.epsilon} "
-                "is below 1 or not a number; openEMS cannot represent it and "
-                "the timestep estimate would be wrong"
+                f"{subject}: Permittivity is {self.epsilon}. Enter a finite value of 1 or more"
             )
         # Zero reaches plan.plan_mesh as `cap / sqrt(eps * mu)` and raises
         # ZeroDivisionError; negative raises a math domain error; NaN goes all
         # the way to the engine.
-        _finite(self.mu, f"{subject}: relative permeability", low=0.0, strict=True)
+        _finite(self.mu, f"{subject}: Permeability", low=0.0, strict=True)
         _finite(self.kappa, f"{subject}: kappa", low=0.0)
-        _finite(self.conductivity, f"{subject}: conductivity", low=0.0)
-        _finite(self.thickness, f"{subject}: thickness", low=0.0)
-        _finite(self.measured_at, f"{subject}: measured_at", low=0.0)
+        _finite(self.conductivity, f"{subject}: Conductivity", low=0.0)
+        _finite(self.thickness, f"{subject}: Thickness", low=0.0)
+        _finite(self.measured_at, f"{subject}: MeasuredAt", low=0.0)
         # After the range checks, so a conductor at epsilon NaN is told it is
         # not a number rather than that it is not 1. The more specific complaint
         # is the useful one, and this check only makes sense about a value that
@@ -399,12 +400,9 @@ class Material:
             # left on a conductor therefore moves the cell count and the
             # clearance thresholds from a value openEMS never sees.
             raise EnvelopeError(
-                f"{subject}: a {self.kind} conductor carries relative "
-                f"permittivity {self.epsilon:g} and permeability {self.mu:g}. "
-                "openEMS is given a conductor's conductivity and nothing else, "
-                "so neither reaches the solver - but both reach the mesher, "
-                "where they resize every cell in the model. Leave them at 1, or "
-                "make this a dielectric"
+                f"{subject}: this conductor carries Permittivity {self.epsilon:g} and "
+                f"Permeability {self.mu:g}, which openEMS ignores but which resize every "
+                "cell of the mesh. Set both to 1, or set MaterialType to Dielectric"
             )
         # The same fault as above, in a sharper form. ``driver._add_material``
         # passes kappa in its ``lossy_dielectric`` branch and in no other, so
@@ -439,8 +437,9 @@ class Material:
             )
         if self.kind == "conducting_sheet" and self.conductivity <= 0:
             raise EnvelopeError(
-                f"material {self.name!r}: a conducting sheet needs a positive "
-                "conductivity; use kind 'pec' for a lossless conductor"
+                f"{subject}: Conductivity is {self.conductivity:g} S/m, and a "
+                "Conducting Sheet needs more than 0. Enter a positive value, or set "
+                "MaterialType to PEC for a lossless conductor"
             )
 
     def given(self) -> tuple[str | float, ...]:
@@ -831,7 +830,7 @@ class Port:
                     f"Setting it to {value} would move where this adapter "
                     "thinks the port is without moving the port"
                 )
-        check_mode(self.mode, f"port {self.number}")
+        check_mode(self.mode, f"port {self.number}: Mode")
         for axis in self.transverse_axes:
             if self.start[axis] == self.stop[axis]:
                 raise EnvelopeError(
@@ -1075,8 +1074,13 @@ class Port:
         """Whether openEMS moves this port's planes onto the nearest grid line."""
         return self.kind in _SNAPS_TO_THE_GRID
 
-    def required_lines(self) -> tuple[list[float], list[float], list[float]]:
+    def required_lines(
+        self, driven: bool | None = None
+    ) -> tuple[list[float], list[float], list[float]]:
         """Positions, per axis, where this port needs a grid line to exist.
+
+        ``driven`` answers as though the port were the source, or were not.
+        Left out, it answers for the run this port belongs to.
 
         Every kind that asks does so for one reason: an excitation is not
         snapped. openEMS discretises an excitation by walking the grid and
@@ -1097,6 +1101,11 @@ class Port:
         The excitation is the one primitive that is not snapped, so a plane
         lying between two lines drives nothing at all.
 
+        A termination asks for nothing, because it has nothing to excite. This
+        is what one run needs. The mesher pins more than that, because one grid
+        serves every run of a sweep, and :func:`plan.plan_grid` asks each port
+        with ``driven`` set.
+
         An axis the box has extent on asks for nothing here. A line inside the
         box is the mesher's to place or not, rather than a position anything can
         name. Whether one landed there is a question about the grid, and
@@ -1108,11 +1117,13 @@ class Port:
         discretising nothing, so it asks through :meth:`wanted_lines` instead.
         """
         lines: tuple[list[float], list[float], list[float]] = ([], [], [])
+        if driven is None:
+            driven = self.excite
         if self.kind == "rect_waveguide":
             axis = self.propagation_axis
             lines[axis].append(self.start[axis])
             lines[axis].append(self.stop[axis])
-        elif self.kind == "lumped" and self.excite_sign:
+        elif self.kind == "lumped" and driven:
             for axis in range(DIMENSIONS):
                 if self.start[axis] == self.stop[axis]:
                     lines[axis].append(self.start[axis])
@@ -1271,7 +1282,7 @@ class Frequency:
                 "ascending positive band of finite numbers"
             )
         if self.points < 2:
-            raise EnvelopeError("a frequency sweep needs at least 2 points")
+            raise EnvelopeError(f"FrequencyPoints is {self.points}. Enter 2 or more")
 
     @property
     def center(self) -> float:
@@ -1433,17 +1444,19 @@ def check_mode(mode: str, subject: str) -> str:
     would be a second rule.
     """
     match = _MODE_PATTERN.match(mode)
+    # openEMS' RectWGPort takes TE modes only
+    # (``openEMS/python/openEMS/ports.py:434``).
     if match is None:
         raise EnvelopeError(
-            f"{subject}: {mode!r} is not a mode this adapter can run; openEMS' "
-            "RectWGPort supports TE modes only (ports.py:434), so use TE10, "
-            "TE01, TE20 ..."
+            f"{subject} is {mode!r}, which openEMS cannot run. Use a TE mode written "
+            "as TE10, TE01, TE20 and so on"
         )
+    # TE00 has a cutoff of zero and mode functions that are identically zero,
+    # so the run would take its full length and excite nothing.
     if match.group(1) == match.group(2) == "0":
         raise EnvelopeError(
-            f"{subject}: TE00 has no field. Its cutoff is zero and its mode "
-            "functions are identically zero, so the run would excite nothing "
-            "and return 0/0 after its full runtime"
+            f"{subject} is TE00, which has no field, so the port drives nothing and "
+            "the run returns no result"
         )
     return mode
 
@@ -1474,10 +1487,7 @@ def check_timestep_factor(value: float, subject: str = "timestep_factor") -> flo
     no-op, so the value never leaves here.
     """
     if not 0.0 < value <= 1.0:
-        raise EnvelopeError(
-            f"{subject} must be above 0 and at most 1, got {value:g}. "
-            "openEMS scales its own timestep by it, and ignores anything else"
-        )
+        raise EnvelopeError(f"{subject} is {value:g}. Enter a value above 0 and at most 1")
     return value
 
 

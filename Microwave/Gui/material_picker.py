@@ -123,10 +123,13 @@ def frequency_note(entry, frequency):
     ratio = max(shown.measured_at, frequency) / min(shown.measured_at, frequency)
     if ratio < FAR:
         return ""
+    # The loss tangent becomes one conductivity at the band centre, which
+    # openEMS holds for the whole run, so a loss quoted far from the band is the
+    # loss the run solves with.
     return (
-        f"Quoted at {hz(shown.measured_at)}, and this study is centred at "
-        f"{hz(frequency)}, where openEMS fixes the conductivity it builds from "
-        "that number."
+        f"Loss quoted at {hz(shown.measured_at)}, far from the study's centre at "
+        f"{hz(frequency)}, so openEMS solves with the loss measured at "
+        f"{hz(shown.measured_at)}."
     )
 
 
@@ -154,7 +157,7 @@ class MaterialPicker(QtWidgets.QDialog):
 
         self.filter = QtWidgets.QLineEdit()
         self.filter.setPlaceholderText(
-            "Filter by material, description, or catalog (try a board house's name)"
+            "Filter by material, description or catalog, such as a board house's name"
         )
         self.filter.textChanged.connect(self.populate)
         layout.addWidget(self.filter)
@@ -251,8 +254,8 @@ def choose_materials(doc):
         user = locations.freecad_user_dir()
         refused(
             "Add Material from Catalog",
-            "no material catalogs loaded. Put a .toml catalog in "
-            f"{user}, or set ${locations.ENV_VAR}.",
+            "no material catalogs are loaded. Put a .toml catalog in "
+            f"{user}, or set ${locations.ENV_VAR}",
         )
         return []
 

@@ -1121,8 +1121,11 @@ class TestLocalRefinement:
         with pytest.raises(MeshError) as excinfo:
             generate_mesh_lines([substrate()], DOMAIN, params(), sizing=[coarse])
         assert "TooCoarse" in str(excinfo.value)
-        assert "refines only" in str(excinfo.value)
-        assert "Coarsen" in str(excinfo.value), "the refusal must name what to do instead"
+        assert "Refine only refines" in str(excinfo.value)
+        assert str(excinfo.value).endswith(
+            "Set the region's Mode to Coarsen to let its object go coarser, or lower "
+            "ElementsPerWavelength in the openEMS mesh settings to coarsen the whole model"
+        ), "the refusal must name what to do instead"
 
     def test_a_region_below_the_cell_floor_is_refused_by_name(self):
         """Silently clamping would hand back a grid nobody asked for."""
@@ -1137,6 +1140,9 @@ class TestLocalRefinement:
             generate_mesh_lines([substrate()], DOMAIN, settings, sizing=[tiny])
         assert "TooFine" in str(excinfo.value)
         assert "floor" in str(excinfo.value)
+        assert str(excinfo.value).endswith(
+            "Ask for less refinement, or lower MinElementSize in the openEMS mesh settings"
+        )
 
     def test_a_box_that_misses_the_domain_in_one_axis_is_refused(self):
         """The trap a separable grid sets.
@@ -1434,10 +1440,14 @@ class TestABlockMeetsTheInteriorBesideIt:
         assert self.seams(1.3, 1.0) == []
 
     def test_a_cell_past_it_is_named(self):
-        assert self.seams(1.31, 1.0) == ["the x axis lower face lays 1.31 against a block of 1"]
+        assert self.seams(1.31, 1.0) == [
+            "the x axis lower face lays a 1.31 mm cell against a 1 mm absorber block"
+        ]
 
     def test_the_block_being_the_coarser_of_the_two_counts_too(self):
-        assert self.seams(1.0, 1.31) == ["the x axis lower face lays 1 against a block of 1.31"]
+        assert self.seams(1.0, 1.31) == [
+            "the x axis lower face lays a 1 mm cell against a 1.31 mm absorber block"
+        ]
 
     def test_a_face_carrying_no_block_is_not_judged(self):
         assert rough_seams((self.NEITHER,) * 3, (self.NEITHER,) * 3, params()) == []
@@ -1450,7 +1460,7 @@ class TestABlockMeetsTheInteriorBesideIt:
             ((1.0, None), (1.0, None), self.NEITHER),
             params(max_ratio=(1.3, 1.15, 1.3)),
         )
-        assert rough == ["the y axis lower face lays 1.2 against a block of 1"]
+        assert rough == ["the y axis lower face lays a 1.2 mm cell against a 1 mm absorber block"]
 
     def test_the_upper_face_is_named_as_the_upper_face(self):
         rough = rough_seams(
@@ -1458,7 +1468,7 @@ class TestABlockMeetsTheInteriorBesideIt:
             ((None, 1.0), self.NEITHER, self.NEITHER),
             params(),
         )
-        assert rough == ["the x axis upper face lays 1.31 against a block of 1"]
+        assert rough == ["the x axis upper face lays a 1.31 mm cell against a 1 mm absorber block"]
 
 
 class TestResolution:
@@ -1516,7 +1526,7 @@ class TestValidationRaises:
     def test_cell_below_the_floor_raises(self):
         settings = params(pml_cells=0)
         lines = [0.0, float(settings.min_cell) / 10.0, 1.0]
-        with pytest.raises(MeshError, match="below the floor"):
+        with pytest.raises(MeshError, match="below the cell floor"):
             mesh._validate(lines, pinned([lines[0], lines[-1]]), settings)
 
     def test_non_increasing_lines_raise(self):
@@ -1723,8 +1733,12 @@ class TestCellFloor:
             Region((-8, -8, 0.0), (8, 8, 0.0), MaterialClass.METAL, "GroundA"),
             Region((-8, -8, 1e-5), (8, 8, 1e-5), MaterialClass.METAL, "GroundB"),
         ]
-        with pytest.raises(MeshError, match="GroundB"):
+        with pytest.raises(MeshError, match="GroundB") as raised:
             generate_mesh_lines(sheets, DOMAIN, params(min_cell=0.01))
+        assert str(raised.value).endswith(
+            "Move them apart, merge them, or set MinElementSize in the openEMS mesh "
+            "settings below 1e-05 mm"
+        )
 
     def test_a_conducting_sheet_is_never_moved(self):
         """Relocating an anchor is undetectable downstream, so it must not happen.
@@ -1988,7 +2002,12 @@ class TestRefusesLoudly:
 
     @pytest.mark.parametrize("ratio", [0.9, 1.0])
     def test_ratio_of_one_or_less_is_rejected(self, ratio):
-        with pytest.raises(MeshError, match="max_ratio must be > 1"):
+        with pytest.raises(
+            MeshError,
+            match=re.escape(
+                f"MaxGrowthRatio is {ratio:g}, so cells cannot grade. Enter a value above 1"
+            ),
+        ):
             MeshParams(metal_res=0.1, dielectric_res=1.0, max_ratio=(ratio,) * 3)
 
     def test_negative_resolution_is_rejected(self):
@@ -2009,14 +2028,20 @@ class TestTheWholeGridHasASize:
     def test_an_absurd_absorber_is_refused(self):
         """``PMLCells`` is applied per axis after everything else, so it
         multiplies the finished grid by itself three times."""
-        with pytest.raises(MeshError, match="it is the product that ran away"):
+        with pytest.raises(
+            MeshError,
+            match="PMLCells adds cells on every axis, so lowering it shrinks the grid fastest",
+        ):
             generate_mesh_lines(stackup(), DOMAIN, params(pml_cells=200_001))
 
     def test_a_domain_a_typo_made_enormous_is_refused(self):
         """A port offset with an extra digit drags the domain out with it. Each
         axis stays well inside the per-axis limit and the product does not."""
         huge = ((-400.0, -400.0, -400.0), (400.0, 400.0, 400.0))
-        with pytest.raises(MeshError, match="it is the product that ran away"):
+        with pytest.raises(
+            MeshError,
+            match="PMLCells adds cells on every axis, so lowering it shrinks the grid fastest",
+        ):
             generate_mesh_lines(stackup(), huge, params())
 
     def test_the_message_names_the_shape_and_the_memory(self):

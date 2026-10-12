@@ -47,10 +47,9 @@ from .regions import DIMENSIONS, MaterialClass, MeshParams, Region
 #: Placed by measurement, on a microstrip read as the propagation constant
 #: between two lengths of one line, and set just under the least share measured
 #: to answer acceptably rather than in the middle of the range. See
-#: ``docs/internals/openems-conductor-width.md``, which carries the figures and
-#: the method. That measurement is of metal the grid lost. The same tolerance
-#: is applied to metal it gains, which is not measured and is the looser half
-#: of this figure.
+#: ``docs/internals/openems-conductor-width.md`` for the mechanism. That
+#: measurement is of metal the grid lost. The same tolerance is applied to metal
+#: it gains, which is not measured and is the looser half of this figure.
 CONDUCTOR_WIDTH_KEPT = 0.95
 
 
@@ -730,7 +729,7 @@ class _EdgePair:
 
     ``resolve`` is whether the thirds rule applies here at all - see
     :func:`_edge_to_resolve`. It is the metal's own answer. A caller may hold the
-    face to more than that, and :func:`~.mesh._fixed_positions` does.
+    face to more than that, and :func:`~.mesh._asked_by` does.
     """
 
     #: Where the face is.

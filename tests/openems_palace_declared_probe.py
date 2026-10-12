@@ -38,8 +38,6 @@ from Microwave import Objects  # noqa: E402
 from Microwave.Objects.analysis import members  # noqa: E402
 from Microwave.Objects.declared import declarations, departures  # noqa: E402
 from Microwave.Objects.kinds import classes, kind_of  # noqa: E402
-from Microwave.Objects.mesh import createEMGmshMesh  # noqa: E402
-from Microwave.Objects.solver import createEMSolverPalace  # noqa: E402
 from Microwave.Solvers.openems import document as openems  # noqa: E402
 from Microwave.Solvers.palace import document as palace  # noqa: E402
 
@@ -66,8 +64,6 @@ def drawn(name):
     air, planes = WR42.geometry(doc)
     analysis = WR42.study(doc)
     WR42.markup(analysis, air, planes)
-    analysis.addObject(createEMSolverPalace(doc))
-    analysis.addObject(createEMGmshMesh(doc))
     doc.recompute()
     return analysis
 
@@ -81,7 +77,7 @@ def aged(analysis):
     policy.removeProperty("Medium")
     policy.addProperty("App::PropertyFloat", "ElementsPerWavelength", "Mesh")
     policy.ElementsPerWavelength = 30.0
-    policy.PaddingXMin = ["Air", "Through"]
+    policy.BoundaryXMin = ["Open", "Through"]
     port.removeProperty("ReferenceDepth")
     port.addProperty("App::PropertyLength", "Length", "Waveguide")
     port.Length = 2.5

@@ -14,6 +14,7 @@ resemble one.
 """
 
 import json
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -313,7 +314,7 @@ class TestAPartialMatrixInTheDocument:
         Two lumped ports, one driven. Nothing renormalises the undriven column,
         because that would need the terms it does not have - but its own
         impedance *is* the 50 ohm that was typed, so nothing about the matrix
-        distinguishes it from a port asked for 50. A footnote naming it apart
+        distinguishes it from a port asked for 50. A basis naming it apart
         puts the driven column's two curves on apparently different bases.
         """
         original = self.partial()
@@ -512,7 +513,9 @@ class TestWhatTheDocumentShows:
 class TestItRefusesRatherThanGuesses:
     def test_an_empty_object_says_to_run_the_analysis(self, doc):
         obj = createEMSParameters(doc)
-        with pytest.raises(ResultError, match="no S-matrix yet"):
+        with pytest.raises(
+            ResultError, match=re.escape("holds no S-matrix yet. Run Simulation to fill it")
+        ):
             load(obj)
 
     def test_a_truncated_matrix_is_refused_by_name(self, doc):
@@ -620,10 +623,13 @@ class TestTheGlueThatFilesIt:
 
         stored = glue.record(analysis, matrix())
 
+        [run] = glue.runs_of(analysis)
         assert glue.find_results(analysis, "openEMS") is stored
-        assert stored in analysis.Group
+        assert run in analysis.Group
+        assert run.Group == [stored]
+        assert glue.run_of(stored) is run
 
-    def test_the_filed_matrix_does_not_arrive_marked_stale(self, doc):
+    def test_the_filed_run_does_not_arrive_marked_stale(self, doc):
         """S-Parameters arrive under the analysis carrying the touched mark,
         and only Recompute clears it. The mark tells the user the object in
         front of them is out of date - on a matrix measured a second earlier.
@@ -631,29 +637,47 @@ class TestTheGlueThatFilesIt:
         analysis = self.analysis(doc)
         stored = glue.record(analysis, matrix())
         assert "Touched" not in stored.State
+        assert "Touched" not in glue.run_of(stored).State
 
-    def test_filing_the_matrix_is_one_undo_step(self, doc):
-        """Untransacted, Ctrl-Z after a run leaves the S-parameters in the tree
-        and undoes something earlier instead. Named for what disappears."""
+    def test_filing_the_run_leaves_the_study_as_it_found_it(self, doc):
+        """Adding the run touches the study, and a study marked for recompute
+        after a run reads as one the run has made stale."""
+        analysis = self.analysis(doc)
+        analysis.purgeTouched()
+        glue.record(analysis, matrix())
+        assert "Touched" not in analysis.State
+
+    def test_a_study_an_edit_marked_keeps_its_mark(self, doc):
+        """The mark an edit put there before the run still says the study
+        changed, and recomputing is what clears it."""
+        analysis = self.analysis(doc)
+        assert "Touched" in analysis.State
+        glue.record(analysis, matrix())
+        assert "Touched" in analysis.State
+
+    def test_filing_the_run_is_one_undo_step(self, doc):
+        """Untransacted, Ctrl-Z after a run leaves the run in the tree and
+        undoes something earlier instead. Named for what disappears."""
         analysis = self.analysis(doc)
         glue.record(analysis, matrix())
         assert doc.transactions == [("Store Results", "commit")]
 
-    def test_the_result_object_is_created_inside_it(self, doc, monkeypatch):
+    def test_the_run_and_its_matrix_are_created_inside_it(self, doc, monkeypatch):
         """As for the mesh: wrapping nothing is not the fix. Hoisting the
-        creation above the block leaves the matrix in the tree after Ctrl-Z, and
+        creation above the block leaves the run in the tree after Ctrl-Z, and
         nothing but this notices."""
         analysis = self.analysis(doc)
         opened_when = []
-        real = glue.createEMSParameters
+        for name in ("createEMSParameters", "createEMRun"):
+            real = getattr(glue, name)
 
-        def spy(document):
-            opened_when.append(document._open)
-            return real(document)
+            def spy(*args, real=real):
+                opened_when.append(doc._open)
+                return real(*args)
 
-        monkeypatch.setattr(glue, "createEMSParameters", spy)
+            monkeypatch.setattr(glue, name, spy)
         glue.record(analysis, matrix())
-        assert opened_when == ["Store Results"]
+        assert opened_when == ["Store Results", "Store Results"]
 
     def test_a_failure_while_filing_aborts_rather_than_commits(self, doc, monkeypatch):
         analysis = self.analysis(doc)
@@ -666,19 +690,41 @@ class TestTheGlueThatFilesIt:
             glue.record(analysis, matrix())
         assert doc.transactions == [("Store Results", "abort")]
 
-    def test_a_second_run_overwrites_rather_than_accumulates(self, doc):
-        """A study holds the answer to the question it currently asks.
-
-        Keeping every historical matrix would turn a document into a filing
-        cabinet nobody asked for; a Touchstone export is how you keep one.
-        """
+    def test_a_second_run_is_kept_beside_the_first(self, doc):
+        """A design is iterated by comparing this run with the last one, so a
+        run that replaced the last one would destroy the comparison it was made
+        for."""
         analysis = self.analysis(doc)
         first = glue.record(analysis, matrix(points=4))
         second = glue.record(analysis, matrix(points=6))
 
-        assert first is second
-        assert len([m for m in analysis.Group if m is second]) == 1
-        assert load(second).frequency.size == 6
+        assert first is not second
+        assert glue.results_of(analysis) == [first, second]
+        assert load(first).frequency.size == 4
+        assert glue.find_results(analysis, "openEMS") is second
+
+    def test_the_newest_is_the_highest_number_whatever_its_clock_said(self, doc):
+        """A start is one machine's clock and orders nothing across two
+        machines or a change of the clock; the number is the document's."""
+        analysis = self.analysis(doc)
+        first = glue.record(
+            analysis, matrix(), replace(glue.begin(analysis), started="2026-10-03T12:00:00+02:00")
+        )
+        second = glue.record(
+            analysis, matrix(), replace(glue.begin(analysis), started="2026-10-03T11:00:00+02:00")
+        )
+        assert glue.run_of(second).Number > glue.run_of(first).Number
+        assert glue.find_results(analysis, "openEMS") is second
+
+    def test_a_run_whose_matrix_was_deleted_answers_nothing(self, doc):
+        """It is no run to compare with, draw or export, and the run before it
+        is the newest that answers."""
+        analysis = self.analysis(doc)
+        first = glue.record(analysis, matrix())
+        emptied = glue.record(analysis, matrix())
+        doc.removeObject(emptied.Name)
+        assert glue.find_results(analysis, "openEMS") is first
+        assert glue.results_of(analysis) == [first]
 
     def test_it_reads_back_what_it_filed(self, doc):
         analysis = self.analysis(doc)
@@ -707,16 +753,16 @@ class TestTheGlueThatFilesIt:
         assert type(found.Proxy).__name__ == "EMSParameters"
         assert found is stored
 
-    def test_a_result_object_created_but_never_filled_is_no_backends_answer(self, doc):
-        """``store`` can fail - a read-only document, a full disk - and the
-        object is created first. What says whose answer an object is was
-        written by the run, so an object no run filled is nobody's, and reads
-        as absent rather than as damage."""
+    def test_a_matrix_standing_in_the_study_is_no_backends_run(self, doc):
+        """A matrix on its own - imported, or saved by an earlier build - is a
+        table and not a run, so it is nobody's newest answer."""
         analysis = self.analysis(doc)
-        analysis.addObject(createEMSParameters(doc))
+        alone = createEMSParameters(doc)
+        analysis.addObject(alone)
 
         assert glue.find_results(analysis, "openEMS") is None
         assert glue.stored(analysis, "openEMS") is None
+        assert glue.results_of(analysis) == [alone]
 
     def test_each_backend_keeps_its_own_answer(self, doc):
         """One drawing answered by two backends is the only measurement of what
@@ -730,24 +776,32 @@ class TestTheGlueThatFilesIt:
         assert glue.stored(analysis, "openEMS").ports == 2
         assert glue.stored(analysis, "Palace").ports == 1
 
-    def test_a_rerun_replaces_its_own_backends_answer_and_nothing_else(self, doc):
+    def test_a_rerun_replaces_nothing(self, doc):
         analysis = self.analysis(doc)
         fdtd = glue.record(analysis, matrix(points=4))
         fem = glue.record(analysis, from_backend("Palace", matrix(points=5)))
         again = glue.record(analysis, matrix(points=6))
 
-        assert again is fdtd
-        assert load(fdtd).frequency.size == 6
+        assert again is not fdtd
+        assert load(fdtd).frequency.size == 4
         assert load(fem).frequency.size == 5
+        assert glue.stored(analysis, "openEMS").frequency.size == 6
 
-    def test_the_answer_is_labelled_with_the_backend_that_gave_it(self, doc):
-        """Two of them sit side by side in the tree, and the label is what a
-        user tells them apart by."""
+    def test_a_run_is_labelled_with_its_number_and_backend_and_nothing_else(self, doc):
+        """Several sit side by side in the tree, and the label is what a user
+        tells them apart by. The number is the document's, so FreeCAD never
+        numbers a label itself."""
         analysis = self.analysis(doc)
-        assert glue.record(analysis, matrix()).Label == "S-Parameters (openEMS)"
-        assert (
-            glue.record(analysis, from_backend("Palace", matrix())).Label == "S-Parameters (Palace)"
-        )
+        first = glue.record(analysis, matrix())
+        second = glue.record(analysis, from_backend("Palace", matrix()))
+        assert [glue.run_of(found).Label for found in (first, second)] == [
+            "Run 1 (openEMS)",
+            "Run 2 (Palace)",
+        ]
+        assert [found.Label for found in (first, second)] == [
+            "S-Parameters (run 1, openEMS)",
+            "S-Parameters (run 2, Palace)",
+        ]
 
     def test_a_damaged_result_raises_rather_than_reading_as_absent(self, doc):
         """``None`` means absent and nothing else.
@@ -774,7 +828,7 @@ class TestTheGlueThatFilesIt:
         assert glue.stored(two, "openEMS").port_numbers == (3,)
 
     def test_each_run_gets_its_own_directory(self):
-        assert glue.directory_for("/tmp/board_sim", 2).endswith("board_sim/port2")
+        assert glue.directory_for("/tmp/board_openems", 2).endswith("board_openems/port2")
 
     def test_a_result_with_no_samples_reports_nothing_rather_than_raising(self):
         """A zero-point band is not something a solve produces, but the readout
@@ -827,6 +881,60 @@ class TestWhatPalaceAnswers:
             radiated=None,
             dissipates=True,
             modelled=(),
+            stated={},
+        )
+
+    @pytest.mark.parametrize(("kind", "alike"), [(palace_read.RESISTANCE, True), ("", False)])
+    def test_a_lumped_port_is_compared_at_its_resistance_and_a_guide_at_no_number(
+        self, kind, alike
+    ):
+        """A lumped port's own reference is its element's resistance, so a
+        table held to that number elsewhere is differenced against it. A guide's
+        is its own mode, which no number stands for, so the difference names
+        the port."""
+        from Microwave.Results import overlay
+
+        answer = self.answer()
+        answer.impedance = np.full((answer.frequency.size, 2), 50.0)
+        answer.stated = {1: kind, 2: kind} if kind else {}
+        palace = glue.from_palace(answer)
+        fixed = replace(palace, self_referenced=(), provenance={})
+        tables = (overlay.Table(fixed, "openEMS"), overlay.Table(palace, "Palace"))
+        apart = overlay.difference(*tables, 2, 1)
+        assert float(apart.value.max()) == 0.0
+        if alike:
+            assert apart.unalike == ()
+        else:
+            assert apart.unalike[0] == "port 1 is at its own mode in Palace"
+
+    def test_a_guide_read_and_one_not_read_are_one_basis(self):
+        """Each is at its own mode, whatever figure its impedance has or lacks."""
+        from Microwave.Results import overlay
+
+        read = self.answer()
+        read.impedance = np.full((read.frequency.size, 2), 420.0)
+        tables = [
+            overlay.Table(glue.from_palace(read), "Run 1 (Palace)"),
+            overlay.Table(glue.from_palace(self.answer()), "Run 2 (Palace)"),
+        ]
+        assert overlay.difference(*tables, 2, 1).unalike == ()
+
+    def test_a_guide_against_a_line_at_its_own_impedance_is_two_bases(self):
+        """A line's own impedance states no kind, and a mode is not one."""
+        from Microwave.Results import overlay
+
+        palace = glue.from_palace(self.answer())
+        line = replace(
+            palace,
+            reference=np.outer(np.linspace(45.0, 55.0, 3), [1.0, 1.0]) + 0j,
+            provenance={},
+        )
+        apart = overlay.difference(
+            overlay.Table(palace, "Run 1 (Palace)"), overlay.Table(line, "Run 2 (openEMS)"), 2, 1
+        )
+        assert apart.unalike == (
+            "port 1 is at its own mode in Run 1 (Palace), its own impedance in Run 2 (openEMS)",
+            "port 2 is at its own mode in Run 1 (Palace), its own impedance in Run 2 (openEMS)",
         )
 
     def test_each_column_stands_under_the_port_that_drove_it(self):
@@ -847,16 +955,28 @@ class TestWhatPalaceAnswers:
         kept = glue.from_palace(answer).provenance["unaccounted"]
         (short,) = balance.shortfalls(answer)
         assert kept == {
-            "1": {"share": short.share, "frequency": short.frequency, "port": short.port}
+            "1": {
+                "share": short.share,
+                "frequency": short.frequency,
+                "port": short.port,
+                "radiated": None,
+                "dissipates": True,
+                "lumped": False,
+            }
         }
         assert short.port == 2
 
     def test_no_impedance_is_claimed_for_a_port_the_run_stated_none_for(self):
+        """A port with no figure is a wave port, since a lumped one always
+        states its resistance, so it is named as at its own mode."""
         result = glue.from_palace(self.answer())
         assert result.self_referenced == (1, 2)
         assert np.isnan(result.reference).all()
         assert np.isnan(result.measured_impedance).all()
-        assert IMPEDANCE_STATED not in result.provenance
+        assert result.provenance[IMPEDANCE_STATED] == {
+            "1": palace_read.UNREAD,
+            "2": palace_read.UNREAD,
+        }
 
     def test_a_port_palace_signed_by_its_own_rule_is_named_in_the_provenance(self):
         answer = self.answer()
@@ -877,7 +997,7 @@ class TestWhatPalaceAnswers:
         assert np.isnan(result.reference[:, 0]).all()
         np.testing.assert_array_equal(result.reference[:, 1].real, stated[:, 1])
         np.testing.assert_array_equal(result.measured_impedance, result.reference)
-        assert result.provenance[IMPEDANCE_STATED] == {"2": POWER_VOLTAGE}
+        assert result.provenance[IMPEDANCE_STATED] == {"1": palace_read.UNREAD, "2": POWER_VOLTAGE}
 
     def test_a_guide_stated_at_every_port_is_offered_as_palace_writes_it(self, doc):
         """The per-point file, with the advice Palace can take: a fixed
@@ -943,7 +1063,7 @@ class TestWhatPalaceAnswers:
         assert glue.from_palace(self.answer(driven=(1,))).unmeasured == (2,)
 
     def test_the_reference_reads_as_each_ports_own(self):
-        """The chart's footnote and the property editor both print this line,
+        """The chart's basis and the property editor both print this line,
         and a nan that reached either would name a figure nobody gave."""
         assert glue.from_palace(self.answer()).reference_description() == (
             "each port's own impedance"
@@ -1133,7 +1253,10 @@ class TestDecidingWhatATouchstoneExportWrites:
         export = glue.touchstone_export(self.holder(doc, partial))
         assert export.result is None
         assert "[2]" in export.refusal
-        assert "excitation" in export.refusal
+        assert export.refusal.endswith(
+            "Set Driven to true on those ports and run again, or, if the device is "
+            "mirror-symmetric, set the study's Symmetry to Mirror and run again."
+        )
 
     def referenced(self, reference, self_referenced=()):
         full = matrix()
@@ -1164,7 +1287,11 @@ class TestDecidingWhatATouchstoneExportWrites:
         assert "port 2: 51 - 2.5j ohm" in export.refusal, export.refusal
         # A port referenced to itself hides ReferenceImpedance, so the advice
         # has to name the property that shows it again.
-        assert "ReferencedTo to Fixed impedance" in export.refusal
+        assert export.refusal.endswith(
+            "Set every port's ReferencedTo to Fixed impedance with the same "
+            "ReferenceImpedance and run again, or keep the result in the document, where "
+            "its reference is preserved."
+        )
         assert "ReferenceImpedance" in export.refusal
 
     def test_a_real_reference_that_is_not_one_number_is_offered_at_each_point(self, doc):
@@ -1258,22 +1385,19 @@ class TestDecidingWhatATouchstoneExportWrites:
         it and rewording would be a second copy of that rule."""
         export = glue.touchstone_export(createEMSParameters(doc))
         assert export.result is None
-        assert "Run the analysis" in export.refusal
+        assert "Run Simulation to fill it" in export.refusal
 
     def test_the_default_name_carries_the_document_and_the_result(self, doc):
         obj = self.holder(doc, matrix())
         obj.Label = "Line rev B"
         assert glue.touchstone_export(obj).stem == "Unnamed-Line_rev_B"
 
-    def test_the_default_name_leaves_out_what_the_label_says_of_the_mesh_beside_it(self, doc):
-        """That is the study's state and not the matrix's."""
-        from Microwave.Objects.results import label
-
-        obj = self.holder(doc, matrix())
-        obj.Label = label("Palace", apart=True)
-        assert glue.touchstone_export(obj).stem == "Unnamed-S-Parameters_Palace"
-        obj.Label = label("Palace", apart=True) + "001"
-        assert glue.touchstone_export(obj).stem == "Unnamed-S-Parameters_Palace"
+    def test_the_default_name_of_a_run_names_the_run(self, doc):
+        """Several runs of one study export to several files, and the name is
+        what tells them apart."""
+        analysis = doc.addObject("App::DocumentObjectGroupPython", "EMAnalysis")
+        held = glue.record(analysis, matrix())
+        assert glue.touchstone_export(held).stem == "Unnamed-S-Parameters_run_1_openEMS"
 
     def test_a_label_cannot_redirect_the_write(self, doc):
         """A FreeCAD label is free text. Left alone, ``"../../etc/x"`` is a
@@ -1381,7 +1505,7 @@ class TestAResultWithNothingLeftInIt:
         export = glue.touchstone_export(self.holder(doc))
         assert export.result is None
         assert export.caveat == ""
-        assert "none of its 3 frequency points" in export.refusal
+        assert "holds no number at any of its 3 frequency points" in export.refusal
 
     def test_the_refusal_says_what_to_do(self, doc):
         assert "measurement plane" in glue.touchstone_export(self.holder(doc)).refusal
@@ -1408,3 +1532,336 @@ class TestAResultWithNothingLeftInIt:
         export = glue.touchstone_export(obj)
         assert export.refusal == ""
         assert export.result.frequency.size == 1
+
+
+class TestWhatARunKeeps:
+    """The run's own record, beside its matrix: what it was asked, what it said,
+    what it warned of and what it cost."""
+
+    def test_the_record_lands_on_the_run(self, doc):
+        analysis = doc.addObject("App::DocumentObjectGroupPython", "EMAnalysis")
+        begun = glue.begin(analysis, "/runs/board", processes=4)
+        kept = replace(begun.ended("one\nWARNING: two", ["WARNING: two"]), wall=12.5, cpu=40.0)
+        run = glue.run_of(glue.record(analysis, matrix(), kept))
+        assert (run.Number, run.Directory, run.Processes) == (1, "/runs/board/run1", 4)
+        assert (run.WallSeconds, run.ProcessorSeconds) == (12.5, 40.0)
+        assert run.Log == "one\nWARNING: two"
+        assert run.Diagnostics == ["WARNING: two"]
+        assert run.Started == begun.started
+        assert json.loads(run.Snapshot) == json.loads(json.dumps(begun.snapshot))
+
+    def test_what_it_cost_is_measured_from_when_it_began(self, doc, monkeypatch):
+        analysis = doc.addObject("App::DocumentObjectGroupPython", "EMAnalysis")
+        clock = iter([100.0, 103.5])
+        cpu = iter([10.0, 25.0])
+        monkeypatch.setattr(glue.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(glue, "children_cpu", lambda: next(cpu))
+        ended = glue.begin(analysis).ended("")
+        assert (ended.wall, ended.cpu) == (3.5, 15.0)
+
+    def test_a_number_a_directory_already_carries_is_passed_over(self, doc, tmp_path):
+        """A run stopped or failed keeps nothing in the document and keeps its
+        directory, which no later run writes into."""
+        analysis = doc.addObject("App::DocumentObjectGroupPython", "EMAnalysis")
+        (tmp_path / "run1").mkdir()
+        (tmp_path / "run2").mkdir()
+        assert glue.begin(analysis, tmp_path).directory == str(tmp_path / "run3")
+        assert glue.begin(analysis).directory == ""
+
+    def test_the_number_is_one_past_every_run_in_the_document(self, doc):
+        """Two studies in one document number their runs as one sequence, so
+        FreeCAD never numbers a run's label of its own accord."""
+        one = doc.addObject("App::DocumentObjectGroupPython", "EMAnalysis")
+        two = doc.addObject("App::DocumentObjectGroupPython", "EMAnalysis")
+        glue.record(one, matrix())
+        glue.record(two, matrix())
+        assert [run.Label for run in glue.runs_of(two)] == ["Run 2 (openEMS)"]
+
+
+class TestRunsOnTwoBackends:
+    """What a run says it was asked otherwise names nothing its own backend
+    does not read, and names the switch where the run before was another
+    backend's."""
+
+    def study(self, doc):
+        from Microwave.Objects import createEMAnalysis, createEMGmshMesh, createEMSolverPalace
+
+        analysis = createEMAnalysis(doc)
+        palace = createEMSolverPalace(doc)
+        analysis.addObject(palace)
+        analysis.addObject(createEMGmshMesh(doc))
+        return analysis, palace
+
+    def changes(self, analysis):
+        return {run.Label: (list(run.Changes), run.Label2) for run in glue.runs_of(analysis)}
+
+    def test_another_backends_setting_is_not_said_of_a_run(self, doc):
+        analysis, palace = self.study(doc)
+        glue.record(analysis, matrix())
+        palace.Order = palace.Order + 1
+        glue.record(analysis, matrix())
+        assert self.changes(analysis)["Run 2 (openEMS)"] == (
+            [],
+            "against Run 1 (openEMS): nothing it was asked changed",
+        )
+
+    @pytest.mark.parametrize(("amended", "said"), [("EMGmshMesh", False), ("EMYeeGrid", True)])
+    def test_a_region_is_said_of_a_run_only_on_the_backend_it_amends(self, doc, amended, said):
+        from Microwave.Objects import createEMMeshRegion, members
+        from Microwave.Objects.kinds import kind_of
+
+        analysis, _ = self.study(doc)
+        (settings,) = [one for one in members(analysis) if kind_of(one) == amended]
+        region = createEMMeshRegion(doc, settings)
+        region.ElementSize = 0.5
+        analysis.addObject(region)
+        glue.record(analysis, matrix())
+        region.ElementSize = 0.25
+        glue.record(analysis, matrix())
+        changes, _ = self.changes(analysis)["Run 2 (openEMS)"]
+        assert any("ElementSize" in change for change in changes) is said
+
+    def test_a_refinement_names_as_kept_only_what_its_own_backend_lays(self, doc):
+        """A refinement turns one backend's mesh, so the lengths and counts it
+        leaves as stated are that backend's settings' and its regions'."""
+        from Microwave.Gui import refine
+        from Microwave.Objects import createEMMeshRegion, members
+        from Microwave.Objects.kinds import kind_of
+
+        analysis, _ = self.study(doc)
+        held = {kind_of(one): one for one in members(analysis)}
+        for kind, label in (("EMYeeGrid", "Ours"), ("EMGmshMesh", "Theirs")):
+            held[kind].MinElementSize = 0.01
+            region = createEMMeshRegion(doc, held[kind])
+            region.Label, region.ElementSize = label, 0.5
+            analysis.addObject(region)
+        from Microwave.Objects import createEMYeeGrid
+
+        stray = createEMMeshRegion(doc, createEMYeeGrid(doc))
+        stray.Label, stray.ElementSize = "Elsewhere", 0.5
+        analysis.addObject(stray)
+        said = refine._kept(analysis, ("EMSolverOpenEMS", "EMYeeGrid"))
+        assert [line.split(" stays ")[0] for line in said] == [
+            f"{held['EMYeeGrid'].Label} MinElementSize",
+            f"{held['EMYeeGrid'].Label} MinElementsAcross",
+            "Ours ElementSize",
+        ]
+
+    def test_a_record_narrowed_to_a_backend_keeps_only_what_that_backend_reaches(self):
+        """The drawing a region of the other backend alone names, and that
+        region's shapes, leave the record with the region."""
+        from Microwave.Results import snapshots
+
+        asked = {
+            "members": [
+                {"name": "Grid", "kind": "EMYeeGrid"},
+                {"name": "Gmsh", "kind": "EMGmshMesh"},
+                {"name": "Ours", "kind": "EMMeshRegion", "MeshSettings": {"name": "Grid"}},
+                {"name": "Theirs", "kind": "EMMeshRegion", "MeshSettings": {"name": "Gmsh"}},
+            ],
+            "drawn": [
+                {"name": "Board", glue.BY: ["Ours", "Theirs"]},
+                {"name": "Helper", glue.BY: ["Theirs"]},
+                {"name": "Sheet", glue.BY: ["Study"]},
+            ],
+            snapshots.SHAPES: {"Ours": "a", "Theirs": "b", "Grid": "c", "Gmsh": "d"},
+        }
+        kept = glue.narrowed(asked, ("EMSolverOpenEMS", "EMYeeGrid"))
+        assert [member["name"] for member in kept["members"]] == ["Grid", "Ours"]
+        assert [obj["name"] for obj in kept["drawn"]] == ["Board", "Sheet"]
+        assert kept[snapshots.SHAPES] == {"Ours": "a", "Grid": "c"}
+
+    def test_each_backends_regions_are_neither_new_nor_gone_across_a_switch(self, doc):
+        from Microwave.Objects import createEMMeshRegion, members
+        from Microwave.Objects.kinds import kind_of
+
+        analysis, _ = self.study(doc)
+        for one in list(members(analysis)):
+            if kind_of(one) in ("EMYeeGrid", "EMGmshMesh"):
+                analysis.addObject(createEMMeshRegion(doc, one))
+        glue.record(analysis, matrix())
+        glue.record(analysis, from_backend("Palace", matrix()))
+        assert self.changes(analysis)["Run 2 (Palace)"][0] == ["solved on Palace"]
+
+    def test_its_own_region_changed_across_another_backends_run_is_said_since_its_last(self, doc):
+        from Microwave.Objects import createEMMeshRegion, members
+        from Microwave.Objects.kinds import kind_of
+
+        analysis, _ = self.study(doc)
+        (grid,) = [one for one in members(analysis) if kind_of(one) == "EMYeeGrid"]
+        region = createEMMeshRegion(doc, grid)
+        region.Label, region.ElementSize = "Ours", 0.5
+        analysis.addObject(region)
+        glue.record(analysis, matrix())
+        glue.record(analysis, from_backend("Palace", matrix()))
+        region.ElementSize = 0.25
+        glue.record(analysis, matrix())
+        changes, _ = self.changes(analysis)["Run 3 (openEMS)"]
+        assert any(
+            change.startswith("Ours ElementSize") and change.endswith("since Run 1 (openEMS)")
+            for change in changes
+        ), changes
+
+    def test_a_run_after_another_backends_says_the_switch_and_no_solver_new(self, doc):
+        analysis, _ = self.study(doc)
+        glue.record(analysis, matrix())
+        glue.record(analysis, from_backend("Palace", matrix()))
+        assert self.changes(analysis)["Run 2 (Palace)"] == (
+            ["solved on Palace"],
+            "against Run 1 (openEMS): solved on Palace",
+        )
+
+    def test_its_own_setting_changed_across_another_backends_run_is_said_since_its_last(self, doc):
+        analysis, palace = self.study(doc)
+        glue.record(analysis, from_backend("Palace", matrix()))
+        palace.Order = palace.Order + 1
+        glue.record(analysis, from_backend("Palace", matrix()))
+        was = palace.Order
+        palace.Order = was + 1
+        glue.record(analysis, matrix())
+        glue.record(analysis, from_backend("Palace", matrix()))
+        assert self.changes(analysis)["Run 4 (Palace)"][0] == [
+            "solved on Palace",
+            f"Solver (Palace) Order {was} -> {was + 1} since Run 2 (Palace)",
+        ]
+
+    def test_a_run_whose_backend_has_no_run_before_says_the_switch_alone(self, doc):
+        analysis, palace = self.study(doc)
+        glue.record(analysis, matrix())
+        palace.Order = palace.Order + 1
+        glue.record(analysis, from_backend("Palace", matrix()))
+        assert self.changes(analysis)["Run 2 (Palace)"][0] == ["solved on Palace"]
+
+    def test_a_run_read_back_holds_no_solver_its_backend_does_not_read(self, doc):
+        analysis, _ = self.study(doc)
+        held = glue.record(analysis, matrix())
+        asked = glue.asked_of(glue.run_of(held))
+        assert {member["kind"] for member in asked["members"]} >= {"EMSolverOpenEMS", "EMYeeGrid"}
+        assert not {member["kind"] for member in asked["members"]} & {
+            "EMSolverPalace",
+            "EMGmshMesh",
+        }
+
+    def test_the_overlay_figures_a_setting_only_for_the_runs_that_read_it(self, doc):
+        from Microwave.Gui.plot_s_params import UNHELD, overlay_chart
+
+        analysis, palace = self.study(doc)
+        held = [glue.record(analysis, from_backend("Palace", matrix()))]
+        held.append(glue.record(analysis, matrix()))
+        palace.Order = palace.Order + 1
+        held.append(glue.record(analysis, from_backend("Palace", matrix())))
+        drawn = overlay_chart(glue.overlaid(held), chosen=(2, 1))
+        assert [series.name for series in drawn.series] == [
+            f"S21, Run 1 (Palace), Solver (Palace) Order {palace.Order - 1}",
+            "S21, Run 2 (openEMS)",
+            f"S21, Run 3 (Palace), Solver (Palace) Order {palace.Order}",
+        ]
+        order = drawn.table.columns.index("Solver (Palace) Order")
+        assert [row[order] for row in drawn.table.rows] == [
+            str(palace.Order - 1),
+            UNHELD,
+            str(palace.Order),
+        ]
+
+    def test_its_own_setting_changed_between_two_of_its_runs_is_said_once(self, doc):
+        from Microwave.Objects import solver_of
+
+        analysis, _ = self.study(doc)
+        solver = solver_of(analysis)
+        was = solver.MaxTimesteps
+        glue.record(analysis, matrix())
+        solver.MaxTimesteps = was * 2
+        glue.record(analysis, matrix())
+        assert self.changes(analysis)["Run 2 (openEMS)"][0] == [
+            f"Solver (openEMS) MaxTimesteps {was} -> {was * 2}"
+        ]
+
+    def test_a_run_that_kept_no_record_is_compared_with_nothing(self, doc):
+        analysis, _ = self.study(doc)
+        first = glue.run_of(glue.record(analysis, from_backend("Palace", matrix())))
+        first.Snapshot = ""
+        glue.record(analysis, matrix())
+        glue.record(analysis, from_backend("Palace", matrix()))
+        found = self.changes(analysis)
+        assert found["Run 2 (openEMS)"] == ([], "")
+        assert found["Run 3 (Palace)"][0] == ["solved on Palace"]
+
+    def test_a_table_no_run_kept_has_no_figure_and_no_mark(self, doc):
+        from Microwave.Gui.plot_s_params import overlay_chart
+        from Microwave.Objects.results import createEMSParameters, store
+
+        analysis, palace = self.study(doc)
+        held = [glue.record(analysis, from_backend("Palace", matrix()))]
+        palace.Order = palace.Order + 1
+        held.append(glue.record(analysis, from_backend("Palace", matrix())))
+        alone = createEMSParameters(doc)
+        store(alone, matrix())
+        drawn = overlay_chart(glue.overlaid([*held, alone]), chosen=(2, 1))
+        order = drawn.table.columns.index("Solver (Palace) Order")
+        assert drawn.table.rows[-1][order] == ""
+
+    def test_a_refinement_is_not_refused_for_another_backends_setting(self, doc):
+        from Microwave.Gui import refine
+        from Microwave.Gui.openems_steps import OpenEMSSteps
+
+        analysis, palace = self.study(doc)
+        run = glue.run_of(glue.record(analysis, matrix()))
+        palace.Order = palace.Order + 1
+        refined = refine.refinement(run, OpenEMSSteps.REFINES, OpenEMSSteps.OWNS)
+        assert refined.run is run
+
+    def test_a_backend_this_layer_does_not_know_is_said_as_the_switch_alone(self, doc):
+        from Microwave.Objects.kinds import recipe_kinds, solver_kinds
+
+        analysis, _ = self.study(doc)
+        glue.record(analysis, matrix())
+        glue.record(analysis, from_backend("NEC2", matrix()))
+        glue.record(analysis, matrix())
+        found = self.changes(analysis)
+        assert found["Run 2 (NEC2)"][0] == ["solved on NEC2"]
+        assert found["Run 3 (openEMS)"][0] == ["solved on openEMS"]
+        [unknown] = [run for run in glue.runs_of(analysis) if run.Solver == "NEC2"]
+        known = solver_kinds() | recipe_kinds()
+        assert not {member["kind"] for member in glue.asked_of(unknown)["members"]} & known
+
+    def bound(self, doc, palace, chained):
+        """A variable set whose Order the Palace solver's Order is bound to, and
+        which, ``chained``, is itself bound to its Base. Nothing else reads it."""
+        held = doc.addObject("App::FeaturePython", "Vars")
+        held.addProperty("App::PropertyInteger", "Order", "Vars")
+        held.Order = palace.Order
+        if chained:
+            held.addProperty("App::PropertyInteger", "Base", "Vars")
+            held.Base = palace.Order - 1
+            held.setExpression("Order", "Base + 1")
+        palace.setExpression("Order", "Vars.Order")
+        object.__setattr__(palace, "OutList", [held])
+        return held
+
+    def test_what_only_another_backends_solver_reads_is_not_said_through_a_chain(self, doc):
+        from Microwave.Gui import refine
+        from Microwave.Gui.openems_steps import OpenEMSSteps
+
+        analysis, palace = self.study(doc)
+        held = self.bound(doc, palace, chained=True)
+        run = glue.run_of(glue.record(analysis, matrix()))
+        held.Base += 1
+        held.Order += 1
+        palace.Order = held.Order
+        glue.record(analysis, matrix())
+        assert self.changes(analysis)["Run 2 (openEMS)"][0] == []
+        assert refine.refinement(run, OpenEMSSteps.REFINES, OpenEMSSteps.OWNS).run is run
+
+    def test_a_value_only_another_backends_solver_reads_marks_the_run_as_holding_none(self, doc):
+        from Microwave.Gui.plot_s_params import UNHELD, overlay_chart
+
+        analysis, palace = self.study(doc)
+        held = self.bound(doc, palace, chained=False)
+        runs = []
+        for backend in ("Palace", "openEMS", "Palace"):
+            runs.append(glue.record(analysis, from_backend(backend, matrix())))
+            held.Order += 1
+            palace.Order = held.Order
+        drawn = overlay_chart(glue.overlaid(runs), chosen=(2, 1))
+        assert drawn.series[1].name == "S21, Run 2 (openEMS)"
+        assert [row[drawn.table.columns.index("Order")] for row in drawn.table.rows][1] == UNHELD

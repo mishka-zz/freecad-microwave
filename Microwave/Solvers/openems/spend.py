@@ -15,15 +15,14 @@ pruning scan makes is the same number on every machine and on every run, so it
 can be asserted.
 
 The tally is carried down rather than handed back up, because it is filled
-deep in each phase and the values on the way up are already the answer.
-:func:`~.document.mesh` fills one and the plan it returns carries it, so a
-reader of a finished grid has what it cost without asking for it. The envelope
-route builds no plan, so nothing carries the laying half up from it: provenance
-is not solver input, and what a grid cost is provenance. The measuring half is
-still counted, on the translation itself - see
-:attr:`~.document._Translated.spend`.
- The argument is optional throughout for a caller that
-reaches one phase on its own and has nothing to add it to.
+deep in each phase and the values on the way up are already the answer. The
+argument is optional throughout for a caller that reaches one phase on its own
+and has nothing to add it to. :func:`~.document.mesh` fills one and the plan
+it returns carries it, so a reader of a finished grid has what it cost without
+asking for it. The envelope route builds no plan, so nothing carries the laying
+half up from it: provenance is not solver input, and what a grid cost is
+provenance. The measuring half is still counted, on the translation itself -
+see :attr:`~.document._Translated.spend`.
 
 The point of counting at all is that a phase can be right and unaffordable, and
 the suite has no other way to notice. Each count is paired with what the phase

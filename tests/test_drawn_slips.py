@@ -125,7 +125,7 @@ class TestTheBodyGrown:
     @pytest.mark.parametrize(
         ("fused", "said"),
         [
-            (Fused(4.001, valid=False), "not a valid shape"),
+            (Fused(4.001, valid=False), "could not fuse the body and the room into a valid shape"),
             (Fused(4.1), "where the two hold"),
             (Fused(4.001, solids=2), "comes apart"),
         ],

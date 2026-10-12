@@ -35,7 +35,7 @@ from Microwave.Solvers.palace.problem import (
     SPACE,
     Conductor,
 )
-from Microwave.Solvers.palace.read import FLUX_TABLE, TABLE, Scattering, scattering
+from Microwave.Solvers.palace.read import FLUX_TABLE, RESISTANCE, TABLE, Scattering, scattering
 from tests.test_palace_adapter import mesh_settings, with_members
 from tests.test_palace_lumped import (
     BOTTOM,
@@ -196,7 +196,7 @@ def _stated(described):
 
 
 def settings_of(line):
-    return next(member for member in line.study.Group if hasattr(member, "PaddingXMin"))
+    return next(member for member in line.study.Group if hasattr(member, "BoundaryXMin"))
 
 
 def opened(faces=("ZMax",), clearance=CLEARANCE, through=(), permittivity=None, line=None):
@@ -206,9 +206,9 @@ def opened(faces=("ZMax",), clearance=CLEARANCE, through=(), permittivity=None, 
     settings = settings_of(line)
     settings.Clearance = clearance
     for name in faces:
-        setattr(settings, f"Padding{name}", "Air")
+        setattr(settings, f"Boundary{name}", "Open")
     for name in through:
-        setattr(settings, f"Padding{name}", "Through")
+        setattr(settings, f"Boundary{name}", "Through")
     if permittivity is not None:
         fill = next(m for m in line.study.Group if getattr(m, "Label", "") == "FillBinding")
         fill.Material.Permittivity = permittivity
@@ -389,7 +389,7 @@ class TestTheRoomTheDrawingLeaves:
         monkeypatch.setattr(drawn, "joined", lambda *_: "FillBinding#0")
         monkeypatch.setattr(drawn, "grown", grow)
         line = closed()
-        film = material("ConductingSheet", "Film")
+        film = material("Conducting Sheet", "Film")
         film.Conductivity, film.Thickness = 5.8e7, 0.035
         sheet = obj(
             "Part::Plane", "FilmSheet", Shape=face("film", (-HALF, -1.0, 3.0), (HALF, 1.0, 3.0))
@@ -407,7 +407,7 @@ class TestTheRoomTheDrawingLeaves:
         record, _ = rooms_asked
         everywhere = room((-1e3, -1e3, -1e3), (1e3, 1e3, 1e3), bounded_by=("FillBinding#0",))
         record.answer = [everywhere._replace(volume=1e-6 * everywhere.surface / 2.0)]
-        with pytest.raises(TranslationError, match="drawn to meet that miss each other"):
+        with pytest.raises(TranslationError, match="looks like bodies meant to meet"):
             problem(closed().study)
 
     def test_a_slip_the_kernel_cannot_measure_is_refused_saying_so(self, rooms_asked, monkeypatch):
@@ -419,9 +419,9 @@ class TestTheRoomTheDrawingLeaves:
             raise RuntimeError("the shape is broken")
 
         monkeypatch.setattr(drawn, "joined", joined)
-        with pytest.raises(TranslationError, match="drawn to meet that miss each other") as told:
+        with pytest.raises(TranslationError, match="looks like bodies meant to meet") as told:
             problem(closed().study)
-        assert "The CAD kernel could not measure it: the shape is broken" in str(told.value)
+        assert "FreeCAD could not measure it: the shape is broken" in str(told.value)
 
     def test_a_fuse_the_kernel_answers_wrongly_is_refused_saying_so(self, rooms_asked, monkeypatch):
         record, _ = rooms_asked
@@ -433,7 +433,7 @@ class TestTheRoomTheDrawingLeaves:
             raise ValueError("the kernel's fuse of the body and the room is not a valid shape")
 
         monkeypatch.setattr(drawn, "grown", grown)
-        with pytest.raises(TranslationError, match="drawn to meet that miss each other") as told:
+        with pytest.raises(TranslationError, match="looks like bodies meant to meet") as told:
             problem(closed().study)
         assert "not a valid shape" in str(told.value)
 
@@ -468,7 +468,7 @@ class TestTheRoomTheDrawingLeaves:
             if "left out of the model" in one
         ]
         assert "from (-1, -1, 2) to (1, 1, 3) mm, 4 mm^3" in line
-        assert "'StripBinding' and the domain's side ZMax close it off" in line
+        assert "closed off by 'StripBinding' and the domain's side ZMax" in line
 
     def test_room_inside_a_shell_of_metal_is_left_out_as_well(self, rooms_asked, cut):
         """Nothing drives a room metal closes off inside the drawing either, so a
@@ -566,7 +566,7 @@ class TestTheRoomTheDrawingLeaves:
             for one in policy.reserving(described.reserved, described.sweep)
             if "left out of the model" in one
         ]
-        assert "'FillBinding' and the box, which is built on a bound standing off" in line
+        assert "between 'FillBinding' and the bounding box of a curved face" in line
 
     def test_room_beyond_the_drawing_bounded_by_nothing_is_stated_as_the_drawing_s(
         self, rooms_asked, cut, parted, monkeypatch
@@ -581,7 +581,7 @@ class TestTheRoomTheDrawingLeaves:
             for one in policy.reserving(described.reserved, described.sweep)
             if "left out of the model" in one
         ]
-        assert "between the drawing and the box" in line
+        assert "between the drawing and the bounding box" in line
 
     def test_nothing_is_parted_where_no_bound_stands_off(self, rooms_asked, parted):
         record, _ = rooms_asked
@@ -607,13 +607,13 @@ class TestTheRoomTheDrawingLeaves:
         assert parted == []
 
     @pytest.mark.parametrize(
-        ("padding", "ends"), [("Ends", True), ("Air", False), ("Through", False)]
+        ("padding", "ends"), [("PEC Wall", True), ("Open", False), ("Through", False)]
     )
     def test_only_a_side_the_domain_ends_on_is_moved(self, padding, ends):
         from Microwave.Solvers.palace import document
 
-        settings = SimpleNamespace(**{f"Padding{face}": "Ends" for face in policy.FACES})
-        settings.PaddingZMax = padding
+        settings = SimpleNamespace(**{f"Boundary{face}": "PEC Wall" for face in policy.FACES})
+        settings.BoundaryZMax = padding
         assert ("ZMax" in document._ends(settings)) is ends
 
     def test_room_sealed_off_alone_reserves_nothing(self, rooms_asked):
@@ -651,7 +651,7 @@ class TestTheRoomTheDrawingLeaves:
             raise RuntimeError("BRep_API: command not done")
 
         monkeypatch.setattr(drawn, "rooms", broken)
-        with pytest.raises(TranslationError, match="could not be cut from the box"):
+        with pytest.raises(TranslationError, match="FreeCAD could not cut the bodies bound in"):
             problem(closed().study)
 
 
@@ -715,15 +715,15 @@ class TestTheReservedBox:
         assert described.reserved.upper[0] == HALF
 
     def test_a_through_face_no_port_spans_is_refused(self):
-        with pytest.raises(TranslationError, match="PaddingYMin"):
+        with pytest.raises(TranslationError, match="BoundaryYMin"):
             problem(opened(faces=("ZMax",), through=("YMin",)).study)
 
     def test_through_beside_a_lumped_port_stays_refused_in_a_closed_study(self):
         """Only the reserved box's side is honoured by a lumped plane. A closed
         study is translated as it was."""
         line = closed()
-        settings_of(line).PaddingXMin = "Through"
-        with pytest.raises(TranslationError, match="PaddingXMin"):
+        settings_of(line).BoundaryXMin = "Through"
+        with pytest.raises(TranslationError, match="BoundaryXMin"):
             problem(line.study)
 
     def test_the_clearance_is_derived_where_it_is_nought(self):
@@ -869,7 +869,7 @@ class TestAPortsPlaneOnASideOfTheBox:
 
     def test_an_element_side_meeting_the_air_on_an_ends_side_is_refused(self):
         """The strip as wide as the fill: each element's sides run along the end
-        face's edges, with air beside them in the side. On an Ends side that air
+        face's edges, with air beside them in the side. On a PEC Wall side that air
         is the wall, which shorts the element."""
         line = opened(faces=("YMin", "YMax"), line=stripline(width=SHIELD))
         with pytest.raises(TranslationError, match="runs along the edge of the region"):
@@ -921,7 +921,10 @@ class TestAPortsPlaneOnASideOfTheBox:
         assert all(f"{whole:.4g} mm^2 side" in line for line in said)
         assert all(f"{SHIELD * CLEARANCE:.4g} mm^2" in line for line in said)
         assert all(
-            "reflected" in line and "no figure stated here counts it" in line for line in said
+            line.endswith(
+                "It reflects any wave radiated onto it, and no figure stated here counts that"
+            )
+            for line in said
         )
 
     def test_and_says_nothing_of_it_on_an_ends_side(self):
@@ -964,7 +967,7 @@ class TestMetalAlone:
     def test_is_refused_in_a_closed_one(self):
         line = metal_alone()
         for name in FACES:
-            setattr(settings_of(line), f"Padding{name}", "Ends")
+            setattr(settings_of(line), f"Boundary{name}", "PEC Wall")
         with pytest.raises(TranslationError, match="binds no dielectric to anything"):
             problem(line.study)
 
@@ -972,7 +975,7 @@ class TestMetalAlone:
         """A film a micrometre thick at a thousand siemens a metre lets most of a
         wave in vacuum through, and the vacuum is the one medium here."""
         line = metal_alone()
-        film = material("ConductingSheet", "Film")
+        film = material("Conducting Sheet", "Film")
         film.Conductivity, film.Thickness = 1e3, 1e-3
         sheet = obj(
             "Part::Plane", "FilmSheet", Shape=face("film", (-HALF, -1.0, 3.0), (HALF, 1.0, 3.0))
@@ -980,7 +983,7 @@ class TestMetalAlone:
         binding = obj("EMMaterialBinding", "FilmBinding", Material=film, References=[(sheet, [])])
         line.study.Group = [*line.study.Group, binding]
         free = units.VACUUM_PERMEABILITY * units.SPEED_OF_LIGHT
-        with pytest.raises(TranslationError, match=f"in a medium of the model of {free:.4g} ohms"):
+        with pytest.raises(TranslationError, match=f"in a {free:.4g} ohm medium of the model"):
             problem(line.study)
 
 
@@ -1002,13 +1005,16 @@ class TestNamesTheAdapterGives:
 
 class TestAWavePort:
     def test_is_refused_in_an_open_study_by_name(self):
-        study = with_members(settings=mesh_settings(PaddingZMax="Air"))
+        study = with_members(settings=mesh_settings(BoundaryZMax="Open"))
         with pytest.raises(TranslationError) as raised:
             problem(study)
         said = str(raised.value)
         assert "is a waveguide port" in said
-        assert "PaddingZMax" in said
+        assert "BoundaryZMax" in said
         assert "lumped ports only" in said
+        assert said.endswith(
+            "Drive the study through lumped ports, or set each of those to PEC Wall"
+        )
 
     def test_is_taken_in_a_closed_one(self):
         assert problem(with_members()).reserved is None
@@ -1095,7 +1101,7 @@ class TestAFaceOfARegionStandingInTheAir:
 
     def test_the_side_named_is_the_one_the_face_lies_in_the_plane_of(self):
         """Open at XMin and at the top: the fill's top face reaches the structure's
-        XMin extreme as well, and setting PaddingXMin to Ends would not wall it. The
+        XMin extreme as well, and setting BoundaryXMin to PEC Wall would not wall it. The
         side named is the one the face is square to."""
         (said,) = problem(opened(faces=("XMin", "ZMax")).study).unwalled
         top = {face.where: face.side for face in said.faces}
@@ -1127,9 +1133,9 @@ class TestAFaceOfARegionStandingInTheAir:
         lines = policy.reserving(described.reserved, described.sweep, described.unwalled)
         (said,) = [line for line in lines if line.startswith("'FillBinding'")]
         assert f"the face across Z at {SEPARATION:g} mm" in said
-        assert "toward PaddingZMax" in said
+        assert "toward BoundaryZMax" in said
         assert "none is a wall" in said
-        assert "draw metal on it, or set the Padding it stands toward to Ends" in said
+        assert "draw metal on it, or set the Boundary it stands toward to PEC Wall" in said
 
 
 class TestTheWallTheAdapterStandsInTheAir:
@@ -1170,7 +1176,7 @@ class TestTheWallTheAdapterStandsInTheAir:
         assert f"{SHIELD * CLEARANCE:.4g} mm^2" in line
         assert "the drawing does not cover" in line
         assert "Draw the conductor out to the edge of the air" in line
-        assert "set PaddingXMin to Air" in line
+        assert "set BoundaryXMin to Open" in line
 
     def test_a_closed_study_states_none_of_it(self):
         assert problem(closed().study).reserved is None
@@ -1227,8 +1233,8 @@ class TestTheBoundTheBoxIsBuiltOn:
             for one in policy.reserving(described.reserved, described.sweep)
             if "stands up to" in one
         ]
-        assert f"{stands:.4g} mm past the body of {name!r}" in line
-        assert "an open side of the box is that much further" in line
+        assert f"{stands:.4g} mm off the body of {name!r}" in line
+        assert "an open side stands up to that much farther" in line
 
     def test_the_box_is_built_on_the_kernel_s_bound_and_not_the_tighter_one(self, monkeypatch):
         """The tighter bound is not an enclosing one, so nothing is measured from
@@ -1254,9 +1260,9 @@ class TestAClearanceThatReachesNothing:
         (said,) = [
             line for line in policy.said(described.unlaid, meshed(described)) if "Clearance" in line
         ]
-        assert said.startswith(f"'MeshSettings': Clearance {CLEARANCE:.4g} mm lays nothing")
-        assert "no face of this study is Air" in said
-        assert "Set a face to Air to reserve that space" in said
+        assert said.startswith(f"'MeshSettings': Clearance {CLEARANCE:.4g} mm has no effect")
+        assert "no Boundary is Open" in said
+        assert said.endswith("Set a Boundary to Open to reserve that space")
 
     def test_an_open_study_states_nothing_of_it(self):
         described = problem(opened().study)
@@ -1278,8 +1284,8 @@ class TestAStructureFlatAcrossAnAxis:
             problem(metal_alone(faces=("XMin",)).study)
         said = str(raised.value)
         assert "lies in one plane across Z" in said
-        assert "PaddingZMin is Ends" in said and "PaddingZMax is Ends" in said
-        assert "Set PaddingZMin or PaddingZMax to Air" in said
+        assert "BoundaryZMin is PEC Wall" in said and "BoundaryZMax is PEC Wall" in said
+        assert "Set BoundaryZMin or BoundaryZMax to Open" in said
 
     def test_is_taken_where_air_is_reserved_across_it(self):
         """The strip is flat in z, and air on both faces across z gives the box a
@@ -1311,7 +1317,7 @@ class TestAStructureFlatAcrossAnAxis:
 
 class TestThePolicyIsRefusedBeforeTheBoxIsReserved:
     def test_a_through_face_no_plane_can_lie_in_costs_no_box(self, reserved):
-        with pytest.raises(TranslationError, match="PaddingYMin"):
+        with pytest.raises(TranslationError, match="BoundaryYMin"):
             problem(opened(faces=("ZMax",), through=("YMin",)).study)
         assert reserved == []
 
@@ -1482,7 +1488,7 @@ class TestAWallTouchingACurve:
             closed(),
             f"' meets the side XMax at X={HALF:.6g} only where it curves away from it, "
             "at (1, 2, 3) mm",
-            "Set XMax to Air, or end the drawing on a flat face at that side",
+            "Set BoundaryXMax to Open, or end the drawing on a flat face at that side",
         )
         assert said.startswith("'FillBinding'") or said.startswith("'StripBinding'"), said
 
@@ -1527,7 +1533,7 @@ class TestAWallTouchingACurve:
             f"' meets the side XMax at X={HALF:.6g} only where it curves away from it",
             "Give the body a flat where it meets the side, or move it clear of the side",
         )
-        assert "Set XMax to Air" not in said
+        assert "Set XMax to Open" not in said
 
     def test_an_open_study_with_every_side_open_asks_nothing(self, monkeypatch):
         asked = touching_asked(monkeypatch)
@@ -1560,20 +1566,24 @@ class TestWhatAThroughFaceIsToldToDo:
         with pytest.raises(TranslationError) as raised:
             problem(opened(faces=("ZMax",), through=("YMin",)).study)
         said = str(raised.value)
-        assert "lay a lumped port whose elements lie in that side of the reserved air" in said
-        assert said.index("Set each of those to Air") < said.index("lay a lumped port")
+        assert said.endswith(
+            "Set each to Open, lay a lumped port whose elements lie in that side of the "
+            "reserved air, or set each to PEC Wall to end the domain at the structure"
+        )
         assert "waveguide port" not in said
 
     def test_a_closed_study_is_not_told_to_add_a_port_that_stands_there_already(self):
         """A lumped port's plane is honoured on a side of the reserved air, and a
-        closed study reserves none - so the advice is a waveguide port or Air."""
+        closed study reserves none - so the advice is a waveguide port or Open."""
         line = closed()
-        settings_of(line).PaddingXMin = "Through"
+        settings_of(line).BoundaryXMin = "Through"
         with pytest.raises(TranslationError) as raised:
             problem(line.study)
         said = str(raised.value)
-        assert "stand a waveguide port across that face" in said
-        assert said.index("Set each of those to Air") < said.index("stand a waveguide port")
+        assert said.endswith(
+            "Set each to Open, stand a waveguide port across that face, or set each to PEC "
+            "Wall to end the domain at the structure"
+        )
         assert "lumped port whose" not in said
 
 
@@ -1694,6 +1704,12 @@ class TestTheAbsorbingConditionWritten:
         with pytest.raises(ValueError, match="no attribute carries metal"):
             lumped_run(perfect_conductor=(), magnetic_conductor=())
 
+    def test_an_open_study_factors_the_whole_complex_operator_at_the_coarsest_level(self):
+        """The absorbing term is the operator's imaginary part, and Palace's own
+        coarse solve sums it into the real one."""
+        run = lumped_run(perfect_conductor=(), magnetic_conductor=(), absorbing=(6,))
+        assert json.loads(run.to_json())["Solver"]["Linear"]["ComplexCoarseSolve"] is True
+
     def test_an_absorbing_attribute_carrying_another_condition_cannot_be_written(self):
         with pytest.raises(ValueError, match="more than one condition"):
             lumped_run(absorbing=(6,))
@@ -1747,8 +1763,8 @@ class TestThePowerThroughTheOpenSurfaceRead:
 
 
 def open_answer(radiated, reflected=0.1, transmitted=0.9, dissipates=False, flux=None):
-    """One driven port's column at three frequencies, and what left through the
-    open surface at each."""
+    """One driven port's column at three frequencies through two lumped ports, and
+    what left through the open surface at each."""
     frequency = np.array([2e9, 5e9, 8e9])
     matrix = np.zeros((3, 2, 1), dtype=complex)
     matrix[:, 0, 0] = math.sqrt(reflected)
@@ -1761,6 +1777,13 @@ def open_answer(radiated, reflected=0.1, transmitted=0.9, dissipates=False, flux
         flux=np.zeros((3, 2, 1)) if flux is None else flux,
         dissipates=dissipates,
         radiated=np.asarray(radiated, dtype=float).reshape(3, 1),
+        stated={1: RESISTANCE, 2: RESISTANCE},
+    )
+
+
+def lumped_short(share, radiated=None, dissipates=False):
+    return balance.Shortfall(
+        1, 5e9, share, None, radiated=radiated, dissipates=dissipates, lumped=True
     )
 
 
@@ -1771,63 +1794,44 @@ class TestTheBalanceOfAnOpenRun:
         (shortfall,) = balance.shortfalls(open_answer([0.01, 0.01, 0.01], transmitted=0.89))
         assert shortfall.share == pytest.approx(0.0, rel=0.0, abs=1e-12)
         assert shortfall.radiated == pytest.approx(0.01, rel=1e-12, abs=0.0)
+        assert shortfall.lumped and shortfall.port is None
 
-    def test_where_the_model_dissipates_the_heat_is_what_the_faces_leave(self):
-        """The faces' powers sum to what the model took in, less nothing: part of
-        it is heat and part left through the open surface, so the heat is the
-        faces' sum less the radiated share, and the account closes."""
+    def test_where_the_model_dissipates_the_share_is_what_neither_way_out_took(self):
+        """The faces are not read: the same matrix and open surface give the same
+        share whatever the faces say, and it is the heat."""
         flux = np.zeros((3, 2, 1))
         flux[:, 0, 0] = -(1.0 - 0.1)
-        flux[:, 1, 0] = 0.8
-        answer = open_answer([0.05, 0.05, 0.05], transmitted=0.8, dissipates=True, flux=flux)
-        (shortfall,) = balance.shortfalls(answer)
-        assert shortfall.share == pytest.approx(0.0, rel=0.0, abs=1e-12)
-
-    def test_the_line_says_what_left_through_the_open_surface(self):
-        shortfall = balance.Shortfall(1, 5e9, 2e-3, 2, radiated=0.05)
-        said = balance.said(shortfall, {1: "Port1", 2: "Port2"}, lumped={1, 2})
-        assert "after the 5% that left through the open surface" in said
-
-    def test_more_accounted_than_went_in_is_sent_to_the_mesh_at_the_open_surface(self):
-        shortfall = balance.Shortfall(1, 5e9, -2e-2, 1, radiated=0.3)
-        said = balance.said(shortfall, {1: "Port1", 2: "Port2"}, lumped={1, 2})
-        assert said.startswith(balance.WARNING)
-        assert "refine the mesh at the open surface" in said
-
-    def test_where_the_model_dissipates_the_open_surface_is_not_in_the_figure(self):
-        """The heat is read off the faces less what left through the open surface,
-        so the radiated share cancels: the same faces and matrix give the same
-        share whatever the open surface took."""
-        flux = np.zeros((3, 2, 1))
-        flux[:, 0, 0] = -(1.0 - 0.1)
-        flux[:, 1, 0] = 0.8
+        flux[:, 1, 0] = 0.78
         shares = [
             balance.shortfalls(
-                open_answer([left] * 3, transmitted=0.8, dissipates=True, flux=flux)
+                open_answer([0.05] * 3, transmitted=0.8, dissipates=True, flux=faces)
             )[0]
-            for left in (0.01, 0.05)
+            for faces in (flux, np.zeros((3, 2, 1)))
         ]
-        assert shares[0].share == pytest.approx(shares[1].share, rel=0.0, abs=1e-15)
-        assert all(one.dissipates for one in shares)
+        assert [one.share for one in shares] == pytest.approx([0.05, 0.05], rel=1e-12, abs=0.0)
 
-    def test_where_the_model_dissipates_the_mesh_at_the_open_surface_is_not_blamed(self):
-        shortfall = balance.Shortfall(2, 1e9, -2e-2, 1, radiated=0.05, dissipates=True)
-        said = balance.said(shortfall, NAMES, lumped={1, 2})
-        assert said.startswith(balance.WARNING)
-        assert "at the open surface" not in said
-        assert "does not enter this figure" in said
-        assert said.endswith("Refine the mesh")
+    def test_the_line_says_what_left_through_the_open_surface(self):
+        said = balance.said(lumped_short(2e-3, radiated=0.05), NAMES)
+        assert ": 5% left through the open surface, and the other 0.2% (0.0087 dB) is" in said
 
-    def test_where_the_model_dissipates_the_share_is_not_said_to_follow_the_open_surface(self):
-        shortfall = balance.Shortfall(1, 5e9, 2e-3, 2, radiated=0.05, dissipates=True)
-        said = balance.said(shortfall, NAMES, lumped={1, 2})
-        assert "after the" not in said
-        assert "compares the matrix with the ports' faces alone" in said
+    def test_more_accounted_than_went_in_is_sent_to_the_mesh_at_the_open_surface(self):
+        for dissipates in (False, True):
+            said = balance.said(lumped_short(-2e-2, radiated=0.3, dissipates=dissipates), NAMES)
+            assert said.startswith(balance.WARNING)
+            assert said.endswith("Refine the mesh at the open surface")
+
+    def test_where_the_model_dissipates_the_line_is_a_budget_and_no_warning(self):
+        said = balance.said(lumped_short(0.3, radiated=0.05, dissipates=True), NAMES)
+        assert said == (
+            "Driven from 'Port1', 35% (1.9 dB) of the power does not come back at the ports "
+            "at 5 GHz: 5% left through the open surface, and the other 30% (1.5 dB) is "
+            "dissipated in the model or is the solver's error, which this run cannot separate"
+        )
 
     def test_a_closed_run_says_nothing_of_it(self):
-        shortfall = balance.Shortfall(1, 5e9, 2e-3, 2)
-        said = balance.said(shortfall, {1: "Port1", 2: "Port2"}, lumped={1, 2})
-        assert "open surface" not in said
+        for dissipates in (False, True):
+            said = balance.said(lumped_short(2e-3, dissipates=dissipates), NAMES)
+            assert "open surface" not in said
 
 
 def first_order(frequency, distance):
@@ -1958,7 +1962,7 @@ class TestWhatTheRunSaysOfTheOpenSurface:
         assert one.frequency == [2e9, 5e9, 8e9][best]
         assert one.estimate == pytest.approx(estimates[best], rel=1e-12, abs=0.0)
         said = balance.moved_said(one, NAMES)
-        assert f"by {estimates[best]:.2g}" in said
+        assert f"by about {estimates[best]:.2g}" in said
         assert f"{[0.02, 0.01, 0.001][best] * 100:.3g}% of the power left" in said
 
     def test_the_slanted_reflection_is_taken_where_it_is_the_larger(self):
@@ -2026,8 +2030,8 @@ class TestWhatTheRunSaysOfTheOpenSurface:
         cosine = math.cos(math.atan2(across, 60.0))
         slant = (1 - cosine) / (1 + cosine)
         assert first_order(2e9, 60.0) < slant
-        (said,) = [line for line in order if "estimates it moved" in line]
-        assert f"by {slant * 0.01:.2g}" in said
+        (said,) = [line for line in order if "terms move by about" in line]
+        assert f"by about {slant * 0.01:.2g}" in said
 
     def test_both_figures_reach_the_log_of_a_run(self, tmp_path, monkeypatch):
         """The first before the solve and the second after it, beside what the
@@ -2051,7 +2055,7 @@ class TestWhatTheRunSaysOfTheOpenSurface:
         pipeline.finish(prepared, mesh, 1, on_output=order.append)
         solved = order.index("SOLVE")
         assert any(line.startswith("The open surface is") for line in order[:solved])
-        assert any("It is an estimate and not a bound" in line for line in order[solved:])
+        assert any("an estimate and not a bound" in line for line in order[solved:])
 
 
 class TestTheResultRecordsItsOutside:
@@ -2217,7 +2221,7 @@ class TestTheMediumFillsTheReservedAir:
         described = problem(in_ptfe().study)
         lines = policy.reserving(described.reserved, described.sweep, described.unwalled)
         assert described.unwalled
-        assert any("between the region and the medium 'PTFE'" in line for line in lines)
+        assert any("each borders the medium 'PTFE'" in line for line in lines)
 
     def test_the_run_records_it_apart_from_its_outside(self):
         described = problem(in_ptfe().study)
@@ -2239,7 +2243,7 @@ class TestTheMediumFillsTheReservedAir:
         lines = policy.said(described.unlaid, meshed(described))
         assert any("Medium 'PTFE' fills nothing" in one for one in lines)
 
-    @pytest.mark.parametrize("declared", ["PEC", "ConductingSheet"])
+    @pytest.mark.parametrize("declared", ["PEC", "Conducting Sheet"])
     def test_a_metal_is_refused_naming_the_policy_and_the_material(self, declared):
         line = opened()
         settings_of(line).Medium = material(declared, "Brass")
@@ -2263,7 +2267,7 @@ class TestTheMediumFillsTheReservedAir:
         pipeline.finish(prepared, meshed(described), 1, on_output=order.append)
         slant = policy.slanted(policy.steepest(described.reserved))
         (one,) = balance.moved(open_answer([0.02, 0.01, 0.001]), 30.0, slant, 2.1)
-        (said,) = [line for line in order if "estimates it moved" in line]
-        assert f"by {one.estimate:.2g}" in said
+        (said,) = [line for line in order if "terms move by about" in line]
+        assert f"by about {one.estimate:.2g}" in said
         (vacuum,) = balance.moved(open_answer([0.02, 0.01, 0.001]), 30.0, slant)
         assert f"{one.estimate:.2g}" != f"{vacuum.estimate:.2g}"

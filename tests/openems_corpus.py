@@ -821,6 +821,48 @@ def _mixed_compound(part: Any) -> Any:
     )
 
 
+def _sketch_beside_pad(part: Any) -> Any:
+    """A box and the outline of its base in one object, as a sketch and the pad
+    made from it are when both go into one compound. A pad holds edges of its
+    own rather than the sketch's, measured on FreeCAD 1.1.1, so the outline lies
+    on the box and belongs to none of its faces."""
+    return part.makeCompound(
+        [
+            part.makeBox(3.0, 3.0, 3.0),
+            part.makePolygon(
+                [
+                    _vector(part, 0.0, 0.0, 0.0),
+                    _vector(part, 3.0, 0.0, 0.0),
+                    _vector(part, 3.0, 3.0, 0.0),
+                    _vector(part, 0.0, 3.0, 0.0),
+                    _vector(part, 0.0, 0.0, 0.0),
+                ]
+            ),
+        ]
+    )
+
+
+def _point_beside_sheet(part: Any) -> Any:
+    """A rectangle and a point clear of it in one object, as a point put in one
+    container with a sheet is."""
+    return part.makeCompound(
+        [
+            part.Face(
+                part.makePolygon(
+                    [
+                        _vector(part, 0.0, 0.0, 0.0),
+                        _vector(part, 4.0, 0.0, 0.0),
+                        _vector(part, 4.0, 3.0, 0.0),
+                        _vector(part, 0.0, 3.0, 0.0),
+                        _vector(part, 0.0, 0.0, 0.0),
+                    ]
+                )
+            ),
+            part.Vertex(_vector(part, 6.0, 1.0, 0.0)),
+        ]
+    )
+
+
 def _inside_out(part: Any) -> Any:
     """A box whose faces are wound the other way. The kernel reads it as the
     complement: its volume is negative, every point in the box answers outside,
@@ -1349,6 +1391,20 @@ def specimens() -> tuple[Specimen, ...]:
             "mixed_compound",
             _mixed_compound,
             "solids and a loose face in one object, part volume and part surface",
+            expect="refused",
+            tags=("awkward",),
+        ),
+        Specimen(
+            "sketch_beside_pad",
+            _sketch_beside_pad,
+            "a solid and edges of its own outline in one object, part volume and part edges",
+            expect="refused",
+            tags=("awkward",),
+        ),
+        Specimen(
+            "point_beside_sheet",
+            _point_beside_sheet,
+            "a face and a point in one object, part area and part point",
             expect="refused",
             tags=("awkward",),
         ),

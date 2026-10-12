@@ -128,7 +128,7 @@ def study(doc, air, planes, septum):
     analysis = createEMAnalysis(doc)
     analysis.FrequencyStart = "20 GHz"
     analysis.FrequencyStop = "26 GHz"
-    analysis.NumFrequencyPoints = 3
+    analysis.FrequencyPoints = 3
     analysis.addObject(createEMSolverPalace(doc))
     tetrahedra = createEMGmshMesh(doc)
     analysis.addObject(tetrahedra)
@@ -137,10 +137,10 @@ def study(doc, air, planes, septum):
     # The same number on each pipeline, so the two translations describe one
     # resolution and what the cases differ by is where the drawing stands.
     grid.ElementsPerWavelength = tetrahedra.ElementsPerWavelength = 15
-    settings.PaddingXMin = settings.PaddingXMax = "Through"
+    settings.BoundaryXMin = settings.BoundaryXMax = "Through"
     for axis in ("Y", "Z"):
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Ends")
+            setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
 
     vacuum = createEMMaterial("Vacuum")
     vacuum.MaterialType = "Dielectric"
@@ -154,7 +154,7 @@ def study(doc, air, planes, septum):
     for number, (plane, axis) in enumerate(zip(planes, ("X", "-X"), strict=True), start=1):
         port = createEMPortRectWaveguide(f"Port{number}")
         port.Number = number
-        port.Excitation = number == 1
+        port.Driven = number == 1
         port.PropagationAxis = axis
         port.CrossSection = (plane, ["Face1"])
         port.ReferencedTo = PORT_IMPEDANCE
@@ -259,7 +259,7 @@ def translated(analysis):
         port.ReferenceDepth = "2 mm"
     analysis.Document.recompute()
     read["drawn"] = sorted(box(picks.placed(port)) for port in ports)
-    # And where the mesh preview is drawn, which Update Mesh makes.
+    # And where the mesh preview is drawn, which Mesh makes.
     if "said" not in read["openEMS"]:
         preview, _ = openems_mesh_preview.refresh(analysis)
         read["preview"] = box(picks.placed(preview))

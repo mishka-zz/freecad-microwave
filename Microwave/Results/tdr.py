@@ -34,6 +34,7 @@ needs.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,18 +58,35 @@ from .sparameters import ResultError, SParameters
 #: refused anyway.
 INVENTED_BINS = 4
 
-#: The FFT window. It is one of the two things that decide what the trace can
-#: separate.
+#: Each window the band can be tapered with, as the coefficients of its cosine
+#: series: the weight at frequency ``f`` below the window's edge ``F`` is
+#: ``sum(a[k] * cos(pi * k * f / F))``, and nothing at or above the edge. Each
+#: is the right half of the periodic window scipy calls by the same name, so a
+#: band tapered to its own edge is tapered exactly as scikit-rf tapers it.
+WINDOWS = {
+    "hamming": (0.54, 0.46),
+    "hann": (0.5, 0.5),
+    "blackman": (0.42, 0.5, 0.08),
+    "boxcar": (1.0,),
+}
+
+#: The window the trace is drawn with. It is one of the two things that decide
+#: what the trace can separate, the edge being the other.
 #:
 #: The window trades the width of a transition against the sidelobes either
 #: side. A narrow window rings hard enough to carry ``|rho|`` past unity around
 #: a strong reflection, which turns samples of a trace into blanks. The window
-#: is fixed rather than offered, because a chart whose shape depends on an
-#: unseen setting is worse than one shape consistently applied. It stays a
-#: keyword so that tests can hold the trade.
+#: is fixed rather than offered, and the rise time is offered instead: a slower
+#: edge is what a reader asks for to match an instrument, and the window's name
+#: is not. It stays a keyword so that tests can hold the trade.
 WINDOW = "hamming"
 
-#: Length the spectrum is zero-padded to before the inverse transform.
+#: Where the rise time is read on the step: from this share of its height to
+#: the complement. A sampling scope quotes its edge the same way.
+RISE = 0.1
+
+#: Length the spectrum is zero-padded to at least, before the inverse
+#: transform.
 #:
 #: Padding interpolates and adds no information. It separates nothing that was
 #: not already separable, which
@@ -76,6 +94,13 @@ WINDOW = "hamming"
 #: short sweep spends only a few samples on the narrowest thing its bandwidth
 #: can resolve, and the trace reads as a chain of corners.
 SPECTRUM = 2048
+
+#: How many times the band's own length the spectrum is padded to at least. A
+#: rise time spans a fixed share of the record for a given number of points, so
+#: a long sweep padded to a fixed length draws its edges with too few samples
+#: to rise in the time stated. Padding in proportion keeps tens of samples on
+#: every rise whatever the sweep's length.
+PADDED = 16
 
 
 @dataclass(frozen=True)
@@ -106,6 +131,101 @@ class Trace:
     #: Impedance against time, in ohms; ``nan`` where the reflection reaches or
     #: passes unity. See :func:`_ohms` for why that is not clipped.
     impedance: np.ndarray
+    #: The window's edge, in hertz: the band above it was not read.
+    edge: float
+    #: The rise time the trace was drawn at, in seconds, as :func:`rise_time`
+    #: states it for :attr:`edge`.
+    rise: float
+
+
+def taper(frequency: np.ndarray, edge: float, window: str = WINDOW) -> np.ndarray:
+    """The weight ``window`` gives each of ``frequency`` below ``edge``: the
+    series in :data:`WINDOWS`, and zero at and above the edge."""
+    if window not in WINDOWS:
+        raise ValueError(f"no such window {window!r}; one of {', '.join(WINDOWS)}")
+    frequency = np.asarray(frequency, dtype=float)
+    weight = sum(
+        a * np.cos(np.pi * k * frequency / edge) for k, a in enumerate(WINDOWS[window])
+    ) * np.ones_like(frequency)
+    return np.where(frequency < edge, weight, 0.0)
+
+
+def _grid(frequency: np.ndarray) -> tuple[int, float]:
+    """How many points the band holds once extrapolated to DC, and the step
+    between them.
+
+    ``extrapolate_to_dc`` puts the band on an even grid from DC to its last
+    point, one point for each measured and one for each step under the first
+    (``_vendor/skrf/network.py``, ``Network.extrapolate_to_dc``). A band whose
+    first point is a whole number of steps above DC keeps its points, and any
+    other is moved onto the new grid.
+    """
+    frequency = np.asarray(frequency, dtype=float)
+    if frequency.size < 2:
+        raise ResultError(
+            f"cannot take a step response: the band holds {frequency.size} frequency "
+            "point(s), and a step response needs 2 or more"
+        )
+    if not np.all(np.isfinite(frequency)):
+        raise ResultError("cannot take a step response: some frequency points are not numbers")
+    step = float(np.median(np.diff(frequency)))
+    points = frequency.size + int(round(float(frequency[0]) / step))
+    return points, float(frequency[-1]) / (points - 1)
+
+
+def fastest(result: SParameters) -> float:
+    """The highest edge a window can have on ``result``'s band, in hertz: one
+    step past its last point, on the grid the band is transformed on. A window
+    there tapers the band as a window over every point would, and the trace has
+    the fastest rise the band allows."""
+    _, step = _grid(result.frequency)
+    return float(result.frequency[-1]) + step
+
+
+#: The fewest points of the band, DC among them, a window may taper. Fewer, and
+#: the rise time the window states is not the one the trace is drawn at.
+FEWEST = 4
+
+
+def slowest(result: SParameters) -> float:
+    """The edge a window has to stand above on ``result``'s band, in hertz, to
+    hold :data:`FEWEST` of its points from DC up: one step short of that many
+    steps of the grid the band is transformed on."""
+    _, step = _grid(result.frequency)
+    return (FEWEST - 1) * step
+
+
+@functools.cache
+def _rise_at_unit_edge(window: str) -> float:
+    """The rise time of ``window`` with its edge at one hertz, in seconds.
+
+    The step of a band tapered by ``window`` and nothing else, which is the
+    trace of a perfect short, read from :data:`RISE` of its height to the
+    complement. The band is sampled finely enough and padded long enough that
+    neither moves the reading, so the figure is the window's rather than any
+    grid's.
+    """
+    points = 1 << 12
+    padded = 1 << 20
+    frequency = np.arange(points) / points
+    impulse = np.fft.fftshift(np.fft.irfft(taper(frequency, 1.0, window), n=padded))
+    step = np.cumsum(impulse)
+    step /= step[-1]
+    time = (np.arange(padded) - padded // 2) * points / padded
+    return float(time[np.argmax(step >= 1 - RISE)] - time[np.argmax(step >= RISE)])
+
+
+def rise_time(edge: float, window: str = WINDOW) -> float:
+    """The rise time of a trace drawn with ``window`` ending at ``edge`` hertz,
+    in seconds. A rise time is inversely proportional to the edge, and the
+    constant is the window's."""
+    return _rise_at_unit_edge(window) / edge
+
+
+def edge_for(rise: float, window: str = WINDOW) -> float:
+    """The edge, in hertz, at which ``window`` draws a trace rising in ``rise``
+    seconds."""
+    return _rise_at_unit_edge(window) / rise
 
 
 def _ohms(reflection: np.ndarray, reference: float) -> np.ndarray:
@@ -151,12 +271,17 @@ def _reference_of(result: SParameters, port: int, chosen: float | None) -> tuple
     drive it rather than to change what it is measured against.
     """
     if port in result.unmeasured:
+        # Mirror symmetry derives the second column of a two-port only.
+        mirror = (
+            ", or, if the device is mirror-symmetric, set the study's Symmetry to Mirror "
+            "and run again"
+            if result.ports == 2
+            else ""
+        )
         raise ResultError(
-            f"cannot take a step response at port {port}: nobody drove it, so its "
-            f"column of the matrix holds no numbers. A time-domain solve drives "
-            f"one port per run - mark port {port} as an excitation source and "
-            "solve again, or declare the study symmetric so its column can be "
-            "derived from the port that was driven"
+            f"cannot take a step response at port {port}: the port was not driven, so "
+            f"its reflection holds no numbers. Set Driven to true on port {port} and "
+            f"run again{mirror}"
         )
     if chosen is not None:
         return float(chosen), False
@@ -188,11 +313,12 @@ def _one_port(result: SParameters, port: int, reference: float) -> Any:
     term = np.asarray(result.parameter(port, port), dtype=complex)
     if not np.all(np.isfinite(term)):
         blank = int((~np.isfinite(term)).sum())
+        # The transform reads the whole band at once, so a hole spreads across
+        # the entire trace.
         raise ResultError(
             f"cannot take a step response at port {port}: {blank} of "
-            f"{term.size} points of S{port}{port} hold no number. A transform "
-            "reads the whole band at once, so a hole in it spreads across the "
-            "entire trace rather than staying where it is"
+            f"{term.size} points of S{port}{port} hold no number, and a gap anywhere "
+            "in the band spoils the whole trace"
         )
     stored = np.asarray(result.reference, dtype=complex)[:, result.index_of(port)]
     skrf = _skrf.module()
@@ -202,9 +328,20 @@ def _one_port(result: SParameters, port: int, reference: float) -> Any:
         z0=stored.reshape(-1, 1),
         s_def="power",
     )
-    network.renormalize(reference, s_def="power")
+    try:
+        network.renormalize(reference, s_def="power")
+    except np.linalg.LinAlgError as error:
+        raise ResultError(
+            f"cannot take a step response at port {port}: its reflection cannot be "
+            f"renormalised to {reference:g} ohm at every point ({error})"
+        ) from error
     return network
 
+
+#: How far from a whole number of steps above DC the first point may be, as a
+#: share of a step. One per cent of a step moves no feature a reader could
+#: see.
+HARMONIC = 0.01
 
 #: How far the frequency steps may vary before the sweep is not uniform.
 #:
@@ -226,37 +363,66 @@ def _check_the_sweep(result: SParameters, port: int) -> None:
     frequency = np.asarray(result.frequency, dtype=float)
     if frequency.size < 2:
         raise ResultError(
-            f"cannot take a step response at port {port}: a transform needs more "
-            f"than {frequency.size} frequency point(s)"
+            f"cannot take a step response at port {port}: the band holds "
+            f"{frequency.size} frequency point(s), and a step response needs 2 or more"
+        )
+    if not np.all(np.isfinite(frequency)):
+        raise ResultError(
+            f"cannot take a step response at port {port}: some frequency points are not numbers"
         )
     steps = np.diff(frequency)
     step = float(np.median(steps))
     if step <= 0.0:
         raise ResultError(
-            f"cannot take a step response at port {port}: the frequency points "
-            "do not ascend, so they have no step to measure the band against"
+            f"cannot take a step response at port {port}: the frequency points do not rise"
         )
     if float(np.ptp(steps)) > UNIFORM * step:
+        # A transform reads its points as evenly spaced whatever they are, so
+        # the trace would be of a structure the solver was never asked about.
         raise ResultError(
             f"cannot take a step response at port {port}: the frequency points "
             f"are spaced between {steps.min() / 1e6:.4g} and "
-            f"{steps.max() / 1e6:.4g} MHz apart, and a transform reads them as "
-            "evenly spaced whatever they are - so the trace would be of a "
-            "structure the solver was never asked about. Sweep the band linearly"
+            f"{steps.max() / 1e6:.4g} MHz apart, and a step response needs a "
+            "linear sweep"
         )
     invented = float(frequency[0]) / step
-    if invented > INVENTED_BINS:
+    if invented > INVENTED_BINS * (1 + UNIFORM):
+        # A step response is carried by its low frequencies, so an invented
+        # band that wide replaces the answer instead of blurring it, and the
+        # trace that comes back looks ordinary.
         raise ResultError(
             f"cannot take a step response at port {port}: the sweep starts at "
-            f"{frequency[0] / 1e9:.4g} GHz, which is {invented:.0f} steps above "
-            f"DC, and everything below it would be invented rather than "
-            f"measured. A step response is carried by its low frequencies, so an "
-            f"invented band that wide replaces the answer instead of blurring "
-            f"it - and the trace that comes back looks perfectly ordinary. "
-            f"Sweep from near DC: with {frequency.size} points to "
-            f"{frequency[-1] / 1e9:.4g} GHz, start at about "
-            f"{frequency[-1] / frequency.size / 1e9:.4g} GHz"
+            f"{frequency[0] / 1e9:.4g} GHz, {invented:.3g} steps above DC, and the "
+            "band below it would be invented rather than measured. A step response "
+            f"needs a sweep {_harmonic(frequency, step)}"
         )
+
+    off = abs(invented - round(invented))
+    if off > HARMONIC:
+        # The band is moved onto a grid that holds DC by interpolating between
+        # its points, which lowers a narrow feature.
+        raise ResultError(
+            f"cannot take a step response at port {port}: the sweep starts "
+            f"{invented:.3g} steps above DC, which is not a whole number of steps, "
+            "so a narrow feature would come back lower than it was solved. A step "
+            f"response needs a sweep {_harmonic(frequency, step)}"
+        )
+
+
+def _harmonic(frequency: np.ndarray, step: float) -> str:
+    """The sweep that gives a low-pass step response over the band
+    ``frequency`` covers, said as a user sets it.
+
+    The step is kept and the band starts one step above DC, at the first point
+    of a grid holding DC. The step is what sets the record the trace is drawn
+    over, so a sweep keeping the point count instead would shorten the record
+    and could be refused next for wrapping.
+    """
+    points = int(np.ceil(float(frequency[-1]) / step - UNIFORM))
+    return (
+        f"from {step / 1e9:.6g} GHz to {points * step / 1e9:.6g} GHz in {points} "
+        f"points, {step / 1e6:.6g} MHz apart"
+    )
 
 
 def step_response(
@@ -264,8 +430,9 @@ def step_response(
     port: int,
     *,
     reference: float | None = None,
+    edge: float | None = None,
     window: str = WINDOW,
-    spectrum: int = SPECTRUM,
+    spectrum: int | None = None,
 ) -> Trace:
     """The reflection at ``port`` against time, and the impedance it implies.
 
@@ -278,6 +445,9 @@ def step_response(
     The sweep is extrapolated to DC before transforming, as a reflectometer
     built on a swept measurement does, so nothing here asks the solver for zero
     hertz. :data:`INVENTED_BINS` is the bar the extrapolation is held to.
+
+    ``spectrum`` is the length the band is padded to, and the larger of
+    :data:`SPECTRUM` and :data:`PADDED` times the band where it is ``None``.
     """
     # First, because nothing changes it. A reflection is moved onto another
     # impedance from the one it was measured against, so a port the solver
@@ -288,7 +458,7 @@ def step_response(
     if stated.size and not np.isfinite(stated).any():
         raise ResultError(
             f"cannot take a step response at port {port}: the solver states no "
-            "impedance for it, so there is nothing to measure its reflection against"
+            "impedance for it, so its reflection has no reference"
         )
     _check_the_sweep(result, port)
     ohms, measured = _reference_of(result, port, reference)
@@ -298,12 +468,34 @@ def step_response(
             f"against {ohms:g} ohm, and a reflection coefficient needs a "
             "positive one"
         )
+    allowed = fastest(result)
+    if edge is None:
+        edge = allowed
+    elif not edge > 0.0:
+        raise ValueError(f"a window's edge is a frequency above zero, not {edge!r}")
+    elif edge > allowed * (1 + UNIFORM):
+        raise ResultError(
+            f"cannot take a step response at port {port} rising in "
+            f"{rise_time(edge, window) * 1e12:.4g} ps: a sweep to "
+            f"{result.frequency[-1] / 1e9:.6g} GHz rises in "
+            f"{rise_time(allowed, window) * 1e12:.4g} ps at the fastest. That rise "
+            "time needs a sweep to a higher frequency"
+        )
+    if edge <= slowest(result):
+        _, step = _grid(result.frequency)
+        raise ResultError(
+            f"cannot take a step response at port {port} rising in "
+            f"{rise_time(edge, window) * 1e12:.3g} ps: at that rise time the window "
+            f"covers fewer than {FEWEST} points of a band with a {step / 1e6:.4g} MHz "
+            "step, so the trace would not rise in the stated time. That rise time "
+            "needs a finer frequency step"
+        )
     network = _one_port(result, port, ohms)
     extrapolated = network.extrapolate_to_dc(kind="linear")
-    time, reflection = extrapolated.step_response(
-        window=window, pad=max(0, spectrum - len(extrapolated))
-    )
-    reflection = np.asarray(reflection).ravel()
+    if spectrum is None:
+        spectrum = max(SPECTRUM, PADDED * len(extrapolated))
+    _check_the_record(extrapolated, port, window, spectrum)
+    time, reflection = _drawn(extrapolated, edge, window, spectrum)
     return Trace(
         port=port,
         reference=ohms,
@@ -311,6 +503,8 @@ def step_response(
         time=np.asarray(time).ravel(),
         reflection=reflection,
         impedance=_ohms(reflection, ohms),
+        edge=float(edge),
+        rise=rise_time(edge, window),
     )
 
 
@@ -338,31 +532,33 @@ def velocity(result: SParameters, receiving: int, driving: int, separation: floa
     if not np.all(np.isfinite(term)):
         raise ResultError(
             f"cannot measure a velocity: S{receiving}{driving} holds points that "
-            "are not numbers, and a phase slope is taken across the whole band"
+            "are not numbers, and the phase slope is taken across the whole band"
         )
     if separation <= 0.0:
         raise ResultError(
             f"cannot measure a velocity: the ports are {separation:g} m apart, "
-            "and the two reference planes have to be at different places"
+            "and their reference planes need to be at different places"
         )
     band = float(frequency[-1] - frequency[0])
     if band <= 0.0:
+        # A delay is the phase divided by the band it turned through.
         raise ResultError(
             f"cannot measure a velocity: the sweep runs from "
-            f"{frequency[0] / 1e9:.4g} GHz to {frequency[-1] / 1e9:.4g} GHz, and "
-            "a delay is the phase divided by the band it turned through. Sweep "
-            "a band, from its bottom to its top"
+            f"{frequency[0] / 1e9:.4g} GHz to {frequency[-1] / 1e9:.4g} GHz, so "
+            "there is no band to take the phase slope over. Sweep a band from a "
+            "lower to a higher frequency"
         )
 
     phase = np.unwrap(np.angle(term))
     delay = float(phase[0] - phase[-1]) / (2 * np.pi * band)
     if delay <= 0.0 or separation / delay > SPEED_OF_LIGHT:
+        # Unwrapping a phase that turns more than half a turn between adjacent
+        # points folds the delay down onto a shorter one.
         raise ResultError(
             f"cannot measure a velocity: the phase of S{receiving}{driving} puts "
-            f"{separation:g} m at {delay * 1e12:.1f} ps, which is not a speed "
-            "anything travels at. The phase turns more than half a turn between "
-            "adjacent frequency points, so unwrapping it folds the delay down "
-            "onto a shorter one. Sweep the band with more points"
+            f"{separation:g} m at {delay * 1e12:.1f} ps, which is not a physical "
+            "speed, because the phase turns more than half a turn between adjacent "
+            "frequency points. Sweep the band with more points"
         )
     return separation / delay
 
@@ -374,3 +570,88 @@ def distance(trace: Trace, speed: float) -> np.ndarray:
     length, and the units do not show it.
     """
     return 0.5 * speed * np.asarray(trace.time, dtype=float)
+
+
+#: How far the trace before the reference plane may reach, as a share of the
+#: largest reflection drawn, before the trace is refused. A solve leaves a
+#: floor there of its own that a finer step does not lower, so the bar stands
+#: well above it: what it catches is a response that runs past the end of the
+#: trace by a share a reader would see on a chart scaled to the trace.
+RINGING = 1 / 10
+
+#: How many rise times before the reference plane the window's own skirt is
+#: left out of that reading. Past it the window's ripple on an edge is a small
+#: fraction of :data:`RINGING`.
+SKIRT = 3
+
+
+def _drawn(band: Any, edge: float, window: str, spectrum: int) -> tuple[np.ndarray, np.ndarray]:
+    """The step response of ``band`` tapered by ``window`` up to ``edge``, as
+    ``(time, reflection)``, padded to ``spectrum`` points."""
+    tapered = band.copy()
+    tapered.s = tapered.s * taper(tapered.f, edge, window).reshape(-1, 1, 1)
+    time, reflection = tapered.step_response(window=None, pad=max(0, spectrum - len(tapered)))
+    return np.asarray(time, dtype=float).ravel(), np.asarray(reflection).ravel().real
+
+
+def _check_the_record(extrapolated: Any, port: int, window: str, spectrum: int) -> None:
+    """Refuse a trace whose response runs past its end.
+
+    A sweep a step apart holds one over the step of round trip. The transform
+    puts its second half before the reference plane, and the step response
+    sums from the start of that half: whatever the structure returns past half
+    the record is added to the whole trace, and past the whole record it is
+    folded onto its start. A passive structure puts nothing before the plane,
+    so the trace there, past the window's own skirt, is the response running
+    past the end of the trace. The band's fastest edge is read, whatever edge
+    the trace is drawn at: whether the record holds the response is a fact
+    about the sweep.
+
+    The advice reads how fast the response dies away over the two quarters of
+    the record before the plane, and halves the step until that rate would take
+    what runs past the end under the bar.
+    """
+    step = float(extrapolated.f[1] - extrapolated.f[0])
+    record = 1.0 / step
+    edge = float(extrapolated.f[-1]) + step
+    time, trace = _drawn(extrapolated, edge, window, spectrum)
+    before = time <= -SKIRT * rise_time(edge, window)
+    after = time >= 0.0
+    largest = float(np.abs(trace[after]).max())
+    # A structure that reflects nothing draws rounding alone, and a share of
+    # rounding says nothing about when the response ends.
+    if not before.any() or largest <= np.finfo(float).eps * len(extrapolated):
+        return
+    runs = float(np.abs(trace[before]).max()) / largest
+    if runs <= RINGING:
+        return
+    # Nothing passive reflects before the reference plane, so a trace there is
+    # the response running past the end of the record.
+    said = (
+        f"cannot take a step response at port {port}: the trace before the "
+        f"reference plane reaches {runs:.0%} of the largest reflection, because the "
+        f"response runs past {record * 0.5e9:.3g} ns of round trip, where the trace "
+        f"a {step / 1e6:.6g} MHz step holds ends, and what it returns later is drawn "
+        "on the trace. "
+    )
+    impulse = np.abs(np.gradient(trace, time))
+    first = time < -record / 4
+    second = (time >= -record / 4) & before
+    early = float(impulse[first].max()) if first.any() else 0.0
+    late = float(impulse[second].max()) if second.any() else early
+    if early <= late:
+        raise ResultError(
+            said + "It is not dying away inside the record, so the step that would "
+            "hold it cannot be estimated. Each halving of the frequency step doubles "
+            "the record"
+        )
+    # The response falls by late / early over a quarter of the record. After k
+    # halvings of the step the trace ends 2 ** (k + 1) - 2 quarters later.
+    quarters = np.log(RINGING / runs) / np.log(late / early)
+    halvings = max(1, int(np.ceil(np.log2((quarters + 2) / 2))))
+    finer = step / 2**halvings
+    raise ResultError(
+        said + f"A step of {finer / 1e6:.6g} MHz, "
+        f"{int(np.ceil(float(extrapolated.f[-1]) / finer))} points to the same top "
+        "frequency, holds it if it keeps dying away as it does inside this record"
+    )

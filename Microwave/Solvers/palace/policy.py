@@ -10,7 +10,7 @@ the profile the tetrahedral mesher is given.
 
 It also refuses, by name, what the study asks for and this backend cannot do,
 and it states what an open study's outer surface does to a radiated wave before
-the run starts. There is no absorbing layer here. An ``Air`` face is met by air
+the run starts. There is no absorbing layer here. An ``Open`` face is met by air
 the adapter reserves round the structure, with an absorbing condition on its
 outer sides, and that condition reflects a share of a wave the structure
 radiates which the distance, the band and the angle the wave meets it at decide.
@@ -40,12 +40,17 @@ from ..medium import said as medium_said
 from ..properties import label, value
 from .config import Sweep
 from .problem import (
+    FLOORED,
+    SETTLED,
+    UNREFINED,
     Coarsening,
     Conductor,
     CountAcross,
     Creases,
     Floored,
     Joined,
+    Narrow,
+    Narrowed,
     Refinement,
     RegionCount,
     Relaxed,
@@ -58,15 +63,18 @@ from .problem import (
 )
 
 __all__ = [
-    "AIR",
+    "ACROSS",
+    "OPEN_FACE",
     "DISCRETE",
     "FACES",
+    "FLOOR",
     "PROFILE",
     "SWEEPS",
     "THROUGH",
     "band",
     "demand",
     "element_size",
+    "floor",
     "joining",
     "one_metal",
     "reserving",
@@ -88,16 +96,16 @@ SIDES = ("Min", "Max")
 #: Every face of the domain, spelt the way a per-face property name spells it.
 FACES = tuple(f"{axis}{side}" for axis in AXIS_NAMES for side in SIDES)
 
-#: The padding values. ``Air`` says there is free space beyond the structure on
+#: The padding values. ``Open`` says there is free space beyond the structure on
 #: that face, and a study saying it on any face is open. ``Through`` says the
-#: structure runs out through the absorber, and ``Ends`` that the domain ends
+#: structure runs out through the absorber, and ``PEC Wall`` that the domain ends
 #: where the structure does.
 #:
 #: Stated again here rather than imported, because ``Objects/mesh.py`` sits
 #: behind ``import FreeCAD``. A test holds the copies together.
-AIR = "Air"
+OPEN_FACE = "Open"
 THROUGH = "Through"
-ENDS = "Ends"
+PEC_WALL_FACE = "PEC Wall"
 
 #: How a sweep reaches the points across the band, as the solver object offers
 #: them. Stated again here for the reason the padding words above are.
@@ -126,6 +134,17 @@ PROFILE = Profile(top=3, element_order=2, curved=True, written="msh22", connecte
 #: names the labels holding the elements it turned inside out.
 FLOOR = 100.0
 
+#: How many elements are laid between two edges of a sheet of metal that face
+#: each other across it, or across a slot in it, where the size at its edges
+#: would lay fewer. The field is singular along both edges, and a strip's
+#: impedance is set by the field across its width, so a strip that the size at
+#: its edges spans in one element is a line the mesh does not resolve. The
+#: published low-pass gate on Palace holds the count: it doubles it and asks that
+#: the corner move less than the measurement is read to. A lower order leaves
+#: more to the count, and a Mesh Refinement at the edges lays a finer size where
+#: wanted.
+ACROSS = 4
+
 
 def band(analysis: Any) -> Sweep:
     """The band the study is characterised over, and how many points across it.
@@ -136,7 +155,7 @@ def band(analysis: Any) -> Sweep:
     """
     start = value(analysis.FrequencyStart)
     stop = value(analysis.FrequencyStop)
-    points = int(analysis.NumFrequencyPoints)
+    points = int(analysis.FrequencyPoints)
     try:
         return Sweep(start=start, stop=stop, points=points)
     except ValueError as error:
@@ -152,15 +171,21 @@ def sweeping(sweep: Sweep) -> str:
     return (
         f"The {sweep.samples} points are answered by a reduced model built to a field "
         f"error of {sweep.adaptive.tolerance:g} from at most {sweep.adaptive.solves} full "
-        "solves for each driven port, and checked against the band solved again in full "
-        "where it is likeliest to be wrong"
+        "solves for each driven port, and checked against full solves at up to two points"
     )
 
 
 def opens(settings: Any) -> tuple[str, ...]:
     """The faces the mesh policy opens to free space, by ``{axis}{side}``. A study
     is open where there is one."""
-    return tuple(face for face in FACES if str(getattr(settings, f"Padding{face}")) == AIR)
+    return tuple(face for face in FACES if str(getattr(settings, f"Boundary{face}")) == OPEN_FACE)
+
+
+def floor(recipe: Any, bulk: float) -> float:
+    """The floor under every element, in millimetres: ``MinElementSize`` on the
+    recipe, or :data:`FLOOR` times finer than ``bulk``, the size in the slowest
+    region, where that is zero."""
+    return value(recipe.MinElementSize) or bulk / FLOOR
 
 
 def element_size(per_wavelength: float, stop: float, slowing: float) -> float:
@@ -193,33 +218,31 @@ def refusals(
         :func:`demand` passes the ones it does.
     """
     asked_on = label(recipe)
-    stated = label(settings)
     per_wavelength = value(recipe.ElementsPerWavelength)
     if per_wavelength <= 0:
         raise TranslationError(
-            f"{asked_on!r}: ElementsPerWavelength is {per_wavelength:.4g}, and an "
-            "element size is that many across a wavelength"
+            f"{asked_on!r}: ElementsPerWavelength is {per_wavelength:.4g}. Enter a value above 0"
         )
     bulk = element_size(per_wavelength, stop, slowest)
-    finest = value(settings.MinElementSize)
+    finest = value(recipe.MinElementSize)
     if finest < 0:
         raise TranslationError(
-            f"{stated!r}: MinElementSize is {finest:.4g} mm, and a floor on an "
-            "element size is a length or nothing at all"
+            f"{asked_on!r}: MinElementSize is {finest:.4g} mm. Enter 0 to derive it, or a "
+            "positive length"
         )
+    # Raising ElementsPerWavelength lowers the largest element, so only a lower
+    # MinElementSize lifts this.
     if finest and finest >= bulk:
         raise TranslationError(
-            f"{stated!r}: MinElementSize is {finest:.4g} mm and the largest element "
-            f"the band and the ElementsPerWavelength on {asked_on!r} allow is "
-            f"{bulk:.4g} mm, so the floor stands above the ceiling and every "
-            "element would be the coarsest one. Lower MinElementSize, or raise "
-            "ElementsPerWavelength"
+            f"{asked_on!r}: MinElementSize is {finest:.4g} mm, at or above the {bulk:.4g} mm "
+            "largest element the band and ElementsPerWavelength allow, so every element "
+            "would be the largest one. Lower MinElementSize"
         )
     per_turn = int(recipe.ElementsPerTurn)
     if per_turn < 0:
         raise TranslationError(
-            f"{asked_on!r}: ElementsPerTurn is {per_turn}, and it counts elements "
-            "round a full turn of a curved surface, or is zero for none"
+            f"{asked_on!r}: ElementsPerTurn is {per_turn}. Enter 0 for none, or a count of "
+            "elements round a full turn of a curved surface"
         )
     _check_through_is_bounded(settings, bounded, reserving)
     _check_the_surface_is_not_held_to_a_distance(settings)
@@ -240,6 +263,7 @@ def demand(
     medium: float = 1.0,
     wall: str = "",
     mirrors: Sequence[str] = (),
+    narrow: Sequence[Narrow] = (),
 ) -> Demand:
     """The element size asked for, in millimetres, from both objects that say.
 
@@ -273,6 +297,9 @@ def demand(
     on a magnetic wall, one of the ``mirrors``, is the room and its reflection,
     and opens twice as wide. Each refinement region set to refine, and finer
     than the bulk, sizes each thing it names where that thing is.
+    Where two edges of a sheet face each other across it, or across a slot in
+    it, closer than :data:`ACROSS` times the size at the rim, each of the two is
+    laid at their distance apart over :data:`ACROSS`, each of the ``narrow``.
     ``MaxGrowthRatio`` is how fast either grows back to the bulk size.
 
     :param settings: the mesh policy.
@@ -312,7 +339,7 @@ def demand(
 
     bulk = size(slowest)
     coarsest = size(medium) if reserving else bulk
-    finest = value(settings.MinElementSize) or bulk / FLOOR
+    finest = floor(recipe, bulk)
     per_turn = int(recipe.ElementsPerTurn)
     places = [
         *_at_rims(recipe, bulk, finest, rims, coarsened),
@@ -322,15 +349,16 @@ def demand(
             if size(slowing) < coarsest
         ),
         *_at_marks(coarsest, finest, refinements),
+        *_across(recipe, bulk, finest, narrow, coarsened),
     ]
     if not places:
         return Demand(coarsest=coarsest, finest=finest, per_turn=per_turn)
     growth = value(recipe.MaxGrowthRatio)
     if not (math.isfinite(growth) and growth > 1.0):
         raise TranslationError(
-            f"{asked_on!r}: MaxGrowthRatio is {growth:.4g}, and a finer size at an edge or "
-            "in a refinement region grows back to the bulk size by that ratio, which "
-            "at 1 or less never grows. Raise MaxGrowthRatio above 1"
+            f"{asked_on!r}: MaxGrowthRatio is {growth:.4g}, so a finer size at an edge or in "
+            "a refinement region never grows back to the bulk size. Raise MaxGrowthRatio "
+            "above 1"
         )
     return Demand(
         coarsest=coarsest,
@@ -356,7 +384,7 @@ def _at_rims(
 
     A refinement of one asks for the bulk size, which is no place at all, and
     one below it asks for edges coarser than open space - which the other backend
-    refuses in the same words. A rim finer than the floor is laid at the floor,
+    refuses as well. A rim finer than the floor is laid at the floor,
     which is as fine as the policy lets any element be, and :func:`unlaid`
     states it.
 
@@ -366,12 +394,12 @@ def _at_rims(
     """
     subject = label(recipe)
     refinement = value(recipe.EdgeRefinement)
+    # Edges carry the field singularity that sets a line's impedance, so they
+    # need the finer mesh and never the coarser one.
     if not refinement >= 1:
         raise TranslationError(
-            f"{subject!r}: EdgeRefinement is {refinement:g}, so conductor edges would be "
-            "meshed more coarsely than open space. Edges carry the field singularity that "
-            "sets a line's impedance; they need the finer mesh, not the coarser one. Use 1 "
-            "for no refinement"
+            f"{subject!r}: EdgeRefinement is {refinement:g}, so conductor edges are meshed "
+            "more coarsely than open space. Enter 1 or more, where 1 means no refinement"
         )
     if refinement == 1 or not rims:
         return []
@@ -381,6 +409,35 @@ def _at_rims(
         settled = max(size, coarsened.get(rim, 0.0))
         if settled < coarsest:
             places.append(AtRim(name=rim, label=rim, size=settled, reentrant=True))
+    return places
+
+
+def _across(
+    recipe: Any,
+    bulk: float,
+    finest: float,
+    narrow: Sequence[Narrow],
+    coarsened: Mapping[str, float] = MappingProxyType({}),
+) -> list[Place]:
+    """One place at each edge of a sheet of metal facing another closer than
+    :data:`ACROSS` times the size at the rim, at their distance apart over
+    :data:`ACROSS`, and never below ``MinElementSize``.
+
+    It is a refinement of the edges of metal, so a refinement of one lays none of
+    it, as it lays no rim. A coarsening that names a metal whole settles these
+    edges as it settles its rim: none is laid finer than the size it settles
+    for, and where that is no finer than the rim, none is laid.
+    """
+    refinement = value(recipe.EdgeRefinement)
+    if not refinement > 1:
+        return []
+    rim = max(bulk / refinement, finest)
+    places: list[Place] = []
+    for one in narrow:
+        settled = coarsened.get(one.rim, 0.0)
+        size = max(one.apart / ACROSS, finest, settled)
+        if size < rim:
+            places.append(Near(name=one.mark.name, label=one.mark.name, size=size))
     return places
 
 
@@ -419,6 +476,8 @@ def unlaid(
     relaxed: Sequence[Relaxed] = (),
     opened: bool = False,
     unfilled: str = "",
+    narrow: Sequence[Narrow] = (),
+    bodies: Sequence[tuple[str, float]] = (),
 ) -> tuple[Unlaid, ...]:
     """What the document states about element sizes that this backend does not lay
     as stated.
@@ -441,6 +500,11 @@ def unlaid(
         what ``Clearance`` measures from. A closed study lays none of it.
     :param unfilled: the medium's name where the study links one and its drawing
         leaves it no room, and empty otherwise.
+    :param narrow: each edge of a sheet of metal facing another closer than
+        :data:`ACROSS` times the size at the rim, or the size in the slowest
+        region where no rim is laid.
+    :param bodies: each label of metal drawn as bodies, with the middle side of
+        the box round it.
     """
     subject = label(settings)
     asked_on = label(recipe)
@@ -450,9 +514,9 @@ def unlaid(
         found.append(Unreserved(subject=subject, clearance=stated))
     if unfilled:
         found.append(Unfilled(subject=subject, medium=unfilled))
-    count = int(settings.MinElementsAcross)
+    count = int(recipe.MinElementsAcross)
     if count > 0 and regions:
-        found.append(CountAcross(subject=subject, count=count, labels=tuple(regions)))
+        found.append(CountAcross(subject=asked_on, count=count, labels=tuple(regions)))
     refinement = value(recipe.EdgeRefinement)
     edge = (asked.coarsest if bulk is None else bulk) / refinement
     laid = {place.name for place in asked.places}
@@ -472,6 +536,9 @@ def unlaid(
     found.extend(
         replace(one, edge=max(edge, asked.finest) if refinement > 1 else None) for one in relaxed
     )
+    narrowed = _narrowed_record(asked_on, refinement, edge, asked, narrow, bodies, relaxed)
+    if narrowed is not None:
+        found.append(narrowed)
     for region in refinements:
         if region.coarsens:
             if region.part or region.bodies:
@@ -501,7 +568,7 @@ def unlaid(
                 Floored(
                     subject=region.label,
                     size=region.size,
-                    policy=subject,
+                    settings=asked_on,
                     floor=asked.finest,
                     places=tuple(mark.name for mark in region.marks),
                 )
@@ -515,6 +582,61 @@ def unlaid(
                 )
             )
     return tuple(found)
+
+
+def _narrowed_record(
+    subject: str,
+    refinement: float,
+    edge: float,
+    asked: Demand,
+    narrow: Sequence[Narrow],
+    bodies: Sequence[tuple[str, float]],
+    relaxed: Sequence[Relaxed],
+) -> Narrowed | None:
+    """Where the count across a narrow sheet is laid, where it is not and why,
+    and the metal drawn as bodies narrow enough to want it, or nothing where none
+    of those is."""
+    rim = max(edge, asked.finest) if refinement > 1 else edge
+    sizes = {place.name: place.size for place in asked.places}
+    settled = {one.rim: one.size for one in relaxed}
+    least: dict[tuple[str, str], tuple[float, float]] = {}
+    for one in narrow:
+        if one.mark.name in sizes:
+            continue
+        if refinement <= 1:
+            why, size = UNREFINED, rim
+        elif one.rim in settled:
+            why, size = SETTLED, max(settled[one.rim], rim)
+        else:
+            why, size = FLOORED, rim
+        if one.apart >= ACROSS * size:
+            continue
+        key = (one.drawn, why)
+        if key not in least or one.apart < least[key][0]:
+            least[key] = (one.apart, size)
+    narrowed = Narrowed(
+        subject=subject,
+        refinement=refinement,
+        across=ACROSS,
+        rim=rim,
+        laid=tuple(
+            (one.mark.name, one.apart, sizes[one.mark.name])
+            for one in narrow
+            if one.mark.name in sizes
+        ),
+        unlaid=tuple((drawn, apart, size, why) for (drawn, why), (apart, size) in least.items()),
+        settled=tuple(
+            (rim_label, size)
+            for rim_label, size in settled.items()
+            if any(one.rim == rim_label for one in narrow)
+        )
+        if refinement > 1
+        else (),
+        bodies=tuple((name, side) for name, side in bodies if side < ACROSS * rim),
+    )
+    if not (narrowed.laid or narrowed.unlaid or narrowed.bodies):
+        return None
+    return narrowed
 
 
 def said(records: Sequence[Unlaid], mesh: Mesh) -> list[str]:
@@ -536,17 +658,16 @@ def said(records: Sequence[Unlaid], mesh: Mesh) -> list[str]:
             lines.append(_floored(record, mesh))
         elif isinstance(record, Unreserved):
             lines.append(
-                f"{record.subject!r}: Clearance {record.clearance:.4g} mm lays nothing. It is "
-                "how far the room this solver reserves reaches past the structure on an "
-                f"{AIR} face, and no face of this study is {AIR}, so the domain is flush with "
-                "the structure on every face and each face of it is a perfect wall. Set a face "
-                f"to {AIR} to reserve that space"
+                f"{record.subject!r}: Clearance {record.clearance:.4g} mm has no effect, since "
+                f"no Boundary is {OPEN_FACE}: every face of the domain is a perfect wall flush "
+                f"with the structure. Set a Boundary to {OPEN_FACE} to reserve that space"
             )
+        elif isinstance(record, Narrowed):
+            lines.extend(_narrowed(record, mesh))
         elif isinstance(record, Unfilled):
             lines.append(
-                f"{record.subject!r}: Medium {record.medium!r} fills nothing. Every room in "
-                "the domain is drawn and bound or closed off by metal, so no space is left "
-                "for it"
+                f"{record.subject!r}: Medium {record.medium!r} fills nothing, since every room "
+                "in the domain is drawn and bound or closed off by metal"
             )
         else:
             lines.extend(_creases(record, mesh))
@@ -563,20 +684,21 @@ def _coarsening(record: Coarsening, mesh: Mesh) -> str:
             + (f" (drawn with {_listed([repr(one) for one in others])})" if others else "")
             for label, others in zip(record.part, record.joined, strict=True)
         ]
+        # The rim of metal settles for a coarser size only where every face each
+        # binding drawn under its label names is coarsened.
         parts.append(
-            f"it names some faces of {_listed(named)} and not all, and the rim of metal "
-            "settles for a coarser size only where every face each binding drawn under its "
-            "label names is coarsened"
+            f"it names only some faces of {_listed(named)}, and metal is coarsened only "
+            "where every face of each of its bindings is named"
         )
     if record.bodies:
         parts.append(
             f"it names what {_listed([repr(one) for one in record.bodies])} is made of, "
-            "whose size is the one everywhere"
+            "which is meshed at the size everywhere"
         )
     return (
-        f"{record.subject!r}: Mode Coarsen at {record.size:.4g} mm is not laid where "
-        f"{'; and where '.join(parts)}. What it names there is meshed as though the "
-        f"region were not there, and the elements run {_run(mesh.edges)}"
+        f"{record.subject!r}: Mode Coarsen at {record.size:.4g} mm has no effect where "
+        f"{'; and where '.join(parts)}, so what it names there is meshed as though the "
+        f"region were absent. The elements run {_run(mesh.edges)}"
     )
 
 
@@ -603,12 +725,12 @@ def _relaxed(record: Relaxed, mesh: Mesh) -> str:
     elif reached is None:
         said = (
             f"{subject} lays no size at the rim of {record.rim!r} rather than "
-            f"{record.edge:.4g} mm, since it is no finer than the size everywhere"
+            f"{record.edge:.4g} mm, since that is no finer than the size everywhere"
         )
     elif not reached.laid:
         return (
-            f"{subject} lays nothing at {record.rim!r}, since the room turns round none of "
-            "its edges by more than half a turn"
+            f"{subject} lays nothing at {record.rim!r}, since none of its edges is a free or "
+            "re-entrant edge"
         )
     elif reached.asked > record.edge:
         said = (
@@ -624,7 +746,7 @@ def _relaxed(record: Relaxed, mesh: Mesh) -> str:
         said += (
             f". {_listed([f'{name!r} at {size:.4g} mm' for name, size in record.refined])} "
             f"{'refines' if len(record.refined) == 1 else 'refine'} some of the same metal "
-            "finer, and where a finer size is laid it is the one the elements follow"
+            "finer, and the finer size holds where it is laid"
         )
     said += f". Its edges are {record.length:.4g} mm long"
     if reached is not None and reached.laid and reached.extent:
@@ -636,8 +758,8 @@ def _relaxed(record: Relaxed, mesh: Mesh) -> str:
         else:
             said += (
                 f", and they come within {gap:.4g} mm of {other!r}. A gap between them is "
-                "meshed as the rim is where the rim is laid, and the other backend keeps it "
-                "at its own size"
+                "meshed at the rim's size where the rim is laid, and openEMS keeps it at its "
+                "own size"
             )
     return said
 
@@ -647,25 +769,25 @@ def _run(edges: Edges) -> str:
 
 
 def _count_across(record: CountAcross, mesh: Mesh) -> list[str]:
-    """A line for each region the policy's count is asked of."""
+    """A line for each region the mesh settings' count is asked of."""
     lines = []
     for name in record.labels:
         held = mesh.labels.get(name)
         if held is None:
             continue
         edges = held.edges or mesh.edges
+        # An element size here is the same along every axis, so a count across
+        # the body's thinnest extent would fill the whole body at that size.
         line = (
-            f"{record.subject!r}: MinElementsAcross {record.count} is not laid in {name!r}. "
-            "An element size here is the same along every axis, so a count across the "
-            "body's thinnest extent would fill the whole body at that size. Its elements "
-            f"run {_run(edges)}"
+            f"{record.subject!r}: MinElementsAcross {record.count} is not laid in {name!r}, "
+            f"since a Palace element is the same size along every axis. Its elements run "
+            f"{_run(edges)}"
         )
         if held.lower is not None and held.upper is not None:
             side = min(high - low for low, high in zip(held.lower, held.upper, strict=True))
             line += f", and the smallest side of the box round it is {side:.4g} mm"
         lines.append(
-            line + ". A Mesh Refinement lays its ElementSize at what it references, and "
-            "throughout a body it references"
+            line + ". A Mesh Refinement on the body lays its ElementSize throughout the body"
         )
     return lines
 
@@ -689,10 +811,9 @@ def _measured(name: str, mesh: Mesh) -> str:
 def _region_count(record: RegionCount, mesh: Mesh) -> list[str]:
     """A line for each thing a refinement region's count is asked of."""
     return [
-        f"{record.subject!r}: MinElementsAcross {record.count} is not laid. An element "
-        "size here is the same along every axis, so its ElementSize is laid at what it "
-        f"references instead: {_measured(name, mesh)}, and the smallest side of the box "
-        f"round it is {side:.4g} mm"
+        f"{record.subject!r}: MinElementsAcross {record.count} is not laid, since a Palace "
+        "element is the same size along every axis, and its ElementSize is laid instead: "
+        f"{_measured(name, mesh)}, and the smallest side of the box round it is {side:.4g} mm"
         for name, side in record.places
     ]
 
@@ -701,16 +822,13 @@ def _unrefining(record: Unrefining, mesh: Mesh) -> str:
     """A refinement region no finer than the size everywhere, said with the elements
     the mesh holds."""
     line = (
-        f"{record.subject!r}: ElementSize {record.size:.4g} mm is not laid. "
-        f"ElementsPerWavelength on {record.recipe!r} asks for {record.coarsest:.4g} mm "
-        "everywhere, which is no coarser, and a size here refines and never coarsens. The "
+        f"{record.subject!r}: ElementSize {record.size:.4g} mm is not laid, since "
+        f"ElementsPerWavelength on {record.recipe!r} already asks for "
+        f"{record.coarsest:.4g} mm everywhere and a refinement never coarsens. The "
         f"elements run {_run(mesh.edges)}"
     )
     if record.count:
-        line += (
-            f". Its MinElementsAcross {record.count} is not laid either, since an element "
-            "size here is the same along every axis"
-        )
+        line += f". Its MinElementsAcross {record.count} is not laid either"
     return line
 
 
@@ -719,10 +837,76 @@ def _floored(record: Floored, mesh: Mesh) -> str:
     each thing it names."""
     return (
         f"{record.subject!r}: ElementSize {record.size:.4g} mm is laid at "
-        f"{record.floor:.4g} mm, the floor under every element, which MinElementSize "
-        f"on {record.policy!r} sets or derives: "
+        f"{record.floor:.4g} mm, the floor MinElementSize on {record.settings!r} sets, or "
+        "derives where it is 0: "
         f"{'; '.join(_measured(name, mesh) for name in record.places)}"
     )
+
+
+def _narrowed(record: Narrowed, mesh: Mesh) -> list[str]:
+    """A line for the edges laid at the count across, one for each reason others
+    carry no finer size, and one for each body of metal as narrow."""
+    lines = []
+    # The edge an edge faces may be its own reflection in a lumped port's
+    # plane, which is a magnetic wall.
+    if record.laid:
+        lines.append(
+            f"{record.subject!r}: EdgeRefinement {record.refinement:g} lays "
+            f"{record.rim:.4g} mm at the edges of metal, which leaves fewer than "
+            f"{record.across} elements across a sheet or a gap in it narrower than "
+            f"{record.across * record.rim:.4g} mm. Each such edge is laid at its distance "
+            f"to the edge it faces over {record.across}, or at the floor or a coarsening's "
+            "size where that is coarser: "
+            + "; ".join(
+                f"{name!r} stands {apart:.4g} mm from the edge it faces and is laid at "
+                f"{size:.4g} mm, and {_measured(name, mesh)}"
+                for name, apart, size in record.laid
+            )
+        )
+    across = (
+        f"lay a Mesh Refinement at those edges with an ElementSize of their distance apart "
+        f"over {record.across}"
+    )
+    because = {
+        UNREFINED: (
+            f"EdgeRefinement {record.refinement:g} lays no size at the edges of metal",
+            f"Set EdgeRefinement above 1, or {across}",
+        ),
+        SETTLED: (
+            "a coarsening settles "
+            + ", ".join(f"{rim!r} at {size:.4g} mm" for rim, size in record.settled),
+            across[0].upper() + across[1:],
+        ),
+        FLOORED: (
+            "the edges of metal are laid at the floor MinElementSize sets, or derives "
+            "where it is 0",
+            "Set MinElementSize in the Palace mesh settings below each distance over "
+            f"{record.across}",
+        ),
+    }
+    for why, (said, remedy) in because.items():
+        held = [
+            (drawn, apart, size) for drawn, apart, size, reason in record.unlaid if reason == why
+        ]
+        if not held:
+            continue
+        lines.append(
+            f"{record.subject!r}: fewer than {record.across} elements lie across a sheet or "
+            f"a gap in it, since {said}: "
+            + "; ".join(
+                f"{drawn!r} {apart:.4g} mm across, {apart / size:.2g} times {size:.4g} mm"
+                for drawn, apart, size in held
+            )
+            + f". {remedy}"
+        )
+    lines.extend(
+        f"{record.subject!r}: {name!r} is drawn as bodies {side:.4g} mm across, about "
+        f"{side / record.rim:.2g} elements at the {record.rim:.4g} mm laid at its edges. The "
+        f"{record.across} elements across are laid on sheets only; lay a Mesh Refinement at "
+        "the body's edges for a finer size there"
+        for name, side in record.bodies
+    )
+    return lines
 
 
 def _creases(record: Creases, mesh: Mesh) -> list[str]:
@@ -746,8 +930,7 @@ def _creases(record: Creases, mesh: Mesh) -> list[str]:
     if floored:
         parts.append(
             f"asks for {record.size:.4g} mm at the edges of metal and is laid at "
-            f"{record.floor:.4g} mm, the floor under every element, which MinElementSize "
-            "sets or derives"
+            f"{record.floor:.4g} mm, the floor MinElementSize sets, or derives where it is 0"
         )
     if not record.rims and record.coarsened:
         parts.append(
@@ -760,20 +943,19 @@ def _creases(record: Creases, mesh: Mesh) -> list[str]:
         parts.append(f"is laid at the edges of {', '.join(repr(rim) for rim in refined)}")
     if bare:
         parts.append(
-            f"is laid at no edge of {', '.join(repr(rim) for rim in bare)}, since the room "
-            "turns round none of them by more than half a turn"
+            f"is laid at no edge of {', '.join(repr(rim) for rim in bare)}, since none of "
+            "them is a free or re-entrant edge"
         )
     if not record.rims:
         parts.append(f"the elements run {_run(mesh.edges)}")
+    # A free or re-entrant edge is one the room turns round by more than half a
+    # turn, where the field is singular.
     return [
         f"{record.subject!r}: EdgeRefinement {record.refinement:g} {', and '.join(parts)}. "
-        "What is refined is an edge of metal that the room turns round by more than half "
-        "a turn, where the field is singular: "
-        "the free edge of a sheet, a step, the edge of an iris. A corner the room stands "
-        "in, a flat seam and metal meeting metal are not refined. A Mesh Refinement set "
-        "to Coarsen naming a metal whole at the size everywhere lays nothing at its "
-        "edges, and the count of elements that mesh holds against this one's is what "
-        "they cost"
+        "It refines only edges where the field is singular: the free edge of a sheet, a "
+        "step, the edge of an iris, and not an inside corner, a flat seam or metal meeting "
+        "metal. A Mesh Refinement set to Coarsen that names a metal whole at the size "
+        "everywhere lays nothing at its edges"
     ]
 
 
@@ -799,36 +981,34 @@ def _check_through_is_bounded(
     stands there. ``bounded`` is which faces
     are bounded, and it is read off the study's own ports.
 
-    ``Air`` is not asked here. The adapter reserves free space beyond each
-    ``Air`` face, and nothing is read off another pipeline's recipe, so a study
+    ``Open`` is not asked here. The adapter reserves free space beyond each
+    ``Open`` face, and nothing is read off another pipeline's recipe, so a study
     losing the other pipeline's object does not change which problem this one
     solves.
     """
     through = [
         face
         for face in FACES
-        if str(getattr(settings, f"Padding{face}")) == THROUGH and face not in bounded
+        if str(getattr(settings, f"Boundary{face}")) == THROUGH and face not in bounded
     ]
     if not through:
         return
-    named = ", ".join(f"Padding{face}" for face in through)
-    # Air first, because it is the one answer the other backend takes as well:
-    # openEMS refuses a lumped port lying in a Through face.
+    named = ", ".join(f"Boundary{face}" for face in through)
+    # Open first, because it is the one answer the other backend takes as well:
+    # openEMS refuses a lumped port lying in a Through face. Open reserves free
+    # space beyond the face on both solvers, and in a study that reserves no
+    # air it also lets a lumped port's plane in that side end the model.
     remedy = (
-        f"Set each of those to {AIR}, which reserves free space beyond the face on both "
-        "solvers, or lay a lumped port whose elements lie in that side of the reserved air"
+        f"Set each to {OPEN_FACE}, lay a lumped port whose elements lie in that side of "
+        "the reserved air"
         if reserving
-        else f"Set each of those to {AIR}, which reserves free space beyond the face on both "
-        "solvers and honours a lumped port's plane in the side it lies in, or stand a "
-        "waveguide port across that face"
+        else f"Set each to {OPEN_FACE}, stand a waveguide port across that face"
     )
     raise TranslationError(
-        f"{label(settings)!r}: {named} says the structure runs out through the "
-        "absorber, and this solver builds none: where the model ends the boundary "
-        "carries a perfect wall, which reflects the whole wave the structure was "
-        f"meant to carry away. {remedy} - or set each of those to "
-        f"{ENDS}, which says the domain stops where the structure does and takes "
-        "the wall as the answer"
+        f"{label(settings)!r}: {named} {'is' if len(through) == 1 else 'are'} {THROUGH}, "
+        "and Palace builds no absorber, so the perfect wall where the model ends reflects "
+        f"the whole wave there. {remedy}, or set each to {PEC_WALL_FACE} to end the "
+        "domain at the structure"
     )
 
 
@@ -843,10 +1023,8 @@ def _check_the_surface_is_not_held_to_a_distance(settings: Any) -> None:
     tolerance = value(settings.CurveTolerance)
     if tolerance:
         raise TranslationError(
-            f"{label(settings)!r}: CurveTolerance is {tolerance:.4g} mm, and this "
-            "solver is not handed a curved surface as facets to hold to a distance - "
-            "it meshes the surface and carries its shape in the elements. Set "
-            "CurveTolerance to zero"
+            f"{label(settings)!r}: CurveTolerance is {tolerance:.4g} mm, which Palace does "
+            "not use, since it meshes curved surfaces directly. Set CurveTolerance to 0"
         )
 
 
@@ -943,9 +1121,8 @@ def joining(joined: Sequence[Joined]) -> list[str]:
         f"The room from {_point(room.least)} to {_point(room.most)} mm, "
         f"{room.thickness:.3g} mm thick between "
         f"{_listed([repr(one) for one in (room.into, *room.across)])}, "
-        f"is solved as part of {room.into!r}. It is the medium, {room.into!r} is of the "
-        "medium's own material, and the device is the same with the gap closed into it, "
-        "so no element as thin as the gap is laid"
+        f"is solved as part of {room.into!r}, which is of the study's medium, so no "
+        "element as thin as the gap is laid"
         for room in joined
     ]
 
@@ -994,37 +1171,38 @@ def reserving(reserved: Reserved, sweep: Sweep, unwalled: Sequence[Unwalled] = (
         lines.append(_surface(reserved, sweep))
     if reserved.overstated is not None:
         shape, stands = reserved.overstated
+        # The bound is exact for a face square to an axis and stands off a
+        # curved surface.
         lines.append(
-            f"The box is measured to the CAD kernel's bounding box of each bound shape, and "
-            f"that bound stands up to {stands:.4g} mm past the body of {shape!r}. It is exact "
-            "for a face square to an axis and stands off a curved surface, so an open side of "
-            "the box is that much further from the body than the clearance"
+            f"The reserved air is measured from FreeCAD's bounding box of each bound shape, "
+            f"which stands up to {stands:.4g} mm off the body of {shape!r}, so an open side "
+            "stands up to that much farther from the body than the clearance"
         )
+    # The field a line holds in the air meets a Through side squarely, and a
+    # magnetic wall ends the line there as the port's plane does.
     for one in reserved.magnetic:
         lines.append(
             f"The air beside the lumped ports' faces in {one.side} is a magnetic wall, as "
-            f"each port's plane is: {one.area:.4g} mm^2 of that {one.whole:.4g} mm^2 side. The "
-            "field a line holds in the air meets the side squarely, and a magnetic wall ends "
-            "the line there as the plane does. A wave radiated onto it is reflected, and no "
-            "figure stated here counts it"
+            f"each port's plane is: {one.area:.4g} mm^2 of that {one.whole:.4g} mm^2 side. It "
+            "reflects any wave radiated onto it, and no figure stated here counts that"
         )
     for one in reserved.walled:
         lines.append(
             f"{one.side} of the reserved air is a perfect conductor over {one.area:.4g} mm^2 "
-            f"of its {one.whole:.4g} mm^2, which the drawing does not cover: the side is as wide "
-            f"as the box, and Padding{one.side} says the domain ends there. The field has to "
-            "meet something at the side. Draw the conductor out to the edge of the air to make "
-            f"that wall the drawing's, or set Padding{one.side} to {AIR} to open the side instead"
+            f"of its {one.whole:.4g} mm^2 that the drawing does not cover, because "
+            f"Boundary{one.side} ends the domain there. Draw the conductor out to the edge of "
+            f"the air, or set Boundary{one.side} to {OPEN_FACE}"
         )
     for room in reserved.sealed:
         if room.stands_off:
+            # The box is built on a bound that stands off a curved face, on a side
+            # the domain ends on the structure.
             lines.append(
                 f"The room from {_point(room.least)} to {_point(room.most)} mm, "
-                f"{room.volume:.4g} mm^3, is left out of the model: it lies between "
+                f"{room.volume:.4g} mm^3, between "
                 f"{_listed([repr(one) for one in room.bounded_by] or ['the drawing'])} and "
-                "the box, which is built on a bound standing off a curved face, on a side the "
-                "domain ends on the structure. The model ends on the drawing there, which "
-                "carries the wall"
+                "the bounding box of a curved face, is left out of the model. The model ends "
+                "on the drawing there, which carries the wall"
             )
             continue
         closing = [repr(one) for one in room.bounded_by]
@@ -1033,23 +1211,22 @@ def reserving(reserved: Reserved, sweep: Sweep, unwalled: Sequence[Unwalled] = (
             closing.append(f"the domain's {sides} {_listed(room.sides)}")
         lines.append(
             f"The room from {_point(room.least)} to {_point(room.most)} mm, {room.volume:.4g} "
-            f"mm^3, is left out of the model: {_listed(closing)} close it off, and no lumped "
-            "element, other material or open side stands in it and no port faces into it, so "
-            "no field reaches it. The model ends on its faces, which carry the wall"
+            f"mm^3, is left out of the model: it is closed off by {_listed(closing)}, and no "
+            "port, lumped element, other material or open side reaches it, so no field does. "
+            "The model ends on its faces, which carry the wall"
         )
     beyond = f"the medium {reserved.medium!r}" if reserved.medium else "vacuum"
     for bare in unwalled:
         faces = "; ".join(
             f"{face.where}, {face.area:.4g} mm^2"
-            + (f", toward Padding{face.side}" if face.side else "")
+            + (f", toward Boundary{face.side}" if face.side else "")
             for face in bare.faces
         )
         lines.append(
             f"{bare.region!r} stands in the reserved air over {bare.area:.4g} mm^2, on "
-            f"{faces}. No metal is drawn on those faces, so each is the boundary between the "
-            f"region and {beyond}, and none is a wall. Where one is meant as a wall, draw metal on "
-            "it, or set the Padding it stands toward to Ends, which keeps that side of the box "
-            "flush with the structure and walls it"
+            f"{faces}. No metal is drawn on those faces, so each borders {beyond} and none is "
+            "a wall. Where one is meant as a wall, draw metal on it, or set the Boundary it "
+            f"stands toward to {PEC_WALL_FACE}"
         )
     return lines
 
@@ -1075,18 +1252,19 @@ def _surface(reserved: Reserved, sweep: Sweep) -> str:
     angle = steepest(reserved)
     dipole, slant = reflection(sweep.start, distance, slowing), slanted(angle)
     larger = "dipole mode's" if dipole >= slant else "slanted wave's"
+    # The field a line holds to its cross-section falls off over a distance the
+    # cross-section sets rather than the wavelength, so neither figure covers it.
     return (
         f"The open surface is {_listed(reserved.faces)} of the reserved air, "
         f"{distance:.4g} mm from the structure: {' and '.join(wavelengths)}{thinnest}. "
         "It carries a first-order absorbing condition. At the bottom of the band, "
         f"{sweep.start / 1e9:.4g} GHz, it reflects {percent(dipole, 2)} of the dipole mode "
         f"radiated from the structure, and {percent(slant, 2)} of a plane wave meeting a "
-        f"side {math.degrees(angle):.3g} degrees from square, the steepest angle a straight "
-        f"line from the structure meets an open side at. The {larger} is the larger, and "
-        "the estimate after the run is formed from the larger at each frequency. Neither "
-        "figure bounds what the surface reflects, and neither covers the field a line "
-        "holds to its cross-section, which falls off over a distance the cross-section "
-        "sets rather than the wavelength"
+        f"side {math.degrees(angle):.3g} degrees from square, the steepest angle at which a "
+        f"line from the structure meets an open side. The {larger} is the larger, and sets "
+        "the estimate after the run. "
+        "Neither figure is a bound, and neither covers the field a line holds close to "
+        "its cross-section"
     )
 
 

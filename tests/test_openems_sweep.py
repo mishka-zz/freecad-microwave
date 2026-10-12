@@ -14,11 +14,13 @@ environment, so an ``importorskip`` would mean this never runs at all - which
 is how the panel came to have no coverage the first time.
 """
 
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+from Microwave.Gui import openems_steps
 from Microwave.Objects.analysis import createEMAnalysis
 from Microwave.Results.sparameters import ResultError, SParameters
 
@@ -66,9 +68,11 @@ class Run:
         tail_share=None,
         smallest_response=1.0,
         provenance=None,
+        stopped=None,
     ):
         self.excited_port = port
         self.reproducible = reproducible
+        self.stopped = stopped
         self.tail_share = {port: 1e-4} if tail_share is None else tail_share
         self.smallest_response = smallest_response
         self.provenance = provenance or {}
@@ -157,7 +161,7 @@ def panel(panel_module, **attributes):
     instance.label_solver = Label()
     instance._stage = ""
     instance.status_color = None
-    instance.log = instance.logged.append
+    instance.log = lambda line, failed=False: instance.logged.append(line)
 
     def set_status(text, colour=None):
         instance.status_color = colour
@@ -195,7 +199,7 @@ class TestWhereTheRunsGo:
     ):
         written = []
         monkeypatch.setattr(
-            panel_module.write,
+            openems_steps.write,
             "write",
             lambda problem, directory, report=(): (
                 written.append(directory) or f"{directory}/e.json"
@@ -213,7 +217,7 @@ class TestWhereTheRunsGo:
 
     def test_a_single_port_run_is_not_a_special_case(self, panel_module, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            panel_module.write,
+            openems_steps.write,
             "write",
             lambda problem, directory, report=(): f"{directory}/e.json",
         )
@@ -225,7 +229,7 @@ class TestWhereTheRunsGo:
 
     def test_the_log_says_where_each_envelope_went(self, panel_module, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            panel_module.write,
+            openems_steps.write,
             "write",
             lambda problem, directory, report=(): f"{directory}/e.json",
         )
@@ -360,9 +364,22 @@ class TestSayingWhatTheSweepWillReach:
 
         assert missing == [2]
         line = next(line for line in subject.logged if "not marked as sources" in line)
+        assert line.endswith(
+            "For the full matrix, set Driven to true on them, or, if the device is "
+            "mirror-symmetric, set Symmetry to Mirror on the study."
+        )
         assert "[2]" in line
         assert "S11" in line and "S21" in line
         assert "S22" not in line
+
+    def test_a_three_port_is_not_sent_to_mirror_symmetry(self, panel_module):
+        """Mirror symmetry derives the second column of a two-port only."""
+        subject = panel(panel_module, problems=self.problems([1], [1, 2, 3]))
+
+        panel_module.SimulationTaskPanel.report_coverage(subject)
+
+        line = next(line for line in subject.logged if "not marked as sources" in line)
+        assert line.endswith("For the full matrix, set Driven to true on them.")
 
     def test_full_coverage_reports_nothing_missing(self, panel_module):
         subject = panel(panel_module, problems=self.problems([1, 2], [1, 2]))
@@ -387,7 +404,7 @@ class TestADeclaredSymmetry:
     def test_an_undriven_column_is_reported_as_derived_not_missing(self, panel_module, monkeypatch):
         """Same document, opposite meaning: with the declaration the missing
         column is a saving, without it it is a gap."""
-        monkeypatch.setattr(panel_module.symmetry_check, "mirror_warnings", lambda problem: [])
+        monkeypatch.setattr(openems_steps.symmetry_check, "mirror_warnings", lambda problem: [])
         subject = panel(
             panel_module,
             analysis=self.study("Mirror"),
@@ -399,10 +416,11 @@ class TestADeclaredSymmetry:
         line = next(line for line in subject.logged if "[2]" in line)
         assert "derived rather than solved" in line
         assert "half the run time" in line
+        assert line.endswith("Set Driven to true on every port to measure them instead.")
 
     def test_the_cheap_asymmetry_checks_are_reported(self, panel_module, monkeypatch):
         monkeypatch.setattr(
-            panel_module.symmetry_check,
+            openems_steps.symmetry_check,
             "mirror_warnings",
             lambda problem: ["the ports are different kinds"],
         )
@@ -420,7 +438,7 @@ class TestADeclaredSymmetry:
         """Nothing is checked, and nothing is said, on a study that never
         claimed anything."""
         monkeypatch.setattr(
-            panel_module.symmetry_check,
+            openems_steps.symmetry_check,
             "mirror_warnings",
             lambda problem: ["should never be reached"],
         )
@@ -471,7 +489,9 @@ class TestADeclaredSymmetry:
         monkeypatch.setattr(
             panel_module.results_glue, "assemble", lambda runs, **kw: self.derived_matrix()
         )
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1)])
 
         panel_module.SimulationTaskPanel.collect_results(subject, ["a/results.json"])
@@ -492,7 +512,9 @@ class TestADeclaredSymmetry:
             "assemble",
             lambda runs, **kw: self.derived_matrix(mismatch=0.08),
         )
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1)])
 
         panel_module.SimulationTaskPanel.collect_results(subject, ["a/results.json"])
@@ -515,14 +537,18 @@ class TestADeclaredSymmetry:
             lambda locations: [Run(n, smallest_response=s) for n, s in zip((1, 2), smallest)],
         )
         monkeypatch.setattr(panel_module.results_glue, "assemble", lambda runs, **kw: held)
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1), Problem(2)])
 
         panel_module.SimulationTaskPanel.collect_results(subject, ["a/results.json"])
 
         said = [line for line in subject.logged if "up to about 0.003 (-50.5 dB)" in line]
         assert len(said) == int(warned)
-        assert all(line.startswith("WARNING: A term of column 1 can be off S") for line in said)
+        assert all(
+            line.startswith("WARNING: A term driven from port 1 can be off by") for line in said
+        )
 
     @pytest.mark.parametrize(("smallest", "warned"), [((0.1, 1.0), True), ((1.0, 1.0), False)])
     def test_a_matrix_departing_from_reciprocity_is_warned_of_past_the_tail_bar(
@@ -539,12 +565,14 @@ class TestADeclaredSymmetry:
             lambda locations: [Run(n, smallest_response=s) for n, s in zip((1, 2), smallest)],
         )
         monkeypatch.setattr(panel_module.results_glue, "assemble", lambda runs, **kw: held)
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1), Problem(2)])
 
         panel_module.SimulationTaskPanel.collect_results(subject, ["a/results.json"])
 
-        said = [line for line in subject.logged if "the device's two are equal" in line]
+        said = [line for line in subject.logged if "the two terms are equal for the device" in line]
         assert len(said) == int(warned)
         assert all(
             line.startswith("WARNING: S21 and S12 differ by up to 0.003 (-50.5 dB) at 2 GHz")
@@ -566,7 +594,9 @@ class TestADeclaredSymmetry:
         analysis = createEMAnalysis(doc)
         monkeypatch.setattr(panel_module.results_glue, "load_runs", lambda locations: [Run(1)])
         monkeypatch.setattr(panel_module.results_glue, "assemble", lambda runs, **kw: held)
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1)])
 
         panel_module.SimulationTaskPanel.collect_results(subject, ["a/results.json"])
@@ -577,9 +607,7 @@ class TestADeclaredSymmetry:
             line.startswith(
                 "WARNING: Port 1 is reported against 50 ohm and its own impedance is 475 ohm"
             )
-            and line.endswith(
-                "Reference it to its own impedance, where the error is not magnified."
-            )
+            and line.endswith("Set ReferencedTo to Port impedance on that port.")
             for line in said
         )
 
@@ -592,7 +620,9 @@ class TestADeclaredSymmetry:
             "assemble",
             lambda runs, **kw: self.derived_matrix(mismatch=1e-9),
         )
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1)])
 
         panel_module.SimulationTaskPanel.collect_results(subject, ["a/results.json"])
@@ -623,19 +653,22 @@ class TestADeclaredSymmetry:
         ]
         monkeypatch.setattr(panel_module.results_glue, "load_runs", lambda locations: [Run(1)])
         monkeypatch.setattr(panel_module.results_glue, "assemble", lambda runs, **kw: folded)
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1)])
 
         panel_module.SimulationTaskPanel.collect_results(subject, ["a/results.json"])
 
         assert any(
-            line.startswith("'FR4' is not one model in the two: openEMS solved")
+            line.startswith("'FR4' is not one model in the two: Run 2 (openEMS) solved")
             for line in subject.logged
         )
 
     def comparing(self, panel_module, monkeypatch, doc, drawn=""):
         """The openEMS panel filing a matrix beside a Palace one, and what it logged."""
         from Microwave.Gui import results as glue
+        from Microwave.Results.compared import DRAWING
 
         analysis = createEMAnalysis(doc)
         palace = matrix()
@@ -645,9 +678,12 @@ class TestADeclaredSymmetry:
         answer.s[:, 1, 0] *= 0.9
         monkeypatch.setattr(panel_module.results_glue, "load_runs", lambda locations: [Run(1)])
         monkeypatch.setattr(panel_module.results_glue, "assemble", lambda runs, **kw: answer)
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1)])
-        subject.drawn = drawn
+        if drawn:
+            subject.begun = replace(glue.begin(analysis), snapshot={DRAWING: drawn})
         panel_module.SimulationTaskPanel.collect_results(subject, ["a/results.json"])
         return analysis, subject.logged
 
@@ -666,11 +702,10 @@ class TestADeclaredSymmetry:
 
         analysis, logged = self.comparing(panel_module, monkeypatch, doc, drawn="started")
         assert load(glue.find_results(analysis, "openEMS")).provenance[DRAWING] == "started"
-        assert any(
-            line.startswith("Not compared with what Palace solved:")
-            and "two different drawings" in line
-            for line in logged
-        )
+        assert (
+            "Not compared with Run 1 (Palace): no Palace run was solved from the same drawing "
+            "as this one"
+        ) in logged
 
     def test_a_two_run_sweep_reports_the_check_through_collect_results(
         self, panel_module, monkeypatch, doc
@@ -687,7 +722,9 @@ class TestADeclaredSymmetry:
             panel_module.results_glue, "load_runs", lambda locations: [Run(1), Run(2)]
         )
         monkeypatch.setattr(panel_module.results_glue, "assemble", lambda runs, **kw: matrix())
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1), Problem(2)])
 
         panel_module.SimulationTaskPanel.collect_results(subject, ["a", "b"])
@@ -719,7 +756,9 @@ class TestADeclaredSymmetry:
             panel_module.results_glue, "load_runs", lambda locations: [Run(1), Run(2)]
         )
         monkeypatch.setattr(panel_module.results_glue, "assemble", lambda runs, **kw: result)
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: None)
+        monkeypatch.setattr(
+            panel_module, "show_matrix", lambda result, _source="", _document="": None
+        )
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1), Problem(2)])
         panel_module.SimulationTaskPanel.collect_results(subject, ["a", "b"])
         return subject
@@ -729,6 +768,11 @@ class TestADeclaredSymmetry:
         asked for" rather than "this went wrong". Nothing else says which."""
         subject = self.with_matrix(panel_module, monkeypatch, doc, self.holed_matrix())
         assert any("1 of 5 frequency points are blank" in line for line in subject.logged)
+        assert (
+            "The runs disagree by more than 10% about a port's impedance at some "
+            "frequencies, so those points are blank."
+        ) in subject.logged
+        assert subject.status[-1] == ("1 frequency point is blank - see the log", "orange")
 
     def test_they_change_the_status_from_green(self, panel_module, monkeypatch, doc):
         """``on_finished`` sets green just before this runs, and a result with
@@ -750,7 +794,7 @@ class TestADeclaredSymmetry:
             "2 of 5 frequency points are blank" in line and "carry no power there" in line
             for line in subject.logged
         )
-        assert not any("microstrip" in line or "disagreed" in line for line in subject.logged)
+        assert not any("microstrip" in line or "disagree" in line for line in subject.logged)
 
     def test_a_whole_band_says_nothing_about_blanks(self, panel_module, monkeypatch, doc):
         subject = self.with_matrix(panel_module, monkeypatch, doc, matrix())
@@ -775,7 +819,7 @@ class TestADeclaredSymmetry:
         """Mirror symmetry completes a two-port driven at one end and nothing
         else. Promising otherwise on Check is a promise broken after the solve,
         and the pre-flight warning right above it says the opposite."""
-        monkeypatch.setattr(panel_module.symmetry_check, "mirror_warnings", lambda problem: [])
+        monkeypatch.setattr(openems_steps.symmetry_check, "mirror_warnings", lambda problem: [])
         subject = panel(
             panel_module,
             analysis=self.study("Mirror"),
@@ -831,13 +875,13 @@ class TestThePanelNamesTheSolverItStarts:
 
     def test_the_one_a_new_study_ships_with_is_named(self, panel_module, doc):
         analysis = createEMAnalysis(doc)
-        assert panel_module.solver_line(analysis) == "openEMS"
+        assert panel_module.solver_line(analysis) == "Solver (openEMS)"
 
     def test_a_study_holding_both_says_which_one_run_starts(self, panel_module, doc):
         analysis = createEMAnalysis(doc)
         self._palace(doc, analysis)
         line = panel_module.solver_line(analysis)
-        assert line == "openEMS - Run leaves Palace alone"
+        assert line == "Solver (openEMS) - Run leaves Solver (Palace) alone"
 
     def test_a_study_holding_only_the_other_backends_says_run_leaves_it(self, panel_module, doc):
         """Amber rather than red. Nothing has gone wrong: it is a good study for
@@ -847,7 +891,7 @@ class TestThePanelNamesTheSolverItStarts:
         analysis.Group = self._openems_only(analysis)
         line = panel_module.solver_line(analysis)
         assert "orange" in line
-        assert "Palace - nothing here starts openEMS" in line
+        assert "Solver (Palace) - this panel runs openEMS only" in line
 
     def test_a_study_holding_no_solver_says_so(self, panel_module, doc):
         analysis = createEMAnalysis(doc)
@@ -882,14 +926,14 @@ class TestThePanelNamesTheSolverItStarts:
     def test_a_study_holding_this_panels_solver_is_not_refused_here(self, panel_module, doc):
         analysis = createEMAnalysis(doc)
         self._palace(doc, analysis)
-        assert panel_module.not_this_panel_s_solver(analysis) == ""
+        assert openems_steps.not_this_panel_s_solver(analysis) == ""
 
     def test_a_study_holding_none_is_left_to_the_adapters_own_refusal(self, panel_module, doc):
         """The adapter says a study holds no solver of its kind and asks for
         one, which is the right thing to say when the study holds nothing."""
         analysis = createEMAnalysis(doc)
         analysis.Group = self._openems_only(analysis)
-        assert panel_module.not_this_panel_s_solver(analysis) == ""
+        assert openems_steps.not_this_panel_s_solver(analysis) == ""
 
     def test_a_study_holding_only_the_other_backends_is_refused_by_name(self, panel_module, doc):
         """Said instead of the adapter's, which asks for a solver to be added in
@@ -897,8 +941,8 @@ class TestThePanelNamesTheSolverItStarts:
         analysis = createEMAnalysis(doc)
         self._palace(doc, analysis)
         analysis.Group = self._openems_only(analysis)
-        said = panel_module.not_this_panel_s_solver(analysis)
-        assert "'Palace'" in said
+        said = openems_steps.not_this_panel_s_solver(analysis)
+        assert "'Solver (Palace)'" in said
         assert "EM Analysis" in said
 
     def test_the_refusal_names_the_backend_this_panel_starts(self, panel_module, doc):
@@ -909,7 +953,7 @@ class TestThePanelNamesTheSolverItStarts:
         analysis = createEMAnalysis(doc)
         self._palace(doc, analysis)
         analysis.Group = self._openems_only(analysis)
-        assert capabilities().solver in panel_module.not_this_panel_s_solver(analysis)
+        assert capabilities().solver in openems_steps.not_this_panel_s_solver(analysis)
 
     def test_the_directory_line_does_not_tell_a_saved_document_to_save(self, panel_module, doc):
         """Where a run is written is a property of this panel's solver, and a
@@ -918,15 +962,24 @@ class TestThePanelNamesTheSolverItStarts:
         analysis = createEMAnalysis(doc)
         self._palace(doc, analysis)
         analysis.Group = self._openems_only(analysis)
-        under_test = panel(panel_module, analysis=analysis, label_simdir=Label())
-        panel_module.SimulationTaskPanel.update_simdir_label(under_test)
-        assert under_test.label_simdir.text == "<b>Directory:</b> (none)"
-        assert "save" not in under_test.label_simdir.text
+        under_test = panel(panel_module, analysis=analysis, label_rundir=Label())
+        panel_module.SimulationTaskPanel.update_rundir_label(under_test)
+        assert under_test.label_rundir.text == "<b>Directory:</b> (none)"
+        assert "save" not in under_test.label_rundir.text
 
     def test_a_study_that_has_the_solver_still_says_to_save(self, panel_module, doc):
-        under_test = panel(panel_module, analysis=createEMAnalysis(doc), label_simdir=Label())
-        panel_module.SimulationTaskPanel.update_simdir_label(under_test)
-        assert "save the document" in under_test.label_simdir.text
+        under_test = panel(panel_module, analysis=createEMAnalysis(doc), label_rundir=Label())
+        panel_module.SimulationTaskPanel.update_rundir_label(under_test)
+        assert "save the document" in under_test.label_rundir.text
+
+    def test_a_saved_study_is_shown_where_run_will_write(self, panel_module, doc):
+        """A saved document has a file to set the directory beside, so telling
+        it to save is an instruction to do what is done."""
+        doc.FileName = "/drawings/board.FCStd"
+        under_test = panel(panel_module, analysis=createEMAnalysis(doc), label_rundir=Label())
+        panel_module.SimulationTaskPanel.update_rundir_label(under_test)
+        assert "/drawings/board_openems (set at the first Run)" in under_test.label_rundir.text
+        assert "save" not in under_test.label_rundir.text
 
     def test_translating_stops_there_rather_than_asking_the_adapter(
         self, panel_module, doc, monkeypatch
@@ -1012,7 +1065,7 @@ class TestThePanelNamesTheSolverItStarts:
         )
         assert panel_module.SimulationTaskPanel.translate(under_test) is None
         assert reached == [analysis]
-        assert "Run leaves Palace alone" in under_test.label_solver.text
+        assert "Run leaves Solver (Palace) alone" in under_test.label_solver.text
 
 
 class TestTheLogSaysWhatWroteIt:
@@ -1081,12 +1134,15 @@ class TestTheVerdictCheckPaints:
         monkeypatch.setattr(
             panel_module.document, "sweep_and_report", lambda analysis: (problems, list(said))
         )
-        monkeypatch.setattr(panel_module.preflight, "check", lambda problem: list(findings))
-        monkeypatch.setattr(panel_module.preflight, "refusals", lambda f: [])
+        monkeypatch.setattr(openems_steps.preflight, "check", lambda problem: list(findings))
+        monkeypatch.setattr(openems_steps.preflight, "refusals", lambda f: [])
 
         subject = panel(panel_module, analysis=object())
         subject.update_mesh_label = lambda: None
         subject.log_view = MagicMock()
+        # The interpreter Check names is found by a probe of its own, which
+        # ``TestCheckNamesTheInterpreter`` reads.
+        subject.engine = lambda: "/usr/bin/python3"
         return subject
 
     def test_what_the_shapes_lost_is_said_in_the_log(self, panel_module, monkeypatch):
@@ -1112,7 +1168,7 @@ class TestTheVerdictCheckPaints:
         """
         written = []
         monkeypatch.setattr(
-            panel_module.write,
+            openems_steps.write,
             "write",
             lambda problem, directory, report=(): (
                 written.append(list(report)) or f"{directory}/e.json"
@@ -1151,8 +1207,8 @@ class TestTheVerdictCheckPaints:
         # counts subjects as well as reading severity, and a fake that carries
         # only what today's code touches goes stale the next time it touches
         # one thing more.
-        warning = panel_module.preflight.Finding(
-            panel_module.preflight.WARN, "Trace", "it is thinner than a skin depth"
+        warning = openems_steps.preflight.Finding(
+            openems_steps.preflight.WARN, "Trace", "it is thinner than a skin depth"
         )
         subject = self.translate_returning(
             panel_module, monkeypatch, [1, 2], [1, 2], findings=[warning]
@@ -1167,8 +1223,8 @@ class TestTheVerdictCheckPaints:
         headline is the only number the user sees before opening the log.
         Counting lines would report a wall three solids run through as one
         problem."""
-        warning = panel_module.preflight.Finding(
-            panel_module.preflight.WARN,
+        warning = openems_steps.preflight.Finding(
+            openems_steps.preflight.WARN,
             ("Substrate", "Ground", "Trace"),
             "it extends past the wall",
         )
@@ -1186,13 +1242,13 @@ class TestTheVerdictCheckPaints:
         it. What is under test is that the red headline counts objects, and
         that is the only claim to read off it.
         """
-        refusal = panel_module.preflight.Finding(
-            panel_module.preflight.REFUSE, ("Board A", "Board B"), "it is outside the grid"
+        refusal = openems_steps.preflight.Finding(
+            openems_steps.preflight.REFUSE, ("Board A", "Board B"), "it is outside the grid"
         )
         subject = self.translate_returning(
             panel_module, monkeypatch, [1, 2], [1, 2], findings=[refusal]
         )
-        monkeypatch.setattr(panel_module.preflight, "refusals", lambda f: list(f))
+        monkeypatch.setattr(openems_steps.preflight, "refusals", lambda f: list(f))
 
         panel_module.SimulationTaskPanel.on_check(subject)
 
@@ -1250,6 +1306,15 @@ class TestTheProgressLine:
         assert colour == "red"
         assert text.startswith("Run 3/4 (port 3): ")
 
+    def test_an_error_shows_its_message_without_the_marker_s_fields(self, panel_module):
+        subject = panel(panel_module)
+
+        panel_module.SimulationTaskPanel.on_marker(
+            subject, "ERROR", "kind=UnsupportedModel message='Port1': no material"
+        )
+
+        assert subject.status[-1] == ("openEMS failed: 'Port1': no material", "red")
+
     def test_an_unknown_marker_is_shown_rather_than_swallowed(self, panel_module):
         """A new marker in the driver must degrade to visible, not to silence."""
         subject = panel(panel_module)
@@ -1287,14 +1352,51 @@ class TestCheckingTheRunsCameBack:
 
         assert subject.logged == []
 
-    def test_energy_termination_is_reported_once_for_the_sweep(self, panel_module):
+    def test_each_run_says_where_it_stopped(self, panel_module):
+        """A run that took every step is not said to have stopped where load put
+        it, and neither run is said to repeat: the criterion is tested on a
+        wall-clock timer, so a slower machine can stop either one elsewhere."""
         subject = panel(panel_module, problems=[Problem(1), Problem(2)])
-
-        panel_module.SimulationTaskPanel.report_provenance(
-            subject, [Run(1), Run(2, reproducible=False)]
+        capped = Run(
+            1,
+            reproducible=False,
+            stopped="cap",
+            provenance={"max_timesteps": 50000, "timesteps": 50000, "end_criteria": 1e-9},
+        )
+        short = Run(
+            2,
+            reproducible=False,
+            stopped="early",
+            provenance={"max_timesteps": 50000, "timesteps": 31212, "end_criteria": 1e-9},
         )
 
-        assert sum("energy termination" in line for line in subject.logged) == 1
+        panel_module.SimulationTaskPanel.report_provenance(subject, [capped, short])
+
+        assert subject.logged == [
+            "Run 1: it took all 50,000 steps MaxTimesteps allows, and EnergyDecay did not "
+            "stop it. A repeated run can stop earlier and give different numbers. Set "
+            "EnergyDecay to 0 for reproducible results.",
+            "Run 2: it stopped at step 31,212 of 50,000. A repeated run can stop at another "
+            "step and give different numbers. Set EnergyDecay to 0 for reproducible results.",
+        ]
+
+    def test_a_run_without_its_step_count_says_what_it_may_have_done(self, panel_module):
+        subject = panel(panel_module, problems=[Problem(1)])
+
+        panel_module.SimulationTaskPanel.report_provenance(subject, [Run(1, reproducible=False)])
+
+        assert subject.logged == [
+            "Run 1: it used EnergyDecay, so where it stopped depends on machine load, and a "
+            "repeated run can give different numbers. Set EnergyDecay to 0 for reproducible "
+            "results."
+        ]
+
+    def test_a_run_without_energy_decay_says_nothing_of_its_end(self, panel_module):
+        subject = panel(panel_module, problems=[Problem(1)])
+
+        panel_module.SimulationTaskPanel.report_provenance(subject, [Run(1)])
+
+        assert subject.logged == []
 
     def test_a_run_that_stopped_before_its_response_did_is_called_out(self, panel_module):
         """Per run, and naming which one. The driver says it too, on a marker
@@ -1359,7 +1461,7 @@ class TestCheckingTheRunsCameBack:
         warned = [line for line in subject.logged if line.startswith("WARNING")]
         assert len(warned) == 3
         assert "run 1" in warned[0] and "port 2: its waveguide reading is left" in warned[0]
-        assert "run 2" in warned[1] and "the largest part of it at port 2" in warned[1]
+        assert "run 2" in warned[1] and "mostly at port 2" in warned[1]
         # A record cut short says so, and the planes it moved apart are not blamed.
         assert "run 3" in warned[2] and "stopped before the response" in warned[2]
 
@@ -1397,9 +1499,15 @@ class TestWhatHappensToTheMatrix:
             return matrix()
 
         monkeypatch.setattr(panel_module.results_glue, "assemble", fake_assemble)
-        plotted = []
-        monkeypatch.setattr(panel_module, "show_matrix", lambda result: plotted.append(result))
+        plotted, drawn_from = [], []
+
+        def show_matrix(result, _source="", document=""):
+            plotted.append(result)
+            drawn_from.append(document)
+
+        monkeypatch.setattr(panel_module, "show_matrix", show_matrix)
         subject = panel(panel_module, analysis=analysis, problems=[Problem(1), Problem(2)])
+        subject.drawn_from = drawn_from
         return subject, analysis, plotted, panel_module, assembled_with
 
     def test_the_study_s_symmetry_declaration_reaches_the_assembly(self, collected):
@@ -1508,6 +1616,7 @@ class TestWhatHappensToTheMatrix:
 
         assert len(plotted) == 1
         assert isinstance(plotted[0], SParameters)
+        assert subject.drawn_from == [subject.analysis.Document.Name]
 
     def test_a_refusal_to_assemble_is_shown_verbatim(self, panel_module, monkeypatch, doc):
         """The refusal names what disagreed and what to do about it. Replacing
@@ -1586,7 +1695,7 @@ class TestTheButtonRowIsOneTable:
 
     def test_it_holds_every_button_the_panel_shows(self, built):
         assert [button.label for button, _ in built.buttons] == [
-            "Update Mesh",
+            "Mesh",
             "Check",
             "Run",
             "Stop",
@@ -1732,7 +1841,11 @@ class TestStoppingARun:
             lambda analysis: SimpleNamespace(SolverPython="python3"),
         )
         replacement = Worker(subject.worker_slots(), running=False)
-        monkeypatch.setattr(panel_module, "SimulationWorker", lambda *arguments: replacement)
+        monkeypatch.setattr(
+            panel_module, "SimulationWorker", lambda *arguments, **named: replacement
+        )
+        record = panel_module.results_glue.RunRecord(1, "", directory="/nowhere/run1")
+        monkeypatch.setattr(panel_module.results_glue, "begin", lambda *_, **__: record)
 
         panel_module.SimulationTaskPanel.on_run(subject)
         return subject, first, replacement
@@ -1838,7 +1951,7 @@ class TestStoppingARun:
         assert not any("Stopped" in text for text, _ in subject.status)
 
 
-class TestWhatUpdateMeshSays:
+class TestWhatMeshSays:
     """The status line after a mesh, which is the only verdict most users read.
 
     Every measured way into a runaway grid was met on this button, and this
@@ -1877,3 +1990,99 @@ class TestWhatUpdateMeshSays:
         text, colour = subject.status[-1]
         assert colour == "orange"
         assert "large" in text
+
+
+class TestWhatARunWarnedOf:
+    def test_a_line_warns_by_how_it_begins_and_a_preflight_warning_is_one(self, panel_module):
+        from Microwave.Gui import results as glue
+
+        subject = panel(panel_module)
+        subject.logged.extend(
+            ["Port 1: run", "WARNING: run 1: still ringing.", "[warn] Copper: thin", "[error] x"]
+        )
+        kept = panel_module.SimulationTaskPanel.kept(subject, glue.RunRecord(1, ""))
+        assert kept.diagnostics == ("WARNING: run 1: still ringing.", "[warn] Copper: thin")
+        assert kept.log.splitlines() == subject.logged
+
+
+class TestCheckNamesTheInterpreter:
+    """Check looks for the Python Run starts openEMS with, as Palace's Check
+    looks for Palace, and a machine without one is told which property names
+    it."""
+
+    def checked(self, panel_module, monkeypatch, configured="", found=None):
+        from types import SimpleNamespace
+
+        subject = TestTheVerdictCheckPaints().translate_returning(
+            panel_module, monkeypatch, [1, 2], [1, 2]
+        )
+        del subject.engine
+        monkeypatch.setattr(
+            panel_module.Objects,
+            "solver_of",
+            lambda analysis: SimpleNamespace(SolverPython=configured, Label="Solver (openEMS)"),
+        )
+
+        def interpreter_for(explicit=None, cancel=None):
+            if found is None:
+                raise panel_module.solver_run.EngineNotFound("openEMS was not found")
+            return found
+
+        monkeypatch.setattr(panel_module.solver_run, "interpreter_for", interpreter_for)
+        panel_module.SimulationTaskPanel.on_check(subject)
+        return subject
+
+    def test_the_interpreter_found_is_named_and_the_model_is_ready(self, panel_module, monkeypatch):
+        subject = self.checked(panel_module, monkeypatch, found="/usr/bin/python3")
+        assert "openEMS: /usr/bin/python3" in subject.logged
+        assert subject.status[-1] == ("Ready to run", "green")
+
+    def test_none_found_is_red_and_names_the_property_that_points_at_one(
+        self, panel_module, monkeypatch
+    ):
+        subject = self.checked(panel_module, monkeypatch)
+        assert subject.status[-1] == ("openEMS was not found - see the log", "red")
+        assert subject.logged[-2:] == [
+            "openEMS was not found",
+            "Set SolverPython on 'Solver (openEMS)' to a Python that can import openEMS.",
+        ]
+
+    def test_a_configured_one_that_fails_is_not_told_to_be_configured(
+        self, panel_module, monkeypatch
+    ):
+        subject = self.checked(panel_module, monkeypatch, configured="/opt/python")
+        assert subject.logged[-1] == "openEMS was not found"
+
+    def test_a_refusal_of_check_is_drawn_as_a_failure(self, panel_module):
+        """A refusal is drawn as a failure and a warning as a warning. A
+        substitution says what was built in place of what was drawn, and the
+        run does not count it as a warning, so it is drawn as neither."""
+        preflight = openems_steps.preflight
+        subject = panel(panel_module)
+        said = "it is outside the grid"
+        assert subject.tone(str(preflight.Finding(preflight.REFUSE, "Board", said))) == "failed"
+        assert subject.tone(str(preflight.Finding(preflight.WARN, "Board", said))) == "warned"
+        assert subject.tone(f"{openems_steps.WARNING}{said}") == "warned"
+        assert subject.tone(str(preflight.Finding(preflight.SUBSTITUTE, "Board", said))) is None
+        assert subject.tone(said) is None
+
+
+class TestWhatAFailedSweepSays:
+    """A sweep that raised is said in the panel. Only a defect here is given
+    to the Report view with its traceback."""
+
+    def test_no_interpreter_is_the_machines_and_says_where_to_set_one(self, panel_module):
+        run = panel_module.solver_run
+        named = "SolverPython of 'Solver (openEMS)' names a Python that can import openEMS"
+        said, defect = panel_module.failure(run.EngineNotFound("openEMS was not found"), named)
+        assert (said, defect) == (f"openEMS was not found\n{named}", False)
+
+    def test_a_solver_that_failed_said_why_as_it_ran(self, panel_module):
+        run = panel_module.solver_run
+        assert panel_module.failure(run.SolverFailed("exited with code 1")) == (
+            "exited with code 1",
+            False,
+        )
+
+    def test_anything_else_is_a_defect(self, panel_module):
+        assert panel_module.failure(KeyError("x")) == ("'x'", True)

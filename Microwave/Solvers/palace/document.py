@@ -59,13 +59,13 @@ The room round the structure
 ----------------------------
 
 The domain is a box round every shape bound to a material, grown by
-``Clearance`` on each face the mesh policy says ``Air`` on and flush with the
+``Clearance`` on each face the mesh policy says ``Open`` on and flush with the
 structure on every other, as the other backend's domain is. A study is open
-where it has an ``Air`` face, and closed otherwise. Every part of the box no
-bound body stands in is the study's medium, as it is on the other backend. The ``Air`` sides
+where it has an ``Open`` face, and closed otherwise. Every part of the box no
+bound body stands in is the study's medium, as it is on the other backend. The ``Open`` sides
 carry an absorbing condition, and the other sides are the wall. Where a lumped
-port's plane lies in one of those, the plane is the port's magnetic wall. On an
-``Ends`` side it is the faces of the bodies drawn there, and the air beside them
+port's plane lies in one of those, the plane is the port's magnetic wall. On a
+``PEC Wall`` side it is the faces of the bodies drawn there, and the air beside them
 is the wall. On a ``Through`` side it is the whole side, the air beside the
 drawn faces included: the field a line holds in the air meets that side
 squarely, and a magnetic wall is what the plane is. A part bound to no material
@@ -86,10 +86,12 @@ no metal is drawn on that meets the reserved air, and does not refuse it: air
 drawn round a device on purpose is the same drawing.
 
 A refusal names the object and says what is wrong with it. The failure being
-guarded against is a plausible answer rather than a crash: a region no material
-fills is deleted from the mesh with one line of print, and a wall nobody named
-becomes a perfect magnetic conductor with a warning. Both finish clean and
-answer about a different device.
+guarded against is a plausible answer rather than a crash. Once a model has a
+physical group, Gmsh writes only the volumes in one (Gmsh's
+``src/geo/GModelIO_MSH4.cpp:2861`` and ``:2344-2348``), so a region no material
+fills is left out of the mesh. Palace takes a wall nobody named for a perfect
+magnetic conductor and prints a warning (``palace/utils/geodata.cpp:2857-2860``).
+Both finish clean and answer about a different device.
 """
 
 from __future__ import annotations
@@ -121,14 +123,16 @@ from ..sheets import PASSES, lets_through
 from .capabilities import capabilities
 from .config import Adaptive, Filling, Sweep
 from .policy import (
-    AIR,
+    ACROSS,
     DISCRETE,
     FACES,
+    OPEN_FACE,
     PROFILE,
     THROUGH,
     band,
     demand,
     element_size,
+    floor,
     opens,
     refusals,
     unlaid,
@@ -144,6 +148,7 @@ from .problem import (
     Joined,
     LossyConductor,
     LumpedFeed,
+    Narrow,
     Plane,
     Problem,
     Refinement,
@@ -155,7 +160,7 @@ from .problem import (
     Unwalled,
 )
 
-__all__ = ["Contents", "contents", "problem"]
+__all__ = ["Contents", "contents", "problem", "RECIPE", "SOLVER"]
 
 #: The kind of solver object this adapter runs from.
 SOLVER = "EMSolverPalace"
@@ -165,10 +170,15 @@ SOLVER = "EMSolverPalace"
 #: the same name, so the kind is what tells them apart.
 RECIPE = "EMGmshMesh"
 
+#: The kind of a run a study keeps. What a run holds records a solve that
+#: happened, and nothing in it is part of what the study asks now, so the walk
+#: over a study stops there.
+RUN = "EMRun"
+
 #: What a user presses to put back whichever of this backend's objects a study
-#: lacks. Named in every refusal for a missing one, because a study saved before
-#: the recipe became an object of its own has no other route back that keeps the
-#: solver's own settings.
+#: lacks. Named in every refusal for a missing one, because the command adds
+#: only what the study lacks and leaves the solver it already holds, with its
+#: settings, as it is.
 ADDS_WHAT_IS_MISSING = "Press Add Palace Solver to add one"
 
 #: What a port's S-parameters may be reported against here. Palace reports a
@@ -225,26 +235,24 @@ def contents(analysis: Any) -> Contents:
 
     ``Group`` is FreeCAD's own ownership and reading it is duck typing like
     everything else here. Nested groups are followed: sorting ports into a
-    subgroup is housekeeping and must not drop them from the study.
+    subgroup is housekeeping and must not drop them from the study. A run is
+    not followed.
     """
     if kind(analysis) != "EMAnalysis":
-        raise TranslationError(
-            f"{label(analysis)!r} is not a study, so nothing about it says what to run. "
-            "Select the analysis"
-        )
+        raise TranslationError(f"{label(analysis)!r} is not an analysis. Select the analysis")
 
     members = _members(analysis)
     out_of_step([analysis, *(obj for obj in members if _read_here(kind(obj)))])
     check_each_links_a_material(obj for obj in members if kind(obj) == "EMMaterialBinding")
-    solver = _the_one(members, SOLVER, analysis, "Palace solver", "Add one to the analysis")
+    solver = _the_one(members, SOLVER, analysis, "Palace solver", ADDS_WHAT_IS_MISSING)
     settings = _the_one(members, "EMMeshPolicy", analysis, "mesh policy", ADDS_WHAT_IS_MISSING)
-    recipe = _the_one(members, RECIPE, analysis, "Gmsh mesh", ADDS_WHAT_IS_MISSING)
+    recipe = _the_one(members, RECIPE, analysis, "Palace mesh settings", ADDS_WHAT_IS_MISSING)
 
     bindings = tuple(obj for obj in members if kind(obj) == "EMMaterialBinding")
     if not bindings:
         raise TranslationError(
-            f"{label(analysis)!r} binds no material to anything, so there is no region "
-            "for a field to be in. Bind a material to the body the field occupies"
+            f"{label(analysis)!r} binds no material to anything, so the model holds no "
+            "region for the field. Bind a material to the body the field occupies"
         )
 
     return Contents(
@@ -254,7 +262,7 @@ def contents(analysis: Any) -> Contents:
         recipe=recipe,
         bindings=bindings,
         ports=tuple(obj for obj in members if kind(obj).startswith("EMPort")),
-        refinements=tuple(obj for obj in members if kind(obj) == "EMMeshRegion"),
+        refinements=mesh_regions.amending(analysis, members, recipe, kind),
     )
 
 
@@ -274,8 +282,7 @@ def _the_one(members: list[Any], wanted: str, analysis: Any, name: str, remedy: 
     if len(found) > 1:
         named = ", ".join(sorted(label(obj) for obj in found))
         raise TranslationError(
-            f"{label(analysis)!r} holds more than one {name} ({named}), and nothing "
-            f"says which one describes the run. Keep one"
+            f"{label(analysis)!r} holds more than one {name} ({named}). Keep one"
         )
     return found[0]
 
@@ -293,7 +300,7 @@ def _members(group: Any, seen: set[int] | None = None) -> list[Any]:
             continue
         seen.add(id(member))
         found.append(member)
-        if getattr(member, "Group", None) is not None:
+        if getattr(member, "Group", None) is not None and kind(member) != RUN:
             found.extend(_members(member, seen))
     return found
 
@@ -320,14 +327,15 @@ def _problem(analysis: Any) -> Problem:
         [region.filling.slowing for region in regions] + ([medium.filling.slowing] if air else []),
         default=1.0,
     )
+    extent = _extent(regions, conductors, lossy)
     reserved, regions, grown = _reserved(
-        found, regions, conductors, lossy, sweep, air, feeds, laid, slowest, medium
+        found, regions, conductors, lossy, sweep, air, feeds, laid, slowest, medium, extent
     )
     if reserved is None and not regions:
         raise TranslationError(
             f"{label(found.analysis)!r} binds no dielectric to anything and its drawing "
-            "leaves no room in the box round it, so there is no region for a field to be "
-            "in. Bind a material to the body the field occupies"
+            "leaves no room in the box round it, so the model holds no region for the "
+            "field. Bind a material to the body the field occupies"
         )
     if reserved is not None and not air:
         slowest = max(slowest, medium.filling.slowing)
@@ -360,7 +368,7 @@ def _problem(analysis: Any) -> Problem:
             walled=tuple(
                 one
                 for side, one in beside.items()
-                if str(getattr(found.settings, f"Padding{side}")) != THROUGH
+                if str(getattr(found.settings, f"Boundary{side}")) != THROUGH
             ),
             magnetic=tuple(beside[side] for side in magnetic if side in beside),
             thinnest=_thinnest(regions, unwalled),
@@ -397,6 +405,18 @@ def _problem(analysis: Any) -> Problem:
         coarsened,
         {conductor.label: conductor.joined for conductor in conductors},
     )
+    narrow = _narrow(
+        found,
+        conductors,
+        lossy,
+        planes,
+        None if reserved is None else reserved[0],
+        extent,
+        sweep.stop,
+        slowest,
+        [*rims, *named, WALL, *((SPACE, reserved[0].label) if reserved is not None else ())]
+        + [mark.name for region in refinements for mark in region.marks],
+    )
     asked = demand(
         found.settings,
         found.recipe,
@@ -413,6 +433,7 @@ def _problem(analysis: Any) -> Problem:
         medium=medium.filling.slowing,
         wall=WALL,
         mirrors=[plane.label for plane in planes],
+        narrow=narrow,
     )
     return Problem(
         regions=tuple(regions),
@@ -436,6 +457,12 @@ def _problem(analysis: Any) -> Problem:
             ),
             opened=bool(air),
             unfilled=medium.name if reserved is None else "",
+            narrow=narrow,
+            bodies=[
+                (conductor.label, _narrowest_body(conductor.shapes))
+                for conductor in conductors
+                if conductor.solid
+            ],
         ),
         profile=PROFILE,
         order=_order(found.solver),
@@ -448,8 +475,10 @@ def _problem(analysis: Any) -> Problem:
         smallest=smallest,
         marks=tuple(
             mark
-            for region in refinements
-            for mark in region.marks
+            for mark in (
+                *(mark for region in refinements for mark in region.marks),
+                *(one.mark for one in narrow),
+            )
             if mark.name in {place.name for place in asked.places}
         ),
         joined=grown.joined,
@@ -476,7 +505,7 @@ def _check_the_guides_are_uniform(
     """
     bound = [
         *(
-            reference_plane.Bound(region.label, shape, False)
+            reference_plane.Bound(region.label, shape, False, material=region.material)
             for region in regions
             for shape in region.shapes
         ),
@@ -533,12 +562,36 @@ def _check_no_wave_port_is_open(feeds: Sequence[Feed], settings: Any, air: Seque
     """
     if not feeds:
         return
-    named = ", ".join(f"Padding{face}" for face in air)
+    named = ", ".join(f"Boundary{face}" for face in air)
     raise TranslationError(
-        f"{feeds[0].label!r} is a waveguide port, and {label(settings)!r} opens {named} "
-        "to free space. This solver takes a study open to free space through lumped "
-        "ports only: a wave port beside the absorbing surface is not one it offers yet. "
-        "Drive the study through lumped ports, or set each of those to Ends"
+        f"{feeds[0].label!r} is a waveguide port, and {label(settings)!r} sets {named} to "
+        f"{OPEN_FACE}. On Palace, the workbench drives a study open to free space through "
+        "lumped ports only. "
+        "Drive the study through lumped ports, or set each of those to PEC Wall"
+    )
+
+
+def _extent(
+    regions: Sequence[Region],
+    conductors: Sequence[Conductor],
+    lossy: Sequence[LossyConductor],
+) -> tuple[list[float], list[float]] | None:
+    """The least and the greatest corner of the box round every shape bound to a
+    material, or nothing where none is bound."""
+    boxes = [
+        _box(shape)
+        for shapes in (
+            *(region.shapes for region in regions),
+            *(conductor.shapes for conductor in conductors),
+            *(sheet.shapes for sheet in lossy),
+        )
+        for shape in shapes
+    ]
+    if not boxes:
+        return None
+    return (
+        [min(low[dim] for low, _ in boxes) for dim in range(DIMENSIONS)],
+        [max(high[dim] for _, high in boxes) for dim in range(DIMENSIONS)],
     )
 
 
@@ -553,6 +606,7 @@ def _reserved(
     laid: Sequence[_Laid],
     slowest: float,
     medium: _Medium,
+    extent: tuple[list[float], list[float]] | None,
 ) -> tuple[tuple[Reserved, Any, dict[str, Beside]] | None, list[Region], _Grown]:
     """The room a study reserves round the structure, the box it fills, and the
     air in each side of that box the drawing does not cover - or ``None`` for a
@@ -586,11 +640,9 @@ def _reserved(
         *((conductor.label, shape) for conductor in conductors for shape in conductor.shapes),
         *((sheet.label, shape) for sheet in lossy for shape in sheet.shapes),
     ]
-    if not bound:
+    if extent is None:
         return None, list(regions), _Grown()
-    boxes = [_box(shape) for _, shape in bound]
-    lower = [min(low[dim] for low, _ in boxes) for dim in range(DIMENSIONS)]
-    upper = [max(high[dim] for _, high in boxes) for dim in range(DIMENSIONS)]
+    lower, upper = list(extent[0]), list(extent[1])
     distance = 0.0
     if air:
         refusals(
@@ -770,9 +822,8 @@ def _rooms(
         )
     except (RuntimeError, ValueError) as error:
         raise TranslationError(
-            f"the bodies bound in {label(found.analysis)!r} could not be cut from the box "
-            f"round them to find the room they leave: {error}. Check each with Part's "
-            "Check geometry"
+            f"FreeCAD could not cut the bodies bound in {label(found.analysis)!r} from the "
+            f"box round them: {error}. Check each with Part > Check geometry"
         ) from error
 
     def named(room: drawn.Room) -> tuple[str, ...]:
@@ -795,11 +846,11 @@ def _rooms(
         chosen = linked(found.settings.Medium, found.settings)
         filler = "vacuum" if chosen is None else f"the medium {label(chosen)!r}"
         return TranslationError(
-            f"{label(found.analysis)!r}: the room from {_point(room.least)} to "
-            f"{_point(room.most)} mm is {2.0 * room.volume / room.surface:.3g} mm thick "
-            f"between {_named(named(room))}, under {drawn.SLIP:g} of the least extent of "
-            "the bodies round it, so it reads as bodies drawn to meet that miss each other. "
-            f"It would be {filler}, and the mesh would lay elements that thin across it"
+            f"{label(found.analysis)!r}: the gap from {_point(room.least)} to "
+            f"{_point(room.most)} mm between {_named(named(room))} is "
+            f"{2.0 * room.volume / room.surface:.3g} mm thick, under {drawn.SLIP:g} of the "
+            "smallest extent of the bodies round it, so it looks like bodies meant to meet. "
+            f"It would be filled with {filler} and meshed with elements that thin"
             + (f". {reason}" if reason else "")
             + ". Move the bodies to meet, or draw a body filling the gap and bind the "
             "material meant there to it"
@@ -812,7 +863,7 @@ def _rooms(
         try:
             into = drawn.joined(room, held, kin, extents, clear)
         except (RuntimeError, ValueError) as error:
-            raise refused(room, f"The CAD kernel could not measure it: {error}") from error
+            raise refused(room, f"FreeCAD could not measure it: {error}") from error
         if into is None:
             unjoined.append(room)
         else:
@@ -871,7 +922,9 @@ def _ends(settings: Any) -> tuple[str, ...]:
     """The faces the mesh policy ends the domain on the structure at, by
     ``{axis}{side}``: neither open to free space nor run out through."""
     return tuple(
-        face for face in FACES if str(getattr(settings, f"Padding{face}")) not in (AIR, THROUGH)
+        face
+        for face in FACES
+        if str(getattr(settings, f"Boundary{face}")) not in (OPEN_FACE, THROUGH)
     )
 
 
@@ -1014,7 +1067,7 @@ def _overstated(bound: Sequence[tuple[str, Any]]) -> tuple[str, float] | None:
     which is exact for a face square to an axis and stands off a curved surface.
     So a clearance is measured to that bound rather than to the body. The figure
     says how much, and it is stated rather than corrected: see
-    :func:`~Microwave.drawn.tightest`. On an ``Ends`` side the room between the
+    :func:`~Microwave.drawn.tightest`. On a ``PEC Wall`` side the room between the
     bound and the body is left out instead: see :func:`_rooms`.
     """
     furthest: tuple[str, float] | None = None
@@ -1033,7 +1086,7 @@ def _beside(found: Contents, shapes: Sequence[Any], reserved: Reserved) -> dict[
     axis and as wide as the box across the other two, so the drawing covers it
     only where a body, a sheet or a port's face reaches the corners of the box. What is left is
     reserved air carrying whatever condition the side carries, and the run states
-    it: on an ``Ends`` side a perfect wall the drawing does not hold, and on a
+    it: on a ``PEC Wall`` side a perfect wall the drawing does not hold, and on a
     ``Through`` side the rest of a lumped port's plane.
     """
     found_beside: dict[str, Beside] = {}
@@ -1053,10 +1106,9 @@ def _beside(found: Contents, shapes: Sequence[Any], reserved: Reserved) -> dict[
             area = drawn.bare([side], shapes)
         except (RuntimeError, ValueError) as error:
             raise TranslationError(
-                f"the reserved air in {face} of the domain could not be set against the "
-                f"drawing to find what the drawing covers there: {error}. Bind materials to "
-                "closed bodies that the CAD kernel can cut a face against, and check each "
-                "with Part's Check geometry"
+                f"FreeCAD could not find what the drawing covers of the reserved air in "
+                f"{face}: {error}. Bind materials to closed bodies, and check each with "
+                "Part > Check geometry"
             ) from error
         if area > FLATNESS * math.sqrt(whole):
             found_beside[face] = Beside(side=face, area=area, whole=whole)
@@ -1081,15 +1133,13 @@ def _check_the_structure_spans_every_axis(
         if any(face[0] == axis for face in air):
             continue
         stated = ", ".join(
-            f"Padding{axis}{side} is {str(getattr(found.settings, f'Padding{axis}{side}'))}"
+            f"Boundary{axis}{side} is {str(getattr(found.settings, f'Boundary{axis}{side}'))}"
             for side in ("Min", "Max")
         )
         raise TranslationError(
             f"everything bound to a material in {label(found.analysis)!r} lies in one plane "
-            f"across {axis}, and {stated}, so the free space this solver reserves spans nothing "
-            f"along {axis} and holds no field. Set Padding{axis}Min or Padding{axis}Max to "
-            f"{AIR}, which reserves air on that face and gives the space a thickness across "
-            f"{axis}"
+            f"across {axis}, and {stated}, so the reserved air has no thickness along {axis}. "
+            f"Set Boundary{axis}Min or Boundary{axis}Max to {OPEN_FACE}"
         )
 
 
@@ -1125,10 +1175,9 @@ def _check_every_element_stands_in_the_box(
             ]
             if past:
                 raise TranslationError(
-                    f"{one.feed.label!r} lays {rectangle.label!r} past {' and '.join(past)}. "
-                    "The model lies inside the box round every shape bound to a material, "
-                    "grown by the clearance on each side open to free space. The part of an "
-                    f"element outside that box lies on nothing the mesh fills. {remedy}"
+                    f"{one.feed.label!r} lays {rectangle.label!r} past {' and '.join(past)}, "
+                    "outside the box round every shape bound to a material, where nothing is "
+                    f"meshed. {remedy}"
                 )
             flat = AXIS_NAMES[rectangle.flat]
             for side in air:
@@ -1136,8 +1185,8 @@ def _check_every_element_stands_in_the_box(
                 if side[0] == flat and abs(rectangle.lower[rectangle.flat] - at) <= FLATNESS:
                     raise TranslationError(
                         f"{one.feed.label!r} lays {rectangle.label!r} in the side {side} at "
-                        f"{flat}={at:.6g}, which is open to free space. That side carries the "
-                        f"absorbing condition, and an element there claims the same face. {remedy}"
+                        f"{flat}={at:.6g}, which is open to free space and carries the "
+                        f"absorbing condition. {remedy}"
                     )
 
 
@@ -1181,16 +1230,17 @@ def _check_no_wall_touches_a_curve(
             remedy = (
                 "Give the body a flat where it meets the side, or move it clear of the side"
                 if side in through
-                else f"Set {side} to Air, or end the drawing on a flat face at that side: draw "
-                "the housing or a block of the medium there, or give the body a flat where "
-                "it meets the side"
+                else f"Set Boundary{side} to Open, or end the drawing on a flat face at that "
+                "side: draw the housing or a block of the medium there, or give the body a "
+                "flat where it meets the side"
             )
+            # The domain stands on the drawing on that side, so the side touches
+            # the body at a point or along a line, and the room between them
+            # closes to nothing there.
             raise TranslationError(
                 f"{name!r} meets the side {side} at {side[0]}={_plain(at):.6g} only where it "
-                f"curves away from it, at {_point(point)} mm. The domain stands on the "
-                "drawing on that side, so the side touches the body at a point or along a "
-                "line. The room between the side and the body closes to nothing at the "
-                "touch, and the mesh would lay elements of vanishing thickness there. " + remedy
+                f"curves away from it, at {_point(point)} mm, so the mesh would need elements "
+                "of vanishing thickness there. " + remedy
             )
 
 
@@ -1330,9 +1380,9 @@ def _unwalled(
                 standing.append(Bare(where=_where(face), area=area, side=_toward(face, reserved)))
         except (RuntimeError, ValueError) as error:
             raise TranslationError(
-                f"the bodies of {region.label!r} could not be set against the reserved air "
-                f"to find where they meet it: {error}. Bind the dielectric to closed bodies "
-                "that the CAD kernel can fuse, and check each with Part's Check geometry"
+                f"FreeCAD could not find where the bodies of {region.label!r} meet the "
+                f"reserved air: {error}. Bind the dielectric to closed bodies, and check each "
+                "with Part > Check geometry"
             ) from error
         if standing:
             found.append(Unwalled(region=region.label, faces=tuple(standing)))
@@ -1363,7 +1413,7 @@ def _toward(face: Any, reserved: Reserved) -> str:
     for a face lying toward none.
 
     A face stands toward a side where it lies flat across that side's axis at the
-    structure's own extreme along it, which is where setting the side to ``Ends``
+    structure's own extreme along it, which is where setting the side to ``PEC Wall``
     puts the box flush with the face and makes it the end of the model. A face
     inside the structure, or one square to no axis, is walled by no padding.
     """
@@ -1559,6 +1609,125 @@ def _rim_of(metal: Conductor | LossyConductor) -> list[Any]:
     return edges
 
 
+def _narrow(
+    found: Contents,
+    conductors: Sequence[Conductor],
+    lossy: Sequence[LossyConductor],
+    planes: Sequence[Plane],
+    reserved: Reserved | None,
+    extent: tuple[list[float], list[float]] | None,
+    stop: float,
+    slowest: float,
+    taken: Sequence[str],
+) -> list[Narrow]:
+    """Each edge of a sheet of metal that faces another edge of metal closer
+    than :data:`~.policy.ACROSS` times the size at the rim, or than as many times
+    the size everywhere where ``EdgeRefinement`` lays no rim. See
+    :func:`~Microwave.drawn.facing`.
+
+    Every sheet is asked at once, so a gap between two metals bound apart - a
+    strip and the ground beside it - is counted as a gap within one. Each edge
+    found is laid under the metal it lies on. The bodies of metal, the sides of
+    the box round the model, and the planes a lumped port's element lies in each
+    stop an edge lying along them from being one. Those planes are magnetic
+    walls, which reflect the model, so an edge facing one faces its own
+    reflection.
+
+    An edge is named by the metal's label and the drawn object it lies on, so a
+    run's report says where it is in the tree, and numbered where that name is
+    taken already: by a label the mesher is handed, by a refinement region's
+    mark, or by another such edge.
+
+    A body of metal is left out, since its faces include its thickness. Nothing
+    is found where ``ElementsPerWavelength`` or ``EdgeRefinement`` is one the
+    demand refuses.
+    """
+    per_wavelength = value(found.recipe.ElementsPerWavelength)
+    refinement = value(found.recipe.EdgeRefinement)
+    if not (math.isfinite(per_wavelength) and per_wavelength > 0.0 and refinement >= 1.0):
+        return []
+    bulk = element_size(per_wavelength, stop, slowest)
+    finest = floor(found.recipe, bulk)
+    reach = ACROSS * (max(bulk / refinement, finest) if refinement > 1.0 else bulk)
+    metal: list[Conductor | LossyConductor] = [*conductors, *lossy]
+    walls: tuple[Sequence[float], Sequence[float]] | None = (
+        (reserved.lower, reserved.upper) if reserved is not None else extent
+    )
+    mirrors = [shape for plane in planes for shape in plane.shapes]
+    drawn_on = {label(binding): _drawn_objects(binding) for binding in found.bindings}
+    seen = set(taken)
+    sheets = [one for one in metal if not (isinstance(one, Conductor) and one.solid)]
+    bodies = [
+        shape for one in metal if isinstance(one, Conductor) and one.solid for shape in one.shapes
+    ]
+    faces = [face for one in sheets for shape in one.shapes for face in shape.Faces]
+    try:
+        facing = drawn.facing(faces, reach, bodies, mirrors, walls) if faces else []
+    except (RuntimeError, ValueError) as error:
+        raise TranslationError(
+            f"FreeCAD could not measure which edges of the metal sheets face each other: {error}"
+        ) from error
+    found_narrow = []
+    for edge, apart in facing:
+        # Asked at the middle of the edge, since its ends may touch the metal
+        # and the object drawn beside the one it lies on.
+        middle = drawn.middle(edge)
+        one = _holding(sheets, middle)
+        owner = next(
+            (
+                name
+                for name, shape in drawn_on.get(one.label, ())
+                if middle.distToShape(shape)[0] <= FLATNESS
+            ),
+            one.label,
+        )
+        base = f"{one.label} at {owner}"
+        name, number = base, 1
+        while name in seen:
+            number += 1
+            name = f"{base} {number}"
+        seen.add(name)
+        found_narrow.append(
+            Narrow(
+                rim=one.label,
+                drawn=owner,
+                apart=apart,
+                mark=RegionMark(name=name, dimension=1, shape=edge, thinnest=0.0),
+            )
+        )
+    return found_narrow
+
+
+def _holding(
+    sheets: Sequence[Conductor | LossyConductor], point: Any
+) -> Conductor | LossyConductor:
+    """The metal holding a point on one of its edges: the one nearest it."""
+    return min(sheets, key=lambda one: min(point.distToShape(shape)[0] for shape in one.shapes))
+
+
+def _drawn_objects(binding: Any) -> list[tuple[str, Any]]:
+    """Each object a binding references, by its label, with its shape where it
+    stands."""
+    found = []
+    for reference in getattr(binding, "References", None) or ():
+        obj = reference[0] if isinstance(reference, tuple) else reference
+        found.append((label(obj), picks.placed(obj)))
+    return found
+
+
+def _narrowest_body(shapes: Sequence[Any]) -> float:
+    """The least middle side of the box round each body among the shapes, in
+    millimetres: across a strip drawn as a body, where the least side is its
+    thickness. A body drawn slanting across the axes reads its box, which is
+    wider than the body."""
+    sides = []
+    for shape in shapes:
+        for solid in getattr(shape, "Solids", None) or (shape,):
+            lower, upper = _box(solid)
+            sides.append(sorted(high - low for low, high in zip(lower, upper, strict=True))[1])
+    return min(sides)
+
+
 def _distinct(made: list[Refinement], taken: list[str]) -> list[Refinement]:
     """The regions with every mark under a name no other place and no label is
     reported under.
@@ -1604,8 +1773,8 @@ def _mark_of(region: str, named: mesh_regions.Named) -> RegionMark:
     )
     if dimension is None or any(high < low for low, high in zip(lower, upper, strict=True)):
         raise TranslationError(
-            f"{region!r} references {named.name!r}, whose shape holds nothing, so there is "
-            "nothing to refine around"
+            f"{region!r} references {named.name!r}, whose shape is empty, so there is "
+            "nothing to refine"
         )
     return RegionMark(
         name=f"{region} on {named.name}",
@@ -1624,10 +1793,7 @@ def _order(solver: Any) -> int:
     """
     order = int(solver.Order)
     if order <= 0:
-        raise TranslationError(
-            f"{label(solver)!r}: Order is {order}, and the solver's polynomial order "
-            "is at least one"
-        )
+        raise TranslationError(f"{label(solver)!r}: Order is {order}. Enter 1 or more")
     return order
 
 
@@ -1694,16 +1860,14 @@ def _bound(
     for binding in found.bindings:
         material = binding.Material
         if material is None:
-            raise TranslationError(
-                f"{label(binding)!r} names no material, so what it covers is a region "
-                "with nothing in it"
-            )
+            raise TranslationError(f"{label(binding)!r} names no material. Set its Material")
         stated = str(material.MaterialType)
         wanted = _KINDS.get(stated)
         if wanted is None or not declared.supports_material(wanted):
+            kinds = sorted(_KINDS)
             raise TranslationError(
-                f"{label(material)!r} is a {stated} material, and this solver takes "
-                f"{' and '.join(sorted(_KINDS))} materials here"
+                f"{label(material)!r} is a {stated} material, and Palace takes "
+                f"{', '.join(kinds[:-1])} and {kinds[-1]} materials only"
             )
         if wanted == PERFECT:
             _check_nothing_reaches_nothing(material, _PERFECT_READS_NOTHING)
@@ -1800,7 +1964,7 @@ def _joined(conductors: Sequence[Conductor]) -> list[Conductor]:
 
 #: What the document calls a material, against what this adapter's declaration
 #: calls it. A kind absent here is one the declaration cannot name.
-_KINDS = {"Dielectric": "dielectric", "PEC": "pec", "ConductingSheet": "conducting_sheet"}
+_KINDS = {"Dielectric": "dielectric", "PEC": "pec", "Conducting Sheet": "conducting_sheet"}
 
 #: The kinds a binding of which is a sheet of metal rather than a region: a
 #: perfect conductor, and a metal of finite conductivity.
@@ -1808,22 +1972,23 @@ PERFECT = "pec"
 LOSSY = "conducting_sheet"
 
 #: The properties a sheet of metal carries and nothing reads, each at the value
-#: that says nothing, and the kind that would read it. Metal is a condition on a
-#: face here, so a permittivity or a loss tangent on it describes a volume that
-#: is not in the problem. A finite conductor's permeability is read: it sets the
-#: skin depth. A perfect conductor has neither a skin depth nor a loss, so its
-#: permeability and conductivity reach nothing. ``Thickness`` is not asked of a
-#: perfect conductor, since every material carries one by default.
-_ON_A_FACE = "metal is a condition on a face here"
-_NO_LOSS = "a perfect conductor has no skin depth and no loss"
+#: that says nothing, the kind that would read it, and why it reaches nothing as
+#: the refusal says it. Metal is a condition on a face here, so a permittivity or
+#: a loss tangent on it describes a volume that is not in the problem. A finite
+#: conductor's permeability is read: it sets the skin depth. A perfect conductor
+#: has neither a skin depth nor a loss, so its permeability and conductivity
+#: reach nothing. ``Thickness`` is not asked of a perfect conductor, since every
+#: material carries one by default.
+_ON_A_FACE = "the metal is a condition on a face"
+_NO_LOSS = "a perfect conductor has no loss"
 _SHEET_READS_NOTHING = {
     "Permittivity": (1.0, "Dielectric", _ON_A_FACE),
     "LossTangent": (0.0, "Dielectric", _ON_A_FACE),
 }
 _PERFECT_READS_NOTHING = {
     **_SHEET_READS_NOTHING,
-    "Permeability": (1.0, "ConductingSheet", _NO_LOSS),
-    "Conductivity": (0.0, "ConductingSheet", _NO_LOSS),
+    "Permeability": (1.0, "Conducting Sheet", _NO_LOSS),
+    "Conductivity": (0.0, "Conducting Sheet", _NO_LOSS),
 }
 
 #: Skin depths past which a thickness changes nothing Palace computes. Palace
@@ -1831,7 +1996,8 @@ _PERFECT_READS_NOTHING = {
 #: depth that tends to one as the metal thickens, its real and imaginary parts
 #: each within ``2 * sqrt(2) * exp(-h / delta)`` of it - under a double's
 #: precision from about 38. The same holds at twice the thickness, which is what
-#: Palace takes where the sheet ends the model.
+#: Palace takes for a condition written ``External``
+#: (``palace/models/surfaceconductivityoperator.cpp:91-95``).
 THICK = 40.0
 
 #: The thickness over the skin depth past which that factor is not a number.
@@ -1880,8 +2046,8 @@ def _check_nothing_reaches_nothing(
         stated = value(getattr(material, name))
         if stated != nothing:
             raise TranslationError(
-                f"{label(material)!r} is a {material.MaterialType} material and carries "
-                f"{name} {stated:g}, which reaches nothing: {why}. Set it to {nothing:g}, "
+                f"{label(material)!r}: {name} is {stated:g}, and Palace ignores it on a "
+                f"{material.MaterialType} material, since {why}. Set {name} to {nothing:g}, "
                 f"or make this a {reader}"
             )
 
@@ -1906,40 +2072,39 @@ def _lossy(binding: Any, material: Any, sweep: Sweep, beside: list[complex]) -> 
     thickness = value(material.Thickness)
     if not (math.isfinite(conductivity) and conductivity > 0):
         raise TranslationError(
-            f"{label(material)!r}: Conductivity is {conductivity:g} S/m, and a conducting "
-            "sheet conducts. Make it PEC for a conductor with no loss"
+            f"{label(material)!r}: Conductivity is {conductivity:g} S/m. Enter a finite value "
+            "above 0, or make it PEC for a conductor with no loss"
         )
     if not (math.isfinite(permeability) and permeability > 0):
         raise TranslationError(
-            f"{label(material)!r}: Permeability is {permeability:g}, and a relative "
-            "permeability is positive"
+            f"{label(material)!r}: Permeability is {permeability:g}. Enter a finite value above 0"
         )
     if not (math.isfinite(thickness) and thickness > 0):
         raise TranslationError(
-            f"{label(material)!r}: Thickness is {thickness:g} mm, and a conducting sheet "
-            "states how thick the metal it stands for is"
+            f"{label(material)!r}: Thickness is {thickness:g} mm. Enter the thickness of the "
+            "metal, above 0"
         )
 
     passes, worst = lets_through(conductivity, thickness, beside)
     if not passes <= PASSES:
         conductance = conductivity * thickness / units.MM_PER_M
         resistance = 1.0 / conductance if conductance else math.inf
+        # Palace takes each face of a sheet as a wall of its own and lets
+        # nothing through it.
         raise TranslationError(
             f"{label(binding)!r} binds {label(material)!r}, {thickness:g} mm at "
             f"{conductivity:g} S/m: a sheet of {resistance:.4g} ohms a square, which lets "
-            f"through up to {passes:.3g} of a wave in a medium of the model of "
-            f"{abs(worst):.4g} ohms. The solver lets none through, taking each face of a "
-            f"sheet as a wall of its own, so a sheet is solved here where it lets through "
-            f"under {PASSES:g}"
+            f"through up to {passes:.3g} of a wave in a {abs(worst):.4g} ohm medium of the "
+            f"model. Palace lets nothing through a sheet, so it takes only a sheet that lets "
+            f"through under {PASSES:g}"
         )
     displaced = 2.0 * math.pi * sweep.stop * units.VACUUM_PERMITTIVITY
     if not conductivity >= CONDUCTS * displaced:
         raise TranslationError(
             f"{label(binding)!r} binds {label(material)!r}, whose {conductivity:g} S/m "
             f"carries {conductivity / displaced:.3g} times the displacement current at the "
-            f"top of the band, and a conducting sheet is solved here where that is past "
-            f"{CONDUCTS:g}. Draw it as a body and bind that to a Dielectric carrying the "
-            "conductivity"
+            f"top of the band, and Palace takes a conducting sheet only past {CONDUCTS:g}. "
+            "Draw it as a body and bind that to a Dielectric carrying the conductivity"
         )
 
     def depths(frequency: float) -> float:
@@ -1960,9 +2125,9 @@ def _lossy(binding: Any, material: Any, sweep: Sweep, beside: list[complex]) -> 
     elif 2.0 * top >= OVERFLOW:
         raise TranslationError(
             f"{label(material)!r}: {thickness:g} mm of this metal is {bottom:.3g} skin depths "
-            f"at the bottom of the band, where the thickness decides the loss, and "
-            f"{top:.3g} at the top, where the solver's thickness model is not a number. "
-            "Split the band into studies that span less"
+            f"at the bottom of the band, where the thickness sets the loss, and {top:.3g} at "
+            "the top, where Palace's thickness model returns no result. Split the band into "
+            "studies that span less"
         )
     else:
         written = thickness
@@ -1977,7 +2142,9 @@ def _lossy(binding: Any, material: Any, sweep: Sweep, beside: list[complex]) -> 
 
 
 def _offered(materials: frozenset[str]) -> str:
-    return " and ".join(sorted(name.replace("_", " ") for name in materials))
+    """Declared names in a sentence, as the user knows them: ``rect_waveguide``
+    is the Waveguide Port."""
+    return " and ".join(sorted(name.replace("rect_", "").replace("_", " ") for name in materials))
 
 
 def _filling(material: Any, sweep: Sweep) -> Filling:
@@ -2014,7 +2181,8 @@ def _whole_shapes(binding: Any) -> tuple[Any, ...]:
         if names:
             raise TranslationError(
                 f"{label(binding)!r} covers {', '.join(names)} of {label(obj)!r}, which is "
-                "part of its surface. A material fills a body, so bind it to the whole one"
+                "part of its surface, and a material fills a whole body. Bind it to the whole "
+                "object"
             )
         placed = picks.placed(obj)
         try:
@@ -2022,20 +2190,21 @@ def _whole_shapes(binding: Any) -> tuple[Any, ...]:
         except drawn.Unmeasured as failed:
             raise TranslationError(
                 f"{label(binding)!r} binds a material that fills a body to {label(obj)!r}, "
-                f"and the CAD kernel could not make a solid of the surfaces it is drawn as: "
-                f"{failed}. Check it with Part's Check geometry"
+                f"and FreeCAD could not make a solid of its surfaces: {failed}. Check it with "
+                "Part > Check geometry"
             ) from None
         if shape is None:
             raise TranslationError(
                 f"{label(binding)!r} binds a material that fills a body to {label(obj)!r}, "
-                "which encloses no volume - an open shell, a face or an empty shape - so "
-                "there is nothing for it to fill. Bind it to a closed body"
+                "which encloses no volume (an open shell, a face or an empty shape). Bind it "
+                "to a closed body"
             )
+        _refuse_edges_beside(binding, obj, placed, "a material that fills a body", "a body")
         if shape is not placed and drawn.loose(placed):
             raise TranslationError(
                 f"{label(binding)!r} binds a material that fills a body to {label(obj)!r}, "
-                "which holds closed surfaces and faces that bound no volume, so it is part "
-                "volume and part surface. Bind them separately, or leave the faces out"
+                "which holds closed surfaces and also faces that bound no volume. Bind them "
+                "separately, or leave the faces out"
             )
         shapes.append(shape)
     if not shapes:
@@ -2073,13 +2242,38 @@ def _check_no_body_is_bound_twice(bindings: Sequence[Any]) -> None:
             if first is not binding:
                 raise TranslationError(
                     f"{label(obj)!r} is bound whole by {label(first)!r} and by "
-                    f"{label(binding)!r}, and one shape is made of one material. Bind it once"
+                    f"{label(binding)!r}. Bind it once"
                 )
+
+
+def _refuse_edges_beside(binding: Any, obj: Any, shape: Any, what: str, held: str) -> None:
+    """Refuse ``obj``'s shape where it holds edges or points of its own beside
+    its faces.
+
+    A region is a body and metal is a condition on a face, so an edge or a
+    point drawn beside them carries neither, and the mesher would meet it in a
+    file its label does not declare. ``what`` is what the binding binds, and
+    ``held`` what the shape is beside them: a body, or a sheet.
+    """
+    edges, points = drawn.stray(shape)
+    if not edges and not points:
+        return
+    apart = " and ".join(
+        f"{len(found)} {name}{'' if len(found) == 1 else 's'}"
+        for found, name in ((edges, "edge"), (points, "point"))
+        if found
+    )
+    raise TranslationError(
+        f"{label(binding)!r} binds {what} to {label(obj)!r}, which holds {held} and "
+        f"{apart} outside its faces. Edges and points carry no material. Hide the object "
+        "that draws them, or remove it from the compound"
+    )
 
 
 def _metal(binding: Any, bodies: bool) -> tuple[tuple[Any, ...], bool]:
     """The sheets or the bodies a binding of metal covers, and whether they are
-    bodies. A wire is refused, and so is a binding holding both.
+    bodies. A wire is refused, and so is a binding or a shape holding both, or
+    a shape holding an edge or a point beside its faces.
 
     A face picked off any shape is a sheet, the face of a body included. A whole
     shape is read off what it holds rather than off its type, since a face that
@@ -2102,7 +2296,7 @@ def _metal(binding: Any, bodies: bool) -> tuple[tuple[Any, ...], bool]:
             if other:
                 raise TranslationError(
                     f"{label(binding)!r} covers {', '.join(other)} of {label(obj)!r}, which "
-                    "is not a face, and metal is a condition on a face here"
+                    "is not a face, and Palace takes metal on faces only. Select faces"
                 )
             sheets.extend(picks.element(obj, name) for name in names)
             continue
@@ -2111,23 +2305,31 @@ def _metal(binding: Any, bodies: bool) -> tuple[tuple[Any, ...], bool]:
             if not bodies:
                 raise TranslationError(
                     f"{label(binding)!r} binds a metal of finite conductivity to "
-                    f"{label(obj)!r}, which is a body, and this solver models such a metal "
-                    "as a sheet only. Draw it as a sheet, or bind the body to a perfect "
-                    "conductor"
+                    f"{label(obj)!r}, which is a body, and Palace takes such a metal as a "
+                    "sheet only. Draw it as a sheet, or bind the body to a perfect conductor"
                 )
+            if drawn.loose(shape):
+                raise TranslationError(
+                    f"{label(binding)!r} binds metal to {label(obj)!r}, which holds a body "
+                    "and also faces that bound no volume. Bind the faces with a binding of "
+                    "their own, or leave them out"
+                )
+            _refuse_edges_beside(binding, obj, shape, "metal", "a body")
             solids.append(shape)
             continue
         if not getattr(shape, "Faces", None):
             raise TranslationError(
                 f"{label(binding)!r} binds metal to {label(obj)!r}, which holds no face, and "
-                "metal is a condition on a face here"
+                "Palace takes metal on faces only"
             )
+        _refuse_edges_beside(binding, obj, shape, "metal", "a sheet")
         sheets.append(shape)
+    # A body leaves the region and a sheet stands in it, so they are two
+    # conditions.
     if sheets and solids:
         raise TranslationError(
-            f"{label(binding)!r} binds metal to bodies and to sheets at once. A body leaves "
-            "the region and a sheet stands in it, so they are two conditions: bind each "
-            "kind with a binding of its own"
+            f"{label(binding)!r} binds metal to bodies and to sheets at once. Bind each kind "
+            "with a binding of its own"
         )
     if not sheets and not solids:
         raise TranslationError(
@@ -2159,8 +2361,8 @@ def _feeds(found: Contents) -> tuple[list[Feed], list[_Laid]]:
             continue
         if kind(port) != WAVE:
             raise TranslationError(
-                f"{label(port)!r} is a {kind(port)[6:].lower()} port, and this solver is "
-                f"driven here through a {_offered(declared.port_types)} port"
+                f"{label(port)!r} is a {kind(port)[6:].lower()} port, and Palace takes "
+                f"{_offered(declared.port_types)} ports only. Drive the study through those"
             )
         _check_the_port_reports_against_its_own_mode(port)
         _check_the_port_asks_for_the_mode_this_adapter_carries(port)
@@ -2176,7 +2378,7 @@ def _feeds(found: Contents) -> tuple[list[Feed], list[_Laid]]:
                 behind=_behind(face[0], inward),
                 mode=DOMINANT_ORDINAL,
                 offset=offset,
-                excited=bool(port.Excitation),
+                excited=bool(port.Driven),
                 inward=inward,
             )
         )
@@ -2184,17 +2386,17 @@ def _feeds(found: Contents) -> tuple[list[Feed], list[_Laid]]:
     if feeds and laid:
         raise TranslationError(
             f"{feeds[0].label!r} is a waveguide port and {laid[0].feed.label!r} a lumped "
-            "port, and this solver is driven here through ports of one kind in a study: a "
-            "wave port's mode run beside a lumped port's element is not one this adapter "
-            "writes. Drive the study through ports of one kind"
+            "port, and on Palace the workbench takes ports of one kind in a study. Drive the "
+            "study through "
+            "ports of one kind"
         )
     ports: list[Feed | LumpedFeed] = [*feeds, *(one.feed for one in laid)]
     _check_labels_are_distinct([port.label for port in ports], "port")
-    _check_the_numbers_are_distinct(ports)
+    _check_the_numbers(ports)
     if not any(port.excited for port in ports):
         raise TranslationError(
-            f"{label(found.analysis)!r}: no port is set to excite, so the run has "
-            "nothing to answer. Set Excitation on the port that drives it"
+            f"{label(found.analysis)!r}: no port has Driven set, so nothing drives the "
+            "run. Set Driven on the port that drives it"
         )
     return feeds, laid
 
@@ -2272,8 +2474,8 @@ def _lumped(port: Any) -> _Laid:
     stated = str(port.ExcitationAxis)
     if stated not in _AXES:
         raise TranslationError(
-            f"{name!r}: ExcitationAxis is {stated!r}, and the axis a lumped port is driven "
-            f"along is one of {', '.join(_AXES)}. Set it to the axis across the gap"
+            f"{name!r}: ExcitationAxis is {stated!r}. Set it to the axis across the gap, one "
+            f"of {', '.join(_AXES)}"
         )
     axis = _AXES[stated]
     resistance = _resistance(port)
@@ -2289,9 +2491,8 @@ def _lumped(port: Any) -> _Laid:
         if spans > FLATNESS:
             raise TranslationError(
                 f"{name!r}: {property_name} names {picked}, which spans {spans:.4g} mm along "
-                f"{AXIS_NAMES[axis]}, the axis the port drives across. A lumped port "
-                "drives from the surface bounding the gap on one side to the surface on the "
-                "other. Select the face or edge at the gap"
+                f"{AXIS_NAMES[axis]}, the axis the port drives across, so it does not bound "
+                "the gap. Select the face or edge at the gap"
             )
 
     from_box = _box(source)
@@ -2308,25 +2509,22 @@ def _lumped(port: Any) -> _Laid:
                 subject=f"{name!r} driven to {picked}",
             )
         except portbox.BoxError as error:
-            raise TranslationError(
-                f"{error}. Pick a reference that faces the source across the gap"
-            ) from error
+            raise TranslationError(str(error)) from error
         lower, upper = made.corners()
         across = [dim for dim in range(DIMENSIONS) if dim != axis]
         flat = [dim for dim in across if upper[dim] - lower[dim] <= FLATNESS]
         if not flat:
             if outline:
                 raise TranslationError(
-                    f"{name!r} is driven from an edge that runs at an angle to the axes, so "
-                    f"where it faces {picked} is a box rather than a rectangle across the gap, "
-                    "and this solver lays a lumped element on a flat face along the axes. "
-                    "Draw the trace's end along an axis"
+                    f"{name!r} is driven from an edge at an angle to the axes, so where it "
+                    f"faces {picked} is a box, and Palace lays a lumped element only on a flat "
+                    "rectangle along the axes. Draw the trace's end along an axis"
                 )
             raise TranslationError(
-                f"{name!r} is driven from a face that spans the two axes across "
-                f"{AXIS_NAMES[axis]}, so where it faces {picked} is a box rather than a "
-                "rectangle across the gap, and this solver lays a lumped element on a flat "
-                "face. Select the edge of the conductor at the gap"
+                f"{name!r} is driven from a face that spans both axes across "
+                f"{AXIS_NAMES[axis]}, so where it faces {picked} is a box, and Palace lays a "
+                "lumped element only on a flat rectangle. Select the edge of the conductor at "
+                "the gap"
             )
         shape = drawn.rectangle(lower[flat[0]], flat[0], lower, upper)
         if shape is None:
@@ -2352,7 +2550,7 @@ def _lumped(port: Any) -> _Laid:
         number=int(port.Number),
         elements=tuple(elements),
         resistance=resistance,
-        excited=bool(port.Excitation),
+        excited=bool(port.Driven),
     )
     return _Laid(feed=feed, rectangles=tuple(rectangles))
 
@@ -2374,9 +2572,8 @@ def _lumped_picks(port: Any, name: str, single: bool) -> list[tuple[str, Any]]:
     names = [n for n in ([sub] if isinstance(sub, str) else list(sub or ())) if n]
     if not names:
         raise TranslationError(
-            f"{label(port)!r}: {name} names the whole of {label(obj)!r} and no {what} of "
-            f"it, and a lumped port is laid from the {what} at the gap. Select the {what} "
-            "of the conductor there"
+            f"{label(port)!r}: {name} names the whole of {label(obj)!r}. Select the {what} "
+            "of the conductor at the gap"
         )
     if single and len(names) != 1:
         raise TranslationError(
@@ -2394,17 +2591,18 @@ def _lumped_picks(port: Any, name: str, single: bool) -> list[tuple[str, Any]]:
 
 def _resistance(port: Any) -> float:
     stated = value(port.Resistance)
+    # Palace stops on a lumped port with no resistance, where openEMS lays
+    # metal across the gap.
     if stated == 0:
         raise TranslationError(
-            f"{label(port)!r}: Resistance is 0 ohm. On this solver a lumped port is a "
-            "resistor, and it stops on a port with no resistance, where the other backend "
-            "lays metal across the gap. Draw a short as a sheet bound to PEC, or give the "
-            "port its resistance"
+            f"{label(port)!r}: Resistance is 0 ohm, and Palace takes a lumped port only as "
+            "a resistor. Draw a short as a sheet bound to PEC, or give the port its "
+            "resistance"
         )
     if not (math.isfinite(stated) and stated > 0):
         raise TranslationError(
-            f"{label(port)!r}: Resistance is {stated:g} ohm, and a lumped port's resistance "
-            "is positive. Set it to the resistance the port terminates in"
+            f"{label(port)!r}: Resistance is {stated:g} ohm. Set it to the resistance the "
+            "port terminates in, above 0"
         )
     return stated
 
@@ -2422,9 +2620,9 @@ def _check_the_lumped_port_reports_against_its_resistance(port: Any, resistance:
     if reference != resistance:
         raise TranslationError(
             f"{label(port)!r}: ReferencedTo is {str(port.ReferencedTo)!r} at "
-            f"ReferenceImpedance {reference:g} ohm, and this solver reports a lumped port "
-            f"against its own Resistance, {resistance:g} ohm, and does not renormalise it. "
-            f"Set ReferenceImpedance to {resistance:g}, or ReferencedTo to {PORT_IMPEDANCE!r}"
+            f"ReferenceImpedance {reference:g} ohm, and Palace reports a lumped port against "
+            f"its Resistance, {resistance:g} ohm, only. Set ReferenceImpedance to "
+            f"{resistance:g}, or ReferencedTo to {PORT_IMPEDANCE!r}"
         )
 
 
@@ -2455,7 +2653,7 @@ def _planes(
     is the box's own sides. A side open to free space is not the wall: nothing
     stands within the clearance of it, and an element facing it is said to face
     the open surface. Any other side an element lies in holds reserved air
-    wherever no body is drawn on it. On an ``Ends`` side the plane is the faces
+    wherever no body is drawn on it. On a ``PEC Wall`` side the plane is the faces
     of the bodies lying in that side, the air beside them is the wall, and an
     element's side meeting it is refused as one meeting the wall is. On a
     ``Through`` side the plane is the whole side, the air included. The field a
@@ -2482,9 +2680,8 @@ def _planes(
         faces = drawn.skin(bodies)
     except (RuntimeError, ValueError) as error:
         raise TranslationError(
-            f"the region's bodies could not be fused to find where the region ends, which "
-            f"the faces lumped ports lie in are read off: {error}. Bind the dielectric to "
-            "closed bodies that the CAD kernel can fuse, and check each with Part's Check "
+            f"FreeCAD could not fuse the region's bodies to find where the region ends: "
+            f"{error}. Bind the dielectric to closed bodies, and check each with Part's Check "
             "geometry"
         ) from error
     metal = [
@@ -2516,7 +2713,7 @@ def _planes(
             if side is None or side in reserved[0].faces:
                 continue
             there = [one for one in own if _side_of(one, reserved[0]) == side]
-            if str(getattr(found.settings, f"Padding{side}")) != THROUGH:
+            if str(getattr(found.settings, f"Boundary{side}")) != THROUGH:
                 standing[index] = there
             elif drawn.bare([face], there) > FLATNESS * math.sqrt(drawn.bare([face], [])):
                 through[index] = side
@@ -2601,10 +2798,10 @@ def _check_nothing_is_drawn_under(
     standing: dict[int, list[Any]],
     reserved: tuple[Reserved, Any, dict[str, Beside]] | None,
 ) -> None:
-    """Refuse an element lying in an ``Ends`` side of the reserved air where no
+    """Refuse an element lying in a ``PEC Wall`` side of the reserved air where no
     body is drawn.
 
-    On an ``Ends`` side the rest of the face an element lies in is a magnetic
+    On a ``PEC Wall`` side the rest of the face an element lies in is a magnetic
     wall only over the faces of the bodies drawn there, and such an element has
     none: it stands on the wall. On a ``Through`` side the whole side is the
     plane, so an element there is held whatever is drawn beside it.
@@ -2616,9 +2813,9 @@ def _check_nothing_is_drawn_under(
     ):
         return
     raise TranslationError(
-        f"{port!r} lays {rectangle.label!r} in a side of the free space the study reserves, "
-        "where no body bound to a dielectric is drawn, so no face of the model holds it. "
-        "Draw the element on the face of a body bound to a dielectric, or inside the air"
+        f"{port!r} lays {rectangle.label!r} in a side of the reserved air where no body bound "
+        "to a dielectric is drawn, so no face of the model holds it. Draw the element on the "
+        "face of a body bound to a dielectric, or inside the air"
     )
 
 
@@ -2689,12 +2886,13 @@ def _lying_in(port: str, rectangle: _Rectangle, faces: list[Any]) -> list[int]:
         if shared > FLATNESS * rectangle.perimeter:
             mine.append(index)
             covered += shared
+    # The rest of the face an element lies in is a magnetic wall only where
+    # the region ends.
     if covered and abs(covered - rectangle.area) > FLATNESS * rectangle.perimeter:
         raise TranslationError(
-            f"{port!r} lays {rectangle.label!r}, which lies partly on the boundary of the "
-            "region and partly inside it, and the rest of the face an element lies in is a "
-            "magnetic wall only where the region ends. Draw the element wholly on the "
-            "region's boundary, or wholly inside the region"
+            f"{port!r} lays {rectangle.label!r} partly on the region's boundary and partly "
+            "inside the region. Draw the element wholly on the region's boundary, or wholly "
+            "inside the region"
         )
     return mine
 
@@ -2720,15 +2918,14 @@ def _check_nothing_meets_the_side(
     for name, face in metal:
         if any(drawn.apart(side, [face]) <= FLATNESS for side in sides):
             raise TranslationError(
-                f"{port!r} lays {rectangle.label!r}, which {name!r} meets along a side, and "
-                "metal along the side of a lumped element joins the two ends it drives "
-                "between and shorts it. Keep the metal off the element's sides"
+                f"{port!r} lays {rectangle.label!r}, which {name!r} meets along a side, so "
+                "the metal shorts the element. Keep the metal off the element's sides"
             )
     if any(drawn.apart(side, walls) <= FLATNESS for side in sides):
         raise TranslationError(
             f"{port!r} lays {rectangle.label!r}, whose side runs along the edge of the "
-            "region, where the region's boundary is the wall, a perfect conductor that "
-            "shorts the element. Draw the element clear of the edge of the region"
+            "region, where the boundary is a perfect conductor that shorts the element. Draw "
+            "the element clear of the edge of the region"
         )
 
 
@@ -2755,8 +2952,8 @@ def _port_face(port: Any) -> tuple[Any, ...]:
         )
     if _FACE.match(names[0]) is None:
         raise TranslationError(
-            f"{label(port)!r} stands on {names[0]}, which is not a face. A wave port is "
-            "a cross-section of the guide"
+            f"{label(port)!r} stands on {names[0]}, which is not a face. Select the face the "
+            "wave leaves through"
         )
     return (picks.element(obj, names[0]),)
 
@@ -2784,9 +2981,8 @@ def _check_the_face_is_square_to_its_axis(
     if spans > FLATNESS:
         raise TranslationError(
             f"{label(port)!r} stands on a face that spans {spans:.4g} mm along {name}, "
-            "the axis the wave travels. A wave port on Palace stands on a flat face "
-            "square to it: select the guide's end face, or cut the guide flat and "
-            "square where the port stands"
+            "the axis the wave travels, and Palace needs a flat face square to it. Select "
+            "the guide's end face, or cut the guide flat and square where the port stands"
         )
 
 
@@ -2812,8 +3008,8 @@ def _inward(port: Any) -> tuple[float, float, float]:
     stated = str(port.PropagationAxis)
     if stated not in INWARD:
         raise TranslationError(
-            f"{label(port)!r}: PropagationAxis is {stated!r}, and a way into the model is "
-            f"one of {', '.join(INWARD)}"
+            f"{label(port)!r}: PropagationAxis is {stated!r}. Set it to the way into the "
+            f"model, one of {', '.join(INWARD)}"
         )
     return INWARD[stated]
 
@@ -2830,19 +3026,18 @@ def _check_nothing_else_is_called_the_wall(named: set[str], reserving: bool = Fa
     """
     if WALL in named:
         raise TranslationError(
-            f"an object is called {WALL!r}, which is the name this solver gives what is "
-            "left of the boundary. One group would hold both, and a body would be meshed "
-            "as a condition on a face. Rename it"
+            f"an object is called {WALL!r}, the name the workbench gives the rest of the "
+            "boundary in the mesh. Rename it"
         )
     reserved = {
-        SPACE: "the free space it reserves round the structure",
-        OPEN: "the sides of that space open to free space",
+        SPACE: "the air reserved round the structure",
+        OPEN: "the open sides of that air",
     }
     for name, what in reserved.items():
         if reserving and name in named:
             raise TranslationError(
-                f"an object is called {name!r}, which is the name this solver gives {what}. "
-                "One group would hold both. Rename it"
+                f"an object is called {name!r}, the name the workbench gives {what} in the "
+                "mesh. Rename it"
             )
 
 
@@ -2864,37 +3059,42 @@ def _check_labels_are_distinct(labels: list[str], subject: str) -> None:
     repeated = sorted({name for name in labels if labels.count(name) > 1})
     if repeated:
         raise TranslationError(
-            f"two objects are called {', '.join(repr(name) for name in repeated)}, and a "
-            f"{subject} reaches the mesh under the name it carries. Rename one of them"
+            f"two objects are called {', '.join(repr(name) for name in repeated)}, and each "
+            f"{subject} needs a name of its own in the mesh. Rename one of them"
         )
 
 
-def _check_the_numbers_are_distinct(feeds: list[Feed | LumpedFeed]) -> None:
+def _check_the_numbers(feeds: list[Feed | LumpedFeed]) -> None:
+    unset = [repr(feed.label) for feed in feeds if feed.number < 1]
+    if unset:
+        raise TranslationError(
+            f"{', '.join(unset)}: port number is unset. Give every port a number, which "
+            "indexes the S-matrix"
+        )
     numbers = [feed.number for feed in feeds]
     repeated = sorted({number for number in numbers if numbers.count(number) > 1})
     if repeated:
         raise TranslationError(
-            f"two ports carry the number {', '.join(str(n) for n in repeated)}, and the "
-            "number indexes every table the run writes. Give each port its own"
+            f"two ports carry the number {', '.join(str(n) for n in repeated)}. Give each "
+            "port its own"
         )
 
 
 def _check_the_port_reports_against_its_own_mode(port: Any) -> None:
     stated = str(port.ReferencedTo)
     if stated != PORT_IMPEDANCE:
+        # See :data:`PORT_IMPEDANCE` for why a fixed reference is refused.
         raise TranslationError(
-            f"{label(port)!r}: ReferencedTo is {stated!r}. A wave port here is reported "
-            f"against its own mode, and the impedance this solver states for one is not "
-            f"the one the other backend renormalises a guide from, so a fixed reference "
-            f"would put two numbers on one guide's reflection. Set it to {PORT_IMPEDANCE!r}"
+            f"{label(port)!r}: ReferencedTo is {stated!r}, and Palace reports a wave port "
+            f"against its own mode only. Set it to {PORT_IMPEDANCE!r}"
         )
 
 
 def _check_the_port_asks_for_the_mode_this_adapter_carries(port: Any) -> None:
     stated = str(port.Mode)
     if stated != DOMINANT:
+        # See :data:`DOMINANT` for why no other mode is taken.
         raise TranslationError(
-            f"{label(port)!r}: Mode is {stated}. This solver ranks a port's modes by wave "
-            f"number and names none of them, so which ordinal is {stated} depends on the "
-            f"cross-section and nothing here checks it. Use {DOMINANT}"
+            f"{label(port)!r}: Mode is {stated}, and the workbench drives a waveguide port "
+            f"on Palace in {DOMINANT} only. Set Mode to {DOMINANT}"
         )

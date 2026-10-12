@@ -36,17 +36,17 @@ from Microwave.Objects.kinds import classes, recipe_kinds, solver_kinds
 CARRIES = {
     "FrequencyStart": 1.0e9,
     "FrequencyStop": 10.0e9,
-    "NumFrequencyPoints": 501,
+    "FrequencyPoints": 501,
     "Symmetry": NO_SYMMETRY,
-    "SmallestResponse": 0.0,
+    "ResponseFloor": 0.0,
 }
 
 #: What each adapter reads off the study to state its run.
-READ_BY_EVERY_ADAPTER = ("FrequencyStart", "FrequencyStop", "NumFrequencyPoints")
+READ_BY_EVERY_ADAPTER = ("FrequencyStart", "FrequencyStop", "FrequencyPoints")
 
 #: What every adapter reads through one reader in ``Solvers/properties.py``,
 #: by the name of the property and then of the reader each adapter calls.
-READ_THROUGH_A_SHARED_READER = {"SmallestResponse": "smallest_response"}
+READ_THROUGH_A_SHARED_READER = {"ResponseFloor": "smallest_response"}
 
 #: What the result layer reads to assemble each backend's matrix: a mirror fills
 #: the column a run did not drive, whichever backend ran it.
@@ -162,12 +162,12 @@ class TestEachDemandMovesTheOpenemsRun:
         return document.problem(model(analysis=analysis(**study)).Objects[0])
 
     def test_the_band_is_the_one_the_pulse_covers(self):
-        asked = self.problem(FrequencyStart=2e9, FrequencyStop=9e9, NumFrequencyPoints=33)
+        asked = self.problem(FrequencyStart=2e9, FrequencyStop=9e9, FrequencyPoints=33)
         assert (asked.frequency.start, asked.frequency.stop) == (2e9, 9e9)
         assert asked.frequency.points == 33
 
     def test_the_smallest_response_is_what_the_record_is_held_to(self):
-        assert self.problem(SmallestResponse=-40.0).smallest_response == pytest.approx(0.01)
+        assert self.problem(ResponseFloor=-40.0).smallest_response == pytest.approx(0.01)
 
 
 class TestEachDemandMovesThePalaceRun:
@@ -179,17 +179,20 @@ class TestEachDemandMovesThePalaceRun:
         return problem(guide(**study)[0])
 
     def test_the_band_is_the_one_swept(self):
-        asked = self.problem(FrequencyStart=21e9, FrequencyStop=25e9, NumFrequencyPoints=5)
+        asked = self.problem(FrequencyStart=21e9, FrequencyStop=25e9, FrequencyPoints=5)
         assert (asked.sweep.start, asked.sweep.stop, asked.sweep.points) == (21e9, 25e9, 5)
 
     def test_the_smallest_response_is_what_the_reduced_model_is_held_to(self):
-        assert self.problem(SmallestResponse=-40.0).smallest == pytest.approx(0.01)
+        assert self.problem(ResponseFloor=-40.0).smallest == pytest.approx(0.01)
 
     def test_a_response_that_is_not_a_depth_is_refused_by_name(self):
         from Microwave.Solvers.errors import TranslationError
 
-        with pytest.raises(TranslationError, match="SmallestResponse"):
-            self.problem(SmallestResponse=3.0)
+        with pytest.raises(TranslationError) as refused:
+            self.problem(ResponseFloor=3.0)
+        assert str(refused.value).endswith(
+            "ResponseFloor is 3 dB. Enter 0 dB for full scale, or a negative value to read below it"
+        )
 
 
 class TestTheMirrorIsAppliedWhicheverBackendRan:
@@ -221,5 +224,6 @@ class TestTheMirrorIsAppliedWhicheverBackendRan:
             radiated=None,
             dissipates=False,
             modelled=(),
+            stated={},
         )
         assert results.from_palace(answer, symmetry=MIRROR).derived == (2,)

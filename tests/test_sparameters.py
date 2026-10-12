@@ -524,8 +524,29 @@ class TestAOnePathMeasurement:
         np.testing.assert_allclose(result.impedance(2).real, self.Z02)
 
     def test_a_network_is_refused_by_name(self):
-        with pytest.raises(ResultError, match=r"port\(s\) \[2\] were never driven"):
+        with pytest.raises(ResultError, match=r"port\(s\) \[2\] were never driven") as raised:
             self.one_path().network()
+        assert str(raised.value).endswith(
+            "Set Driven to true on those ports and run again, or, if the device is "
+            "mirror-symmetric, set the study's Symmetry to Mirror and run again"
+        )
+
+    def test_a_three_port_is_not_sent_to_mirror_symmetry(self):
+        """Mirror symmetry derives the second column of a two-port and nothing
+        else, so a three-port is told only to drive the ports."""
+        s = np.full((2, 3, 3), np.nan + 1j * np.nan)
+        s[:, :, 0] = 0.1
+        partial = SParameters(
+            frequency=np.array([1e9, 2e9]),
+            s=s,
+            port_numbers=(1, 2, 3),
+            reference=np.full((2, 3), 50.0 + 0j),
+            measured_impedance=np.full((2, 3), 50.0 + 0j),
+            driven=(1,),
+        )
+        with pytest.raises(ResultError) as raised:
+            partial.network()
+        assert str(raised.value).endswith("Set Driven to true on those ports and run again")
 
     def test_a_touchstone_file_is_refused_by_name(self, tmp_path):
         """There is no honest .s2p for a one-path measurement: the file has a
@@ -592,7 +613,14 @@ class TestAPortThatSendsBackPartOfWhatReachesIt:
         driven, reflected = runs[0].waves[1]
         runs[0].waves[2] = (driven.copy(), reflected)
 
-        with pytest.raises(ResultError, match="in proportion at 2 of 2 frequency points"):
+        with pytest.raises(
+            ResultError,
+            match=re.escape(
+                "reflect all of what reaches them at 2 of 2 frequency points, so no column "
+                "can be told apart from the others there. Draw each guide or line running "
+                "on unchanged from its port into the absorber"
+            ),
+        ):
             SParameters.from_runs(runs[:1], reference=50.0, symmetry=MIRROR)
 
     def test_each_run_is_split_again_at_the_impedance_the_matrix_is_normalised_to(self):
@@ -654,7 +682,7 @@ class TestAPortThatSendsBackPartOfWhatReachesIt:
         incident, reflected = runs[0].waves[1]
         runs[0].waves[1] = (np.array([incident[0], 0.0]), reflected)
 
-        with pytest.raises(ResultError, match="S11 is not a number at 1 of 2"):
+        with pytest.raises(ResultError, match="S11 has no value at 1 of 2"):
             SParameters.from_runs(runs[:1], reference=50.0)
 
     def test_a_point_already_discarded_is_not_counted(self):
@@ -672,7 +700,7 @@ class TestAPortThatSendsBackPartOfWhatReachesIt:
         volts = _volts(incident, reflected, (1, 2), [1, 2], (), blanked=(1,))
 
         np.testing.assert_allclose(volts[0], s, rtol=0, atol=1e-12)
-        with pytest.raises(ResultError, match="in proportion at 1 of 2"):
+        with pytest.raises(ResultError, match="reflect all of what reaches them at 1 of 2"):
             _volts(incident, reflected, (1, 2), [1, 2], (), blanked=())
 
     def test_runs_close_to_proportion_are_still_counted(self):
@@ -692,7 +720,7 @@ class TestAPortThatSendsBackPartOfWhatReachesIt:
         incident, reflected = runs[0].waves[2]
         runs[0].waves[2] = (np.array([np.nan, incident[1]]), reflected)
 
-        with pytest.raises(ResultError, match="S21 is not a number at 1 of 2"):
+        with pytest.raises(ResultError, match="S21 has no value at 1 of 2"):
             SParameters.from_runs(runs, reference=50.0)
         assert np.all(np.isfinite(SParameters.from_runs(runs[:1], reference=50.0).s[:, :, 0]))
 
@@ -806,9 +834,12 @@ class TestWhatAColumnReadAloneCarries:
 
         said = result.sent_back(share * 0.99)
 
-        assert said.startswith("A term of column 1 can be off S by up to about")
-        assert "at 1 GHz, against a bar of" in said and "port 2 most" in said
-        assert "Drive port 2 as well" in said and "declare the mirror" in said
+        assert said.startswith("A term driven from port 1 can be off by up to about")
+        assert "at 1 GHz, above the threshold of" in said and "port 2 most" in said
+        assert said.endswith(
+            "Set Driven to true on port 2 as well and run again, or set the study's "
+            "Symmetry to Mirror if the device is mirror-symmetric"
+        )
         assert result.sent_back(share) is None
 
     def test_a_three_port_is_told_to_drive_every_port_left(self):
@@ -818,10 +849,8 @@ class TestWhatAColumnReadAloneCarries:
 
         said = result.sent_back(0.1)
 
-        assert (
-            "column 1 can be off S by up to about 0.2 (-14.0 dB)" in said and "port 3 most" in said
-        )
-        assert "Drive ports 2 and 3 as well" in said
+        assert "port 1 can be off by up to about 0.2 (-14.0 dB)" in said and "port 3 most" in said
+        assert said.endswith("Set Driven to true on ports 2 and 3 as well and run again")
         assert "mirror" not in said
 
 
@@ -1060,9 +1089,7 @@ class TestHowFarARenormalisationMagnifiesTheSolvesError:
             "Ports 1 and 2 are reported against 50 ohm and their own impedance is 475 ohm "
             "at 1 GHz, so renormalising there can magnify an error in the solve by up to "
         )
-        assert said.endswith(
-            "Reference them to their own impedance, where the error is not magnified"
-        )
+        assert said.endswith("Set ReferencedTo to Port impedance on those ports")
 
     def line_over(self, phases, impedance=GUIDE):
         """Both runs of a matched line whose phase is ``phases`` at 1, 2, 3 GHz
@@ -1116,7 +1143,7 @@ class TestHowFarARenormalisationMagnifiesTheSolvesError:
         assert said.startswith(
             "Port 1 is reported against 50 ohm and its own impedance is 475 ohm at 1 GHz"
         )
-        assert "Reference it to its own impedance" in said
+        assert said.endswith("Set ReferencedTo to Port impedance on that port")
 
     @pytest.mark.parametrize(
         ("factor", "written"), [(14.47, "15"), (2.0307, "2.1"), (25845.0, "26000")]
@@ -1718,7 +1745,9 @@ class TestWhatItCarries:
         runs = series_resistor(50.0, 50.0, 10.0)
         for run in runs:
             run._z = {1: run._z[1] * np.nan, 2: run._z[2]}
-        with pytest.raises(ResultError, match="port 1 reports a non-finite .* at 2 of 2 frequency"):
+        with pytest.raises(
+            ResultError, match="port 1 returns no reference impedance at 2 of 2 frequency"
+        ):
             SParameters.from_runs(runs)
 
     def test_it_names_the_run_and_the_points_and_no_cause(self):
@@ -1736,7 +1765,7 @@ class TestWhatItCarries:
             SParameters.from_runs(runs)
 
         said = str(raised.value)
-        assert "port 1 reports a non-finite reference impedance at 1 of 2 frequency" in said
+        assert "port 1 returns no reference impedance at 1 of 2 frequency" in said
         assert "(at 2 GHz) in the run driven by port 2" in said
         assert "cutoff" not in said and "lumped" not in said
 
@@ -1756,7 +1785,10 @@ class TestWhatItCarries:
 
         said = str(raised.value)
         assert "driven by port 2" in said and "no incident wave" in said
-        assert "inside the grid" in said, "it should say what to look at"
+        assert said.endswith(
+            "Check that the port's box lies inside the grid and that the face it was "
+            "built from spans the gap it drives"
+        ), "it should say what to look at"
 
     def test_a_live_run_is_not_mistaken_for_a_dead_one(self):
         """The guard is "identically zero", not "small". A well-matched port
@@ -1782,17 +1814,18 @@ class TestWhatItCarries:
             SParameters.from_runs(runs)
 
         said = str(raised.value)
-        assert "S21 is not a number at 2 of 2 frequency points" in said
+        assert "S21 has no value at 2 of 2 frequency points" in said
         assert "driven by port 1" in said
 
     def test_per_solve_provenance_is_kept_per_run(self):
         """A two-run matrix must not report one run's wall time as its own."""
         runs = series_resistor(50.0, 50.0, 10.0)
         for index, run in enumerate(runs):
-            run.provenance = dict(run.provenance, wall_seconds=10.0 + index)
+            run.provenance = dict(run.provenance, wall_seconds=10.0 + index, timesteps=5000 - index)
 
         result = SParameters.from_runs(runs)
         assert result.provenance["wall_seconds"] == {1: 10.0, 2: 11.0}
+        assert result.provenance["timesteps"] == {1: 5000, 2: 4999}
 
     def test_each_run_keeps_what_its_own_tails_were_worth(self):
         """The one field here that can say a matrix is wrong. Merged as though
@@ -1810,6 +1843,20 @@ class TestWhatItCarries:
         assert result.provenance["tail_share"] == {
             1: {"1": 1e-4, "2": 0.0},
             2: {"1": 1e-4, "2": 0.2},
+        }
+
+    def test_each_run_keeps_how_its_waveguide_ports_were_read(self):
+        """One run of a sweep can leave its ports as openEMS read them while
+        another corrects them, and the matrix keeps what each said."""
+        runs = series_resistor(50.0, 50.0, 10.0)
+        for index, run in enumerate(runs):
+            reading = {"corrected": bool(index)}
+            run.provenance = dict(run.provenance, port_reading={"1": reading, "2": reading})
+
+        result = SParameters.from_runs(runs)
+        assert result.provenance["port_reading"] == {
+            1: {"1": {"corrected": False}, "2": {"corrected": False}},
+            2: {"1": {"corrected": True}, "2": {"corrected": True}},
         }
 
     def test_each_run_keeps_what_its_ports_read_besides_their_mode(self):
@@ -2086,7 +2133,7 @@ class TestTouchstone:
 
         assert "which scikit-rf reads as 50 ohm and another reader may refuse" in header
         assert "At port 2 it is the wave impedance of its mode, k Z0 / beta." in header
-        assert "renormalising them is not" in header
+        assert "Renormalised ones do." in header
         # Nothing the workbench wrote starts a line with a word the reader
         # dispatches on, whatever the wrapping.
         ours = text.split("# ")[0].lower().splitlines()
@@ -2792,7 +2839,7 @@ class TestAPortThatCarriesNoPower:
         """The first point carrying power, not the last carrying none: the
         cutoff lies between the two, and a band started just past the second
         can still start below it."""
-        with pytest.raises(ResultError, match="Start the band at 3 GHz or above"):
+        with pytest.raises(ResultError, match="Set FrequencyStart to 3 GHz or above"):
             SParameters.from_runs(below_cutoff()).network()
 
     def test_one_port_is_named_alone(self):
@@ -2823,7 +2870,7 @@ class TestAPortThatCarriesNoPower:
         assert "carry no power at 5 of the 5" in said
         # Where the cutoff lies above the band is not known from it, so the
         # top of the band is not offered as a start that clears it.
-        assert "Start the band above" not in said
+        assert "Set FrequencyStart to" not in said
         assert "above the cutoff of each port's mode, which lies above 5 GHz" in said
 
     def test_ports_cut_off_at_different_frequencies_are_named_each_with_its_own(self):
@@ -2838,7 +2885,19 @@ class TestAPortThatCarriesNoPower:
             "At each of them a port carries no power: port 1 at 2 (lowest 1 GHz, highest "
             "2 GHz); port 2 at 1 (at 1 GHz)"
         )
-        assert "Start the band at 3 GHz or above" in cause
+        assert cause.endswith(
+            "Set FrequencyStart to 3 GHz or above, where every port carries power"
+        )
+
+    @pytest.mark.parametrize("hz", [6.557140376e9, 1.0000001e9, 2.4999996e6, 999.99951])
+    def test_the_start_it_quotes_is_never_below_the_point(self, hz):
+        """A lower bound shortened to six figures is rounded up, so the figure
+        the user enters is at or past the point that carries power."""
+        from Microwave.Results import sparameters
+
+        value, unit = sparameters._engineering_hz(hz, up=True).split()
+        scale = {"GHz": 1e9, "MHz": 1e6, "kHz": 1e3, "Hz": 1.0}[unit]
+        assert float(value) * scale >= hz
 
     def test_and_beside_another_cause_each_still_says_where(self):
         """The sentence then starts with where its points are, units intact."""

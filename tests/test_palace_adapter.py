@@ -12,6 +12,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import threading
@@ -85,9 +86,26 @@ from Microwave.Solvers.palace.modes import (
     propagates,
     reflected,
 )
-from Microwave.Solvers.palace.policy import PROFILE, band, demand, one_metal, sweeping
+from Microwave.Solvers.palace.policy import (
+    PROFILE,
+    band,
+    demand,
+    element_size,
+    one_metal,
+    sweeping,
+    unlaid,
+)
 from Microwave.Solvers.palace.policy import said as unlaid_said
-from Microwave.Solvers.palace.problem import Coarsening
+from Microwave.Solvers.palace.problem import (
+    FLOORED,
+    SETTLED,
+    UNREFINED,
+    Coarsening,
+    Narrow,
+    Narrowed,
+    RegionMark,
+    Relaxed,
+)
 from Microwave.Solvers.palace.read import (
     FLUX_TABLE,
     IMPEDANCE_TABLE,
@@ -307,7 +325,7 @@ class TestWhatFillsTheDomain:
         """Palace stops on the pair, and a loss tangent and a conductivity are
         two ways of saying one thing.
         """
-        with pytest.raises(ValueError, match="one or the other"):
+        with pytest.raises(ValueError, match="Set one of them to 0"):
             Filling(loss_tangent=0.02, conductivity=5.8e7)
 
     def test_either_model_of_loss_alone_is_written(self):
@@ -410,6 +428,20 @@ class TestTheFileThatIsWritten:
         """Away from what the workbench ships, so a written-in figure fails."""
         assert driven(order=4).to_dict()["Solver"]["Order"] == 4
 
+    @pytest.mark.parametrize("order", [3, 4])
+    def test_from_order_three_the_smoother_is_the_elements_own_order(self, order):
+        """Palace's own is twice the order, and each of its steps applies the
+        operator of the level it smooths."""
+        linear = driven(order=order).to_dict()["Solver"]["Linear"]
+        assert linear["MGSmoothOrder"] == order
+
+    @pytest.mark.parametrize("order", [1, 2])
+    def test_below_order_three_palaces_own_smoother_stands(self, order):
+        assert "MGSmoothOrder" not in driven(order=order).to_dict()["Solver"]["Linear"]
+
+    def test_a_closed_study_keeps_palaces_own_coarse_solve(self):
+        assert "ComplexCoarseSolve" not in driven().to_dict()["Solver"]["Linear"]
+
     def test_an_order_of_nothing_is_refused(self):
         with pytest.raises(ValueError, match="an order is positive"):
             driven(order=0)
@@ -453,11 +485,11 @@ class TestTheBandItself:
         """A frequency-domain method answers one point at a time, and it has
         nothing to answer at nothing.
         """
-        with pytest.raises(ValueError, match="nothing to answer at zero"):
+        with pytest.raises(ValueError, match="Set FrequencyStart and FrequencyStop above 0 Hz"):
             Sweep(0.0, 26e9, 13)
 
     def test_a_band_asked_for_at_no_points_is_refused(self):
-        with pytest.raises(ValueError, match="asked for at 0 points"):
+        with pytest.raises(ValueError, match="FrequencyPoints is 0. Enter 1 or more"):
             Sweep(20e9, 26e9, 0)
 
 
@@ -471,6 +503,15 @@ def palace_solver(name="Palace", **overrides):
     properties = dict(Order=2, Sweep="Adaptive", SweepTolerance=1e-3, SweepSolves=20)
     properties.update(overrides)
     return obj("EMSolverPalace", name, **properties)
+
+
+@pytest.fixture(autouse=True)
+def nothing_faces(monkeypatch):
+    """No edge of a stand-in faces another across a sheet. Which edges do is a
+    question for the kernel, held under a real one by
+    ``tests/test_palace_narrow.py``; what is laid at them is held below on
+    edges stated outright."""
+    monkeypatch.setattr(drawn, "facing", lambda *_, **__: [])
 
 
 #: How far across the end face of a WR-42 guide reaches, corner to corner.
@@ -496,6 +537,8 @@ class Drawn:
         # not nest are, unless the test places one inside the other.
         Drawn.made += 1
         apart = 1000.0 * Drawn.made
+        # A face lists itself among its faces, as the kernel's does.
+        self.Faces = [self]
         self.BoundBox = SimpleNamespace(
             DiagonalLength=reach,
             XLength=spans[0],
@@ -511,6 +554,12 @@ class Drawn:
 
     def exportBrep(self, path):
         Path(path).write_text(self.name, encoding="utf-8")
+
+    def hashCode(self):
+        return id(self)
+
+    def isSame(self, other):
+        return other is self
 
     def fuse(self, others):
         """The faces glued: an edge two of them hold as one object stays one."""
@@ -548,14 +597,12 @@ class Sheet(Drawn):
 def mesh_settings(**overrides):
     """A mesh policy as the document carries one, reached by duck typing."""
     properties = dict(
-        MinElementSize=0.0,
         CurveTolerance=0.0,
-        MinElementsAcross=9,
         Clearance=0.0,
         Medium=None,
-        # The domain ends on the drawing. A face saying Air reserves free space
+        # The domain ends on the drawing. A face saying Open reserves free space
         # beyond it, which the open studies of test_palace_open.py are about.
-        **{f"Padding{axis}{side}": "Ends" for axis in "XYZ" for side in ("Min", "Max")},
+        **{f"Boundary{axis}{side}": "PEC Wall" for axis in "XYZ" for side in ("Min", "Max")},
     )
     properties.update(overrides)
     return obj("EMMeshPolicy", "MeshSettings", **only_declared("mesh", "EMMeshPolicy", properties))
@@ -568,6 +615,8 @@ def gmsh_mesh(**overrides):
         EdgeRefinement=8.0,
         ElementsPerTurn=6,
         MaxGrowthRatio=1.6,
+        MinElementsAcross=9,
+        MinElementSize=0.0,
     )
     properties.update(overrides)
     return obj("EMGmshMesh", "GmshMesh", **only_declared("mesh", "EMGmshMesh", properties))
@@ -575,7 +624,7 @@ def gmsh_mesh(**overrides):
 
 def study(**overrides):
     properties = dict(
-        FrequencyStart=20e9, FrequencyStop=26e9, NumFrequencyPoints=13, SmallestResponse=0.0
+        FrequencyStart=20e9, FrequencyStop=26e9, FrequencyPoints=13, ResponseFloor=0.0
     )
     properties.update(overrides)
     return obj("EMAnalysis", "Study", **properties)
@@ -608,36 +657,36 @@ class TestHowTheBandIsSwept:
     and every point solved in full otherwise."""
 
     def test_many_points_are_swept_adaptively_to_the_solvers_tolerance(self):
-        found, _ = guide(NumFrequencyPoints=21)
+        found, _ = guide(FrequencyPoints=21)
         members_of(found, "EMSolverPalace").SweepTolerance = 1e-4
         members_of(found, "EMSolverPalace").SweepSolves = 12
         assert problem(found).sweep.adaptive == Adaptive(tolerance=1e-4, solves=12)
 
     def test_no_more_points_than_solves_are_each_solved_in_full(self):
-        found, _ = guide(NumFrequencyPoints=20)
+        found, _ = guide(FrequencyPoints=20)
         assert problem(found).sweep.adaptive is None
 
     def test_a_discrete_sweep_solves_every_point(self):
-        found, _ = guide(NumFrequencyPoints=501)
+        found, _ = guide(FrequencyPoints=501)
         members_of(found, "EMSolverPalace").Sweep = "Discrete"
         assert problem(found).sweep.adaptive is None
 
     @pytest.mark.parametrize(
         ("name", "value", "said"),
         [
-            ("SweepTolerance", 0.0, "relative error is above zero"),
-            ("SweepTolerance", 1.0, "relative error is above zero"),
-            ("SweepSolves", FEWEST_SOLVES - 1, f"no sooner than {FEWEST_SOLVES}"),
+            ("SweepTolerance", 0.0, "Enter a value above 0 and below 1"),
+            ("SweepTolerance", 1.0, "Enter a value above 0 and below 1"),
+            ("SweepSolves", FEWEST_SOLVES - 1, f"Set SweepSolves to {FEWEST_SOLVES} or more"),
         ],
     )
     def test_a_setting_no_sweep_can_meet_is_refused_by_the_solver(self, name, value, said):
-        found, _ = guide(NumFrequencyPoints=501)
+        found, _ = guide(FrequencyPoints=501)
         setattr(members_of(found, "EMSolverPalace"), name, value)
         with pytest.raises(TranslationError, match=f"'Palace': .*{said}"):
             problem(found)
 
     def test_a_discrete_sweep_is_not_refused_for_a_tolerance_it_does_not_use(self):
-        found, _ = guide(NumFrequencyPoints=501)
+        found, _ = guide(FrequencyPoints=501)
         members_of(found, "EMSolverPalace").Sweep = "Discrete"
         members_of(found, "EMSolverPalace").SweepTolerance = 0.0
         assert problem(found).sweep.adaptive is None
@@ -761,23 +810,31 @@ class TestTheElementSizeTheMesherIsAskedFor:
             demand(mesh_settings(), gmsh_mesh(ElementsPerTurn=per_turn), stop=30e9, slowest=VACUUM)
 
     def test_a_floor_is_carried_through_as_it_was_stated(self):
-        asked = demand(mesh_settings(MinElementSize=0.01), gmsh_mesh(), stop=30e9, slowest=VACUUM)
+        asked = demand(mesh_settings(), gmsh_mesh(MinElementSize=0.01), stop=30e9, slowest=VACUUM)
         assert asked.finest == 0.01
 
     def test_a_count_of_nothing_across_a_wavelength_is_refused(self):
-        with pytest.raises(TranslationError, match="across a wavelength"):
+        with pytest.raises(
+            TranslationError, match="ElementsPerWavelength is 0. Enter a value above 0"
+        ):
             demand(mesh_settings(), gmsh_mesh(ElementsPerWavelength=0.0), stop=30e9, slowest=VACUUM)
 
     def test_a_floor_below_nothing_is_refused(self):
-        with pytest.raises(TranslationError, match="a length or nothing at all"):
-            demand(mesh_settings(MinElementSize=-1.0), gmsh_mesh(), stop=30e9, slowest=VACUUM)
+        with pytest.raises(
+            TranslationError,
+            match=re.escape("MinElementSize is -1 mm. Enter 0 to derive it, or a positive length"),
+        ):
+            demand(mesh_settings(), gmsh_mesh(MinElementSize=-1.0), stop=30e9, slowest=VACUUM)
 
     def test_a_floor_above_the_ceiling_is_refused_rather_than_taken(self):
         """Gmsh takes it silently and meshes to the ceiling, so every element
         would be the coarsest one and nothing would say so.
         """
-        with pytest.raises(TranslationError, match="above the ceiling"):
-            demand(mesh_settings(MinElementSize=5.0), gmsh_mesh(), stop=30e9, slowest=VACUUM)
+        with pytest.raises(TranslationError) as raised:
+            demand(mesh_settings(), gmsh_mesh(MinElementSize=5.0), stop=30e9, slowest=VACUUM)
+        said = str(raised.value)
+        assert "MinElementSize is 5 mm, at or above the " in said
+        assert said.endswith("so every element would be the largest one. Lower MinElementSize")
 
 
 class TestWhatThisBackendCannotBeAskedFor:
@@ -785,7 +842,7 @@ class TestWhatThisBackendCannotBeAskedFor:
         """The adapter reserves the air, so the demand has nothing to refuse
         about it. Asked for no size per region, it asks for the size a closed
         study asks for."""
-        settings = mesh_settings(PaddingXMin="Air", PaddingZMax="Air")
+        settings = mesh_settings(BoundaryXMin="Open", BoundaryZMax="Open")
         asked = demand(settings, gmsh_mesh(), stop=30e9, slowest=VACUUM)
         assert asked == demand(mesh_settings(), gmsh_mesh(), stop=30e9, slowest=VACUUM)
 
@@ -795,8 +852,8 @@ class TestWhatThisBackendCannotBeAskedFor:
         pipeline's object does not change which problem this one solves, and
         here the guide's wave ports are refused as a study open to free space.
         """
-        opened = with_members(settings=mesh_settings(PaddingYMax="Air"))
-        with pytest.raises(TranslationError, match="PaddingYMax"):
+        opened = with_members(settings=mesh_settings(BoundaryYMax="Open"))
+        with pytest.raises(TranslationError, match="BoundaryYMax"):
             problem(opened)
 
     def test_a_face_that_ends_on_the_drawing_asks_for_nothing(self):
@@ -808,10 +865,10 @@ class TestWhatThisBackendCannotBeAskedFor:
         ends the boundary carries a perfect wall, so the wave is reflected whole
         - which is the one thing the value exists to prevent.
         """
-        settings = mesh_settings(PaddingZMax="Through")
-        with pytest.raises(TranslationError, match="PaddingZMax") as raised:
+        settings = mesh_settings(BoundaryZMax="Through")
+        with pytest.raises(TranslationError, match="BoundaryZMax") as raised:
             demand(settings, gmsh_mesh(), stop=30e9, slowest=VACUUM)
-        assert "runs out through the absorber" in str(raised.value)
+        assert "BoundaryZMax is Through, and Palace builds no absorber" in str(raised.value)
         assert "perfect wall" in str(raised.value)
 
     def test_and_honoured_where_a_ports_plane_bounds_that_face(self):
@@ -819,7 +876,7 @@ class TestWhatThisBackendCannotBeAskedFor:
         ends on the port and what a wave meets there is the port's own
         condition. ``bounded`` is read off the study's own ports.
         """
-        settings = mesh_settings(PaddingZMax="Through")
+        settings = mesh_settings(BoundaryZMax="Through")
         asked = demand(settings, gmsh_mesh(), stop=30e9, slowest=VACUUM, bounded=("ZMax", "XMin"))
         assert asked.coarsest > 0
 
@@ -829,19 +886,20 @@ class TestWhatThisBackendCannotBeAskedFor:
         derivation. The guide's ports both face along x, so the lower x face is
         bounded and the upper one is a wall.
         """
-        through = with_members(settings=mesh_settings(PaddingXMin="Through"))
+        through = with_members(settings=mesh_settings(BoundaryXMin="Through"))
         assert problem(through).demand.coarsest > 0
 
-        walled = with_members(settings=mesh_settings(PaddingXMax="Through"))
-        with pytest.raises(TranslationError, match="PaddingXMax"):
+        walled = with_members(settings=mesh_settings(BoundaryXMax="Through"))
+        with pytest.raises(TranslationError, match="BoundaryXMax"):
             problem(walled)
 
     def test_holding_a_curved_surface_to_a_distance_is_refused(self):
         """The surface is meshed rather than sent as facets, so a distance from
         the drawing reaches nothing.
         """
-        with pytest.raises(TranslationError, match="CurveTolerance"):
+        with pytest.raises(TranslationError, match="CurveTolerance") as raised:
             demand(mesh_settings(CurveTolerance=0.001), gmsh_mesh(), stop=30e9, slowest=VACUUM)
+        assert str(raised.value).endswith("Set CurveTolerance to 0")
 
 
 class TestTheProfileTheMesherIsGiven:
@@ -888,7 +946,7 @@ def dielectric(**overrides):
 def waveguide_port(number, body, face, **overrides):
     properties = dict(
         Number=number,
-        Excitation=True,
+        Driven=True,
         ReferencedTo="Port impedance",
         ReferenceImpedance=50.0,
         Mode="TE10",
@@ -937,7 +995,7 @@ def guide(**overrides):
 def sheet_metal(**overrides):
     """A conducting sheet as the bundled catalog states its brass."""
     properties = dict(
-        MaterialType="ConductingSheet",
+        MaterialType="Conducting Sheet",
         Permittivity=1.0,
         Permeability=1.0,
         LossTangent=0.0,
@@ -1012,7 +1070,7 @@ class TestAResistiveFilm:
         for member in found.Group:
             if kind(member) == "EMMaterialBinding" and member.Name == "AirFill":
                 member.Material = dielectric(Permittivity=4.0)
-        with pytest.raises(TranslationError, match="of the model of 188.4 ohms"):
+        with pytest.raises(TranslationError, match="in a 188.4 ohm medium of the model"):
             problem(found)
 
     @pytest.mark.parametrize("first", [True, False])
@@ -1027,7 +1085,7 @@ class TestAResistiveFilm:
             References=[(obj("Part::Feature", "Block", Shape=Shape()), [])],
         )
         found.Group = [block, *found.Group] if first else [*found.Group, block]
-        with pytest.raises(TranslationError, match="of the model of 188.4 ohms"):
+        with pytest.raises(TranslationError, match="in a 188.4 ohm medium of the model"):
             problem(found)
 
     def test_a_conducting_medium_is_judged_at_the_bottom_of_the_band(self):
@@ -1039,7 +1097,7 @@ class TestAResistiveFilm:
                 member.Material = dielectric(Conductivity=0.5)
         start = 2.0 * math.pi * 20e9 * units.VACUUM_PERMITTIVITY
         lowest = FREE_SPACE / abs(complex(1.0, 0.5 / start)) ** 0.5
-        with pytest.raises(TranslationError, match=f"of the model of {lowest:.4g} ohms"):
+        with pytest.raises(TranslationError, match=f"in a {lowest:.4g} ohm medium of the model"):
             problem(found)
 
     def test_a_loss_tangent_makes_the_permittivity_complex_in_proportion_to_it(self):
@@ -1050,7 +1108,7 @@ class TestAResistiveFilm:
             if kind(member) == "EMMaterialBinding" and member.Name == "AirFill":
                 member.Material = dielectric(Permittivity=4.0, LossTangent=0.5)
         lowest = FREE_SPACE / abs(complex(4.0, 4.0 * 0.5)) ** 0.5
-        with pytest.raises(TranslationError, match=f"of the model of {lowest:.4g} ohms"):
+        with pytest.raises(TranslationError, match=f"in a {lowest:.4g} ohm medium of the model"):
             problem(found)
 
     def test_a_permeability_raises_the_impedance_and_lets_less_through(self):
@@ -1084,7 +1142,9 @@ class TestAResistiveFilm:
         for member in found.Group:
             if kind(member) == "EMMaterialBinding" and member.Name == "AirFill":
                 member.Material = dielectric(Permittivity=0.0)
-        with pytest.raises(TranslationError, match="'Air': a relative permittivity of 0"):
+        with pytest.raises(
+            TranslationError, match="'Air': Permittivity is 0. Enter a finite value above 0"
+        ):
             problem(found)
 
     def test_the_phase_of_a_lossy_mediums_impedance_lets_more_through(self):
@@ -1105,10 +1165,13 @@ class TestAResistiveFilm:
         displaced = 2.0 * math.pi * 26e9 * units.VACUUM_PERMITTIVITY
         edge = CONDUCTS * displaced
         problem(lossy_guide(material=sheet_metal(Conductivity=edge * (1 + 1e-9), Thickness=1e3)))
-        with pytest.raises(TranslationError, match="times the displacement current"):
+        with pytest.raises(TranslationError, match="times the displacement current") as raised:
             problem(
                 lossy_guide(material=sheet_metal(Conductivity=edge * (1 - 1e-9), Thickness=1e3))
             )
+        assert str(raised.value).endswith(
+            "Draw it as a body and bind that to a Dielectric carrying the conductivity"
+        )
 
     def test_a_thick_lossy_dielectric_resonating_across_its_thickness_is_refused(self):
         """A sheet carrying less conduction than displacement current, thick
@@ -1351,7 +1414,7 @@ class TestBodiesOfPerfectConductorSharingAVolume:
         via = covered_by(found, "ViaMetal")
         found.Group = [
             *found.Group,
-            refinement([(via, [""])], Mode="Coarsen", ElementSize=2.0),
+            *amending([refinement([(via, [""])], Mode="Coarsen", ElementSize=2.0)], found.Group),
         ]
         (said,) = [one for one in problem(found).unlaid if isinstance(one, Coarsening)]
         assert (said.part, said.bodies, said.joined) == (("BlockMetal",), (), (("ViaMetal",),))
@@ -1360,7 +1423,7 @@ class TestBodiesOfPerfectConductorSharingAVolume:
             for line in unlaid_said(problem(found).unlaid, answered(problem(found)))
             if line.startswith("'Ring'")
         ]
-        assert ("names some faces of 'BlockMetal' (drawn with 'ViaMetal') and not all") in line
+        assert ("names only some faces of 'BlockMetal' (drawn with 'ViaMetal'), and") in line
 
     def test_a_coarsening_names_what_each_label_holds(self, monkeypatch):
         described = problem(metal_bodies(monkeypatch, "Block"))
@@ -1372,7 +1435,7 @@ class TestBodiesOfPerfectConductorSharingAVolume:
         )
         (line,) = unlaid_said((record,), answered(described))
         assert (
-            "names some faces of 'BlockMetal' (drawn with 'ViaMetal') and 'PostMetal' and not all"
+            "names only some faces of 'BlockMetal' (drawn with 'ViaMetal') and 'PostMetal', and"
         ) in line
 
     def test_a_label_joined_to_another_is_still_a_name_taken(self, monkeypatch):
@@ -1550,8 +1613,9 @@ class TestASheetOfFiniteConductivity:
         uses where the sheet ends the model, and that is not known before the
         mesh exists."""
         start = frequency_at(THICK / 2, sheet_metal())
-        with pytest.raises(TranslationError, match="Brass.*not a number"):
+        with pytest.raises(TranslationError, match="Brass.*returns no result") as raised:
             lossy_band(start, frequency_at(OVERFLOW / 2 * 1.01, sheet_metal()))
+        assert str(raised.value).endswith("Split the band into studies that span less")
 
     def test_a_band_just_short_of_the_overflow_is_taken_with_its_thickness(self):
         start = frequency_at(THICK / 2, sheet_metal())
@@ -1561,13 +1625,13 @@ class TestASheetOfFiniteConductivity:
     @pytest.mark.parametrize(
         "changed, said",
         [
-            (dict(Conductivity=0.0), "Conductivity is 0 S/m, and a conducting sheet conducts"),
+            (dict(Conductivity=0.0), "Conductivity is 0 S/m. Enter a finite value above 0"),
             (dict(Conductivity=math.nan), "Conductivity is nan S/m"),
             (dict(Conductivity=math.inf), "Conductivity is inf S/m"),
-            (dict(Thickness=0.0), "Thickness is 0 mm, and a conducting sheet states"),
-            (dict(Permeability=0.0), "Permeability is 0, and a relative permeability"),
-            (dict(Permittivity=4.3), "carries Permittivity 4.3, which reaches nothing"),
-            (dict(LossTangent=0.025), "carries LossTangent 0.025, which reaches nothing"),
+            (dict(Thickness=0.0), "Thickness is 0 mm. Enter the thickness of the metal"),
+            (dict(Permeability=0.0), "Permeability is 0. Enter a finite value above 0"),
+            (dict(Permittivity=4.3), "Permittivity is 4.3, and Palace ignores it"),
+            (dict(LossTangent=0.025), "LossTangent is 0.025, and Palace ignores it"),
         ],
     )
     def test_what_a_sheet_cannot_carry_is_refused_naming_the_material(self, changed, said):
@@ -1577,15 +1641,17 @@ class TestASheetOfFiniteConductivity:
     @pytest.mark.parametrize(
         "changed, said",
         [
-            (dict(Permittivity=4.3), "Permittivity 4.3"),
-            (dict(Permeability=4.0), "Permeability 4"),
-            (dict(Permeability=0.0), "Permeability 0"),
-            (dict(LossTangent=0.025), "LossTangent 0.025"),
+            (dict(Permittivity=4.3), "Permittivity is 4.3"),
+            (dict(Permeability=4.0), "Permeability is 4"),
+            (dict(Permeability=0.0), "Permeability is 0"),
+            (dict(LossTangent=0.025), "LossTangent is 0.025"),
         ],
     )
     def test_what_reaches_nothing_on_a_perfect_conductor_is_refused(self, changed, said):
         metal = dielectric(MaterialType="PEC", **changed)
-        with pytest.raises(TranslationError, match=f"PEC material and carries {said}"):
+        with pytest.raises(
+            TranslationError, match=f"{said}, and Palace ignores it on a PEC material"
+        ):
             problem(lossy_guide(material=metal))
 
     def test_a_perfect_conductor_is_not_refused_for_its_thickness(self):
@@ -1599,44 +1665,51 @@ class TestASheetOfFiniteConductivity:
         [
             ("PEC", "Permittivity", 4.3, "a condition on a face", "Dielectric"),
             ("PEC", "LossTangent", 0.02, "a condition on a face", "Dielectric"),
-            ("PEC", "Permeability", 2.0, "no skin depth and no loss", "ConductingSheet"),
-            ("PEC", "Conductivity", 5.8e7, "no skin depth and no loss", "ConductingSheet"),
-            ("ConductingSheet", "Permittivity", 4.3, "a condition on a face", "Dielectric"),
-            ("ConductingSheet", "LossTangent", 0.02, "a condition on a face", "Dielectric"),
+            ("PEC", "Permeability", 2.0, "a perfect conductor has no loss", "Conducting Sheet"),
+            ("PEC", "Conductivity", 5.8e7, "a perfect conductor has no loss", "Conducting Sheet"),
+            ("Conducting Sheet", "Permittivity", 4.3, "a condition on a face", "Dielectric"),
+            ("Conducting Sheet", "LossTangent", 0.02, "a condition on a face", "Dielectric"),
         ],
     )
     def test_each_value_metal_does_not_read_is_refused_saying_why(
         self, kind, name, stated, reason, reader
     ):
-        base = sheet_metal() if kind == "ConductingSheet" else dielectric(MaterialType="PEC")
+        base = sheet_metal() if kind == "Conducting Sheet" else dielectric(MaterialType="PEC")
         setattr(base, name, stated)
         with pytest.raises(TranslationError) as refused:
             problem(lossy_guide(material=base))
-        assert f"{name} {stated:g}, which reaches nothing" in str(refused.value)
-        assert reason in str(refused.value) and f"make this a {reader}" in str(refused.value)
+        said = str(refused.value)
+        assert f"{name} is {stated:g}, and Palace ignores it on a {kind} material" in said
+        assert reason in said
+        neutral = {"Permittivity": 1, "Permeability": 1, "LossTangent": 0, "Conductivity": 0}
+        assert said.endswith(f"Set {name} to {neutral[name]}, or make this a {reader}")
 
     def test_a_perfect_conductor_carrying_a_conductivity_is_refused(self):
         """A perfect conductor has no loss to take one from, and a sheet switched
         to PEC in the property editor keeps the conductivity it had, which the
         run would drop without a word."""
         metal = dielectric(MaterialType="PEC", Conductivity=5.8e7)
-        with pytest.raises(TranslationError, match="Conductivity 5.8e.07, which reaches nothing"):
+        with pytest.raises(
+            TranslationError, match="Conductivity is 5.8e.07, and Palace ignores it"
+        ):
             problem(lossy_guide(material=metal))
-        with pytest.raises(TranslationError, match="make this a ConductingSheet"):
+        with pytest.raises(TranslationError, match="make this a Conducting Sheet"):
             problem(lossy_guide(material=metal))
 
     @pytest.mark.parametrize("name", ["LossTangent", "Conductivity"])
     @pytest.mark.parametrize("stated", [-0.02, math.nan, math.inf])
     def test_a_dielectric_loss_that_is_not_a_loss_is_refused(self, name, stated):
         """Palace would take a negative one as a material that supplies energy."""
-        with pytest.raises(TranslationError, match="not a loss|not a number a loss can be"):
+        with pytest.raises(
+            TranslationError, match=f"{name} is .*Enter a finite value of 0 or more"
+        ):
             problem(guide(material=dielectric(**{name: stated}))[0])
 
     @pytest.mark.parametrize("name", ["Permittivity", "Permeability"])
     @pytest.mark.parametrize("stated", [0.0, -2.0, math.nan, math.inf])
     def test_a_filling_that_carries_no_wave_is_refused_naming_it(self, name, stated):
         """Refused by name before anything divides by it."""
-        with pytest.raises(TranslationError, match=f"'Air': a relative {name.lower()}"):
+        with pytest.raises(TranslationError, match=f"'Air': {name} is "):
             problem(guide(material=dielectric(**{name: stated}))[0])
 
     def test_a_body_of_finite_conductivity_is_refused(self):
@@ -1646,7 +1719,7 @@ class TestASheetOfFiniteConductivity:
         found.Group = [*found.Group, metal_binding(rod, material=sheet_metal())]
         with pytest.raises(
             TranslationError,
-            match="'Rod', which is a body, and this solver models such a metal as a sheet",
+            match="'Rod', which is a body, and Palace takes such a metal as a sheet only",
         ):
             problem(found)
 
@@ -1805,7 +1878,7 @@ class TestWhatTheStudyHasToHold:
         assert described.order == 2
 
     def test_anything_but_a_study_is_refused_by_name(self):
-        with pytest.raises(TranslationError, match="is not a study"):
+        with pytest.raises(TranslationError, match="is not an analysis. Select the analysis"):
             problem(palace_solver())
 
     def test_the_refusal_names_the_backend_it_is_about(self):
@@ -1820,6 +1893,7 @@ class TestWhatTheStudyHasToHold:
         with pytest.raises(TranslationError) as refusal:
             problem(found)
         assert "holds no Palace solver" in str(refusal.value)
+        assert str(refusal.value).endswith("Press Add Palace Solver to add one")
 
     def test_a_study_with_no_solver_of_this_kind_is_refused(self):
         found, _ = guide()
@@ -1975,7 +2049,7 @@ class TestHowTheDrawingBecomesLabels:
         sheet = metal_binding(septum())
         sheet.Label = "wall"
         found.Group = [*found.Group, sheet]
-        with pytest.raises(TranslationError, match="the name this solver gives"):
+        with pytest.raises(TranslationError, match="the name the workbench gives"):
             problem(found)
 
 
@@ -2101,7 +2175,12 @@ class TestWhatTheTranslationRefuses:
         found, _ = guide()
         ports = [member for member in found.Group if kind(member).startswith("EMPort")]
         ports[0].ReferencedTo = "Fixed impedance"
-        with pytest.raises(TranslationError, match="two numbers on one guide's reflection"):
+        with pytest.raises(
+            TranslationError,
+            match=re.escape(
+                "Palace reports a wave port against its own mode only. Set it to 'Port impedance'"
+            ),
+        ):
             problem(found)
 
     def test_a_mode_this_adapter_does_not_carry_is_refused(self):
@@ -2109,7 +2188,14 @@ class TestWhatTheTranslationRefuses:
         found, _ = guide()
         ports = [member for member in found.Group if kind(member).startswith("EMPort")]
         ports[0].Mode = "TE20"
-        with pytest.raises(TranslationError, match="ranks a port's modes"):
+        with pytest.raises(
+            TranslationError,
+            match=re.escape(
+                "Mode is TE20, and the workbench drives a waveguide port on Palace in TE10 "
+                "only. Set Mode to TE10"
+            )
+            + "$",
+        ):
             problem(found)
 
     def test_a_reference_plane_inside_the_guide_is_the_ports_offset(self, uniform_asked):
@@ -2141,7 +2227,13 @@ class TestWhatTheTranslationRefuses:
         found, _ = guide()
         ports = [member for member in found.Group if kind(member).startswith("EMPort")]
         ports[0].ReferenceDepth = -1.0
-        with pytest.raises(TranslationError, match="ReferenceDepth is -1 mm"):
+        with pytest.raises(
+            TranslationError,
+            match=re.escape(
+                "ReferenceDepth is -1 mm. Enter 0 mm for the picked face, or a positive "
+                "depth into the guide"
+            ),
+        ):
             problem(found)
 
     def test_a_port_an_earlier_build_saved_is_refused_by_what_departs(self):
@@ -2194,12 +2286,24 @@ class TestWhatTheTranslationRefuses:
         third = waveguide_port(1, body, "Face3")
         third.Label = third.Name = "PortThree"
         found.Group = [*found.Group, third]
-        with pytest.raises(TranslationError, match="indexes every table"):
+        with pytest.raises(TranslationError, match="Give each port its own"):
+            problem(found)
+
+    def test_a_port_left_unnumbered_is_refused_before_anything_is_meshed(self):
+        """Its number indexes the S-matrix, and Palace's configuration takes no
+        port numbered below one (a port's ``Index`` has ``exclusiveMinimum`` 0 in
+        Palace's ``scripts/schema/config-schema.json``), so a run reaching it
+        would fail after the mesh."""
+        found, body = guide()
+        third = waveguide_port(0, body, "Face3")
+        third.Label = third.Name = "PortThree"
+        found.Group = [*found.Group, third]
+        with pytest.raises(TranslationError, match="'PortThree': port number is unset"):
             problem(found)
 
     def test_a_port_kind_this_adapter_cannot_drive_is_refused(self):
         found, body = guide()
-        microstrip = obj("EMPortMicrostrip", "Strip", Number=3, Excitation=True)
+        microstrip = obj("EMPortMicrostrip", "Strip", Number=3, Driven=True)
         found.Group = [*found.Group, microstrip]
         with pytest.raises(TranslationError, match="'Strip' is a microstrip port.*lumped"):
             problem(found)
@@ -2208,8 +2312,11 @@ class TestWhatTheTranslationRefuses:
         found, _ = guide()
         for member in found.Group:
             if kind(member).startswith("EMPort"):
-                member.Excitation = False
-        with pytest.raises(TranslationError, match="no port is set to excite"):
+                member.Driven = False
+        with pytest.raises(
+            TranslationError,
+            match="no port has Driven set, so nothing drives the run. Set Driven on",
+        ):
             problem(found)
 
     def test_metal_bound_to_bodies_and_sheets_at_once_is_refused(self):
@@ -2223,6 +2330,63 @@ class TestWhatTheTranslationRefuses:
         with pytest.raises(TranslationError, match="binds metal to bodies and to sheets at once"):
             problem(found)
 
+    def test_metal_bound_to_a_body_holding_a_loose_sheet_is_refused_by_the_object(self):
+        """One shape of a body and a sheet beside it is two conditions, as a
+        binding of each is, and the mesher would otherwise meet the sheet in a
+        file its label does not declare."""
+        found, _ = guide()
+        rod = Shape(name="rod")
+        held = Drawn("rod and a sheet")
+        held.Faces = [*rod.Faces, Drawn("sheet")]
+        held.Solids = [rod]
+        binding = metal_binding(obj("Part::Feature", "Rod", Shape=held))
+        found.Group = [*found.Group, binding]
+        with pytest.raises(TranslationError, match="'Rod', which holds a body and also faces"):
+            problem(found)
+
+    def test_metal_bound_to_a_body_holding_an_edge_beside_it_is_refused_by_the_object(self):
+        """An edge belonging to none of the body's faces carries no condition,
+        and the mesher would otherwise meet it in a file its label does not
+        declare."""
+        found, _ = guide()
+        rod = Shape(name="rod")
+        held = Drawn("rod and a sketch")
+        held.Faces, held.Solids, held.Edges = rod.Faces, [rod], [Drawn("sketched")]
+        found.Group = [*found.Group, metal_binding(obj("Part::Feature", "Rod", Shape=held))]
+        with pytest.raises(
+            TranslationError, match="'Rod', which holds a body and 1 edge"
+        ) as raised:
+            problem(found)
+        assert str(raised.value).endswith(
+            "outside its faces. Edges and points carry no material. Hide the object that draws "
+            "them, or remove it from the compound"
+        )
+
+    def test_metal_bound_to_a_sheet_holding_a_point_beside_it_is_refused_by_the_object(self):
+        found, _ = guide()
+        sheet = Sheet("plate")
+        sheet.Edges, sheet.Vertexes = [], [Drawn("point")]
+        found.Group = [*found.Group, metal_binding(obj("Part::Feature", "Plate", Shape=sheet))]
+        with pytest.raises(TranslationError, match="'Plate', which holds a sheet and 1 point"):
+            problem(found)
+
+    def test_a_region_holding_an_edge_beside_its_body_is_refused_by_the_object(self):
+        found, _ = guide()
+        rod = Shape(name="rod")
+        held = Drawn("rod and a sketch")
+        held.Faces, held.Solids, held.Edges = rod.Faces, [rod], [Drawn("sketched")]
+        fill = obj(
+            "EMMaterialBinding",
+            "RodFill",
+            Material=dielectric(Permittivity=4.0),
+            References=[(obj("Part::Feature", "Rod", Shape=held), [])],
+        )
+        found.Group = [*found.Group, fill]
+        with pytest.raises(
+            TranslationError, match="fills a body to 'Rod', which holds a body and 1 edge"
+        ):
+            problem(found)
+
     def test_a_body_bound_whole_twice_is_refused(self):
         """A body of metal stands above every region, so the metal would take
         the body from the dielectric with nothing said."""
@@ -2231,8 +2395,7 @@ class TestWhatTheTranslationRefuses:
         with pytest.raises(TranslationError) as refused:
             problem(found)
         assert str(refused.value) == (
-            "'Pipe' is bound whole by 'AirFill' and by 'PipeMetal', and one shape is made of "
-            "one material. Bind it once"
+            "'Pipe' is bound whole by 'AirFill' and by 'PipeMetal'. Bind it once"
         )
 
     def test_a_face_of_a_bound_body_is_not_the_body(self):
@@ -2272,9 +2435,9 @@ class TestWhatTheTranslationRefuses:
     def test_a_dispersive_material_is_refused_by_the_material_it_came_from(self):
         """Palace states a material as one number for the whole band, and a
         table of them has no single one to be."""
-        found, _ = guide(material=dielectric(MaterialType="FrequencyDependentDielectric"))
+        found, _ = guide(material=dielectric(MaterialType="Frequency Dependent Dielectric"))
         with pytest.raises(
-            TranslationError, match="FrequencyDependentDielectric material, and this solver"
+            TranslationError, match="Frequency Dependent Dielectric material, and Palace takes"
         ):
             problem(found)
 
@@ -2352,7 +2515,7 @@ class TestWhatTheTranslationRefuses:
         for member in found.Group:
             if kind(member) == "EMSolverPalace":
                 member.Order = 0
-        with pytest.raises(TranslationError, match="polynomial order"):
+        with pytest.raises(TranslationError, match="Order is 0. Enter 1 or more"):
             problem(found)
 
     def test_two_objects_sharing_a_name_cannot_be_told_apart_in_the_mesh(self):
@@ -2768,7 +2931,7 @@ class TestTheCrossSectionAPortStandsOn:
             configured(described, mesh, "results")
         said = str(refused.value)
         assert "'SeptumMetal' and the region's own boundary" in said
-        assert "; 'IrisMetal' -" in said
+        assert "; 'IrisMetal')" in said
 
     def test_metal_apart_from_the_wall_on_any_part_of_the_face_is_refused(self):
         """A dielectric's interface joins the face's two sides into one guide, and
@@ -3238,19 +3401,25 @@ class TestFindingTheMPILauncher:
         monkeypatch.setenv("PATH", str(tmp_path / "bin"))
         assert find_launcher() == found
 
-    def test_a_path_without_mpirun_is_refused_naming_it(self, tmp_path, monkeypatch):
-        """What a FreeCAD started from Finder or the Dock is given."""
-        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    def test_a_path_without_mpirun_is_refused_saying_what_to_set(self, tmp_path, monkeypatch):
+        """What a FreeCAD started from Finder or the Dock is given. FreeCAD puts
+        each of its Mod directories on PATH, so the PATH is not quoted: the
+        advice would arrive under a screen of them."""
+        searched = os.pathsep.join(str(tmp_path / f"Mod{index}") for index in range(3))
+        monkeypatch.setenv("PATH", searched)
         with pytest.raises(SolverNotFound) as raised:
             find_launcher()
-        assert str(tmp_path / "empty") in str(raised.value)
+        assert str(raised.value).endswith(
+            "Set MPILauncher on the Palace solver to the mpirun of the MPI Palace was built "
+            "with, or start FreeCAD from a shell that finds mpirun"
+        )
+        assert str(tmp_path) not in str(raised.value)
 
-    def test_with_no_path_at_all_the_path_searched_is_the_one_named(self, tmp_path, monkeypatch):
+    def test_with_no_path_at_all_the_default_is_searched(self, tmp_path, monkeypatch):
+        found = self.program(tmp_path / "default")
         monkeypatch.delenv("PATH")
         monkeypatch.setattr(run_module.os, "defpath", str(tmp_path / "default"))
-        with pytest.raises(SolverNotFound) as raised:
-            find_launcher()
-        assert str(tmp_path / "default") in str(raised.value)
+        assert find_launcher() == found
 
     def test_a_setting_that_names_no_program_is_refused_rather_than_searched_past(
         self, tmp_path, monkeypatch
@@ -3354,7 +3523,7 @@ class TestWhichPalaceIsRun:
         stand_in.write_text(f"#!/bin/sh\nsleep 60 &\necho $! > {child}\nwait\n")
         stand_in.chmod(0o755)
         began = time.monotonic()
-        with pytest.raises(SolverUnsupported, match="had not answered"):
+        with pytest.raises(SolverUnsupported, match="did not state its version within"):
             version(stand_in)
         # Well short of the child's own minute: a stop that missed it waits it out.
         assert time.monotonic() - began < 10.0
@@ -3407,7 +3576,7 @@ class TestWhichPalaceIsRun:
         )
         stand_in.chmod(0o755)
         began = time.monotonic()
-        with pytest.raises(SolverUnsupported, match="had not answered"):
+        with pytest.raises(SolverUnsupported, match="did not state its version within"):
             version(stand_in)
         assert time.monotonic() - began < 10.0
 
@@ -3418,7 +3587,7 @@ class TestWhichPalaceIsRun:
         stand_in.write_text("#!/bin/sh\ntrap '' TERM\nsleep 60\n")
         stand_in.chmod(0o755)
         began = time.monotonic()
-        with pytest.raises(SolverUnsupported, match="had not answered"):
+        with pytest.raises(SolverUnsupported, match="did not state its version within"):
             version(stand_in)
         assert time.monotonic() - began < 10.0
 
@@ -3498,11 +3667,12 @@ class TestHowAnAdaptiveSweepSampled:
             )
         message = str(failed.value)
         assert message.startswith("'WGPort2': ")
-        assert f"all 4 full solves it is allowed before {CONVERGENCE_MEMORY} in a row" in message
+        assert f"all 4 full solves before {CONVERGENCE_MEMORY} in a row" in message
         assert "tolerance 1e-12" in message
-        assert "the last being 0.35 off it" in message
-        assert "Raise SweepSolves or SweepTolerance" in message
-        assert "set its Sweep to Discrete" in message
+        assert "the last was 0.35 off it" in message
+        assert message.endswith(
+            "Raise SweepSolves or SweepTolerance on the Palace solver, or set its Sweep to Discrete"
+        )
 
     def test_a_port_the_log_says_nothing_of_fails_the_run(self):
         """The model's error there is not known, and the table cannot say."""
@@ -3590,6 +3760,9 @@ class TestWhatTheCheckOfTheReducedModelSays:
         beyond = reduced.said(reduced.compared(self.model(), self.full(3e-4), 0.01))
         within = reduced.said(reduced.compared(self.model(), self.full(3e-4), 1.0))
         assert "SweepTolerance" in beyond and "SweepTolerance" not in within
+        assert beyond.endswith(
+            "Lower SweepTolerance on the Palace solver, or set its Sweep to Discrete"
+        )
         assert "-40 dB" in beyond
 
 
@@ -3837,21 +4010,49 @@ class TestWhatPetscHeld:
     def test_an_option_from_the_environment_fails_the_run_naming_each(self):
         (failed,) = complaints(ENVIRONMENT_OPTIONS)
         assert failed.startswith(
-            "PETSc held options this workbench does not write: -ems_probe_unused "
+            "PETSc read options the workbench does not set: -ems_probe_unused "
             "from its environment, -eps_tol 1e-6 from its environment. "
+        )
+        assert failed.endswith(
+            "Remove them from the launcher in SolverPath, or from the file $BASH_ENV names"
         )
         assert "-options_view" not in failed
 
     def test_an_option_from_a_file_fails_the_run(self):
         (failed,) = complaints(FILE_OPTIONS)
         assert failed.startswith(
-            "PETSc held options this workbench does not write: -eps_view from a file. "
+            "PETSc read options the workbench does not set: -eps_view from a file. "
         )
 
     def test_the_list_is_read_where_another_process_ran_into_it(self):
         """Processes share one stream and nothing prefixes their lines."""
         (failed,) = complaints("Sol. ||E|| = 1.0e-05-eps_tol 1e-6 # (source: environment)\n")
         assert ": -eps_tol 1e-6 from its environment." in failed
+
+
+class TestHowManyRanks:
+    def test_a_count_is_the_count(self):
+        assert run_module.ranks(3) == 3
+
+    def test_a_negative_count_is_refused(self):
+        with pytest.raises(ValueError, match="Processes is -1. Enter 0, or a count of at least"):
+            run_module.ranks(-1)
+
+    @pytest.mark.parametrize(("logical", "made"), [(8, 4), (16, 8), (1, 1), (None, 1)])
+    def test_the_machine_is_half_its_logical_processors_and_at_least_one(
+        self, monkeypatch, logical, made
+    ):
+        """Open MPI counts a slot to a core and refuses more ranks than slots,
+        and a core carries one or two logical processors."""
+        monkeypatch.setattr(run_module.os, "process_cpu_count", lambda: logical, raising=False)
+        monkeypatch.setattr(run_module.os, "cpu_count", lambda: logical)
+        assert run_module.ranks(run_module.MACHINE) == made
+
+    def test_the_machine_reaches_the_command_line_as_a_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(run_module.os, "process_cpu_count", lambda: 8, raising=False)
+        monkeypatch.setattr(run_module.os, "cpu_count", lambda: 8)
+        said = solve(tmp_path / "palace.json", run_module.MACHINE, solver=stands_in(tmp_path))
+        assert "-np 4 " in said
 
 
 class TestRunningPalace:
@@ -3941,6 +4142,18 @@ class TestRunningPalace:
             on_output=seen.append,
         )
         assert "a" in seen and "b" in seen
+
+    def test_what_palace_printed_reaches_the_caller_between_two_blank_lines(self, tmp_path):
+        """Set apart from what is said about the run either side. The log a
+        run returns holds what Palace printed and nothing else."""
+        seen = []
+        said = solve(
+            tmp_path / "palace.json",
+            1,
+            solver=stands_in(tmp_path, says="a\nb"),
+            on_output=seen.append,
+        )
+        assert seen == ["", *said.splitlines(), ""]
 
     def test_a_run_that_ended_badly_is_a_failure(self, tmp_path):
         with pytest.raises(SolverFailed, match="exited with code"):
@@ -4121,7 +4334,8 @@ class TestRunningPalace:
         with pytest.raises(SolverFailed) as raised:
             solve(tmp_path / "palace.json", 1, solver=stands_in(tmp_path, says="x", status=137))
         assert (
-            raised.value.said[0] == "status 137 is how a process ended by signal 9 (SIGKILL) exits"
+            raised.value.said[0]
+            == "exit status 137 means a process was ended by signal 9 (SIGKILL)"
         )
 
     def test_a_status_says_nothing_of_a_signal_where_the_signal_is_already_said(self, tmp_path):
@@ -4135,9 +4349,9 @@ class TestRunningPalace:
             )
         assert raised.value.said == (f"Palace stopped: {signalled}",)
 
-    def test_a_run_on_no_processes_is_refused(self, tmp_path):
+    def test_a_run_on_a_negative_count_of_processes_is_refused(self, tmp_path):
         with pytest.raises(ValueError, match="at least one process"):
-            solve(tmp_path / "palace.json", 0, solver=stands_in(tmp_path))
+            solve(tmp_path / "palace.json", -1, solver=stands_in(tmp_path))
 
 
 class TestARunCanBeStopped:
@@ -4179,7 +4393,7 @@ class TestARunCanBeStopped:
                 cancel=cancel,
             )
         assert time.monotonic() - began < 30.0
-        assert started and not _alive(started[0])
+        assert started and _ends(started[0])
 
     def test_a_stop_reaches_a_run_that_has_stopped_printing(self, tmp_path):
         """Its output ends while it goes on running, and the run then waits on
@@ -4201,7 +4415,7 @@ class TestARunCanBeStopped:
             "from Microwave.Solvers.palace.run import solve\n"
             f"solve({str(tmp_path / 'palace.json')!r}, 1, "
             f"solver={str(self.launcher(tmp_path))!r}, "
-            "on_output=lambda line: print(line, flush=True))\n"
+            "on_output=lambda line: line and print(line, flush=True))\n"
         )
         assert line.startswith("pid=")
         gone_within(int(line.split("=")[1]), 10.0)
@@ -4321,6 +4535,8 @@ class TestARunCanBeStopped:
                 "from Microwave.Solvers.palace.run import solve\n"
                 "cancel = Cancellation()\n"
                 "def heard(line):\n"
+                "    if not line:\n"
+                "        return\n"
                 "    print(line, flush=True)\n"
                 "    cancel.cancel()\n"
                 f"solve({str(tmp_path / 'palace.json')!r}, 1, solver={str(launcher)!r}, "
@@ -4410,12 +4626,39 @@ class TestWhatAStopSignals:
         assert signalled == []
 
 
+def _ends(pid, within=10.0):
+    """Whether ``pid`` exits within ``within`` seconds.
+
+    A process's output closes while it exits, so the run sees the output end a
+    moment before the process has, and a look taken at once can find it still
+    there.
+    """
+    deadline = time.monotonic() + within
+    while _alive(pid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def _alive(pid):
+    """Whether ``pid`` has not exited.
+
+    Signal 0 also reaches a process that has exited and that whoever inherited
+    it has not yet reaped, which is what the launcher's child is once both are
+    stopped. Where ``/proc`` says a process is such a one, it is not alive.
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except OSError:
+        return True
+    # The state follows the command name, which is in parentheses and may
+    # itself hold any character.
+    return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
 
 
 #: What a port's mode run finds on WR-42's face at 26 GHz, in the order Palace
@@ -4787,14 +5030,14 @@ class TestTheStagesInOrder:
             self.run(
                 tmp_path,
                 monkeypatch,
-                drawn=guide(NumFrequencyPoints=41)[0],
+                drawn=guide(FrequencyPoints=41)[0],
                 log=CONVERGED + REACHED,
             )
 
     def adaptive(self, **study):
         """The guide swept adaptively over the thirteen points the stand-in
         table holds, both ports driven and each sweep converged."""
-        found, _ = guide(NumFrequencyPoints=13, **study)
+        found, _ = guide(FrequencyPoints=13, **study)
         found.Group = [
             palace_solver(SweepSolves=FEWEST_SOLVES) if kind(member) == "EMSolverPalace" else member
             for member in found.Group
@@ -4816,7 +5059,7 @@ class TestTheStagesInOrder:
         driven_ = asked["checked"]["Solver"]["Driven"]
         assert "AdaptiveTol" not in driven_
         solving, checked = [line for line in heard if "reduced model" in line][-2:]
-        assert solving.startswith("The band is solved again in full at 20 and 26 GHz")
+        assert solving == "Checking the reduced model with full solves at 20 and 26 GHz"
         assert "the reduced model is off the full solve by 0 " in checked
         assert not checked.startswith(balance.WARNING)
 
@@ -4845,7 +5088,7 @@ class TestTheStagesInOrder:
         study reading down to -40 dB."""
         at_full_scale, _ = self.checked(tmp_path / "full", monkeypatch, shifted=0.01)
         reading_down, _ = self.checked(
-            tmp_path / "deep", monkeypatch, shifted=0.01, study={"SmallestResponse": -40.0}
+            tmp_path / "deep", monkeypatch, shifted=0.01, study={"ResponseFloor": -40.0}
         )
         assert not at_full_scale.startswith(balance.WARNING)
         assert reading_down.startswith(balance.WARNING)
@@ -5027,7 +5270,7 @@ class TestTheStagesInOrder:
     ):
         found, _ = guide()
         with pytest.raises(ValueError, match="at least one process"):
-            pipeline.solve(found, tmp_path, 0)
+            pipeline.solve(found, tmp_path, -1)
         assert list(tmp_path.iterdir()) == []
 
     def test_a_machine_without_palace_is_told_before_the_mesh_is_built(self, tmp_path, monkeypatch):
@@ -5211,7 +5454,7 @@ class TestTheStagesInOrder:
         pair = (complex(459.05, 0.0), complex(459.05, 0.0), complex(0.0, 692.8))
         found, _ = guide()
         found.Group = [*found.Group, metal_binding(septum())]
-        with pytest.raises(TranslationError, match="a face 'SeptumMetal' divides"):
+        with pytest.raises(TranslationError, match="its face, divided by 'SeptumMetal',"):
             self.run(
                 tmp_path,
                 monkeypatch,
@@ -5249,7 +5492,9 @@ class TestTheStagesInOrder:
         def carried(frequency):
             return ONE_MODE if frequency > 20.0 else lossy
 
-        with pytest.raises(TranslationError, match="at 20 GHz, the bottom of the band. Palace"):
+        with pytest.raises(
+            TranslationError, match="at 20 GHz, the bottom of the band, so the port face"
+        ):
             self.run(tmp_path, monkeypatch, carried=carried)
 
     def test_a_lossy_filling_is_named_where_a_face_carries_no_mode(self, tmp_path, monkeypatch):
@@ -5273,7 +5518,7 @@ class TestTheStagesInOrder:
         self, tmp_path, monkeypatch
     ):
         """One point is written as the start of the band, wherever its stop."""
-        asked = self.run(tmp_path, monkeypatch, drawn=guide(NumFrequencyPoints=1)[0])
+        asked = self.run(tmp_path, monkeypatch, drawn=guide(FrequencyPoints=1)[0])
         assert [run["config"]["Solver"]["BoundaryMode"]["Freq"] for run in asked["modes"]] == [
             20.0,
             20.0,
@@ -5296,7 +5541,7 @@ class TestTheStagesInOrder:
 
     def test_a_port_carrying_two_modes_stops_the_run_before_the_band(self, tmp_path, monkeypatch):
         pair = (complex(459.05, 0.0), complex(459.05, 0.0), complex(0.0, 692.8))
-        with pytest.raises(TranslationError, match="'Port1' stands on a face carrying 2 modes"):
+        with pytest.raises(TranslationError, match="'Port1': its face carries 2 modes"):
             self.run(tmp_path, monkeypatch, carried=pair)
         assert not (tmp_path / OUTPUT_NAME).exists(), "the band was solved after the refusal"
 
@@ -5310,7 +5555,7 @@ class TestTheStagesInOrder:
         for port in (1, 2):
             for edge in ("bottom", "top"):
                 mode_table(tmp_path / MODES_NAME / str(port) / edge, ONE_MODE)
-        with pytest.raises(ResultsError, match="left no table"):
+        with pytest.raises(ResultsError, match="wrote no table"):
             self.run(tmp_path, monkeypatch, carried=None)
 
     def test_preparing_a_run_starts_no_process(self, tmp_path, monkeypatch):
@@ -5326,6 +5571,17 @@ class TestTheStagesInOrder:
         prepared = pipeline.prepare(guide()[0], tmp_path)
         assert prepared.pieces
         assert all(Path(piece.file).is_file() for piece in prepared.pieces)
+
+    def test_a_mesh_alone_looks_for_no_palace(self, tmp_path):
+        """Gmsh makes the mesh, so a Palace configured where none is stops a
+        run and not a mesh."""
+        nowhere = tmp_path / "no-palace"
+        prepared = pipeline.prepare(guide()[0], tmp_path, solver=nowhere, solving=False)
+        assert prepared.binary is None and prepared.pieces
+        with pytest.raises(ValueError, match="mesh alone"):
+            pipeline.binary(prepared)
+        with pytest.raises(pipeline.run.SolverNotFound, match="no-palace"):
+            pipeline.prepare(guide()[0], tmp_path, solver=nowhere)
 
     def test_what_a_refinement_region_names_reaches_the_mesher_as_marks(
         self, tmp_path, monkeypatch
@@ -5384,9 +5640,20 @@ class TestTheStagesInOrder:
             )
         said = str(refusal.value)
         assert said.startswith("elements turned inside out in 'Rod'. ")
-        assert "raise ElementsPerTurn on the Gmsh mesh from 6," in said
-        assert "set MinElementSize on the mesh policy below the floor of " in said
-        assert "lay a Mesh Refinement there" in said
+        assert re.search(
+            re.escape(
+                ". Where the drawing curves or narrows tightly, raise ElementsPerTurn in the "
+                "Palace mesh settings from 6, set MinElementSize in the Palace mesh settings "
+                "below "
+            )
+            + r"\S+"
+            + re.escape(
+                " mm, or lay a Mesh Refinement on that part with an ElementSize near its "
+                "smallest radius or width"
+            )
+            + "$",
+            said,
+        )
 
     def test_shapes_the_kernel_could_not_cut_are_told_nothing_about_the_element_size(
         self, tmp_path, monkeypatch
@@ -5487,7 +5754,7 @@ class TestReadingTheTable:
         lines[3] = ",".join(cells)
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-        with pytest.raises(ResultsError, match="not a finite number at 21 GHz"):
+        with pytest.raises(ResultsError, match="the solve returned no result at 21 GHz"):
             scattering(tmp_path, driven())
 
     def test_the_band_comes_back_in_hertz(self, tmp_path):
@@ -5531,7 +5798,7 @@ class TestReadingTheTable:
         """A run whose excitations do not drive one port each writes every other
         table and not this one, and says nothing about it.
         """
-        with pytest.raises(ResultsError, match="exactly one port"):
+        with pytest.raises(ResultsError, match="Palace wrote no scattering table"):
             scattering(tmp_path, driven())
 
     def test_a_table_shorter_than_the_band_is_a_run_that_stopped(self, tmp_path):
@@ -5656,7 +5923,7 @@ class TestHowManyModesAPortCarries:
     def test_one_mode_is_said_with_how_fast_the_next_dies(self):
         said = judged("Port1", ONE_MODE, 26e9, "the top of the band")
         assert said.startswith("'Port1' carries one mode at 26 GHz, 459.06 per metre")
-        assert said.endswith(f"of the others found falls by e in {1e3 / 218.82:.3g} mm")
+        assert said.endswith(f"slowest-decaying other mode falls to 1/e in {1e3 / 218.82:.3g} mm")
 
     @pytest.mark.parametrize(
         "found",
@@ -5670,22 +5937,29 @@ class TestHowManyModesAPortCarries:
         with pytest.raises(TranslationError) as refused:
             judged("Port1", found, 26e9, "the top of the band")
         said = str(refused.value)
-        assert "'Port1' stands on a face carrying 2 modes at 26 GHz" in said
+        assert "'Port1': its face carries 2 modes at 26 GHz" in said
         assert all(f"{k.real:.2f}" in said for k in found if k.real)
+        assert said.endswith(
+            "End the band below the cutoff of the second mode, or change the cross-section "
+            "so it carries one mode"
+        )
 
     def test_what_divides_the_face_is_named_where_something_does(self):
         pair = (complex(459.05, 0.0), complex(459.05, 0.0), complex(0.0, 692.8))
-        with pytest.raises(TranslationError, match="a face 'Sheet' divides, whose parts carry 2"):
+        with pytest.raises(TranslationError, match="its face, divided by 'Sheet', carries 2"):
             judged("Port1", pair, 26e9, "the top of the band", "'Sheet'")
 
     def test_a_face_carrying_nothing_is_refused_with_how_fast_its_first_dies(self):
         below = (complex(0.0, 700.0), complex(0.0, 300.0), complex(0.0, 500.0))
-        with pytest.raises(TranslationError, match=f"falls by e in {1e3 / 300.0:.3g} mm"):
+        with pytest.raises(TranslationError) as refused:
             judged("Port1", below, 26e9, "the top of the band")
+        said = str(refused.value)
+        assert f"falls to 1/e in {1e3 / 300.0:.3g} mm" in said
+        assert said.endswith("Start the band above the guide's cutoff")
 
     def test_a_face_where_every_mode_asked_for_propagates_may_carry_more(self):
         every = (complex(515.1, 0.0), complex(459.1, 0.0), complex(152.7, 0.0))
-        with pytest.raises(TranslationError, match=f"carrying at least {MODES} modes"):
+        with pytest.raises(TranslationError, match=f"carries at least {MODES} modes"):
             judged("Port1", every, 26e9, "the top of the band")
 
     def test_a_run_that_found_fewer_than_asked_says_so_rather_than_counting(self):
@@ -5727,8 +6001,11 @@ class TestHowManyModesAPortCarries:
         with pytest.raises(TranslationError) as refused:
             judged("Port1", lossy, 15e9, "the bottom of the band")
         said = str(refused.value)
-        assert "'Port1' carries a mode of 370.30-160.10i per metre at 15 GHz" in said
+        assert "'Port1': its mode is 370.30-160.10i per metre at 15 GHz" in said
         assert f"reflects {reflected(lossy[0]):.3g} of the power" in said
+        assert said.endswith(
+            "Draw the port where the guide loses less, or start the band further above its cutoff"
+        )
 
     @pytest.mark.parametrize(("loss", "refused"), [(12.5, False), (12.8, True)])
     def test_the_bar_is_the_one_the_run_holds_its_power_to(self, loss, refused):
@@ -5743,9 +6020,8 @@ class TestHowManyModesAPortCarries:
         else:
             said = judged("Port1", found, 26e9, "the top of the band")
             assert said.endswith(
-                "Palace matches the port to the real part of the constant, so as a TE mode "
-                f"its face reflects {reflected(constant):.2g} of the power, and two faces in "
-                "phase 4 times that"
+                f"the port face reflects about {reflected(constant):.2g} of the power, and two "
+                "ports up to 4 times that"
             )
 
     def test_a_mode_lossless_to_the_solves_own_tolerance_is_said_as_before(self):
@@ -5759,13 +6035,13 @@ class TestHowManyModesAPortCarries:
         bar and far past the solve's own rounding."""
         walls = complex(459.09, -0.0375)
         said = judged("Port1", (walls, *ONE_MODE[1:]), 26e9, "the top of the band")
-        assert f"its face reflects {reflected(walls):.2g} of the power" in said
+        assert f"face reflects about {reflected(walls):.2g} of the power" in said
 
     def test_a_lossy_filling_carrying_nothing_says_it_may_hide_the_guides_mode(self):
         """At 5 S/m the mode run found TE01, TE20 and TE11 and not TE10, which
         propagates there."""
         found = (complex(331.3, -716.0), complex(389.0, -609.0), complex(310.0, -765.0))
-        with pytest.raises(TranslationError, match="can also hide the guide's own mode"):
+        with pytest.raises(TranslationError, match="can also hide the guide's mode"):
             judged("Port1", found, 12e9, "the bottom of the band", lossy=True)
 
     def test_lossy_walls_carrying_nothing_are_not_told_about_a_filling(self):
@@ -5786,7 +6062,7 @@ class TestHowManyModesAPortCarries:
         said = judged(
             "Port1", (complex(459.06, 0.0), 0j, complex(0.0, 692.8)), 26e9, "the top of the band"
         )
-        assert said.endswith("no distance a number states")
+        assert said.endswith("slowest-decaying other mode does not decay")
 
 
 class TestAPortReadsItsVoltageAcrossTheMiddleOfItsBroadSide:
@@ -6083,7 +6359,7 @@ class TestTheModeTableRead:
         assert modes(tmp_path) == ONE_MODE
 
     def test_a_missing_table_is_no_answer(self, tmp_path):
-        with pytest.raises(ResultsError, match="left no table"):
+        with pytest.raises(ResultsError, match="wrote no table"):
             modes(tmp_path)
 
 
@@ -6425,21 +6701,38 @@ def refinement(references, **overrides):
 
 def with_members(*added, settings=None, recipe=None):
     """The guide, with ``added`` among its members and its policy or its recipe
-    replaced where one is given."""
+    replaced where one is given. A region among ``added`` amends the guide's
+    recipe unless it names other settings, as the toolbar would link it."""
     found, _ = guide()
     members = list(found.Group)
     for replacing, wanted in ((settings, "EMMeshPolicy"), (recipe, "EMGmshMesh")):
         if replacing is not None:
             members = [member for member in members if kind(member) != wanted]
             members.append(replacing)
-    found.Group = [*members, *added]
+    found.Group = [*members, *amending(added, members)]
     return found
+
+
+def amending(added, members):
+    """``added``, each region among them not naming its settings set to amend
+    the recipe among ``members``."""
+    (recipe,) = [member for member in members if kind(member) == "EMGmshMesh"]
+    for one in added:
+        if kind(one) == "EMMeshRegion" and not hasattr(one, "MeshSettings"):
+            one.MeshSettings = recipe
+    return list(added)
 
 
 #: What the Gmsh mesh declares rather than the mesh policy. An override below
 #: goes to the object that declares it, so a test names the property and not
 #: the object it happens to sit on today.
-OF_THE_RECIPE = ("ElementsPerWavelength", "EdgeRefinement", "MaxGrowthRatio")
+OF_THE_RECIPE = (
+    "ElementsPerWavelength",
+    "EdgeRefinement",
+    "MaxGrowthRatio",
+    "MinElementsAcross",
+    "MinElementSize",
+)
 
 
 def two_sheets(**asked):
@@ -6485,8 +6778,9 @@ class TestTheSizeAtTheEdgeOfMetal:
         assert problem(two_sheets(EdgeRefinement=1.0)).demand.places == ()
 
     def test_a_refinement_below_one_is_refused(self):
-        with pytest.raises(TranslationError, match="EdgeRefinement is 0.5"):
+        with pytest.raises(TranslationError, match="EdgeRefinement is 0.5") as raised:
             problem(two_sheets(EdgeRefinement=0.5))
+        assert str(raised.value).endswith("Enter 1 or more, where 1 means no refinement")
 
     def test_a_model_with_no_metal_asks_for_the_bulk_alone(self):
         """The rest of the boundary is the sides of a box, which the room stands
@@ -6517,7 +6811,7 @@ class TestTheSizeAtTheEdgeOfMetal:
             if "EdgeRefinement" in line
         ]
         assert f"asks for {coarsest / 6.0:.4g} mm" in line
-        assert f"laid at {floor:.4g} mm, the floor under every element" in line
+        assert f"laid at {floor:.4g} mm, the floor MinElementSize sets" in line
 
     def test_a_rim_above_the_floor_is_said_nothing_about_it(self):
         _, said = TestWhatIsStatedAndNotLaid().lines(two_sheets(MinElementSize=0.01))
@@ -6553,6 +6847,20 @@ class TestARefinementRegion:
         assert (place.label, place.size) == (mark.name, 0.5)
         assert (mark.dimension, mark.shape, mark.thinnest) == (3, rod.Shape, 3.0)
         assert "Ring" in place.name and "Rod" in place.name
+
+    def test_a_region_amending_the_yee_grid_is_no_mark_of_this_mesh(self):
+        """A region is the backend's whose settings it amends, so the same place
+        refined for openEMS asks nothing of the tetrahedra."""
+        theirs = obj("EMYeeGrid", "YeeGrid", ElementsPerWavelength=20.0)
+        region = refinement([(self.rod(), [""])], MeshSettings=theirs)
+        described = problem(with_members(theirs, region))
+        assert list(described.marks) == []
+        assert list(marked(described.demand)) == []
+
+    def test_a_region_amending_nothing_is_refused_by_name(self):
+        region = refinement([(self.rod(), [""])], MeshSettings=None)
+        with pytest.raises(TranslationError, match="'Ring' amends no mesh settings"):
+            problem(with_members(region))
 
     def test_a_face_it_names_is_a_mark_of_its_own_dimension(self):
         described = problem(with_members(refinement([(self.rod(), ["Face1"])])))
@@ -6612,7 +6920,7 @@ class TestARefinementRegion:
         coarsest = problem(guide()[0]).demand.coarsest
         floor = coarsest / 4.0
         region = refinement([(self.rod(), [""])], ElementSize=floor / 2.0)
-        described = problem(with_members(region, settings=mesh_settings(MinElementSize=floor)))
+        described = problem(with_members(region, recipe=gmsh_mesh(MinElementSize=floor)))
         (place,) = marked(described.demand)
         assert place.size == floor
         assert coverage.asked(described.demand, PROFILE) == []
@@ -6628,7 +6936,7 @@ class TestARefinementRegion:
             line for line in unlaid_said(described.unlaid, mesh) if line.startswith("'Ring'")
         ]
         assert f"ElementSize {floor / 2.0:.4g} mm is laid at {floor:.4g} mm" in line
-        assert "MinElementSize" in line and "0.7 mm" in line
+        assert "MinElementSize on 'GmshMesh'" in line and "0.7 mm" in line
 
     def test_a_size_at_the_floor_is_laid_as_stated_and_not_said(self):
         """The floor lays nothing finer than it, so a size standing on it is laid
@@ -6636,7 +6944,7 @@ class TestARefinementRegion:
         coarsest = problem(guide()[0]).demand.coarsest
         floor = coarsest / 4.0
         region = refinement([(self.rod(), [""])], ElementSize=floor)
-        described = problem(with_members(region, settings=mesh_settings(MinElementSize=floor)))
+        described = problem(with_members(region, recipe=gmsh_mesh(MinElementSize=floor)))
         (place,) = marked(described.demand)
         assert place.size == floor
         mesh = answered(
@@ -6659,6 +6967,7 @@ class TestARefinementRegion:
         twice = refinement([(rod, ["Face1"]), (rod, ["Face1"])])
         assert len(marked(problem(with_members(twice)).demand)) == 1
         other = refinement([(rod, ["Face1"])], ElementSize=0.4)
+        twice = refinement([(rod, ["Face1"]), (rod, ["Face1"])])
         asked = problem(with_members(twice, other)).demand
         assert len({place.name for place in asked.places}) == len(asked.places) == 2
         assert coverage.asked(asked, PROFILE) == []
@@ -6696,6 +7005,9 @@ class TestARefinementRegion:
         with pytest.raises(TranslationError) as refused:
             problem(with_members(stale))
         assert "'Ring' coarsens 'Rod:Face9', which no material binding names" in str(refused.value)
+        assert str(refused.value).endswith(
+            ". Bind a material to it, or aim the region at geometry a material is bound to"
+        )
         with pytest.raises(TranslationError) as other:
             check_relaxations_were_used(relaxations([stale]), set())
         assert str(other.value) == str(refused.value)
@@ -6710,7 +7022,7 @@ class TestARefinementRegion:
         )
         with pytest.raises(TranslationError, match="'Ring'") as refused:
             problem(with_members(refinement([(empty, [""])])))
-        assert "'Empty', whose shape holds nothing" in str(refused.value)
+        assert "'Empty', whose shape is empty" in str(refused.value)
 
     def test_a_reference_whose_shape_holds_no_element_is_refused_by_name(self):
         """What a mark is is read off what its shape holds, and a shape holding no
@@ -6720,7 +7032,7 @@ class TestARefinementRegion:
         hollow = obj("Part::Feature", "Hollow", Shape=bare)
         with pytest.raises(TranslationError, match="'Ring'") as refused:
             problem(with_members(refinement([(hollow, [""])])))
-        assert "'Hollow', whose shape holds nothing" in str(refused.value)
+        assert "'Hollow', whose shape is empty" in str(refused.value)
 
 
 class Rim:
@@ -6789,6 +7101,362 @@ def plates(*coarsenings, faces=1, named=None, gap=3.0, closed=False, **asked):
         *regions,
         recipe=gmsh_mesh(**asked),
     )
+
+
+class TestTheCountAcrossANarrowSheet:
+    """Two edges of a sheet that face each other closer than ``ACROSS`` times the
+    size at the rim are each laid at their distance apart over ``ACROSS``. Which
+    edges face each other is the kernel's to say, and is held under a real one by
+    ``tests/test_palace_narrow.py``; here the edges are stated outright."""
+
+    STOP, SLOWEST = 10e9, 4.4
+
+    def rim(self, refinement=8.0):
+        return element_size(20.0, self.STOP, self.SLOWEST) / refinement
+
+    def edge(self, apart, name="TraceMetal at Strip", rim="TraceMetal"):
+        return Narrow(
+            rim=rim,
+            drawn="Strip",
+            apart=apart,
+            mark=RegionMark(name=name, dimension=1, shape=None, thinnest=0.0),
+        )
+
+    def asked(self, narrow, coarsened=None, **overrides):
+        settings = mesh_settings(
+            **{name: value for name, value in overrides.items() if name not in OF_THE_RECIPE}
+        )
+        recipe = gmsh_mesh(
+            **{name: value for name, value in overrides.items() if name in OF_THE_RECIPE}
+        )
+        return (
+            settings,
+            recipe,
+            demand(
+                settings,
+                recipe,
+                self.STOP,
+                self.SLOWEST,
+                rims=["TraceMetal"],
+                coarsened=coarsened or {},
+                narrow=narrow,
+            ),
+        )
+
+    def near(self, asked):
+        return {place.name: place.size for place in asked.places if isinstance(place, Near)}
+
+    def stated(self, narrow, relaxed=(), coarsened=None, reached=None, **overrides):
+        settings, recipe, asked = self.asked(narrow, coarsened, **overrides)
+        records = unlaid(
+            settings, recipe, asked, [], [], ["TraceMetal"], WALL, relaxed=relaxed, narrow=narrow
+        )
+        mesh = Mesh(
+            path="/run/model.msh",
+            labels={},
+            worst_quality={},
+            edges=Edges(shortest=0.1, longest=3.0),
+            settled=(),
+            version="",
+            algorithm={},
+            rims={},
+            reached=reached or {},
+        )
+        return [record for record in records if isinstance(record, Narrowed)], unlaid_said(
+            records, mesh
+        )
+
+    def test_an_edge_facing_another_within_the_count_is_laid_at_the_distance_over_it(self):
+        apart = 2.0 * self.rim()
+        _, _, asked = self.asked([self.edge(apart)])
+        assert self.near(asked) == {
+            "TraceMetal at Strip": pytest.approx(apart / palace_policy.ACROSS, abs=0.0)
+        }
+
+    def test_an_edge_the_rim_already_lays_the_count_across_lays_nothing(self):
+        for apart in (palace_policy.ACROSS * self.rim(), 2.0 * palace_policy.ACROSS * self.rim()):
+            _, _, asked = self.asked([self.edge(apart)])
+            assert self.near(asked) == {}
+
+    def test_it_follows_the_rim_it_refines(self):
+        """The count is asked against the size at the rim, so a finer rim lays
+        the same edge only where the finer rim leaves too few."""
+        apart = 3.0 * self.rim()
+        assert self.near(self.asked([self.edge(apart)])[2])
+        assert self.near(self.asked([self.edge(apart)], EdgeRefinement=16.0)[2]) == {}
+
+    def test_a_refinement_of_one_lays_nothing_and_says_what_is_across(self):
+        apart = 2.0 * self.rim()
+        _, _, asked = self.asked([self.edge(apart)], EdgeRefinement=1.0)
+        assert self.near(asked) == {}
+        (record,), lines = self.stated([self.edge(apart)], EdgeRefinement=1.0)
+        bulk = self.rim(refinement=1.0)
+        assert record.unlaid == (("Strip", apart, pytest.approx(bulk, abs=0.0), UNREFINED),)
+        (line,) = [line for line in lines if "EdgeRefinement 1 lays no size" in line]
+        assert f"'Strip' {apart:.4g} mm across, {apart / bulk:.2g} times {bulk:.4g} mm" in line
+        assert line.endswith(
+            "Set EdgeRefinement above 1, or lay a Mesh Refinement at those edges with an "
+            f"ElementSize of their distance apart over {palace_policy.ACROSS}"
+        )
+        assert (
+            f"Mesh Refinement at those edges with an ElementSize of their distance apart over "
+            f"{palace_policy.ACROSS}" in line
+        )
+
+    def test_a_coarsening_of_the_metal_settles_its_edges_and_is_said(self):
+        apart = 2.0 * self.rim()
+        coarser = 2.0 * self.rim()
+        _, _, asked = self.asked([self.edge(apart)], coarsened={"TraceMetal": coarser})
+        assert self.near(asked) == {}
+        relaxed = Relaxed(
+            rim="TraceMetal",
+            size=coarser,
+            asked_by="Coarsen",
+            length=10.0,
+            nearest=None,
+            refined=(),
+        )
+        (record,), lines = self.stated(
+            [self.edge(apart)], relaxed=[relaxed], coarsened={"TraceMetal": coarser}
+        )
+        assert record.settled == (("TraceMetal", coarser),)
+        assert record.unlaid == (("Strip", apart, coarser, SETTLED),)
+        (line,) = [line for line in lines if "since a coarsening settles" in line]
+        assert f"settles 'TraceMetal' at {coarser:.4g} mm" in line
+        assert (
+            f"'Strip' {apart:.4g} mm across, {apart / coarser:.2g} times {coarser:.4g} mm" in line
+        )
+
+    def test_a_coarsening_is_no_reason_where_the_refinement_lays_nothing(self):
+        """With EdgeRefinement 1 nothing is laid at any edge, so that is the
+        reason given for every edge, coarsened or not."""
+        apart = 2.0 * self.rim()
+        relaxed = Relaxed(
+            rim="TraceMetal",
+            size=self.rim(),
+            asked_by="Coarsen",
+            length=10.0,
+            nearest=None,
+            refined=(),
+        )
+        (record,), lines = self.stated([self.edge(apart)], relaxed=[relaxed], EdgeRefinement=1.0)
+        assert {reason for *_, reason in record.unlaid} == {UNREFINED}
+        assert record.settled == ()
+        assert not any("coarsening settles" in line for line in lines)
+
+    def test_an_object_with_several_narrow_edges_is_said_at_its_narrowest(self):
+        narrow = [
+            self.edge(2.0 * self.rim(), name="TraceMetal at Strip"),
+            self.edge(self.rim(), name="TraceMetal at Strip 2"),
+            self.edge(3.0 * self.rim(), name="TraceMetal at Strip 3"),
+        ]
+        (record,), _ = self.stated(narrow, EdgeRefinement=1.0)
+        bulk = self.rim(refinement=1.0)
+        assert record.unlaid == (("Strip", self.rim(), pytest.approx(bulk, abs=0.0), UNREFINED),)
+
+    def test_a_rim_at_the_floor_leaves_the_narrow_edges_said(self):
+        """Where the floor is the rim, nothing finer can be laid, and the edges
+        the count wants finer are said with the floor."""
+        floor = 2.0 * self.rim()
+        apart = 2.0 * floor
+        _, _, asked = self.asked([self.edge(apart)], MinElementSize=floor)
+        assert self.near(asked) == {}
+        (record,), lines = self.stated([self.edge(apart)], MinElementSize=floor)
+        assert record.unlaid == (("Strip", apart, floor, FLOORED),)
+        (line,) = [line for line in lines if "edges of metal are laid at the floor" in line]
+        assert line.endswith(
+            f"Set MinElementSize in the Palace mesh settings below each distance over "
+            f"{palace_policy.ACROSS}"
+        )
+
+    def test_a_coarsening_finer_than_the_distance_over_the_count_is_its_floor(self):
+        apart = 2.0 * self.rim()
+        settles = 0.75 * self.rim()
+        _, _, asked = self.asked([self.edge(apart)], coarsened={"TraceMetal": settles})
+        assert self.near(asked) == {"TraceMetal at Strip": pytest.approx(settles, abs=0.0)}
+
+    def test_an_edge_finer_than_the_floor_is_laid_at_the_floor(self):
+        apart = self.rim()
+        floor = self.rim() / 2.0
+        _, _, asked = self.asked([self.edge(apart)], MinElementSize=floor)
+        assert self.near(asked) == {"TraceMetal at Strip": pytest.approx(floor, abs=0.0)}
+
+    def test_each_edge_laid_is_said_with_what_the_mesh_reached_there(self):
+        apart = 2.0 * self.rim()
+        size = apart / palace_policy.ACROSS
+        reached = {
+            "TraceMetal at Strip": Reached(
+                asked=size, reached=size, standing=size, elements=12, dimension=1, along=0.123
+            )
+        }
+        (record,), lines = self.stated([self.edge(apart)], reached=reached)
+        assert record.laid == (("TraceMetal at Strip", apart, pytest.approx(size, abs=0.0)),)
+        (line,) = [line for line in lines if "is laid at" in line and "faces" in line]
+        assert f"lays {self.rim():.4g} mm at the edges of metal" in line
+        assert f"'TraceMetal at Strip' stands {apart:.4g} mm from the edge it faces" in line
+        assert f"laid at {size:.4g} mm" in line and "0.123 mm" in line
+
+    def test_nothing_is_said_where_no_edge_wants_the_count(self):
+        records, lines = self.stated([self.edge(2.0 * palace_policy.ACROSS * self.rim())])
+        assert records == [] and not any("face each other" in line for line in lines)
+
+    def test_a_body_as_narrow_is_said_and_one_wider_is_not(self):
+        settings, recipe, asked = self.asked([])
+        records = unlaid(
+            settings,
+            recipe,
+            asked,
+            [],
+            [],
+            ["TraceMetal"],
+            WALL,
+            bodies=[("Wire", self.rim()), ("Bar", 2.0 * palace_policy.ACROSS * self.rim())],
+        )
+        (record,) = [record for record in records if isinstance(record, Narrowed)]
+        assert record.bodies == (("Wire", self.rim()),)
+
+
+class TestTheNarrowEdgesTheTranslationFinds:
+    """What the translation asks the kernel about a sheet's edges, and what it does
+    with the edges it is told face each other."""
+
+    class Edge:
+        """An edge the kernel says faces another, lying on the shape named."""
+
+        def __init__(self, on):
+            self.on = on
+
+    class Middle:
+        def __init__(self, edge):
+            self.edge = edge
+
+        def distToShape(self, shape):
+            return (0.0 if shape.name == self.edge.on else 1.0, [], [])
+
+    def described(self, monkeypatch, found=None, members=(), **asked):
+        """The two sheets, the kernel saying each edge ``found`` names faces
+        another, and every call it was asked."""
+        found = found or {}
+        calls = []
+
+        def facing(faces, reach, others=(), mirrors=(), walls=None):
+            calls.append(
+                {
+                    "faces": faces,
+                    "reach": reach,
+                    "others": others,
+                    "mirrors": mirrors,
+                    "walls": walls,
+                }
+            )
+            names = {face.name for face in faces}
+            return [
+                (self.Edge(on), apart)
+                for on, apart in found.items()
+                if any(name.startswith(on) for name in names)
+            ]
+
+        monkeypatch.setattr(drawn, "facing", facing)
+        monkeypatch.setattr(drawn, "middle", self.Middle)
+        study = two_sheets(**asked)
+        for member in members:
+            study.Group.append(member)
+        return problem(study), calls
+
+    def test_the_search_reaches_the_count_times_the_rim(self, monkeypatch):
+        described, calls = self.described(monkeypatch, EdgeRefinement=8.0)
+        (rim,) = {place.size for place in described.demand.places if isinstance(place, AtRim)}
+        assert [call["reach"] for call in calls] == [palace_policy.ACROSS * rim]
+
+    def test_with_no_rim_the_search_reaches_the_count_times_the_size_everywhere(self, monkeypatch):
+        described, calls = self.described(monkeypatch, EdgeRefinement=1.0)
+        reach = palace_policy.ACROSS * described.demand.coarsest
+        assert [call["reach"] for call in calls] == [reach]
+
+    def test_every_sheet_is_asked_at_once_with_the_bodies_and_the_walls(self, monkeypatch):
+        """The walls are the box round everything bound, where the study reserves
+        no room round it."""
+        post = obj("Part::Feature", "Post", Shape=Shape(name="post"))
+        described, calls = self.described(monkeypatch, members=[metal_binding(post)])
+        assert described.reserved is None
+        boxes = [
+            shape.BoundBox
+            for one in (*described.regions, *described.conductors, *described.lossy)
+            for shape in one.shapes
+        ]
+        extent = (
+            [min(getattr(box, f"{axis}Min") for box in boxes) for axis in "XYZ"],
+            [max(getattr(box, f"{axis}Max") for box in boxes) for axis in "XYZ"],
+        )
+        (call,) = calls
+        assert {face.name for face in call["faces"]} == {"septum.face1", "film.face1"}
+        assert [shape.name for shape in call["others"]] == ["post"]
+        assert call["walls"] == extent
+
+    def test_an_edge_found_is_laid_under_the_metal_it_lies_on(self, monkeypatch):
+        """Each sheet is asked beside the others, so an edge facing across a gap
+        between two metals is laid under its own."""
+        rim = self.described(monkeypatch)[0].demand.places[0].size
+        described, _ = self.described(monkeypatch, {"film": rim})
+        assert [
+            (one.label, one.name) for one in described.demand.places if isinstance(one, Near)
+        ] == [("FilmMetal at Film", "FilmMetal at Film")]
+
+    def test_an_edge_found_is_laid_named_after_the_object_it_lies_on(self, monkeypatch):
+        rim = self.described(monkeypatch)[0].demand.places[0].size
+        described, _ = self.described(monkeypatch, {"septum": rim})
+        near = {
+            place.name: place.size for place in described.demand.places if isinstance(place, Near)
+        }
+        assert near == {"SeptumMetal at Septum": pytest.approx(rim / palace_policy.ACROSS, abs=0.0)}
+        assert [mark.name for mark in described.marks] == ["SeptumMetal at Septum"]
+        assert described.marks[0].dimension == 1
+
+    def test_two_edges_on_one_object_are_numbered(self, monkeypatch):
+        rim = self.described(monkeypatch)[0].demand.places[0].size
+
+        def facing(faces, reach, others=(), mirrors=(), walls=None):
+            if not any(face.name.startswith("septum") for face in faces):
+                return []
+            return [(self.Edge("septum"), rim), (self.Edge("septum"), rim)]
+
+        monkeypatch.setattr(drawn, "facing", facing)
+        monkeypatch.setattr(drawn, "middle", self.Middle)
+        described = problem(two_sheets())
+        assert sorted(mark.name for mark in described.marks) == [
+            "SeptumMetal at Septum",
+            "SeptumMetal at Septum 2",
+        ]
+
+    def test_a_name_a_label_carries_is_not_taken(self, monkeypatch):
+        rim = self.described(monkeypatch)[0].demand.places[0].size
+        clash = metal_binding(septum("Taken"))
+        clash.Label = "SeptumMetal at Septum"
+        described, _ = self.described(monkeypatch, {"septum": rim}, members=[clash])
+        assert "SeptumMetal at Septum 2" in {mark.name for mark in described.marks}
+        assert "SeptumMetal at Septum" not in {mark.name for mark in described.marks}
+
+    def test_an_edge_not_laid_hands_the_mesher_no_mark(self, monkeypatch):
+        rim = self.described(monkeypatch)[0].demand.places[0].size
+        described, _ = self.described(monkeypatch, {"septum": 2.0 * palace_policy.ACROSS * rim})
+        assert described.marks == ()
+
+    def test_metal_drawn_as_bodies_is_not_searched_and_is_said(self, monkeypatch):
+        """A body narrower than the count of the size at its edges is said: with
+        no rim laid, that size is the size everywhere."""
+        post = obj("Part::Feature", "Post", Shape=Shape(name="post"))
+        # A strip of a body: thin, a millimetre across, and long, so its middle
+        # side is the one across it.
+        post.Shape.BoundBox = SimpleNamespace(
+            XMin=0.0, XMax=20.0, YMin=0.0, YMax=1.0, ZMin=0.0, ZMax=0.05
+        )
+        described, calls = self.described(
+            monkeypatch, members=[metal_binding(post)], EdgeRefinement=1.0
+        )
+        searched = {face.name for call in calls for face in call["faces"]}
+        assert not any(name.startswith("post") for name in searched)
+        (record,) = [one for one in described.unlaid if isinstance(one, Narrowed)]
+        assert record.bodies == (("PostMetal", 1.0),)
 
 
 class TestACoarseningOfMetal:
@@ -6861,7 +7529,7 @@ class TestACoarseningOfMetal:
         )
         finer = refinement([(plate, ["Face1"])], ElementSize=edge / 2.0)
         finer.Label = "Fine"
-        found.Group = [*found.Group, finer]
+        found.Group = [*found.Group, *amending([finer], found.Group)]
         (line,) = self.lines(problem(found))
         assert f"'Fine' at {edge / 2.0:.4g} mm refines some of the same metal finer" in line
         (unrefined,) = self.lines(problem(plates((["Face1"], size))))
@@ -6898,8 +7566,7 @@ class TestACoarseningOfMetal:
         )
         (line,) = self.lines(described, PlateMetal=reached)
         assert line.endswith(
-            "lays nothing at 'PlateMetal', since the room turns round none of its edges by "
-            "more than half a turn"
+            "lays nothing at 'PlateMetal', since none of its edges is a free or re-entrant edge"
         )
 
     def test_a_rim_touching_another_conductor_is_said_to_touch_it(self):
@@ -6935,10 +7602,12 @@ class TestACoarseningOfMetal:
         reads the room round, so every such edge is measured."""
         # Two faces sharing every edge: a skin that closes, as a body's does.
         block = Plate("block", {"strip": 3.0}, faces=2)
-        block.Faces[1].Edges = block.Faces[0].Edges
+        block.Faces[1].Edges = list(block.Faces[0].Edges)
         block.Solids = [block]
-        # A seam is where one face meets itself, and no edge of the body.
-        block.Edges = [*block.Faces[0].Edges, Rim(7.0, seam=True)]
+        # A seam is where one face meets itself, so it is an edge of that face
+        # and of no other.
+        block.Faces[0].Edges.append(Rim(7.0, seam=True))
+        block.Edges = block.Faces[0].Edges
         body = obj("Part::Box", "Block", Shape=block)
         strip = obj("Part::Plane", "Strip", Shape=Plate("strip", {"block": 3.0}))
         bare = problem(with_members(metal_binding(body), metal_binding(strip)))
@@ -6967,7 +7636,7 @@ class TestACoarseningOfMetal:
         assert self.rims(described) == self.rims(bare)
         (line,) = self.lines(described)
         assert line.startswith("'Coarsen1': Mode Coarsen at")
-        assert "not laid where it names some faces of 'PlateMetal' and not all" in line
+        assert "has no effect where it names only some faces of 'PlateMetal', and" in line
 
     def test_two_coarsenings_naming_a_binding_between_them_settle_it_at_the_finer(self):
         bare = problem(plates(faces=2))
@@ -7030,19 +7699,19 @@ class TestWhatIsStatedAndNotLaid:
     def test_a_count_across_each_region_is_said_with_its_elements_and_its_box(self):
         _, said = self.lines(guide()[0])
         (line,) = [line for line in said if "MinElementsAcross" in line]
-        assert line.startswith("'MeshSettings': MinElementsAcross 9 is not laid in 'AirFill'")
+        assert line.startswith("'GmshMesh': MinElementsAcross 9 is not laid in 'AirFill'")
         assert "from 0.7 mm to 2.9 mm" in line
         assert "the smallest side of the box round it is 4.3 mm" in line
 
     def test_a_count_across_is_asked_of_nothing_the_mesher_is_given(self):
-        counted = problem(with_members(settings=mesh_settings(MinElementsAcross=9))).demand
-        uncounted = problem(with_members(settings=mesh_settings(MinElementsAcross=0))).demand
+        counted = problem(with_members(recipe=gmsh_mesh(MinElementsAcross=9))).demand
+        uncounted = problem(with_members(recipe=gmsh_mesh(MinElementsAcross=0))).demand
         assert counted == uncounted
 
     def test_no_count_says_nothing_about_one_and_the_least_count_is_said(self):
-        _, said = self.lines(with_members(settings=mesh_settings(MinElementsAcross=0)))
+        _, said = self.lines(with_members(recipe=gmsh_mesh(MinElementsAcross=0)))
         assert not any("MinElementsAcross" in line for line in said)
-        _, said = self.lines(with_members(settings=mesh_settings(MinElementsAcross=1)))
+        _, said = self.lines(with_members(recipe=gmsh_mesh(MinElementsAcross=1)))
         assert any("MinElementsAcross 1 is not laid" in line for line in said)
 
     def test_nothing_is_said_where_every_metal_carries_its_edges(self):
@@ -7067,10 +7736,7 @@ class TestWhatIsStatedAndNotLaid:
             if "EdgeRefinement" in line
         ]
         assert line.startswith("'GmshMesh': EdgeRefinement 6 is laid at the edges of 'FilmMetal'")
-        assert (
-            "no edge of 'SeptumMetal', since the room turns round none of them by more than "
-            "half a turn"
-        ) in line
+        assert ("no edge of 'SeptumMetal', since none of them is a free or re-entrant edge") in line
         assert "creases" not in line.split(". ")[0]
 
     def test_a_refinement_of_one_says_nothing_about_creases(self):
@@ -7110,7 +7776,7 @@ class TestWhatIsStatedAndNotLaid:
         region = refinement([(body, [])], Mode="Coarsen", ElementSize=5.0)
         _, said = self.lines(with_members(region))
         (line,) = [line for line in said if line.startswith("'Ring'")]
-        assert "Mode Coarsen at 5 mm is not laid where it names what 'AirFill' is made of" in line
+        assert "Mode Coarsen at 5 mm has no effect where it names what 'AirFill' is made of" in line
         assert "from 0.6 mm to 3.1 mm" in line
 
 
@@ -7205,12 +7871,12 @@ class TestEveryPropertyOfTheMeshObjectsIsReadHere:
             "def f(settings, axis, side):\n"
             "    settings.EdgeRefinement\n"
             '    getattr(settings, "Enabled", True)\n'
-            '    getattr(settings, f"Padding{axis}{side}")\n'
+            '    getattr(settings, f"Boundary{axis}{side}")\n'
         )
-        assert self.unread(["EdgeRefinement", "Enabled", "PaddingXMin"], [source]) == []
-        assert self.unread(["Paddington", "InventedForTheNet"], [source]) == [
+        assert self.unread(["EdgeRefinement", "Enabled", "BoundaryXMin"], [source]) == []
+        assert self.unread(["Boundaryless", "InventedForTheNet"], [source]) == [
+            "Boundaryless",
             "InventedForTheNet",
-            "Paddington",
         ]
 
     def test_the_growth_is_read_by_the_code_and_not_by_its_messages(self):

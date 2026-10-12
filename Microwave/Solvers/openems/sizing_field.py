@@ -184,9 +184,9 @@ class _SizingField:
         nearest point of every span is itself a knot, so the polyline carries
         each ramp's own value where that ramp wins.
 
-        Asked once per axis by the report rather than during placement, so it
-        keeps the ramps and scans them rather than having placement carry an
-        answer around.
+        Placement never asks it, so it keeps the ramps and scans them rather
+        than having placement carry an answer around. The suite asks it of a
+        finished field to name the constraint that set a position.
         """
         if self._bounds is None:
             return ""
@@ -441,9 +441,9 @@ def _settle(
     Published sizes only ever shrink and are floored, so this settles. It does
     not settle quickly. A constraint travels one gap per pass, so the budget has
     to scale with the number of pinned positions rather than being a fixed small
-    number. Too small a budget gives up quietly, and the symptom surfaces a step
-    later as ``mesh._validate`` blaming the user's geometry for a smoothness violation
-    the mesher itself caused.
+    number. A budget that runs out is refused here, naming the seams still
+    moving, rather than handed on for ``mesh._validate`` to report as a
+    smoothness violation in the user's geometry.
 
     The stopping test is a relative tolerance rather than exact equality. Chasing
     the last 0.1% of a monotonically shrinking sequence costs many passes and
@@ -487,9 +487,9 @@ def _settle(
 
     raise MeshError(
         f"cell sizes either side of {sources.describe_all(moved)} did not agree "
-        f"after {budget} passes on the {sources.axis} axis. This is a mesher "
-        "limitation, not a fault in the geometry; widening max_ratio or reducing "
-        "the number of pinned features usually clears it."
+        f"after {budget} passes on the {sources.axis} axis. This is a limit of the mesh "
+        "generator, not a fault in the geometry. Raise MaxGrowthRatio in the openEMS mesh "
+        "settings, or draw fewer features that need their own grid line"
     )
 
 
@@ -501,8 +501,9 @@ def _place_lines(sources: _Sources, field: _SizingField, floor: float, cap: floa
         lines.extend(_segment_lines(lower, upper, field, sources, floor, cap)[1:])
         if len(lines) > _MAX_LINES_PER_AXIS:
             raise MeshError(
-                f"grid would need more than {_MAX_LINES_PER_AXIS} lines on one "
-                "axis; the resolutions or the domain size are unrealistic"
+                f"the grid would need more than {_MAX_LINES_PER_AXIS} lines on one "
+                "axis, so the cells asked for are far finer than the model, or the "
+                "domain is far larger than intended"
             )
     return lines
 
@@ -578,8 +579,8 @@ def _cell_count(
         raise MeshError(
             f"the {sources.axis} axis span from {sources.at(lower)} to "
             f"{sources.at(upper)} needs about {total:.3g} cells on its own, past "
-            f"the {_MAX_LINES_PER_AXIS} per-axis limit. The resolutions are far "
-            "finer than the model, or the domain is far larger than intended."
+            f"the limit of {_MAX_LINES_PER_AXIS} per axis, so the cells asked for are "
+            "far finer than the model, or the domain is far larger than intended"
         )
 
     # A fixed number of cells rather than a share of the count. The rounding
@@ -612,10 +613,11 @@ def _cell_count(
         if size < floor * (1.0 - 1e-9) or size > cap * (1.0 + 1e-9):
             raise MeshError(
                 f"the {sources.axis} axis span from {sources.at(lower)} to "
-                f"{sources.at(upper)} holds one cell of {size:.6g}, which is "
-                f"not between the {floor:g} floor and the {cap:g} cap. Raise "
-                "dielectric_res, lower min_cell, or coarsen min_lines for the "
-                "feature here."
+                f"{sources.at(upper)} holds one cell of {size:.6g} mm, not between the "
+                f"cell floor of {floor:g} mm and the largest cell of {cap:g} mm. Lower "
+                "ElementsPerWavelength or MinElementsAcross in the openEMS mesh settings, "
+                "or MinElementsAcross on the refinement region here, or set "
+                f"MinElementSize in the openEMS mesh settings below {floor:g} mm"
             )
         return 1
 
@@ -628,9 +630,11 @@ def _cell_count(
 
     raise MeshError(
         f"the {sources.axis} axis span from {sources.at(lower)} to "
-        f"{sources.at(upper)} cannot be filled: {up} cells fall below the "
-        f"{floor:g} cell floor and {down} exceed the {cap:g} cap. Raise "
-        "dielectric_res, lower min_cell, or coarsen min_lines for the feature here."
+        f"{sources.at(upper)} cannot be filled: {up} cells fall below the cell "
+        f"floor of {floor:g} mm and {down} exceed the largest cell of {cap:g} mm. "
+        "Lower ElementsPerWavelength or MinElementsAcross in the openEMS mesh settings, "
+        "or MinElementsAcross on the refinement region here, or set MinElementSize "
+        f"in the openEMS mesh settings below {floor:g} mm"
     )
 
 

@@ -64,8 +64,9 @@ LARGE_GRID_BYTES = MAX_GRID_BYTES // 8
 class FixedLine:
     """A position the grid had to contain, and what put it there.
 
-    ``mesh._fixed_positions`` already builds strings like ``"conducting sheet
-    'Trace'"`` and ``"'GND' edge at 0, inside"`` for its own error messages.
+    ``mesh._asked_by`` and ``mesh._thirds_lines`` already build strings like
+    ``"conducting sheet 'Trace'"`` and ``"'GND' edge at 0, inside"`` for their
+    own error messages.
     Carrying them out lets a mesh report state why the smallest cell in the
     model is where it is. Recovering that from positions alone is guesswork: a
     line at the top of a substrate and a line two thirds of a cell outside a
@@ -243,20 +244,20 @@ def _validate_total_size(lines: MeshLines) -> None:
 
     ``sizing_field._MAX_LINES_PER_AXIS`` bounds one axis, and the product of the three is
     what decides what a solve costs. Three axes each comfortably inside the
-    per-axis limit can multiply to a grid nothing can allocate, and every route
-    that has reached one did so from a mistyped property rather than from a large
-    model. It is checked here because the finished grid exists here: the absorber
-    has been appended, and the per-axis limit never sees that.
+    per-axis limit can multiply to a grid nothing can allocate. It is checked
+    here because the finished grid exists here: the absorber has been appended,
+    and the per-axis limit never sees that.
     """
     cells = lines.cell_count
     if cells * BYTES_PER_CELL <= MAX_GRID_BYTES:
         return
     shape = " x ".join(str(n) for n in lines.shape)
+    # No single axis is out of bounds: it is the product that ran away, and
+    # PMLCells reaches it fastest because it is applied to every axis after
+    # everything else.
     raise MeshError(
-        f"the grid is {cells:,} cells ({shape} lines), which openEMS counts as "
-        f"{cells * BYTES_PER_CELL / 1024**3:,.1f} GiB of operator and field, "
-        f"against a ceiling of {MAX_GRID_BYTES / 1024**3:g} GiB. No single axis "
-        "is out of bounds - it is the product that ran away, and PMLCells "
-        "reaches it fastest because it is applied to every axis after "
-        "everything else"
+        f"the grid is {cells:,} cells ({shape} lines), "
+        f"{cells * BYTES_PER_CELL / 1024**3:,.1f} GiB of operator and field memory "
+        f"in openEMS, past the {MAX_GRID_BYTES / 1024**3:g} GiB limit. PMLCells "
+        "adds cells on every axis, so lowering it shrinks the grid fastest"
     )

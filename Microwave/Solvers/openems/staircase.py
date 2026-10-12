@@ -85,8 +85,8 @@ CORNERS = 3
 #:
 #: A choice rather than a derivation. A conductor here is only electrically
 #: perfect: the rule zeroes the electric operator and leaves the magnetic one
-#: alone. A resonance and an impedance are therefore read off two walls about a
-#: sixth of a cell apart, and one set of vertices cannot serve both. The half
+#: alone. A resonance and an impedance are therefore read off two walls a
+#: fraction of a cell apart, and one set of vertices cannot serve both. The half
 #: serves the resonance. A detuned filter is a worse failure than a line a per
 #: cent mismatched.
 #:

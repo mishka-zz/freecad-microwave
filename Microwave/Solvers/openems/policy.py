@@ -48,9 +48,9 @@ WALL = "PEC"
 #: here rather than imported, because ``Objects/mesh.py`` sits behind
 #: ``import FreeCAD`` and this module reaches no FreeCAD at all. A test holds
 #: the two lists together.
-AIR_FACE = "Air"
+OPEN_FACE = "Open"
 THROUGH_FACE = "Through"
-ENDS_FACE = "Ends"
+PEC_WALL_FACE = "PEC Wall"
 
 
 # ---------------------------------------------------------------------------
@@ -63,11 +63,11 @@ def _frequency(analysis: Any) -> Frequency:
     stop = _value(analysis.FrequencyStop)
     if start <= 0 or stop <= start:
         raise TranslationError(
-            f"{_label(analysis)!r}: the band runs {start:.4g} to {stop:.4g} Hz. "
-            "FrequencyStart must be above zero and below FrequencyStop"
+            f"{_label(analysis)!r}: FrequencyStart is {start:.4g} Hz and FrequencyStop is "
+            f"{stop:.4g} Hz. Set FrequencyStart above 0 and below FrequencyStop"
         )
     with _model_fault(_label(analysis)):
-        return Frequency(start=start, stop=stop, points=int(analysis.NumFrequencyPoints))
+        return Frequency(start=start, stop=stop, points=int(analysis.FrequencyPoints))
 
 
 #: The one excitation this adapter has. ``driver`` builds a single pulse and
@@ -90,16 +90,15 @@ def _waveform(solver: Any) -> None:
     declared = str(solver.Waveform)
     if declared != GAUSSIAN:
         raise TranslationError(
-            f"{_label(solver)!r}: Waveform is {declared!r}. openEMS is driven "
-            f"here with a {GAUSSIAN} pulse covering the whole band, and this "
-            f"adapter has no other excitation to offer. Set it to {GAUSSIAN}"
+            f"{_label(solver)!r}: Waveform is {declared!r}, and openEMS is driven only "
+            f"with a {GAUSSIAN} pulse here. Set Waveform to {GAUSSIAN}"
         )
 
 
 def _absorbing(solver: Any, opened: Sequence[str] = ()) -> str:
     """The word openEMS takes for a face that absorbs, as the solver says it does.
 
-    ``opened`` names each ``Ends`` face that absorbs because waveguide ports
+    ``opened`` names each ``PEC Wall`` face that absorbs because waveguide ports
     cover it. Mur's condition there is refused: the port's source lies on the
     face, and openEMS holds a Mur face shut until the source on it has finished,
     which for this adapter's drive is never, so the face would reflect for the
@@ -110,22 +109,20 @@ def _absorbing(solver: Any, opened: Sequence[str] = ()) -> str:
         if opened:
             raise TranslationError(
                 f"{_label(solver)!r}: Absorber is Mur, and waveguide ports stand on "
-                f"{' and '.join(opened)}, which absorb because the ports cover them. The "
-                "ports' sources lie on those faces, and openEMS holds a Mur face shut "
-                "until the source on it has finished, which for this drive is never, so "
-                "the face would reflect for the whole run. Set Absorber to PML"
+                f"{' and '.join(opened)}, so the face under each port reflects for the "
+                "whole run. Set Absorber to PML"
             )
         return "MUR"
     if kind != "PML":
         raise TranslationError(
-            f"{_label(solver)!r}: Absorber is {kind!r}, which the openEMS adapter does not "
-            f"build. Use {' or '.join(ABSORBERS)}"
+            f"{_label(solver)!r}: Absorber is {kind!r}, which openEMS does not offer here. "
+            f"Set Absorber to {' or '.join(ABSORBERS)}"
         )
     cells = int(solver.PMLCells)
     if cells < 1:
         raise TranslationError(
-            f"{_label(solver)!r}: Absorber is PML but PMLCells is {cells}. An absorber "
-            "needs depth; eight cells is the usual choice"
+            f"{_label(solver)!r}: Absorber is PML and PMLCells is {cells}, so the absorber "
+            "has no depth. Set PMLCells to 1 or more; 8 is the usual depth"
         )
     return f"PML_{cells}"
 
@@ -136,11 +133,11 @@ def _boundary(
     """The condition on each face of the domain, read off what the mesh policy
     says lies beyond it.
 
-    ``Air`` and ``Through`` absorb: beyond an ``Air`` face the medium runs on, and
-    through a ``Through`` face the structure runs on without end. ``Ends`` says
+    ``Open`` and ``Through`` absorb: beyond an ``Open`` face the medium runs on, and
+    through a ``Through`` face the structure runs on without end. ``PEC Wall`` says
     the domain stops where the structure does, and what stops it there is a
     perfect wall - which is what a backend that builds no absorber puts on every
-    face it does not open. The one exception is an ``Ends`` face waveguide ports
+    face it does not open. The one exception is a ``PEC Wall`` face waveguide ports
     stand across, whole: the wave leaves through the port, and a wall behind it
     would send the wave back. openEMS states one condition for a whole face, so
     a face the ports cover in part is refused rather than given either.
@@ -157,13 +154,13 @@ def _boundary(
     for dim, axis in enumerate(AXIS_NAMES):
         for side, name in enumerate(("Min", "Max")):
             face = f"{axis}{name}"
-            stated = str(getattr(settings, f"Padding{face}"))
+            stated = str(getattr(settings, f"Boundary{face}"))
             at = float((lower, upper)[side][dim])
             _check_no_port_lies_in(face, stated, dim, at, ports)
-            guided = stated == ENDS_FACE and _left_through_a_guide(
+            guided = stated == PEC_WALL_FACE and _left_through_a_guide(
                 settings, face, dim, at, lower, upper, ports
             )
-            absorbs.append(stated != ENDS_FACE or guided)
+            absorbs.append(stated != PEC_WALL_FACE or guided)
             if guided:
                 opened.append(face)
     # Asked only where a face absorbs, so a study walled on every face states
@@ -196,13 +193,13 @@ def _check_no_guide_runs_on_behind_its_port(
         if words[2 * dim + side] != WALL:
             continue
         face = f"{AXIS_NAMES[dim]}{('Min', 'Max')[side]}"
+        # A solver that ends the model on the port's plane cuts the stub away,
+        # so the drawing does not decide between the two answers.
         raise TranslationError(
             f"waveguide port {port.name!r} stands inside the guide, and the face behind "
-            f"it, {face}, is {ENDS_FACE}: openEMS makes that face a perfect wall, so the "
-            "guide between it and the port is a stub shorted at the wall, which a solver "
-            "that ends the model on the port cuts away. Set "
-            f"{_label(settings)!r} Padding{face} to {THROUGH_FACE}, so the guide runs on "
-            "into the absorber, or stand the port on the guide's end face"
+            f"it, {face}, is {PEC_WALL_FACE}, so openEMS solves the guide behind the port "
+            f"as a stub shorted at that face. Set Boundary{face} to {THROUGH_FACE} on "
+            f"{_label(settings)!r}, or move the port onto the guide's end face"
         )
 
 
@@ -212,17 +209,17 @@ def _check_no_port_lies_in(
     """Refuse a port whose plane lies in a face of the domain the wall or the
     absorber is laid on, where it cannot be driven there.
 
-    On an ``Ends`` face openEMS lays a perfect wall, and a wall across a port's
+    On a ``PEC Wall`` face openEMS lays a perfect wall, and a wall across a port's
     plane shorts it: a lumped port lying flat in the face, or a microstrip or
     coaxial port whose feed stands on it. Only rectangular waveguide ports
     standing across the whole face are left to :func:`_left_through_a_guide`,
     which opens the face for them. On a ``Through`` face a lumped port is
     refused as well, since the line it drives runs on into the absorber rather
     than ending on the port; a microstrip or coaxial port there is the line
-    running out through the absorber, which is what the face says. An ``Air``
+    running out through the absorber, which is what the face says. An ``Open``
     face stands a clearance off the structure, so no port lies in it.
     """
-    if stated == AIR_FACE:
+    if stated == OPEN_FACE:
         return
     for port in ports:
         if port.kind == "rect_waveguide":
@@ -235,33 +232,22 @@ def _check_no_port_lies_in(
         if port.kind == "lumped":
             if not flat:
                 continue
-        elif stated != ENDS_FACE or not fed:
+        elif stated != PEC_WALL_FACE or not fed:
             continue
         if stated == THROUGH_FACE:
-            what = (
-                "the absorber is laid over that face, so the line the port drives runs on "
-                "into it rather than ending on the port"
-            )
-            remedy = (
-                f"Set Padding{face} to {AIR_FACE}, which stands the face off the structure, "
-                "or draw the port inside the structure"
-            )
+            what = "the line the port drives runs on into the absorber past the port"
+            remedy = f"Set Boundary{face} to {OPEN_FACE}, or draw the port inside the structure"
         else:
-            what = (
-                "openEMS makes that face a perfect wall, and a wall across the port's plane "
-                "shorts it"
-            )
+            what = "openEMS lays a perfect wall across the port's plane and shorts it"
             remedy = (
-                f"Set Padding{face} to {AIR_FACE}, which stands the face off the structure, "
-                "or draw the port inside the structure"
+                f"Set Boundary{face} to {OPEN_FACE}, or draw the port inside the structure"
                 if port.kind == "lumped"
-                else f"Set Padding{face} to {THROUGH_FACE}, so the line runs on out through "
-                f"the absorber, or to {AIR_FACE}, or raise the port's FeedOffset so the feed "
-                "stands inside the structure"
+                else f"Set Boundary{face} to {THROUGH_FACE} or {OPEN_FACE}, or raise FeedOffset "
+                "on the port so the feed stands inside the structure"
             )
         raise TranslationError(
             f"{port.kind.replace('_', ' ')} port {port.name!r} lies in the {face} face of "
-            f"the domain, and Padding{face} is {stated}: {what}. {remedy}"
+            f"the domain, and Boundary{face} is {stated}, so {what}. {remedy}"
         )
 
 
@@ -305,16 +291,17 @@ def _left_through_a_guide(
     if whole - covered <= FLATNESS * 2.0 * (spans[0] + spans[1]):
         return True
     names = " and ".join(repr(port.name) for port in standing)
+    # openEMS states one condition for a whole face. An absorber there takes
+    # away the wall beside the port, and a wall there stands behind the port.
     raise TranslationError(
         f"{names} {'stands' if len(standing) == 1 else 'stand'} on the {face} face of "
         f"the domain and {'leaves' if len(standing) == 1 else 'leave'} "
-        f"{whole - covered:.4g} mm^2 of its {whole:.4g} mm^2 uncovered. Padding{face} is "
-        f"{ENDS_FACE}, so the rest of the face is a perfect wall, and openEMS states one "
-        "condition for a whole face: an absorber there would take the wall away, and a "
-        "wall would stand behind the port. Draw the guide as the air inside it alone, "
-        f"so the {ENDS_FACE} faces are its walls and the port covers its end face, or "
-        f"set {_label(settings)!r} Padding{face} to {THROUGH_FACE} and stand the port on "
-        "a plane inside the guide"
+        f"{whole - covered:.4g} mm^2 of its {whole:.4g} mm^2 uncovered. Boundary{face} is "
+        f"{PEC_WALL_FACE}, and openEMS applies one condition to a whole face, so the face "
+        "cannot be a wall beside the port and open under it. Draw the guide as the air "
+        f"inside it alone, so the {PEC_WALL_FACE} faces are its walls and the port covers "
+        f"its end face, or set Boundary{face} to {THROUGH_FACE} on {_label(settings)!r} and "
+        "move the port to a plane inside the guide"
     )
 
 
@@ -360,7 +347,7 @@ def _padding(
     """Per-face domain padding in millimetres, in the form :func:`~.plan.domain` wants.
 
     What lies beyond the structure on each face is the policy's, because it is a
-    statement about the problem, and so is how far: ``Air`` is padded by the
+    statement about the problem, and so is how far: ``Open`` is padded by the
     policy's ``Clearance``, and :func:`~...properties.clearance` derives it
     where it is zero, in the medium ``slowing`` names. The length stated is the
     length laid, whatever the grid's density.
@@ -371,9 +358,9 @@ def _padding(
     open circuit, and the reflection contaminates every impedance read from it.
     The choice is therefore made per face by the user rather than inferred.
 
-    ``Ends`` is air with no room in it. The domain stops on the structure and the
-    absorber is added beyond it rather than taken out of it, which is what a
-    padding of nought expresses to :func:`~.plan.domain`. It is what a face
+    ``PEC Wall`` leaves no room past the face. The domain stops on the structure,
+    and an absorber a face carries is added beyond it rather than taken out of
+    it, which is what a padding of nought expresses to :func:`~.plan.domain`. It is what a face
     walled by a conductor wants: nothing is measured outside the wall, so cells
     spent there are cells spent where the field does not go.
     """
@@ -381,17 +368,17 @@ def _padding(
     for axis in AXIS_NAMES:
         pair: list[Any] = []
         for name in ("Min", "Max"):
-            mode = str(getattr(settings, f"Padding{axis}{name}"))
+            mode = str(getattr(settings, f"Boundary{axis}{name}"))
             if mode == THROUGH_FACE:
                 pair.append(THROUGH)
-            elif mode == ENDS_FACE:
+            elif mode == PEC_WALL_FACE:
                 pair.append(0)
-            elif mode == AIR_FACE:
+            elif mode == OPEN_FACE:
                 pair.append(clearance(settings.Clearance, frequency.stop, settings, slowing))
             else:
                 raise TranslationError(
-                    f"{_label(settings)!r}: Padding{axis}{name} is {mode!r}; expected "
-                    f"{AIR_FACE!r}, {THROUGH_FACE!r} or {ENDS_FACE!r}"
+                    f"{_label(settings)!r}: Boundary{axis}{name} is {mode!r}. Set it to "
+                    f"{OPEN_FACE}, {THROUGH_FACE} or {PEC_WALL_FACE}"
                 )
         faces.append((pair[0], pair[1]))
     return tuple(faces)
@@ -415,21 +402,19 @@ def _wavelength(materials: Iterable[Material], frequency: Frequency) -> float:
 
 
 def _mesh_params(
-    settings: Any,
     recipe: Any,
     materials: Iterable[Material],
     frequency: Frequency,
     absorber: Faces,
     medium: float = 1.0,
 ) -> MeshParams:
-    """What the grid is laid to, in millimetres, from both objects that say.
+    """What the grid is laid to, in millimetres, from the Yee grid.
 
     The Yee grid states the cell: ``ElementsPerWavelength`` counts cells across
     the wavelength in the slowest material in the model at the top of the band,
     and never a length. A remembered millimetre value under-resolves the moment
-    anything raises the permittivity or the frequency. The mesh policy states
-    what the device asks whatever lays it: a count across a dielectric, and a
-    floor against a sliver.
+    anything raises the permittivity or the frequency. It states as well a count
+    across a dielectric, and a floor against a sliver.
 
     ``medium`` is the product a wave slows by the root of in the study's medium.
     The medium fills every cell no solid asks a size of, so its bulk size is the
@@ -444,19 +429,18 @@ def _mesh_params(
     overridden rather than obeyed. The defaults follow openEMS' own
     ``MSL_Losses.m``: bulk at lambda/20, edges six times finer.
     """
-    _check_mesh_policy(settings)
     per_wavelength, refinement = _check_yee_grid(recipe)
     wavelength = _wavelength(materials, frequency)
     bulk = wavelength / per_wavelength
     ratio = float(recipe.MaxGrowthRatio)
     # Zero means "derive it", which MeshParams spells as None.
-    floor = _value(settings.MinElementSize) or None
-    _check_the_floor_leaves_the_edge_cell_room(settings, recipe, bulk / refinement, floor)
+    floor = _value(recipe.MinElementSize) or None
+    _check_the_floor_leaves_the_edge_cell_room(recipe, bulk / refinement, floor)
     return MeshParams(
         metal_res=bulk / refinement,
         dielectric_res=bulk,
         max_ratio=(ratio, ratio, ratio),
-        min_lines=int(settings.MinElementsAcross),
+        min_lines=int(recipe.MinElementsAcross),
         pml_cells=absorber,
         min_cell=floor,
         # The bulk size in vacuum. Every dielectric asks for its own
@@ -470,15 +454,15 @@ def _mesh_params(
 
 
 def _check_the_floor_leaves_the_edge_cell_room(
-    settings: Any, recipe: Any, edge_cell: float, floor: float | None
+    recipe: Any, edge_cell: float, floor: float | None
 ) -> None:
     """Refuse a floor that stands above the cell a conductor's edge is meshed at.
 
     The mesher holds the same bound and states it in its own words -
     ``min_cell`` against ``metal_res``, neither of which is a property anybody
-    can find. This says it in the units the two properties are stated in and
-    names the objects that carry them, so the message is one the user can act
-    on, and it fires before the mesher is reached.
+    can find. This says it in the units the properties are stated in and names
+    the object that carries them, so the message is one the user can act on, and
+    it fires before the mesher is reached.
 
     The bound is the edge cell rather than the bulk one. The floor is a guard
     against a sliver a boolean left, so a floor above the finest cell the grid
@@ -487,12 +471,9 @@ def _check_the_floor_leaves_the_edge_cell_room(
     if floor is None or floor <= edge_cell:
         return
     raise TranslationError(
-        f"{_label(settings)!r}: MinElementSize is {floor:.4g} mm, and the cell a "
-        f"conductor's edge is meshed at here is {edge_cell:.4g} mm - so the floor would "
-        "override the resolution it is meant to protect. It is a guard against a sliver "
-        f"a boolean left, and nothing else. Lower it below {edge_cell:.4g} mm, or raise "
-        f"ElementsPerWavelength or EdgeRefinement on {_label(recipe)!r} until the edge "
-        "cell is coarser than the floor"
+        f"{_label(recipe)!r}: MinElementSize is {floor:.4g} mm, above the {edge_cell:.4g} mm "
+        "cell at conductor edges, so it coarsens the edges. Lower MinElementSize below "
+        f"{edge_cell:.4g} mm"
     )
 
 
@@ -550,67 +531,52 @@ def _curve_tolerance(settings: Any) -> float:
     return max(0.0, _value(getattr(settings, "CurveTolerance", 0.0)))
 
 
-def _check_mesh_policy(settings: Any) -> None:
-    """Validate what the device asks, before anything reads it.
-
-    Called from :func:`contents`, which is the one point every route passes
-    through, and from :func:`_mesh_params` as well, for the reason
-    :func:`_check_yee_grid` is called twice: the mesher holds the same bound and
-    states it in its own words, so no route inside this adapter may reach it
-    first.
-
-    The count is what the mesher holds too, and it states the bound as
-    ``min_lines``, which is no property anybody can find. A count of nought also
-    reads as "ask for nothing" - it is what the same-named property on a
-    refinement region means - so it is a value a user reaches honestly, and the
-    value that asks for nothing here is one: the mesher spends a count only from
-    two up (``mesh._dielectric_spans`` and ``lfs.features``), and a dielectric the
-    grid spans is spanned by one cell whatever this says.
-    """
-    across = int(settings.MinElementsAcross)
-    if across < 1:
-        raise TranslationError(
-            f"{_label(settings)!r}: MinElementsAcross is {across}, and a count of "
-            "fewer than one element through a dielectric asks for nothing rather "
-            "than for something coarse. One is the value that asks for nothing, "
-            "since the grid spans a dielectric with a cell whatever this says, and "
-            "nine is what this ships"
-        )
-
-
 def _check_yee_grid(recipe: Any) -> tuple[float, float]:
-    """Validate the Yee grid's settings once, before anything reads them.
+    """Validate the Yee grid's settings before anything reads them.
 
-    It is called from :func:`contents` rather than only from
-    :func:`_mesh_params`. ``_Context`` divides by ``ElementsPerWavelength`` to
-    size ports, and it is built before mesh parameters exist, so validating
-    inside ``_mesh_params`` would let a zero through to a ``ZeroDivisionError``
-    two functions before the message meant to explain it. These checks belong
-    at the one place every route passes through, for the reason the driver
-    re-runs pre-flight.
+    :func:`~.document.contents` calls it as soon as it has found the grid, so
+    the check does not wait for :func:`_mesh_params`. ``_Context`` divides by
+    ``ElementsPerWavelength`` to size ports, and it is built before mesh
+    parameters exist, so validating inside ``_mesh_params`` would let a zero
+    through to a ``ZeroDivisionError`` two functions before the message meant
+    to explain it. These checks belong at the one place every route passes
+    through, for the reason the driver re-runs pre-flight.
 
-    It returns the two numbers it had to parse anyway.
+    It returns the two numbers it had to parse anyway, and each function here
+    that reads them calls it again for that reason.
     """
     if not hasattr(recipe, "ElementsPerWavelength"):
         raise TranslationError(
-            f"{_label(recipe)!r} has no ElementsPerWavelength, so it does not "
-            "look like a Yee grid object; attach an EMYeeGrid"
+            f"{_label(recipe)!r} has no ElementsPerWavelength, so it cannot size the openEMS mesh"
         )
 
     per_wavelength = float(recipe.ElementsPerWavelength)
     if per_wavelength <= 0:
         raise TranslationError(
-            f"{_label(recipe)!r}: ElementsPerWavelength is {per_wavelength}; it "
-            "counts cells across a wavelength and must be above zero"
+            f"{_label(recipe)!r}: ElementsPerWavelength is {per_wavelength:g}. Enter a "
+            "value above 0"
         )
 
     refinement = float(recipe.EdgeRefinement)
     if refinement < 1:
         raise TranslationError(
-            f"{_label(recipe)!r}: EdgeRefinement is {refinement}, so conductor "
-            "edges would be meshed more coarsely than open space. Edges carry the "
-            "field singularity that sets a line's impedance; they need the finer "
-            "grid, not the coarser one. Use 1 for no refinement"
+            f"{_label(recipe)!r}: EdgeRefinement is {refinement:g}, so conductor edges "
+            "are meshed more coarsely than open space. Enter 1 or more, where 1 means no "
+            "refinement"
+        )
+
+    # The mesher holds the same bound as ``min_lines``, which is no property
+    # anybody can find. A count of nought also reads as "ask for nothing" - it is
+    # what the same-named property on a refinement region means - so it is a
+    # value a user reaches honestly, and the value that asks for nothing here is
+    # one: the mesher spends a count only from two up
+    # (``mesh._dielectric_spans`` and ``lfs.features``), and a dielectric the
+    # grid spans is spanned by one cell whatever this says.
+    across = int(recipe.MinElementsAcross)
+    if across < 1:
+        raise TranslationError(
+            f"{_label(recipe)!r}: MinElementsAcross is {across}. Enter 1 or more; 1 asks "
+            "for no minimum"
         )
     return per_wavelength, refinement
 
@@ -635,30 +601,28 @@ def _termination(solver: Any) -> Termination:
     decay = float(solver.EnergyDecay)
     if not math.isfinite(decay):
         raise TranslationError(
-            f"{_label(solver)!r}: EnergyDecay is {decay:g}. It is a level in dB below "
-            "the energy's peak, such as -40. Use 0 to take every step"
+            f"{_label(solver)!r}: EnergyDecay is {decay:g}. Enter a level in dB below the "
+            "energy peak, such as -40, or 0 to run every step"
         )
     if decay > 0:
-        advice = "The level is below the peak and negative"
+        advice = "Enter a negative level"
         if _held(-decay):
-            advice += f": {_exactly(-decay)} is {_exactly(decay)} dB down"
+            advice += f", such as {_exactly(-decay)} for {_exactly(decay)} dB down"
         raise TranslationError(
-            f"{_label(solver)!r}: EnergyDecay is {decay:g} dB, a level above the "
-            f"energy's peak, so the run would never stop early. {advice}. Use 0 to "
-            "take every step"
+            f"{_label(solver)!r}: EnergyDecay is {decay:g} dB, above the energy peak, so "
+            f"the run never stops early. {advice}, or 0 to run every step"
         )
+    # A share of zero switches the criterion off, and a share of one is the
+    # peak itself.
     if decay < 0 and not _held(decay):
         raise TranslationError(
-            f"{_label(solver)!r}: EnergyDecay is {decay:g} dB, whose share of the peak "
-            f"energy is {_share(decay):g} as openEMS is handed it. openEMS stops on a "
-            "share above zero and below one: zero switches the criterion off, and one "
-            "is the peak itself. Use a level such as -40, or 0 to take every step"
+            f"{_label(solver)!r}: EnergyDecay is {decay:g} dB, a share of "
+            f"{_share(decay):g} of the peak energy, and openEMS needs a share above 0 and "
+            "below 1. Enter a level such as -40, or 0 to run every step"
         )
     steps = int(solver.MaxTimesteps)
     if steps < 1:
-        raise TranslationError(
-            f"{_label(solver)!r}: MaxTimesteps is {steps}. A run takes at least one step"
-        )
+        raise TranslationError(f"{_label(solver)!r}: MaxTimesteps is {steps}. Enter 1 or more")
     with _model_fault(_label(solver)):
         return Termination(
             max_timesteps=steps,
@@ -695,7 +659,7 @@ def _threads(solver: Any) -> int:
     threads = int(solver.Threads)
     if threads < 0:
         raise TranslationError(
-            f"{_label(solver)!r}: Threads is {threads}. Use 0 to let openEMS "
+            f"{_label(solver)!r}: Threads is {threads}. Enter 0 to let openEMS "
             "choose, or a positive count"
         )
     return threads
@@ -709,7 +673,7 @@ def timestep_factor(solver: Any) -> float:
     reported timestep by the factor without constructing an envelope, so the
     envelope's own invariant does not stand between the user and the number on
     screen. Without this check, typing 2 into ``TimestepFactor`` and pressing
-    Update Mesh reports a timestep at twice the vacuum CFL bound, captioned as
+    Mesh reports a timestep at twice the vacuum CFL bound, captioned as
     an estimate of it and in green, and only Run refuses it. The two paths would
     then disagree about whether a value is legal, with the permissive one
     drawing the picture.

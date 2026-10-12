@@ -179,8 +179,8 @@ def behind(
     :param held: per entity of dimension ``top``, the labels drawn over it.
     :param drawn: per shape of dimension ``top`` the caller drew, its label and
         the entities it became.
-    :param measured: the volumes, areas and corners the one arithmetic question
-        is asked of.
+    :param measured: the volumes and corners the one arithmetic question is
+        asked of.
     :param around: where a set of entities of one dimension lies.
 
     Returns each part to leave out, under the label it stands behind, and the

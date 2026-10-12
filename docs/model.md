@@ -11,30 +11,46 @@ Document
 ├── Body / Part::Box / Sketch ...  CAD geometry (independent of study)
 ├── Generic FR4 (1)                EMMaterial          } Global material
 ├── Generic Copper, 1 oz (1)       EMMaterial          } definitions
-└── EM Analysis                    EMAnalysis          Study container
-    ├── openEMS                    EMSolverOpenEMS     Solver backend
-    ├── Palace                     EMSolverPalace      Solver backend
-    ├── Mesh Policy                EMMeshPolicy        What the device asks
-    ├── Yee Grid                   EMYeeGrid           The grid openEMS lays
-    ├── Gmsh Mesh                  EMGmshMesh          The mesh Palace reads
-    ├── EMMaterialBinding          EMMaterialBinding   Material link
-    ├── MicrostripPort             EMPortMicrostrip    Port 1
-    ├── MicrostripPort001          EMPortMicrostrip    Port 2
-    ├── Mesh Refinement            EMMeshRegion        Optional refinement
-    ├── Mesh Preview               EMMeshPreview       Visualized grid
-    ├── Mesh (Palace)              Fem::FemMeshObject  The mesh Palace solved on
-    ├── S-Parameters (openEMS)     EMSParameters       Stored results
-    └── S-Parameters (Palace)      EMSParameters       Stored results
+└── EM Analysis                       EMAnalysis           Study container
+    ├── Solver (openEMS)              EMSolverOpenEMS      Solver backend
+    │   ├── Mesh Settings (openEMS)   EMYeeGrid            The grid openEMS lays
+    │   │   └── Mesh Refinement       EMMeshRegion         Optional refinement
+    │   └── Mesh (openEMS)            EMMeshPreview        The grid, drawn
+    ├── Solver (Palace)               EMSolverPalace       Solver backend
+    │   ├── Mesh Settings (Palace)    EMGmshMesh           The mesh Palace reads
+    │   └── Mesh (Palace)             Fem::FemMeshObjectPython  The mesh Palace solved on
+    ├── Mesh Policy                   EMMeshPolicy         The problem both solve
+    ├── Material Binding              EMMaterialBinding    Material link
+    ├── Port 1 (Microstrip)           EMPortMicrostrip     Port 1
+    ├── Port 2 (Microstrip)           EMPortMicrostrip     Port 2
+    ├── Run 1 (openEMS)               EMRun                One run, kept
+    │   └── S-Parameters (run 1, openEMS)  EMSParameters   Its results
+    └── Run 2 (Palace)                EMRun                One run, kept
+        └── S-Parameters (run 2, Palace)   EMSParameters   Its results
 ```
+
+Every object above is a member of the study. The tree shows under a solver its
+backend's mesh settings and, beside them, the mesh made from them; under the
+mesh settings it shows each refinement region amending them. A region amending
+no mesh settings stands under the study. A mesh that no longer describes the
+study carries a clock at the bottom left of its icon. Deleting a solver deletes
+its mesh settings, the regions amending them and the mesh made from them, in
+one undo step; the mesh policy, the runs and the other backend's objects stay.
+A second study holds its solvers, mesh settings and meshes under the same
+labels as the first.
 
 The **Create EM Analysis** command creates the `EMAnalysis` container, the
 `EMSolverOpenEMS` solver object, its `EMYeeGrid`, and `EMMeshPolicy`
-simultaneously. **Add Palace Solver** creates the `EMSolverPalace` object and
-its `EMGmshMesh`, and adds whichever of the three that backend needs the study
-lacks.
+simultaneously. **Add openEMS Solver** and **Add Palace Solver**, under **Add
+Solver**, each act on the selected study. A backend needs its solver, its mesh
+settings and the mesh policy. The command adds whichever of these the study
+lacks, and says what it added where the solver was already there. A study that
+already holds them all is refused, naming the solver it holds.
 
 The `EMAnalysis` container groups the solvers, the mesh policy, each backend's
-mesh recipe, ports, mesh refinement, and result objects for a study.
+mesh settings, the refinement regions amending them, ports, and the runs made
+of a study. See
+[Results](results.md) for what a run keeps.
 
 Geometry objects (`Part::Box`, `Part::Feature`) and materials (`EMMaterial`)
 reside at the document root, allowing multiple simulation studies to share
@@ -42,17 +58,8 @@ the same geometry and substrate definitions.
 
 ### Object creation workflow
 
-1. Draw CAD geometry (substrate bodies, conductor traces, ground planes).
-2. Create the `EMAnalysis` study and configure `FrequencyStart` and
-   `FrequencyStop`.
-3. Assign materials using `EMMaterialBinding`.
-4. Create ports (**Add Microstrip Port**, **Add Lumped Port**, etc.).
-   Microstrip ports automatically compute initial `MeasurementDistance`
-   from the analysis frequency band.
-5. Optional: Add `EMMeshRegion` objects for localized refinement.
-6. To solve on Palace, press **Add Palace Solver**.
-7. Verify the discretization. On openEMS click **Update Mesh** to see the grid
-   in the 3D viewport. On Palace press **Mesh** in the Palace panel.
+[The standard simulation workflow](README.md#standard-simulation-workflow)
+gives the order the objects are made in, and the button that makes each.
 
 ### Where a new object goes
 
@@ -70,20 +77,25 @@ the target container first.
 | Object | Label | Function | Scope |
 |---|---|---|---|
 | `EMAnalysis` | EM Analysis | Study container (frequency band, points, symmetry) | Solver-neutral |
-| `EMSolverOpenEMS` | openEMS | Solver settings (the pulse, the absorber, time steps, threads) | openEMS |
-| `EMSolverPalace` | Palace | Solver settings (element order, the sweep, processes, the paths to Palace, `mpirun` and the mesher's Python) | Palace |
-| `EMMeshPolicy` | Mesh Policy | What the device asks of any mesh: a count across a feature, a curve tolerance, a floor, and which faces are open to free space | Solver-neutral |
-| `EMYeeGrid` | Yee Grid | Cells per wavelength, edge refinement, growth ratio, absorber cells | openEMS |
-| `EMGmshMesh` | Gmsh Mesh | Elements per wavelength, edge refinement, elements per turn, growth ratio | Palace |
-| `EMMeshRegion` | Mesh Refinement | Localized mesh refinement/coarsening region | Solver-neutral |
+| `EMSolverOpenEMS` | Solver (openEMS) | Solver settings (the pulse, the absorber, time steps, threads) | openEMS |
+| `EMSolverPalace` | Solver (Palace) | Solver settings (element order, the sweep, processes, the paths to Palace, `mpirun` and the mesher's Python) | Palace |
+| `EMMeshPolicy` | Mesh Policy | The problem every backend solves: what lies beyond each face of the domain, the room past it, the medium filling it, and a curve tolerance | Solver-neutral |
+| `EMYeeGrid` | Mesh Settings (openEMS) | Cells per wavelength, edge refinement, growth ratio, a count across a dielectric, a floor under every cell | openEMS |
+| `EMGmshMesh` | Mesh Settings (Palace) | Elements per wavelength, edge refinement, elements per turn, growth ratio, a count across a dielectric, a floor under every element | Palace |
+| `EMMeshRegion` | Mesh Refinement | Localized refinement or coarsening of the mesh its `MeshSettings` lays | The backend of its mesh settings |
 | `EMMaterial` | *material name* | Physical properties (permittivity, loss tangent, thickness) | Solver-neutral |
-| `EMMaterialBinding` | EMMaterialBinding | Associates an `EMMaterial` with target CAD shapes/faces | Solver-neutral |
-| `EMPortMicrostrip` | MicrostripPort | Planar microstrip excitation and measurement port. openEMS drives it, and Palace refuses it | Solver-neutral |
-| `EMPortLumped` | LumpedPort | Discrete element/resistor port across a gap | Solver-neutral |
-| `EMPortRectWaveguide` | WaveguidePort | Rectangular waveguide modal port | Solver-neutral |
-| `EMMeshPreview` | Mesh Preview | Generated Yee grid visualizer | openEMS |
-| `Fem::FemMeshObject` | Mesh (Palace) | The tetrahedral mesh the last **Mesh** or **Run** made, marked out of date when the study changes | Palace |
-| `EMSParameters` | S-Parameters (*backend*) | Extracted S-parameter dataset and provenance | Solver-neutral |
+| `EMMaterialBinding` | Material Binding | Associates an `EMMaterial` with target CAD shapes/faces | Solver-neutral |
+| `EMPortMicrostrip` | Port *n* (Microstrip) | Planar microstrip excitation and measurement port. openEMS drives it, and Palace refuses it | Solver-neutral |
+| `EMPortLumped` | Port *n* (Lumped) | Discrete element/resistor port across a gap | Solver-neutral |
+| `EMPortRectWaveguide` | Port *n* (Waveguide) | Rectangular waveguide modal port | Solver-neutral |
+| `EMMeshPreview` | Mesh (openEMS) | The grid the last **Mesh** laid, drawn, and marked out of date when the study changes | openEMS |
+| `Fem::FemMeshObjectPython` | Mesh (Palace) | The tetrahedral mesh the last **Mesh** or **Run** made, marked out of date when the study changes | Palace |
+| `EMRun` | Run *n* (*backend*) | One run of the study: what it was asked, what it was asked otherwise than the run before it, its log, what it warned of and what it cost | Solver-neutral |
+| `EMSParameters` | S-Parameters (run *n*, *backend*), or a Touchstone file's stem | Extracted S-parameter dataset and provenance, held in its run; or a Touchstone file read in, held whole, in a study or at the root | Solver-neutral |
+
+A port's label is its `Number`, which is its index in S, and its kind. Change
+the number and a label of that form follows it. A label you typed stays as you
+typed it.
 
 ## EM Analysis
 
@@ -95,11 +107,11 @@ properties.
 |---|---|---|
 | `FrequencyStart` | 1.0 GHz | Sweep start frequency |
 | `FrequencyStop` | 10.0 GHz | Sweep stop frequency |
-| `NumFrequencyPoints` | 501 | Number of evaluated frequency sample points |
+| `FrequencyPoints` | 501 | Number of evaluated frequency sample points |
 | `Symmetry` | None | The device is its own mirror between its two ports (`None` or `Mirror`) |
-| `SmallestResponse` | 0.0 | The smallest response the study reads, in dB (0 = full scale) |
+| `ResponseFloor` | 0.0 | The smallest response the study reads, in dB (0 = full scale) |
 
-On openEMS one pulse covers the whole band, so `NumFrequencyPoints` sets how
+On openEMS one pulse covers the whole band, so `FrequencyPoints` sets how
 finely the record is transformed and does not lengthen the run. On Palace each
 point is a full solve, unless the sweep is adaptive and answers the points from
 a reduced model (see [Running](running.md)).
@@ -114,9 +126,9 @@ mesh (see [Meshing](meshing.md)).
 plane between Port 1 and Port 2, and that the two ports are the same port. The
 workbench does not infer it from the drawing.
 
-Every port with `Excitation = true` is solved. To halve the solve:
+Every port with `Driven = true` is solved. To halve the solve:
 
-- Set `Excitation = false` on Port 2.
+- Set `Driven = false` on Port 2.
 - The workbench fills the Port 2 column from the Port 1 run, taking the run
   that drives Port 2 to be the solved one with the two ports exchanged:
   $S_{22} = S_{11}$ and $S_{12} = S_{21}$. The chart draws the filled column
@@ -133,13 +145,18 @@ Where both ports are driven, the log compares the measured $S_{22}$ with
 $S_{11}$, which says whether the declaration holds and one solve would have
 done.
 
-On openEMS, **Check** and **Run** also warn where the ports, the solids or the
-grid do not mirror across the plane. No check blocks the run.
+**Check** and **Run** warn on each backend where the ports or the solids do not
+mirror across the plane between the two ports, and on openEMS where the grid
+does not. The log names two ports of different resistance, two reference planes
+at different depths and a port that stands off its partner's mirror image. On
+openEMS it names a wave port facing a lumped one. Palace refuses a study driven
+through a wave port and a lumped port, and the refusal names both. No check
+blocks the run.
 
 ### The smallest response
 
-`SmallestResponse` is the smallest response the study reads, in dB, where `0.0`
-is full scale: `-40` for a filter whose stopband is the point of the study.
+`ResponseFloor` is the smallest response the study reads, in dB, where `0.0`
+is full scale. For a filter whose stopband is to be measured, `-40` is typical.
 
 Each backend takes a shortcut to answer the band, and measures what the
 shortcut moved. The bar for both is 1% of the smallest response, an absolute
@@ -167,15 +184,15 @@ Pre-flight validation inspects the model against solver capabilities:
 - **Refusal (Error)**: Blocks simulation. Displayed when encountering
   unsupported geometry, conflicting port orientations, or non-physical
   material properties.
-- **Warning**: Logs potential setup issues (e.g. non-zero loss tangent on
-  PEC, or potential PML overlap on openEMS) but allows simulation to proceed.
+- **Warning**: Logs potential setup issues but allows simulation to proceed.
+  On openEMS, a lossy dielectric whose `MeasuredAt` stands far from the band
+  centre, or is not recorded, draws one (see [Materials](materials.md)).
 - **Substitution**: Reports where the adapter solved something other than
   what was drawn - a zero-thickness surface given a thickness, or geometry
   clipped at a `Through` boundary. The run proceeds.
 
 On openEMS, pre-flight checks execute during **Check** and **Run** in the
-simulation panel, and inside the solver driver process. The toolbar **Update
-Mesh** button lays the openEMS grid only, and executes translation and grid
-meshing only. On Palace, pre-flight checks execute during **Check**, **Mesh**
-and **Run** in the Palace panel.
+simulation panel, and inside the solver driver process. **Mesh** on openEMS
+executes translation and grid meshing only. On Palace, pre-flight checks
+execute during **Check**, **Mesh** and **Run** in the Palace panel.
 

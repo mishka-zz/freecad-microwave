@@ -133,6 +133,7 @@ class TestADuplicateCatalogIdIsAFailureNotAShadow:
         assert failure.path == str(second)
         assert str(first) in failure.message
         assert "already loaded" in failure.message
+        assert failure.message.endswith("To load both, change the [catalog] id in this file")
 
     def test_the_bundled_catalog_cannot_be_shadowed(self, tmp_path):
         """Search order puts what ships with the workbench first, on purpose."""

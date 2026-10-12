@@ -1,0 +1,5 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Out of date: an amber clock, drawn in the lower left of the 10 px square FreeCAD pastes. -->
+  <circle cx="24" cy="40" r="21" fill="#f2b01e" stroke="#37474f" stroke-width="5"/>
+  <path d="M24 27 V41 H34" stroke="#37474f" stroke-width="6.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

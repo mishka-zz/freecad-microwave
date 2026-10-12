@@ -105,8 +105,13 @@ $$\frac{\lVert (I - G^2)^{1/2} y \rVert^2}{\lVert x \rVert^2} \le \frac{\lVert y
 and $\lVert A \rVert^2$ is at most the VSWR. $B$ is the adjoint of the same form
 in $S^H$, which is a contraction too. A matched lossless line between two ports
 of one impedance reaches the bound where its transmission lines up with $G$.
-WR-42, at about 500 ohm, reported at 50 ohm is a VSWR of about ten, so the
-matrix can carry up to ten times whatever error the solve left.
+Between real impedances the VSWR is the ratio of the larger to the smaller. A
+rectangular waveguide port states the wave impedance of its mode,
+$k Z_0 / \beta$ with $\beta = \sqrt{k^2 - k_c^2}$
+(`openEMS/python/openEMS/ports.py:540-543`), and $\beta < k$ above cutoff, so
+it exceeds the free-space impedance $Z_0 \approx 376.7$ ohm. Reported at
+50 ohm, such a port has a VSWR above $376.7 / 50 \approx 7.5$, and the matrix
+can carry up to that VSWR times whatever error the solve left.
 
 A column read alone moves only its driven ports, since the undriven ones keep
 their own impedance. A matched line driven at port 1 then has the factor
@@ -153,7 +158,7 @@ and a matrix not every column of which was driven carries what the undriven
 ports sent back in every term, so neither is compared. The log warns where the
 departure passes the bar that what an undriven port sent back is held to. The
 check holds the departure itself to the bar, not the half of it that is the
-floor on the error, and so errs toward saying.
+floor on the error, and so errs toward warning.
 
 ## Applying mirror symmetry
 
@@ -218,9 +223,11 @@ raise an exception.
 ## Characteristic impedance discrepancy between symmetric ports
 
 The difference between the two ports' numerically extracted reference impedances
-is retained as diagnostic output. This metric indicates whether the declared
+is retained as diagnostic output: one figure for the whole band, the largest
+relative gap at any frequency. This metric indicates whether the declared
 mirror symmetry holds: a significant discrepancy indicates physical or meshing
-asymmetry.
+asymmetry. Past the panel's own tolerance the log warns and suggests driving
+both ports. It blanks no point.
 
 This discrepancy does not represent an uncertainty bound on $[S]$. For a truly
 symmetric device, both ports share an identical physical characteristic impedance,
@@ -229,8 +236,28 @@ extractions.
 
 ## Point-wise numerical failures across frequency sweeps
 
-If the extracted reference impedances between symmetric ports diverge beyond the
-specified tolerance at specific frequencies, those individual points are marked
-as `NaN` and reported. Numerical impedance extraction can become ill-conditioned
-near standing-wave nulls. Confining `NaN` flags to affected frequency points
-preserves valid simulation results across the remainder of the sweep.
+A frequency point is blanked, as `NaN` across the whole matrix, in each of these
+cases:
+
+- **The runs disagree about a port's impedance.** The assembly takes the mean
+  of the runs' measurements of each port's reference impedance. Where any run's
+  measurement departs from that mean by more than `IMPEDANCE_TOLERANCE` of it,
+  the point is discarded (`_disagreement` in `Results/sparameters.py`). A
+  microstrip port measures its impedance from its probe fields, and that
+  extraction goes indeterminate near a standing-wave null. Where the nulls fall
+  depends on which port is driven, so the runs disagree exactly where the
+  extraction stopped working. A single run
+  has nothing to disagree with, and nothing is discarded from it.
+- **A port carries no power.** Where a port's impedance has no positive real
+  part, as a waveguide port's has below its mode's cutoff, no wave at it can be
+  normalised (`_powered`).
+
+The whole matrix is blanked at such a point rather than one port's row and
+column, because the renormalisation mixes every term at one frequency. The
+neighbouring points stay sound, since the renormalisation inverts one matrix
+per frequency. They are not left bit for bit as they were: scikit-rf decides
+whether to renormalise at all with a whole-band `np.any(self.z0 != z_new)`
+(`Microwave/_vendor/skrf/network.py:3481`), so one differing point moves the
+entire band onto the Z-parameter path. A sweep in
+which every point is blanked is refused by name. Confining `NaN` to the
+affected points preserves valid results across the remainder of the sweep.

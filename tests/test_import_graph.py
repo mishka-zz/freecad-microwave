@@ -47,9 +47,10 @@ PACKAGE = pathlib.Path(Microwave.__file__).resolve().parent
 #: What holds it is the assertion below and not its place. The second
 #: is the solver-neutral middle - the catalogs, the result objects and the
 #: adapters, none of which may know there is a document. The third is the
-#: document itself. The last is everything that draws: the view providers, the
-#: task panels and the command table are one layer because the architecture
-#: puts no order between them.
+#: document itself. The last is everything that runs the document for a user:
+#: the view providers, the task panels, the command table and the run from the
+#: command line are one layer because the architecture puts no order between
+#: them.
 #:
 #: Named by the first component under ``Microwave``, which is a package for some
 #: of them and a module for the rest.
@@ -57,7 +58,7 @@ LAYERS = (
     frozenset({"Gmsh", "annulus", "drawn", "host_versions", "picks", "portbox", "undo", "units"}),
     frozenset({"Materials", "Results", "Solvers"}),
     frozenset({"Objects"}),
-    frozenset({"Commands", "Gui", "ViewProviders"}),
+    frozenset({"Commands", "Gui", "ViewProviders", "batch"}),
 )
 
 #: Vendored scikit-rf. Upstream's imports are upstream's business.

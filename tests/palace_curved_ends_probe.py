@@ -255,7 +255,7 @@ def study(doc, case, body, ends):
     analysis = createEMAnalysis(doc)
     analysis.FrequencyStart = "2.5 GHz"
     analysis.FrequencyStop = "3.5 GHz"
-    analysis.NumFrequencyPoints = 3
+    analysis.FrequencyPoints = 3
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [one for one in analysis.Group if one is not member]
@@ -280,12 +280,14 @@ def study(doc, case, body, ends):
     settings.Clearance = 2.0
     for face in FACES:
         chosen = (
-            ends.get(face, "Air") if isinstance(ends, dict) else ("Ends" if face in ends else "Air")
+            ends.get(face, "Open")
+            if isinstance(ends, dict)
+            else ("PEC Wall" if face in ends else "Open")
         )
-        setattr(settings, f"Padding{face}", chosen)
+        setattr(settings, f"Boundary{face}", chosen)
     contents(analysis).recipe.ElementsPerWavelength = 6.0
     port = createEMPortLumped("Feed")
-    port.Label, port.Number, port.Excitation = "Feed", 1, True
+    port.Label, port.Number, port.Driven = "Feed", 1, True
     port.Resistance, port.ReferencedTo, port.ExcitationAxis = 50.0, PORT_IMPEDANCE, "X"
     port.SourceEntity = (made["Left"], [edge_at(made["Left"].Shape, l1)])
     port.ReferenceEntity = (made["Right"], [edge_at(made["Right"].Shape, r0)])

@@ -9,8 +9,10 @@ names settle for that size. That is one meaning, and each backend realises it
 the way its mesh can. This module reads the statement and refuses one that
 states nothing. What a backend lays for it is the backend's.
 
-A region is read the same way whichever backend asks, so a document carrying
-one is refused in the same words by both.
+A region amends one pipeline's recipe, the one its ``MeshSettings`` links, and
+:func:`amending` is how a backend finds its own. A region is read the same way
+whichever backend asks, so a document carrying one is refused in the same words
+by both.
 
 This module imports no FreeCAD. Every property is reached by duck typing, and a
 shape is asked for through :mod:`Microwave.picks`.
@@ -30,6 +32,7 @@ __all__ = [
     "COARSEN",
     "REFINE",
     "MeshRegion",
+    "amending",
     "Named",
     "Relaxation",
     "check_relaxations_were_used",
@@ -83,6 +86,49 @@ class MeshRegion:
     named: tuple[Named, ...]
 
 
+def amending(study: Any, members: Sequence[Any], recipe: Any, kind: Any) -> tuple[Any, ...]:
+    """The refinement regions among ``members`` that amend ``recipe``.
+
+    A region amending another backend's recipe in the study is that backend's
+    and is left out. One amending nothing, something that is no backend's mesh
+    settings, or mesh settings ``study`` does not hold is refused by name, in
+    the same words whichever backend asks, since no mesh of the study would be
+    laid with it and the run would not say so.
+
+    :param study: the study ``members`` are of.
+    :param members: what the study holds.
+    :param recipe: this backend's mesh settings in the study.
+    :param kind: what tells an object's kind, as the adapter reads it.
+    """
+    amends: list[Any] = []
+    for obj in members:
+        if kind(obj) != "EMMeshRegion":
+            continue
+        settings = getattr(obj, "MeshSettings", None)
+        if settings is recipe:
+            amends.append(obj)
+        elif settings is None:
+            raise TranslationError(
+                f"{label(obj)!r} amends no mesh settings, so no backend meshes with it. "
+                "Set its MeshSettings to the mesh settings of the backend it refines, "
+                "or delete it"
+            )
+        elif not hasattr(settings, "ElementsPerWavelength"):
+            raise TranslationError(
+                f"{label(obj)!r} amends {label(settings)!r}, which is no backend's mesh "
+                "settings, so no backend meshes with it. Set its MeshSettings to the mesh "
+                "settings of the backend it refines"
+            )
+        elif not any(settings is one for one in members):
+            raise TranslationError(
+                f"{label(obj)!r} amends {label(settings)!r}, which {label(study)!r} does "
+                f"not hold, so no mesh of {label(study)!r} is laid with it. Set its "
+                f"MeshSettings to mesh settings {label(study)!r} holds, or move it to the "
+                f"study holding {label(settings)!r}"
+            )
+    return tuple(amends)
+
+
 def mode(obj: Any) -> str:
     """Which way a mesh region points, for a document that may predate the ask.
 
@@ -95,9 +141,7 @@ def mode(obj: Any) -> str:
     said = str(getattr(obj, "Mode", REFINE) or REFINE)
     if said not in (REFINE, COARSEN):
         raise TranslationError(
-            f"{label(obj)!r}: Mode is {said!r}. A mesh region either makes the "
-            f"elements around its geometry finer ({REFINE}) or lets them go "
-            f"coarser ({COARSEN})"
+            f"{label(obj)!r}: Mode is {said!r}. Set Mode to {REFINE} or {COARSEN}"
         )
     return said
 
@@ -124,15 +168,16 @@ def read(obj: Any) -> MeshRegion:
     across = int(obj.MinElementsAcross)
     if across < 0:
         raise TranslationError(
-            f"{label(obj)!r}: MinElementsAcross is {across}; it must be 0 "
-            "to inherit the global count, or a positive number"
+            f"{label(obj)!r}: MinElementsAcross is {across}. Enter 0 to take the count "
+            "from its mesh settings, or a positive number"
         )
     coarsens = pointing == COARSEN
+    # A count is a demand for resolution, so it would be honoured while the
+    # coarsening beside it was not.
     if coarsens and across:
         raise TranslationError(
             f"{label(obj)!r} is set to {COARSEN} and asks for {across} "
-            "elements across. A count is a demand for resolution, so it "
-            "would be honoured while the coarsening beside it was not. Set "
+            "elements across, so the count would override the coarsening. Set "
             f"MinElementsAcross to 0, or set Mode to {REFINE}"
         )
     references = list(getattr(obj, "References", ()) or ())
@@ -228,7 +273,6 @@ def check_relaxations_were_used(
         drawn = f"{name}:{element}" if element else name
         raise TranslationError(
             f"{relaxation.asked_by!r} coarsens {drawn!r}, which no material "
-            "binding names. Only geometry a material has been bound to has an "
-            "element size to settle for, so this asks for nothing. Bind a "
-            "material to it, or aim the region at geometry that has one"
+            "binding names, so it changes nothing. Bind a material to it, or aim "
+            "the region at geometry a material is bound to"
         )

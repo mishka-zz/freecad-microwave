@@ -349,7 +349,8 @@ def test_a_column_read_alone_says_what_the_undriven_port_sent_back(solved):
     said = one_path.sent_back(residual.WANTED)
     assert said is not None
     driven = int(solved[0].excited_port)
-    assert said.startswith(f"A term of column {driven}") and f"port {3 - driven} most" in said
+    assert said.startswith(f"A term driven from port {driven}")
+    assert f"port {3 - driven} most" in said
 
 
 def test_openems_own_output_is_not_reciprocal(solved):

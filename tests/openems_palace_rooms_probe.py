@@ -80,14 +80,14 @@ def palace_only(doc, start="20 GHz", stop="26 GHz"):
     analysis = createEMAnalysis(doc)
     analysis.FrequencyStart = start
     analysis.FrequencyStop = stop
-    analysis.NumFrequencyPoints = 3
+    analysis.FrequencyPoints = 3
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [one for one in analysis.Group if one is not member]
             doc.removeObject(member.Name)
     analysis.addObject(createEMSolverPalace(doc))
     analysis.addObject(createEMGmshMesh(doc))
-    FACES.padded(analysis, ["Ends"] * 6)
+    FACES.padded(analysis, ["PEC Wall"] * 6)
     return analysis
 
 
@@ -102,7 +102,7 @@ def bind(doc, analysis, name, shapes, kind="PEC", conductivity=0.0, thickness=0.
     material.MaterialType = kind
     if kind == "Dielectric":
         material.Permittivity = 2.2
-    if kind == "ConductingSheet":
+    if kind == "Conducting Sheet":
         material.Conductivity = conductivity
         material.Thickness = thickness
     binding = createEMMaterialBinding(f"{name}Binding")
@@ -137,7 +137,7 @@ def housing(septa=(), kind="PEC", set_in=0.0):
             port = createEMPortRectWaveguide(f"Port{number}")
             port.Label = f"Port{number}"
             port.Number = number
-            port.Excitation = True
+            port.Driven = True
             port.PropagationAxis = "X" if number == 1 else "-X"
             port.CrossSection = (plane, ["Face1"])
             port.ReferencedTo = PORT_IMPEDANCE
@@ -167,7 +167,7 @@ def lumped_round_metal(doc):
     port = createEMPortLumped("Port1")
     port.Label = "Port1"
     port.Number = 1
-    port.Excitation = True
+    port.Driven = True
     port.Resistance = 50.0
     port.ReferencedTo = PORT_IMPEDANCE
     port.ExcitationAxis = "Z"
@@ -286,7 +286,7 @@ def board_under_a_lumped_port(source_on_top):
         analysis = createEMAnalysis(doc)
         analysis.FrequencyStart = "2 GHz"
         analysis.FrequencyStop = "8 GHz"
-        analysis.NumFrequencyPoints = 3
+        analysis.FrequencyPoints = 3
         half = A_MICRON / 4
         ground, strip = bind(
             doc,
@@ -314,7 +314,7 @@ def board_under_a_lumped_port(source_on_top):
         port = createEMPortLumped("Port1")
         port.Label = "Port1"
         port.Number = 1
-        port.Excitation = True
+        port.Driven = True
         port.Resistance = 50.0
         port.ReferencedTo = PORT_IMPEDANCE
         port.ExcitationAxis = "Z"
@@ -328,8 +328,8 @@ def board_under_a_lumped_port(source_on_top):
         )
         analysis.addObject(port)
         FACES.solvers(doc, analysis)
-        FACES.padded(analysis, ["Ends"] * 6)
-        settings = next(one for one in analysis.Group if hasattr(one, "PaddingXMin"))
+        FACES.padded(analysis, ["PEC Wall"] * 6)
+        settings = next(one for one in analysis.Group if hasattr(one, "BoundaryXMin"))
         settings.Medium = next(
             one for one in analysis.Group if getattr(one, "Label", "") == "BoardBinding"
         ).Material
@@ -424,7 +424,7 @@ def blocks_apart(doc):
 DRAWINGS = {
     "septum_near_a_wall": housing((0.5,)),
     "two_septa": housing((2.2, 3.0)),
-    "lossy_septum_alone": housing((0.5,), "ConductingSheet"),
+    "lossy_septum_alone": housing((0.5,), "Conducting Sheet"),
     "ports_set_in": housing(set_in=5.0),
     "lumped_round_metal": lumped_round_metal,
     "groove_filled": grooved(True),

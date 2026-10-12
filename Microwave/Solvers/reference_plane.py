@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .. import drawn
@@ -43,9 +43,8 @@ def depth(port: Any) -> float:
     stated = value(port.ReferenceDepth)
     if not math.isfinite(stated) or stated < 0.0:
         raise TranslationError(
-            f"{label(port)!r}: ReferenceDepth is {stated:g} mm. It is how far into the "
-            "guide from the picked face the S-parameters are referred, so it is a "
-            "length of zero or more, and zero is the face"
+            f"{label(port)!r}: ReferenceDepth is {stated:g} mm. Enter 0 mm for the picked "
+            "face, or a positive depth into the guide"
         )
     return stated
 
@@ -62,12 +61,16 @@ class Bound:
         :data:`~Microwave.Solvers.sheets.PASSES`.
     :param perfect: whether it is a perfect conductor, which on a wall that is
         a perfect conductor already changes nothing.
+    :param material: the name of the material bound to it, which a refusal
+        names where a guide opens into it. Empty where the caller names none,
+        and then the refusal names the shape alone.
     """
 
     name: str
     shape: Any
     wall: bool
     perfect: bool = False
+    material: str = ""
 
 
 #: What a backend says stands beyond the part of a guide's side that no bound
@@ -177,9 +180,7 @@ def _changes(
     if getattr(one.shape, "Solids", None):
         held = swept.common(_solids(one.shape))
         free = _free(one.shape)
-        if free is not None and _changes(
-            Bound(one.name, free, one.wall, one.perfect), swept, step, axis, ends, walled
-        ):
+        if free is not None and _changes(replace(one, shape=free), swept, step, axis, ends, walled):
             return True
         at_face = [piece for piece in _pieces(held) if _across(piece, axis, ends[0])]
         if not at_face:
@@ -247,22 +248,21 @@ def _beyond(side: _Side, cover: Sequence[Bound], solids: Sequence[Bound]) -> tup
 
 def _opens(
     side: _Side, beyond: Any, solids: Sequence[Bound], outside: Outside
-) -> tuple[str, str] | None:
+) -> Bound | str | None:
     """What ``side`` opens into or onto beyond, or ``None`` where it is a wall:
-    ``("into", name)`` for a bound part, ``("onto", what)`` for what the backend
-    says stands where nothing is bound."""
+    the bound part it opens into, or what the backend says stands where nothing
+    is bound."""
     if beyond is None or not _area(_pieces(beyond)):
         return None
     for one in solids:
         if not one.wall and _area(_pieces(beyond.common(one.shape))):
-            return ("into", repr(one.name))
+            return one
     for one in solids:
         if not one.wall:
             beyond = _less(beyond, one.shape)
     if not _area(_pieces(beyond)):
         return None
-    stands = outside(beyond.translated(side.back))
-    return None if stands is None else ("onto", stands)
+    return outside(beyond.translated(side.back))
 
 
 def check_uniform(
@@ -322,11 +322,6 @@ def check_uniform(
     ends = (start, far if abs(reach - referred) <= FLATNESS else None)
     subject = f"{label(port)!r}"
     where = f"between the face and {reach:.6g} mm in, where {why}"
-    said = (
-        "The answer is moved along the guide by the propagation constant of the "
-        "port's own mode, which holds only where the guide is a prism along its "
-        f"axis with walls over that length. {remedy}"
-    )
 
     solids = [one for one in bound if getattr(one.shape, "Solids", None)]
     sheets = [one for one in bound if not getattr(one.shape, "Solids", None)]
@@ -362,17 +357,38 @@ def check_uniform(
         if _changes(one, swept, step, axis, ends, walled):
             raise TranslationError(
                 f"{subject}: the guide changes along {AXIS_NAMES[axis]} at "
-                f"{one.name!r} {where}. {said}"
+                f"{one.name!r} {where}. {remedy}"
             )
 
+    # What the port's face lies on is the guide itself, under the name the
+    # backend gives it, and a part of that name is drawn, not bound, wrongly.
+    guide = {one.name for one in bound if _area(_pieces(face.common(one.shape)))}
     for side in sides:
-        opens = _opens(side, _beyond(side, covering, solids)[1], solids, outside)
-        if opens is not None:
-            how, what = opens
-            raise TranslationError(
-                f"{subject}: the side of the guide at {_plane(side.face)} opens {how} "
-                f"{what} {where}, so the guide there is not walled. {said}"
+        beyond = _beyond(side, covering, solids)[1]
+        opens = _opens(side, beyond, solids, outside)
+        if opens is None:
+            continue
+        # A part the guide opens into is often its wall bound to the wrong
+        # material. It is not where the opening lies behind a sheet that lets
+        # the wave through, which is the wall there.
+        made_of = ""
+        if isinstance(opens, Bound):
+            what = f"into {opens.name!r}"
+            opening = beyond.common(opens.shape).translated(side.back)
+            through = any(
+                not one.wall and _area(_pieces(opening.common(one.shape))) for one in sheets
             )
+            if opens.material and opens.name not in guide and not through:
+                made_of = (
+                    f" {opens.name!r} is {opens.material!r}. If it is the guide's wall, "
+                    "bind it to a PEC material."
+                )
+        else:
+            what = f"onto {opens}"
+        raise TranslationError(
+            f"{subject}: the side of the guide at {_plane(side.face)} opens {what} "
+            f"{where}, so the guide there is not walled.{made_of} {remedy}"
+        )
 
 
 def _middle(face: Any) -> tuple[float, float]:

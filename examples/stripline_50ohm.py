@@ -20,6 +20,9 @@ over the whole port box, which here is the whole line, so every cell on that
 plane goes to the port's strip and the drawn sheet is reported unused. Both are
 the same material, so the structure openEMS builds is the same either way.
 
+Its study carries an openEMS solver alone. Its ports are microstrip ports,
+which Palace does not drive, so Palace refuses the study.
+
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
@@ -169,9 +172,9 @@ the grid adds is a length at the strip, so what it holds answers as a strip a
 little wider than the one drawn, and a wider strip is a lower impedance. The
 drawn width reaches openEMS unchanged.
 
-Refining it is not one knob, and the two are not interchangeable. On the mesh
-policy `MinElementsAcross` sets how many elements span the gap between the
-planes, and `ElementsPerWavelength` sets the bulk element everywhere else -
+Refining it is not one knob, and the two are not interchangeable. On the openEMS
+mesh settings `MinElementsAcross` sets how many elements span the gap between
+the planes, and `ElementsPerWavelength` sets the bulk element everywhere else -
 with `EdgeRefinement` beside it as the ratio between that and the finer
 element at the strip's edges. Asking for elements across the gap alone does
 not converge on the arithmetic: it overshoots.
@@ -279,7 +282,7 @@ def markup(analysis, fill, strip):
     port = createEMPortMicrostrip("Port1")
     port.Label = "Port1"
     port.Number = 1
-    port.Excitation = True
+    port.Driven = True
     # A bare voltage source. The line runs out through the absorber, so there
     # is nothing for a reflection off the feed to come back from.
     port.FeedResistance = 0.0
@@ -298,7 +301,7 @@ def markup(analysis, fill, strip):
     # line the drawing carries all the way.
     port.Length = LENGTH
     port.TraceEnd = (strip, [strip_end(strip)])
-    port.GroundReference = (fill, [lower_plane(fill)])
+    port.Ground = (fill, [lower_plane(fill)])
     port.PropagationAxis = "X"
     port.ExcitationAxis = "-Z"
     analysis.addObject(port)
@@ -311,7 +314,7 @@ def study(doc):
     analysis.Label = "Symmetric stripline"
     analysis.FrequencyStart = f"{BAND[0]:g} Hz"
     analysis.FrequencyStop = f"{BAND[1]:g} Hz"
-    analysis.NumFrequencyPoints = POINTS
+    analysis.FrequencyPoints = POINTS
 
     found = document.contents(analysis)
     settings, grid = found.settings, found.recipe
@@ -320,7 +323,7 @@ def study(doc):
     # round. See GAP_STEPS.
     grid.ElementsPerWavelength = WAVELENGTH / BULK
     grid.EdgeRefinement = BULK / CELL
-    settings.MinElementsAcross = GAP_STEPS
+    grid.MinElementsAcross = GAP_STEPS
     # The line runs out through the absorber at its ends, and the domain stops
     # dead on the drawing everywhere else, where the face is a perfect wall.
     # Those walls are the shield, and the two across the gap are the ground
@@ -328,11 +331,11 @@ def study(doc):
     # ends on is not geometry. Air outside a conducting wall is cells spent on a
     # region the wall keeps the field out of, and it would move the shield away
     # from where it was drawn.
-    settings.PaddingXMin = "Through"
-    settings.PaddingXMax = "Through"
+    settings.BoundaryXMin = "Through"
+    settings.BoundaryXMax = "Through"
     for axis in ("Y", "Z"):
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Ends")
+            setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
     return analysis
 
 

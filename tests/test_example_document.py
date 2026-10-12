@@ -227,7 +227,7 @@ def test_the_yee_grid_is_the_current_one(archive):
 
 
 #: What every port carries, whatever kind it is.
-SHARED_PORT_PROPERTIES = ("Number", "Excitation", "ReferenceImpedance", "ReferencedTo")
+SHARED_PORT_PROPERTIES = ("Number", "Driven", "ReferenceImpedance", "ReferencedTo")
 
 #: And what each kind carries on top, keyed by the class the file names. A
 #: document is checked against the kind it actually holds: the properties that
@@ -263,7 +263,7 @@ def test_the_ports_are_the_current_ones(archive):
 
 
 def test_it_names_no_directory_on_the_machine_that_built_it(archive):
-    """``SimDir`` must ship empty.
+    """``RunDirectory`` must ship empty.
 
     It is an absolute path, and it is set on the first Run - so a document
     saved after one carries the builder's home directory into everybody else's
@@ -272,7 +272,7 @@ def test_it_names_no_directory_on_the_machine_that_built_it(archive):
     """
     document = ElementTree.fromstring(archive["Document.xml"])
     for prop in document.iter("Property"):
-        if prop.get("name") != "SimDir":
+        if prop.get("name") != "RunDirectory":
             continue
         path = prop.find("Path")
         assert path is not None and not path.get("value"), (
@@ -455,7 +455,7 @@ class TestTheStubExampleIsStillATwoPort:
         for name in ("Port1", "Port2"):
             port = properties_of(document, name)
             numbers.add(port["Number"])
-            assert port["Excitation"] == "true", f"{name} is not a source"
+            assert port["Driven"] == "true", f"{name} is not a source"
         assert numbers == {"1", "2"}
 
     def test_each_port_looks_inward_from_its_own_end(self, document):
@@ -581,7 +581,7 @@ class TestTheSteppedLineStillHasAProfileToRead:
         driving = {
             int(properties_of(document, name)["Number"])
             for name in ports_of(document)
-            if properties_of(document, name)["Excitation"] == "true"
+            if properties_of(document, name)["Driven"] == "true"
         }
         assert driving == {1}
         ends = {properties_of(document, name)["SourceEntity"] for name in ports_of(document)}
@@ -601,7 +601,7 @@ class TestTheSteppedLineStillHasAProfileToRead:
         own sweep to one for the same reason.
         """
         analysis = properties_of(document, "EMAnalysis")
-        step = float(analysis["FrequencyStop"]) / int(analysis["NumFrequencyPoints"])
+        step = float(analysis["FrequencyStop"]) / int(analysis["FrequencyPoints"])
         assert float(analysis["FrequencyStart"]) / step == pytest.approx(1.0, rel=1e-9, abs=0.0)
 
     def test_the_board_ends_inside_the_domain(self, document):
@@ -613,8 +613,8 @@ class TestTheSteppedLineStillHasAProfileToRead:
         """
         for axis in "XYZ":
             for side in ("Min", "Max"):
-                face = f"Padding{axis}{side}"
-                assert enum_of(document, "EMMeshPolicy", face) == "Air", f"{face} is not Air"
+                face = f"Boundary{axis}{side}"
+                assert enum_of(document, "EMMeshPolicy", face) == "Open", f"{face} is not Open"
 
 
 class TestTheLowPassIsStillTheFilterItWasSynthesisedAs:
@@ -689,8 +689,8 @@ class TestTheLowPassIsStillTheFilterItWasSynthesisedAs:
         A symmetric two-port's second solve buys a column that repeats the
         first, at the price of the whole run again.
         """
-        assert properties_of(document, "Port1")["Excitation"] == "true"
-        assert properties_of(document, "Port2")["Excitation"] == "false"
+        assert properties_of(document, "Port1")["Driven"] == "true"
+        assert properties_of(document, "Port2")["Driven"] == "false"
 
     def test_every_section_is_the_length_the_synthesis_asked_for(self, document):
         """The assertion this class exists for.
@@ -844,8 +844,8 @@ class TestTheMeasuredLowPassIsTheBoardThatWasBuilt:
     def test_only_the_first_port_is_driven(self, document):
         """A symmetric two-port's second solve buys a column that repeats the
         first, at the price of the whole run again."""
-        assert properties_of(document, "Port1")["Excitation"] == "true"
-        assert properties_of(document, "Port2")["Excitation"] == "false"
+        assert properties_of(document, "Port1")["Driven"] == "true"
+        assert properties_of(document, "Port2")["Driven"] == "false"
 
     def test_the_sections_tile_the_board(self, document):
         """Butted end to end, and covering the substrate exactly."""
@@ -881,7 +881,7 @@ class TestTheWaveguideRunsOutThroughSomethingThatAbsorbs:
 
     def test_the_guide_runs_out_through_both_ends(self, document):
         for side in ("Min", "Max"):
-            assert enum_of(document, "EMMeshPolicy", f"PaddingX{side}") == "Through"
+            assert enum_of(document, "EMMeshPolicy", f"BoundaryX{side}") == "Through"
 
     def test_and_a_port_faces_into_the_model_from_each_of_them(self, document):
         """One port facing along x bounds the lower face, and one facing back
@@ -1060,7 +1060,7 @@ class TestTheStriplineIsStillExact:
         condition per face on its solver is one the adapter refuses.
         """
         for side in ("Min", "Max"):
-            assert enum_of(document, "EMMeshPolicy", f"PaddingX{side}") == "Through"
+            assert enum_of(document, "EMMeshPolicy", f"BoundaryX{side}") == "Through"
         assert enum_of(document, "EMSolverOpenEMS", "Absorber") == "PML"
         root = ElementTree.fromstring(document["Document.xml"])
         solver = next(
@@ -1076,13 +1076,13 @@ class TestTheStriplineIsStillExact:
         on the policy, so no count has to be read beside it."""
         for axis in ("Y", "Z"):
             for side in ("Min", "Max"):
-                assert enum_of(document, "EMMeshPolicy", f"Padding{axis}{side}") == "Ends"
+                assert enum_of(document, "EMMeshPolicy", f"Boundary{axis}{side}") == "PEC Wall"
 
     def test_the_line_runs_out_through_the_absorber(self, document):
         """Give it air at its ends instead and it radiates off an open circuit,
         and every impedance read from it is contaminated by the reflection."""
         for side in ("Min", "Max"):
-            assert enum_of(document, "EMMeshPolicy", f"PaddingX{side}") == "Through"
+            assert enum_of(document, "EMMeshPolicy", f"BoundaryX{side}") == "Through"
 
     def test_the_shield_stays_narrow_enough_to_be_one(self, document):
         """``MSLPort`` drives from the strip to one ground plane, which is

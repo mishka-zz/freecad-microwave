@@ -9,15 +9,20 @@ not nest a freshly created object, and fails two studies over one geometry,
 which then have nothing to scope themselves to.
 """
 
+import re
+
 import pytest
 
 from Microwave.Objects.analysis import (
     NoAnalysis,
+    NoSettings,
     NoSolver,
     analyses,
     analysis_of,
+    companions,
     createEMAnalysis,
     find_analysis,
+    settings_to_amend,
     solver_of,
     solver_to_run,
     solvers_in,
@@ -48,7 +53,7 @@ class TestWhatCreatingOneGives:
         analysis = createEMAnalysis(doc)
         assert float(analysis.FrequencyStart) == pytest.approx(1e9)
         assert float(analysis.FrequencyStop) == pytest.approx(10e9)
-        assert analysis.NumFrequencyPoints == 501
+        assert analysis.FrequencyPoints == 501
 
     def test_a_frequency_behaves_as_a_number(self, doc):
         """A band's two ends go in a set, and order against each other.
@@ -145,7 +150,7 @@ class TestTheSymmetryDeclaration:
         assert declared_symmetry(analysis) == MIRROR
 
 
-class TestTheSmallestResponseDeclaration:
+class TestTheResponseFloorDeclaration:
     """How far down the response is read, which is a statement about the study.
 
     It sits beside the band for the same reason the symmetry does: nothing in a
@@ -159,7 +164,7 @@ class TestTheSmallestResponseDeclaration:
         """Full scale is what a study that declares nothing is held to, and a
         study nobody has thought about declares nothing."""
         analysis = createEMAnalysis(doc)
-        assert analysis.SmallestResponse == 0.0
+        assert analysis.ResponseFloor == 0.0
 
     def test_the_default_reaches_the_envelope_as_what_it_calls_full_scale(self, doc):
         """A study declaring nothing spells it zero dB on the property and a
@@ -230,7 +235,10 @@ class TestChoosingWhereANewObjectGoes:
         assert find_analysis(doc) is analysis
 
     def test_no_analysis_says_to_make_one(self, doc):
-        with pytest.raises(NoAnalysis, match="no EM analysis"):
+        with pytest.raises(
+            NoAnalysis,
+            match=re.escape("no EM analysis to add to. Create one with Create EM Analysis"),
+        ):
             find_analysis(doc)
 
     def test_two_analyses_refuse_rather_than_guess(self, doc):
@@ -371,6 +379,56 @@ class TestEverySolverAStudyHolds:
         assert solvers_in(analysis)[0] is palace
 
 
+class TestWhatASolverBringsToItsStudy:
+    """What deleting a solver takes with it."""
+
+    def study(self, doc):
+        from Microwave.Objects.mesh import createEMGmshMesh
+        from Microwave.Objects.solver import createEMSolverPalace
+
+        analysis = createEMAnalysis(doc)
+        palace, settings = createEMSolverPalace(doc), createEMGmshMesh(doc)
+        analysis.addObject(palace)
+        analysis.addObject(settings)
+        grid = next(obj for obj in analysis.Group if kind(obj) == "EMYeeGrid")
+        regions = [createEMMeshRegion(doc, settings=held) for held in (settings, grid)]
+        nested = doc.addObject("App::DocumentObjectGroup", "Sorted")
+        analysis.addObject(nested)
+        filed = createEMMeshRegion(doc, settings=settings)
+        nested.addObject(filed)
+        for region in regions:
+            analysis.addObject(region)
+        mesh = doc.addObject("App::FeaturePython", "Mesh")
+        mesh.addProperty("App::PropertyLinkList", "MeshedFrom")
+        mesh.MeshedFrom = [settings]
+        analysis.addObject(mesh)
+        return analysis, palace, settings, regions, filed, mesh
+
+    def test_its_settings_come_last_after_what_amends_or_is_made_from_them(self, doc):
+        _, palace, settings, regions, filed, mesh = self.study(doc)
+        brought = companions(palace)
+        assert brought[-1] is settings
+        assert {obj.Name for obj in brought[:-1]} == {regions[0].Name, filed.Name, mesh.Name}
+
+    def test_the_other_backend_the_policy_and_the_solvers_are_not_among_them(self, doc):
+        analysis, palace, _, regions, _, _ = self.study(doc)
+        names = {obj.Name for obj in companions(palace)}
+        kept = [obj for obj in analysis.Group if obj.Name not in names]
+        assert {kind(obj) for obj in kept} >= {
+            "EMSolverOpenEMS",
+            "EMSolverPalace",
+            "EMYeeGrid",
+            "EMMeshPolicy",
+        }
+        assert regions[1].Name not in names
+
+    def test_what_is_no_solver_brings_nothing(self, doc):
+        analysis, _, settings, regions, _, _ = self.study(doc)
+        assert companions(settings) == []
+        assert companions(regions[0]) == []
+        assert companions(analysis) == []
+
+
 class TestChoosingTheSolverToRun:
     """A run is minutes, and a study answered by the backend nobody asked for
     says nothing about having been. So the choice is the selection, then the
@@ -395,7 +453,9 @@ class TestChoosingTheSolverToRun:
 
     def test_both_selected_is_refused_rather_than_the_first_taken(self, doc):
         analysis, fdtd, fem = self._both(doc)
-        with pytest.raises(NoSolver, match="Select the one to run"):
+        with pytest.raises(
+            NoSolver, match=re.escape("are all selected. Select only the one to run")
+        ):
             solver_to_run(analysis, [fem, fdtd])
 
     def test_both_and_neither_selected_is_refused_naming_both(self, doc):
@@ -418,6 +478,15 @@ class TestChoosingTheSolverToRun:
         with pytest.raises(NoSolver, match="Add openEMS Solver or Add Palace Solver"):
             solver_to_run(analysis)
 
+    def test_a_region_in_a_study_with_none_says_how_to_add_one(self, doc):
+        analysis = createEMAnalysis(doc)
+        analysis.Group = [obj for obj in analysis.Group if obj is not solver_of(analysis)]
+        with pytest.raises(
+            NoSettings,
+            match=re.escape("Add one with Add openEMS Solver or Add Palace Solver"),
+        ):
+            settings_to_amend(analysis)
+
 
 class TestWhatARefinementMayBeAimedAt:
     """The other half of the DAG fix, and the more insidious half.
@@ -439,20 +508,84 @@ class TestWhatARefinementMayBeAimedAt:
         from Microwave.Objects.mesh import references_from
 
         board = doc.addObject("Part::Box", "Substrate")
-        assert references_from(self.selection(board)) == [(board, [""])]
+        assert references_from(self.selection(board), createEMAnalysis(doc)) == [(board, [""])]
 
     def test_a_face_selection_keeps_its_sub_elements(self, doc):
         from Microwave.Objects.mesh import references_from
 
         board = doc.addObject("Part::Box", "Substrate")
         chosen = type("Sel", (), {"Object": board, "SubElementNames": ("Face2",)})()
-        assert references_from([chosen]) == [(board, ["Face2"])]
+        assert references_from([chosen], createEMAnalysis(doc)) == [(board, ["Face2"])]
+
+    def test_a_body_comes_through_whole_and_by_its_faces(self, doc):
+        """A ``PartDesign::Body`` carries a ``Group`` of its features beside its
+        ``Shape``, measured under 1.1.1, and is drawn geometry."""
+        from Microwave.Objects.mesh import references_from
+
+        study = createEMAnalysis(doc)
+        body = doc.addObject("PartDesign::Body", "WG")
+        body.Group = [doc.addObject("PartDesign::Pad", "Pad")]
+        face = type("Sel", (), {"Object": body, "SubElementNames": ("Face3",)})()
+        assert references_from(self.selection(body), study) == [(body, [""])]
+        assert references_from([face], study) == [(body, ["Face3"])]
+
+    def test_what_reaches_the_study_through_any_link_is_not_a_reference(self, doc):
+        """Picking it would close the cycle through the study. A part holds the
+        study in its group; a compound names it among its parts, as a link
+        group names its members, with no group at all. FreeCAD lists both
+        in ``OutListRecursive``."""
+        from Microwave.Objects.mesh import reaching, references_from
+
+        study = createEMAnalysis(doc)
+        part = doc.addObject("App::Part", "Assembly")
+        part.Group = [study]
+        compound = doc.addObject("Part::Compound", "Compound")
+        for holder in (part, compound):
+            object.__setattr__(holder, "OutListRecursive", [study, *study.Group])
+        assert references_from(self.selection(part, compound), study) == []
+        assert reaching(self.selection(part, compound), study) == ["Assembly", "Compound"]
+        assert reaching(self.selection(part, part), study) == ["Assembly"]
+
+    def test_what_reads_a_member_or_another_study_is_a_reference(self, doc):
+        """A cycle runs back to the study the link is made from, through its
+        group. No member reaches the study, so a shape sized from a port's
+        property closes none, and neither does one sized from another study, or
+        from a material, which is in no study's group."""
+        from Microwave.Objects import createEMMaterial
+        from Microwave.Objects.mesh import reaching, references_from
+
+        study, other = createEMAnalysis(doc), createEMAnalysis(doc)
+        shapes = []
+        for read in (study.Group[0], other, createEMMaterial("FR4")):
+            shape = doc.addObject("Part::Box", "Substrate")
+            object.__setattr__(shape, "OutListRecursive", [read])
+            shapes.append(shape)
+        assert references_from(self.selection(*shapes), study) == [(s, [""]) for s in shapes]
+        assert reaching(self.selection(*shapes), study) == []
+
+    def test_the_picks_of_one_object_are_one_reference(self, doc):
+        """As a selection gathers them; a whole pick covers every face."""
+        from Microwave.Objects.mesh import references_from
+
+        study = createEMAnalysis(doc)
+        board, trace = doc.addObject("Part::Box", "Substrate"), doc.addObject("Part::Box", "Trace")
+        picked = [
+            type("Sel", (), {"Object": obj, "SubElementNames": names})()
+            for obj, names in (
+                (board, ("Face1",)),
+                (trace, ()),
+                (board, ("Face2",)),
+                (trace, ("Face3",)),
+            )
+        ]
+        assert references_from(picked, study) == [(board, ["Face1", "Face2"]), (trace, [""])]
 
     def test_the_study_itself_is_not_a_reference(self, doc):
         """The selection that closed the cycle."""
         from Microwave.Objects.mesh import references_from
 
-        assert references_from(self.selection(createEMAnalysis(doc))) == []
+        study = createEMAnalysis(doc)
+        assert references_from(self.selection(study), study) == []
 
     def test_our_own_objects_are_not_references(self, doc):
         """A refinement resolves a feature. A mesh policy is not one - and the
@@ -463,7 +596,7 @@ class TestWhatARefinementMayBeAimedAt:
 
         analysis = createEMAnalysis(doc)
         chosen = [*analysis.Group, createEMMeshPreview(doc)]
-        assert references_from(self.selection(*chosen)) == []
+        assert references_from(self.selection(*chosen), analysis) == []
 
     def test_geometry_survives_a_mixed_selection(self, doc):
         """Dropping the whole selection because one entry was ours would be a
@@ -472,7 +605,7 @@ class TestWhatARefinementMayBeAimedAt:
 
         analysis = createEMAnalysis(doc)
         board = doc.addObject("Part::Box", "Substrate")
-        assert references_from(self.selection(analysis, board)) == [(board, [""])]
+        assert references_from(self.selection(analysis, board), analysis) == [(board, [""])]
 
 
 class TestWhatTheWorkbenchRecognisesAsItsOwn:
@@ -504,6 +637,7 @@ class TestWhatTheWorkbenchRecognisesAsItsOwn:
             "EMPortMicrostrip",
             "EMPortRectWaveguide",
             "EMSParameters",
+            "EMRun",
         }
         assert kinds() == expected
 
@@ -574,7 +708,7 @@ class TestWhatTheWorkbenchRecognisesAsItsOwn:
         A recipe added tomorrow for a third pipeline is caught here. Left out of
         the list it counts as membership the preview never links, which leaves
         the comparison unequal for good and the badge stale with no press of
-        Update Mesh able to clear it.
+        Mesh able to clear it.
         """
         from Microwave.Objects.analysis import NOT_MESHED_FROM
         from Microwave.Objects.kinds import recipe_kinds
@@ -601,6 +735,26 @@ class TestWhatTheWorkbenchRecognisesAsItsOwn:
             (solver_kinds() | recipe_kinds()) - {RECIPE} - set(NOT_FEM_MESHED_FROM)
         )
         assert not unaccounted, unaccounted
+
+    @pytest.mark.parametrize(
+        ("amended", "excluded"),
+        [("EMYeeGrid", "NOT_FEM_MESHED_FROM"), ("EMGmshMesh", "NOT_MESHED_FROM")],
+    )
+    def test_a_region_amending_another_pipelines_recipe_is_left_out(self, doc, amended, excluded):
+        """A region is read by the pipeline whose recipe it amends, so one
+        arriving for the other backend moves nothing this mesh is built from,
+        and one amending nothing is counted, since every adapter refuses it."""
+        from Microwave.Objects import analysis
+        from Microwave.Objects.mesh import createEMGmshMesh, createEMMeshRegion, createEMYeeGrid
+
+        made = {"EMYeeGrid": createEMYeeGrid(doc), "EMGmshMesh": createEMGmshMesh(doc)}
+        theirs = createEMMeshRegion(doc, made[amended])
+        ours = createEMMeshRegion(doc, next(r for k, r in made.items() if k != amended))
+        loose = createEMMeshRegion(doc)
+        left = getattr(analysis, excluded)
+        assert analysis.left_out(theirs, left)
+        assert not analysis.left_out(ours, left)
+        assert not analysis.left_out(loose, left)
 
     def test_a_foreign_object_is_not_ours(self, doc):
         from Microwave.Objects.kinds import is_ours

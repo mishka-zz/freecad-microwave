@@ -69,12 +69,12 @@ def _check_cells_per_wavelength(problem: Problem) -> list[Finding]:
     return [
         Finding(
             REFUSE,
-            "grid",
-            f"its finest cell is {finest:.4g} against a shortest wavelength of "
-            f"{wavelength:.4g} at {top / 1e9:g} GHz - {cells:.2f} cells per "
-            "wavelength, and that is the best the grid does anywhere. Nothing "
-            "solved on it means anything. Re-mesh for this band, or lower the "
-            "top of it",
+            "openEMS mesh",
+            f"its finest cell is {finest:.4g} mm against a shortest wavelength of "
+            f"{wavelength:.4g} mm at {top / 1e9:g} GHz, so even the finest part of "
+            f"the grid has only {cells:.2f} cells per wavelength and cannot resolve "
+            "the band. Mesh the model again for this band, or lower the top of the "
+            "band",
         )
     ]
 
@@ -82,8 +82,8 @@ def _check_cells_per_wavelength(problem: Problem) -> list[Finding]:
 def _check_the_grid_is_a_size_somebody_meant(problem: Problem) -> list[Finding]:
     """The grid's size, on the route that did not mesh it.
 
-    A large grid is a warning, and a user meets it in the report, since Update
-    Mesh does not come through here. This reads the same band on an envelope,
+    A large grid is a warning, and a user meets it in the report, since Mesh
+    does not come through here. This reads the same band on an envelope,
     and adds what the report cannot express: past the ceiling the mesher refuses
     at, the grid did not come from the mesher. Refusing it here stops ``driver``
     and ``mesh`` disagreeing about one number.
@@ -95,25 +95,24 @@ def _check_the_grid_is_a_size_somebody_meant(problem: Problem) -> list[Finding]:
 
     shape = " x ".join(str(len(problem.grid[dim])) for dim in range(3))
     where = (
-        f"it is {cells:,} cells ({shape} lines), {used / 1024**3:,.1f} GiB of operator and field"
+        f"it is {cells:,} cells ({shape} lines), {used / 1024**3:,.1f} GiB of operator and field "
+        "memory in openEMS"
     )
     if used > MAX_GRID_BYTES:
         return [
             Finding(
                 REFUSE,
-                "grid",
-                f"{where}, past the {MAX_GRID_BYTES / 1024**3:g} GiB this "
-                "adapter's mesher refuses to build. Nothing here produced this "
-                "grid, so nothing here can say what is wrong with it",
+                "openEMS mesh",
+                f"{where}, past the {MAX_GRID_BYTES / 1024**3:g} GiB limit the workbench "
+                "meshes to, so the workbench did not make this grid",
             )
         ]
     return [
         Finding(
             WARN,
-            "grid",
-            f"{where}. That is a long run rather than a wrong one - but if it "
-            "was not meant, MaxGrowthRatio on the Yee grid, PMLCells and "
-            "FeedOffset are what move it fastest",
+            "openEMS mesh",
+            f"{where}, so the run is long. If that is not intended, lower "
+            "ElementsPerWavelength in the openEMS mesh settings",
         )
     ]
 
@@ -211,11 +210,12 @@ def _check_conductors_are_resolved_across(problem: Problem) -> list[Finding]:
 
         remedy = "Give it a Mesh Refinement with MinElementsAcross set"
         if ceiling:
+            # A count is spent on each axis separately, so with the region's
+            # size held at the global one it lands on the width and costs
+            # nothing along the length.
             remedy += (
-                ", and set that region's ElementSize to the global "
-                f"{_under(float(ceiling))} mm: a count is spent on each axis "
-                "separately, so it lands on the width and costs nothing along "
-                "the length"
+                " and ElementSize at the global "
+                f"{_under(float(ceiling))} mm, so that only the width is refined"
             )
         # A triangulated solid is measured on the box around it, so naming the
         # span as the solid's would put a length in the message that nothing in
@@ -232,13 +232,14 @@ def _check_conductors_are_resolved_across(problem: Problem) -> list[Finding]:
             Finding(
                 WARN,
                 tuple(piece.name for piece in pieces),
+                # Each face lands on the nearer of the two grid lines straddling
+                # it, so the face moves by a whole cell as the lines cross the
+                # edge, and refining the whole grid does not converge on the
+                # drawn width.
                 f"the grid builds it {spanned:.0%} of {where}, {span:.4g} mm in "
-                f"{AXIS_NAMES[dim]}, further from it than the "
-                f"{allowed:.0%} a conductor's width is held to here. Each face "
-                "arrives on whichever of the two grid lines straddling it is the "
-                "nearer, so what is solved is metal that size - and refining does "
-                "not reliably recover it, since the face it lands on changes by a "
-                f"whole cell as the lines cross the edges. {remedy}",
+                f"{AXIS_NAMES[dim]}, off by more than the {allowed:.0%} allowed for "
+                "a conductor's width, and refining the whole grid does not reliably "
+                f"correct it. {remedy}",
             )
         )
     return findings
@@ -373,9 +374,9 @@ def _check_grid_covers_the_model(problem: Problem) -> list[Finding]:
                             label,
                             f"it extends to {AXIS_NAMES[dim]}={position:.4g}, "
                             f"past the grid edge at {inside:.4g}, and is clipped "
-                            "there. That is what THROUGH asks for, and is "
-                            "harmless where the structure is uniform - but "
-                            "anything placed in that band is silently lost",
+                            "there, as Through padding asks. That is harmless "
+                            "where the structure is uniform, but anything else "
+                            "drawn past the edge is lost",
                         )
                     )
                 else:
@@ -384,10 +385,9 @@ def _check_grid_covers_the_model(problem: Problem) -> list[Finding]:
                             REFUSE,
                             label,
                             f"it extends to {AXIS_NAMES[dim]}={position:.4g}, "
-                            f"outside the grid, which ends at {inside:.4g}. "
-                            "openEMS clips geometry to the grid without saying "
-                            "so, and would solve the remaining fragment as if "
-                            "it were the whole model",
+                            f"outside the grid, which ends at {inside:.4g}, so "
+                            "openEMS clips it without a warning and solves only "
+                            "the part inside",
                         )
                     )
     return findings

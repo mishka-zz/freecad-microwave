@@ -353,7 +353,7 @@ def test_a_step_near_the_driven_port_is_warned_of_by_name(interpreter, tmp_path)
     said = _solve(_problem(2, step=plane - NEAR), tmp_path, interpreter)
     near = _near_field(tmp_path)
     warned = [line for line in said if "planes inside their boxes predict" in line]
-    assert len(warned) == 1 and "the largest part of it at port 2" in warned[0]
+    assert len(warned) == 1 and "mostly at port 2" in warned[0]
     assert near["port"] == 2 and near["share"] > nearfield.BAR
     assert near["ports"]["1"]["share"] < nearfield.BAR / 10
 
@@ -398,7 +398,9 @@ def test_a_guide_changing_behind_a_port_is_counted_out(behind):
         assert near["share"] > nearfield.BAR, near
         assert near["port"] == 2 and near["side"] == "behind", near
         [field] = said
-        assert "planes inside their boxes predict" in field and "may then be right" in field
+        assert (
+            "planes inside their boxes predict" in field and "may leave the matrix right" in field
+        )
     assert _departure(alone) > POWER_TOLERANCE
     assert _departure(matrix) < POWER_TOLERANCE
     assert float(np.max(np.abs(ratio - 1))) < RECIPROCITY_TOLERANCE
@@ -409,7 +411,8 @@ def test_a_column_read_alone_says_what_its_undriven_port_sent_back(behind, colum
     port is where the guide runs on uniform into the absorber."""
     changing = SParameters.from_runs([read.read(behind[1][0])], reference=None)
     said = changing.sent_back(residual.WANTED)
-    assert said is not None and said.startswith("A term of column 1") and "port 2 most" in said
+    assert said is not None
+    assert said.startswith("A term driven from port 1") and "port 2 most" in said
     for driven in (1, 2):
         uniform = SParameters.from_runs([read.read(columns[driven])], reference=None)
         assert uniform.sent_back(residual.WANTED) is None

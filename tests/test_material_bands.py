@@ -10,6 +10,7 @@ when it runs, so the other study needs a row the panel does not show.
 """
 
 import math
+import re
 
 import pytest
 
@@ -194,7 +195,7 @@ def test_only_a_dielectric_is_asked_for_a_table():
     """A catalog carries a table on a dielectric alone, so a sheet saved before
     materials held one is solved as shown, on both backends alike."""
     sheet = dict(
-        MaterialType="ConductingSheet",
+        MaterialType="Conducting Sheet",
         Permittivity=1.0,
         Permeability=1.0,
         Conductivity=1.57e7,
@@ -210,5 +211,11 @@ class TestWhatCannotBeFollowed:
     def test_a_table_that_cannot_be_read_as_rows_is_refused_by_name(self):
         material = picked(at=centre(LOW_BAND))
         material.DispersionLossTangent = [LOW.loss_tangent]
-        with pytest.raises(TranslationError, match="'Laminate'.*3, 3, 1"):
+        with pytest.raises(
+            TranslationError,
+            match=re.escape(
+                "'Laminate': the columns of its catalog table hold 3, 3, 1 values, so they "
+                "do not form a table. Re-create the material from its catalog and bind it again"
+            ),
+        ):
             solved(material, centre(HIGH_BAND))

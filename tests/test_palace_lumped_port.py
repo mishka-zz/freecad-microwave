@@ -159,8 +159,8 @@ def test_the_shipped_board_meshes_and_says_its_ports_lie_between_the_boundary(ru
     assert meshed["said"] == "" and meshed["made"]
     assert meshed["boundary"] == [
         f"'Port{number}' lays 'Port{number} element 1', both of whose ends lie on the "
-        "region's boundary, which this solver makes a perfect conductor where no metal is "
-        "drawn, so the element is driven between two parts of that boundary. "
+        "region's boundary, which is a perfect conductor where no metal is drawn, so the "
+        "element is driven between two parts of that boundary. "
         "'GroundBinding' lies on the region's boundary at an end, and stands on the wall "
         "there. 'TraceBinding' lies on the region's boundary at an end, and stands on the "
         "wall there"

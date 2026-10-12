@@ -39,9 +39,9 @@ __all__ = ["Rasterised", "carried", "connectivity", "rasterise"]
 DIMENSIONS = 3
 
 #: How many rounds of label propagation before a component labelling is
-#: abandoned. A round sweeps each axis in turn, so a label travels at least one
-#: node along every axis and often much further. The number of rounds needed is
-#: set by how far a conductor winds through the grid. The limit stops a
+#: abandoned. A round sweeps each axis in turn, and a label travels one node
+#: along each axis a round, so the number of rounds needed is set by how far a
+#: conductor winds through the grid. The limit stops a
 #: pathological shape from taking the session with it. Reaching it is reported
 #: rather than answered.
 MAX_ROUNDS = 4096
@@ -159,8 +159,8 @@ def connectivity(raster: Rasterised) -> tuple[int, int]:
             break
     else:
         raise RuntimeError(
-            f"the conductor's connectivity did not settle in {MAX_ROUNDS} rounds; "
-            "the grid is larger than this check was built to walk"
+            "the grid is too large for the connectivity check, which stopped after "
+            f"{MAX_ROUNDS} rounds"
         )
 
     live = label[label < _EMPTY]

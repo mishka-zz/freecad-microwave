@@ -91,13 +91,14 @@ class TestNothingThatChangesPhysicsHasADefault:
 
     def test_a_dielectric_must_state_its_permittivity(self):
         message = refusal('[[material]]\nid = "x"\nkind = "dielectric"\n')
-        assert "has no epsilon_r" in message
-        assert "no honest default" in message
+        assert "is a dielectric with no epsilon_r. State it explicitly; there is no default" in (
+            message
+        )
 
     def test_a_misspelt_key_is_named_as_the_likely_cause(self):
         message = refusal('[[material]]\nid = "x"\nkind = "dielectric"\nepsilon = 4.3\n')
-        assert "has no epsilon_r" in message
-        assert "'epsilon'" in message and "may be the typo" in message
+        assert "with no epsilon_r" in message
+        assert "The unknown key 'epsilon' may be a misspelling" in message
 
     def test_a_sheet_must_state_conductivity_and_thickness(self):
         message = refusal('[[material]]\nid = "x"\nkind = "conducting_sheet"\n')
@@ -109,8 +110,8 @@ class TestNothingThatChangesPhysicsHasADefault:
             '[[material]]\nid = "x"\nkind = "conducting_sheet"\n'
             "conductivity = 5.8e7\nthickness = 0.0\n"
         )
-        assert "thickness is zero" in message
-        assert "no honest default" not in message
+        assert "thickness is 0. Enter a value above 0" in message
+        assert "there is no default" not in message
 
 
 class TestAKeyThatMeansNothingIsRefused:
@@ -118,14 +119,13 @@ class TestAKeyThatMeansNothingIsRefused:
 
     def test_loss_on_a_perfect_conductor_is_a_refusal(self):
         message = refusal('[[material]]\nid = "x"\nkind = "pec"\nloss_tangent = 0.02\n')
-        assert "loss_tangent means nothing for a pec" in message
-        assert "Remove it" in message
+        assert "loss_tangent does not apply to a pec. Remove it, or change the kind" in message
 
     def test_two_of_them_read_as_english_too(self):
         message = refusal(
             '[[material]]\nid = "x"\nkind = "pec"\nloss_tangent = 0.02\nthickness = 1.0\n'
         )
-        assert "loss_tangent, thickness mean nothing" in message
+        assert "loss_tangent, thickness do not apply" in message
         assert "Remove them" in message
 
     def test_an_unknown_key_is_refused_not_carried(self):
@@ -139,12 +139,13 @@ class TestAKeyThatMeansNothingIsRefused:
         message = refusal(
             '[[material]]\nid = "fr4"\nkind = "dielectric"\nepsilon_r = 4.3\nloss_tangnet = 0.02\n'
         )
-        assert "loss_tangnet means nothing to this workbench" in message
+        assert "loss_tangnet does not name a key this workbench reads" in message
         assert "Check the spelling" in message
 
     def test_a_field_from_a_later_format_is_refused_by_schema_not_by_key(self):
-        """Which is why the refusal points at the schema as well as the spelling."""
-        assert "raise the file's schema" in refusal(
+        """Which is why the refusal says what a key from a later version needs as
+        well as asking for the spelling to be checked."""
+        assert "Check the spelling. A key from a later version needs a newer workbench" in refusal(
             '[[material]]\nid = "x"\nkind = "dielectric"\nepsilon_r = 2.0\n'
             "surface_roughness_um = 1.5\n"
         )
@@ -156,7 +157,7 @@ class TestLossNeedsAFrequency:
             '[[material]]\nid = "x"\nkind = "dielectric"\nepsilon_r = 4.3\nloss_tangent = 0.02\n'
         )
         assert "no measured_at" in message
-        assert "band centre" in message
+        assert "Add measured_at, the frequency in Hz the loss tangent is quoted at" in message
 
     def test_a_lossless_material_needs_none(self):
         assert parse('[[material]]\nid = "x"\nkind = "dielectric"\nepsilon_r = 1.0\n')
@@ -171,7 +172,7 @@ class TestTheFileItself:
         message = refusal(
             FR4, header='schema = 99\n[catalog]\nid = "a"\nname = "A"\nversion = "1"\n'
         )
-        assert "written for a later version" in message
+        assert "written for a later version. Upgrade the workbench to read it" in message
 
     def test_broken_toml_names_the_file(self):
         with pytest.raises(CatalogError, match="not valid TOML"):
@@ -261,7 +262,7 @@ measured_at = 1.0e10
             "[[material.dispersion]]\nfrequency = 1.0e10\nepsilon_r = 3.0\nloss_tangent = 0.0\n"
             "[[material.dispersion]]\nfrequency = 2.5e9\nepsilon_r = 3.1\nloss_tangent = 0.0\n"
         )
-        assert "up in frequency" in message
+        assert "List the rows in increasing frequency, with no repeats" in message
 
 
 class TestTheDigestIsAboutPhysicsOnly:
@@ -321,17 +322,23 @@ class TestNumbersAreSanityChecked:
     @pytest.mark.parametrize(
         "body,fragment",
         [
-            ('id = "x"\nkind = "dielectric"\nepsilon_r = 0.5\n', "cannot be below 1"),
-            ('id = "x"\nkind = "dielectric"\nepsilon_r = 2.0\nmu_r = -1.0\n', "cannot be below 0"),
+            (
+                'id = "x"\nkind = "dielectric"\nepsilon_r = 0.5\n',
+                "epsilon_r is 0.5. Enter 1 or more",
+            ),
+            ('id = "x"\nkind = "dielectric"\nepsilon_r = 2.0\nmu_r = -1.0\n', "Enter 0 or more"),
             (
                 'id = "x"\nkind = "dielectric"\nepsilon_r = 2.0\nloss_tangent = -0.02\n',
-                "cannot be below 0",
+                "Enter 0 or more",
             ),
             (
                 'id = "x"\nkind = "conducting_sheet"\nconductivity = -1.0\nthickness = 0.035\n',
-                "cannot be below 0",
+                "Enter 0 or more",
             ),
-            ('id = "x"\nkind = "dielectric"\nepsilon_r = 2.0\nmu_r = 0.0\n', "needs a real one"),
+            (
+                'id = "x"\nkind = "dielectric"\nepsilon_r = 2.0\nmu_r = 0.0\n',
+                "mu_r is 0. Enter a value above 0",
+            ),
         ],
     )
     def test_an_impossible_number_is_refused(self, body, fragment):
@@ -354,16 +361,16 @@ class TestNumbersAreSanityChecked:
         could state ``epsilon_r = nan``; it loaded, appeared in the picker, and
         solved. One check in ``_number`` covers every field that goes through
         it, which is all of them."""
-        assert "not a finite number" in refusal(f"[[material]]\n{body.format(v=literal)}")
+        assert "Enter a finite number" in refusal(f"[[material]]\n{body.format(v=literal)}")
 
     def test_a_boolean_is_not_a_number(self):
         """TOML has real booleans, and ``float(True)`` is 1.0 - so without the
         explicit check ``epsilon_r = true`` loads as vacuum."""
         message = refusal('[[material]]\nid = "x"\nkind = "dielectric"\nepsilon_r = true\n')
-        assert "not a number" in message
+        assert "epsilon_r is True. Enter a number" in message
 
     def test_a_string_is_not_a_number_either(self):
-        assert "not a number" in refusal(
+        assert "Enter a number" in refusal(
             '[[material]]\nid = "x"\nkind = "dielectric"\nepsilon_r = "4.3"\n'
         )
 
@@ -372,12 +379,14 @@ class TestTheTextFieldsAreChecked:
     def test_a_malformed_colour_is_refused_at_load(self):
         """Not at pick time. ``rgb()`` raises on a bad colour, and the place to
         find out is the file, not a dialog three days later."""
-        assert "expected '#RRGGBB'" in refusal(
+        assert "Enter it as '#RRGGBB'" in refusal(
             '[[material]]\nid = "x"\nkind = "pec"\ncolor = "green"\n'
         )
 
     def test_an_empty_name_is_refused(self):
-        assert "non-empty string" in refusal('[[material]]\nid = "x"\nname = ""\nkind = "pec"\n')
+        assert "name is empty or is not text" in refusal(
+            '[[material]]\nid = "x"\nname = ""\nkind = "pec"\n'
+        )
 
     @pytest.mark.parametrize("identifier", ["FR4", "fr 4", "", "-fr4"])
     def test_an_id_that_is_not_a_slug_is_refused(self, identifier):
@@ -400,8 +409,8 @@ class TestOneMistakeIsReportedOnce:
 
     def test_a_key_the_kind_ignores_is_not_also_value_checked(self):
         message = refusal('[[material]]\nid = "x"\nkind = "pec"\nloss_tangent = -1.0\n')
-        assert "means nothing for a pec" in message
-        assert "cannot be below" not in message
+        assert "does not apply to a pec" in message
+        assert "or more" not in message
 
 
 class TestTheSchemaField:

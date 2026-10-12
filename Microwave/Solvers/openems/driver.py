@@ -76,6 +76,11 @@ RESULTS_NAME = "results.json"
 STRUCTURE_NAME = "structure.xml"
 RUN_DIRNAME = "run"
 
+#: Where openEMS writes what a run came to when it is asked to dump its
+#: statistics: its timestep, and the steps it took (``openEMS/openems.cpp``,
+#: ``openEMS::DumpStatistics``, which ``openems.h`` names this file for).
+STATISTICS_NAME = "openEMS_stats.txt"
+
 #: What the probes a waveguide port is read at again inside its box are named
 #: with, ahead of the name openEMS gives a port's own: at the deeper plane
 #: :func:`.nearfield.inside` places, and at the shallower.
@@ -299,19 +304,20 @@ def _unlaid(bodies: Bodies, csx: Any) -> list[str]:
             default=None,
         )
         if spans is None:
+            # A sheet off every grid line, or a surface enclosing no grid
+            # point, is lost this way.
             said.append(
-                f"{label}: openEMS gave this {prop.GetName()} body no cell, and no primitive "
-                "it laid spans it, so unless bodies around it took its cells the model solved "
-                "is without it - a sheet off every grid line or a surface enclosing no sample "
-                "is lost this way. Draw it where the mesh lays a line, or refine across it"
+                f"{label}: openEMS gave this {prop.GetName()} body no cell, and no body that "
+                "got cells spans it, so the model solved lacks it unless the bodies around "
+                "it took its cells. Draw it on a grid line, or refine the mesh across it"
             )
             continue
         other, holder = spans
-        by = owner.get(other.GetID(), f"a {other.GetTypeName().lower()} a port lays")
+        by = owner.get(other.GetID(), f"a {other.GetTypeName().lower()} laid by a port")
         said.append(
             f"{label}: openEMS gave this {prop.GetName()} body no cell, and {by}, of "
-            f"{holder.GetName()}, spans it and was laid, so where it took these cells they "
-            f"are {holder.GetName()}"
+            f"{holder.GetName()}, spans it, so the cells it took from this body are "
+            f"{holder.GetName()}"
         )
     return said
 
@@ -321,7 +327,7 @@ def _add_medium(prop: Any, problem: Problem) -> None:
 
     It reaches a whole span of the grid past each end, so no cell at the grid's
     edge, the absorber's included, is left to the vacuum openEMS fills an
-    uncovered cell with. Beyond an ``Air`` face that absorber stands in the
+    uncovered cell with. Beyond an ``Open`` face that absorber stands in the
     medium, and beyond a ``Through`` face the structure runs on through it.
 
     A face the domain ends on and the absorber stands beyond is one waveguide
@@ -625,11 +631,13 @@ def solve(problem: Problem, directory: Path, build_only: bool = False) -> Path |
 
     started = time.monotonic()
     marker("SOLVER_STARTED", f"threads={problem.threads} dir={sim_dir}")
-    failed = fdtd.Run(str(sim_dir), cleanup=True, numThreads=problem.threads)
+    # The statistics are asked for because they hold the steps the run took,
+    # which is what says whether it took every step MaxTimesteps allows.
+    failed = fdtd.Run(str(sim_dir), cleanup=True, numThreads=problem.threads, dump_statistics=True)
     if failed:
         # ``openEMS.Run`` returns the code ``openEMS::SetupFDTD`` refused with,
         # and solves nothing.
-        raise SetupFailed(f"openEMS could not set the run up, and returned code {failed}")
+        raise SetupFailed(f"openEMS could not set up the run, and returned code {failed}")
     elapsed = time.monotonic() - started
     marker("SOLVER_FINISHED", f"seconds={elapsed:.1f}")
     for unlaid in _unlaid(bodies, csx):
@@ -732,7 +740,9 @@ def _check_the_records(ports: dict[int, Any]) -> None:
     frequency, and a port's waves and a microstrip port's impedance are made of
     what its probes transform to, so one such sample leaves the port nothing.
     Each probe is read as ``UI_data`` in ``openEMS/python/openEMS/ports.py``
-    holds it.
+    holds it. Every frequency point of what a port reads is a sum over every
+    sample its probes recorded, so one invalid sample leaves the run no
+    S-parameters.
     """
     for number, port in sorted(ports.items()):
         for quantity, data in (("voltage", port.u_data), ("current", port.i_data)):
@@ -740,11 +750,10 @@ def _check_the_records(ports: dict[int, Any]) -> None:
                 bad = np.flatnonzero(~np.isfinite(np.asarray(values, dtype=float)))
                 if bad.size:
                     raise NotANumber(
-                        f"port {number}'s {quantity} probe {name} recorded a value that "
-                        f"is not a number at {bad.size} of {np.size(values)} samples, the "
-                        f"first at {float(np.asarray(times)[bad[0]]) * 1e9:.6g} ns. Every "
-                        "frequency point of what a port reads is a sum over every sample "
-                        "its probes recorded, so this run has no S-parameters to return"
+                        f"port {number}'s {quantity} probe {name} recorded an invalid value "
+                        f"at {bad.size} of {np.size(values)} samples, the first at "
+                        f"{float(np.asarray(times)[bad[0]]) * 1e9:.6g} ns, so the run "
+                        "returns no S-parameters"
                     )
 
 
@@ -773,24 +782,25 @@ def _check_the_impedances(
             else f"at {where.size} frequency points from {where[0]:.6g} to {where[-1]:.6g} GHz"
         )
         said = (
-            f"port {number} states no finite reference impedance {at}, so no "
+            f"port {number} has no finite reference impedance {at}, so no "
             "S-parameter there can be normalised"
         )
         if model.kind == "rect_waveguide" and where.size == 1:
+            # On the cutoff beta is zero, and the impedance k Z0 / beta has no
+            # bound.
             which = (
-                "the cutoff of the guide the grid holds"
+                "the cutoff of the guide as meshed"
                 if "raw" in per_port[str(number)]
                 else f"its {model.mode} cutoff"
             )
-            said += (
-                f". That point lies exactly on {which}, where beta is zero and the "
-                "impedance has no bound. Move the band so no point falls on it"
-            )
+            said += f". That point lies exactly on {which}. Move the band so no point falls on it"
         elif model.kind == "microstrip" and lumped and missing.all():
+            # openEMS' MSLPort measures its impedance off the field, and in a
+            # run a lumped port drives it measures none at any point.
             said += (
-                ". A microstrip port measured in a run a lumped port drives states "
-                "none at any point on this engine. Drive the microstrip port instead, "
-                "or measure both ports the same way"
+                ". A microstrip port has none at any point in a run a lumped port "
+                "drives. Drive the microstrip port instead, or make both ports the "
+                "same kind"
             )
         raise NotANumber(said)
 
@@ -809,7 +819,7 @@ def _read_waveguide(
     """
     timestep = 2.0 * (float(port.i_data.ui_time[0][0]) - float(port.u_data.ui_time[0][0]))
     if not (math.isfinite(timestep) and timestep > 0):
-        raise portreading.NotRead("its probes' first samples do not give the engine's timestep")
+        raise portreading.NotRead("its probes' first samples give no valid timestep")
     ranges = []
     for name in (port.U_filenames[0], port.I_filenames[0]):
         try:
@@ -889,8 +899,8 @@ def _conducts(csx: Any, problem: Problem) -> portreading.Conducts:
             1.0,
         ):
             raise portreading.NotRead(
-                f"the material {found.GetName()!r} lies where it reads its guide, and "
-                "only an empty guide walled by metal is modelled"
+                f"the material {found.GetName()!r} lies in its guide, and only an empty "
+                "guide walled by metal can be read"
             )
         return False
 
@@ -1053,6 +1063,7 @@ def _extract(
     # Every port at once, so the record that drove the run is transformed once
     # for the device rather than once for each port weighed against it.
     records["tail_share"] = residual.tail_shares(recorded, excited.number, frequency)
+    records["timesteps"] = steps_taken(sim_dir)
     if readings:
         records[balance.KEY] = _balance(
             placed, models, ports, read_as, csx, frequency, driven, records["tail_share"]
@@ -1065,6 +1076,23 @@ def _extract(
         "s_parameters": s_parameters,
         "provenance": _provenance(problem, elapsed, records),
     }
+
+
+def steps_taken(sim_dir: Path) -> int | None:
+    """The steps the run in ``sim_dir`` took, from the statistics openEMS wrote
+    there, or ``None`` where it wrote none that can be read."""
+    try:
+        lines = (sim_dir / STATISTICS_NAME).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        figure, _, said = line.partition("%")
+        if said.strip() == "number of iterations":
+            try:
+                return int(float(figure))
+            except ValueError:
+                return None
+    return None
 
 
 def _moved(model: Port, lines: npt.ArrayLike) -> float:
@@ -1211,7 +1239,7 @@ def _near_field(
                 # The deeper plane bounds the field alone, so a shallower plane
                 # that cannot be read leaves the port weighed at one plane.
                 if not planes:
-                    missed[number] = f"it is not read {_cells(cells)} into its box: {why}"
+                    missed[number] = f"its plane {_cells(cells)} into its box cannot be read: {why}"
                 break
             expected = portreading.predicted(
                 here,

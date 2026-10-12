@@ -6,21 +6,21 @@ inside that surface. This page records why the Palace adapter writes the
 condition at the first order, what the figures it states before a run mean, and
 what the estimate it states after a run is worth.
 
-See [Where the domain ends, and where the absorber
-goes](openems-domain-and-absorber.md) for the openEMS side of the same property,
-`Clearance`.
+See [Boundary padding, domain sizing, and absorbing
+boundaries](openems-domain-and-absorber.md) for the openEMS side of the same
+property, `Clearance`.
 
 ## The reserved air
 
-A study is open when its mesh policy sets `Padding` to `Air` on at least one
+A study is open when its mesh policy sets `Boundary` to `Open` on at least one
 face. The adapter then builds a box round every shape bound to a material. The
-box grows by `Clearance` on each `Air` face and is flush with the structure on
-each `Ends` and `Through` face. It is handed to the mesher as a region of the
+box grows by `Clearance` on each `Open` face and is flush with the structure on
+each `PEC Wall` and `Through` face. It is handed to the mesher as a region of the
 study's medium, vacuum unless the mesh policy links one, at a priority below
 every drawn region, so each bound body keeps the space it occupies and the rest
 of the box is the medium.
 
-Each `Air` side of the box is drawn as a rectangle from the box's corners, and
+Each `Open` side of the box is drawn as a rectangle from the box's corners, and
 the rectangles carry one label. No face of the box is chosen from the CAD
 kernel's list of its faces. The label is written as `Boundaries.Absorbing`, and
 the mesh is checked to hold it only where the model ends. Every rectangle stands
@@ -35,7 +35,7 @@ to an axis, and it can stand off a curved face by a fraction of the body's own s
 On any other surface it can fall inside the face, so `drawn.bound` meshes such a
 face and adds the box round the mesh, grown by how far the mesh may depart from the
 face.
-`Shape.optimalBoundingBox` is the tighter bound on a curved body, and it is **not**
+`Shape.optimalBoundingBox` is the tighter bound on a curved body, and it is not
 an enclosing one: it can fall inside the true extreme by more than the tolerance
 this workbench compares coordinates with, which would put part of the structure
 outside the reserved air. So the box stays on `drawn.bound`, and `drawn.tightest`
@@ -49,8 +49,8 @@ grow the box round its mesh along those axes. A curve moved along a line changes
 each coordinate steadily along the line or not at all, and a circle about an axis
 keeps the coordinate along it.
 
-On a side the domain ends on, the room between a curved face and the box on its
-bound is the bound's and not the drawing's. Where `drawn.tightest` says a shape's
+On a side the domain ends on, the room between a curved face and the box built
+on its bound comes from the bound, not from the drawing. Where `drawn.tightest` says a shape's
 bound stands off that side, the adapter takes the side where the drawing reaches
 instead: the box `drawn.reached` gives round points lying on the shape. They are
 the nodes of a mesh laid on each face, and on each side the point of the faces
@@ -62,21 +62,21 @@ onto the side is read as it is where the bound is exact. A room reaching no such
 side is not parted, so room behind a thin curved wall stays whole. The box itself
 stays on the bound, so no body is cut at a plane.
 
-An `Ends` side of the box is the wall, a perfect electric conductor over the whole
-side. Where another face is `Air` the side is wider than the drawing, and the run
+A `PEC Wall` side of the box is the wall, a perfect electric conductor over the whole
+side. Where another face is `Open` the side is wider than the drawing, and the run
 names it with the area of it no bound shape covers. That wall is the domain's own
 truncation: the field has to meet something at the side. A `Through`
 side is accepted only where a lumped port's plane lies in it.
 
-A side the structure is flush with still holds reserved air wherever an `Air`
+A side the structure is flush with still holds reserved air wherever an `Open`
 face beside it grew the box. A lumped port's plane in such a side is a perfect
 magnetic conductor outside the port's elements, because a perfect electric
 conductor beside an element joins the element's two ends and shorts it.
 
-On an `Ends` side the plane is the faces of the bodies drawn in the side, and
+On a `PEC Wall` side the plane is the faces of the bodies drawn in the side, and
 not the whole side. The air beside them is the wall, and an element whose side
-meets that air is refused as one meeting the wall is. An element lying in an
-`Ends` side where no body is drawn is refused by name, since it stands on the
+meets that air is refused as one meeting the wall is. An element lying in a
+`PEC Wall` side where no body is drawn is refused by name, since it stands on the
 wall.
 
 On a `Through` side the plane is the whole side, the air beside the drawn faces
@@ -85,9 +85,8 @@ or beside it, and that field travels along the line and meets the end side
 squarely. An absorbing condition there takes that part of the guided wave as it
 arrives, a share set by how the field divides between the air and the body, and
 the matrix loses it. A magnetic wall ends
-the air part of the line as the plane ends the rest. What it costs is that a
-wave radiated onto that air is reflected rather than absorbed, and neither figure
-counts it. The run says so before it starts.
+the air part of the line as the plane ends the rest. As a consequence, a wave
+radiated onto that air is reflected, not absorbed, and neither figure counts it. The run says so before it starts.
 
 The reserved air is a region, so a study need not bind a dielectric to anything.
 A radiator drawn as metal alone stands in it, and a sheet of finite conductivity
@@ -101,16 +100,16 @@ metal or port's face covers and no other body stands on, and which face of the
 study it lies toward. A face lying in a side the policy does not open is still where the
 model ends and is not named.
 
-Nothing silences the statement. Before this was decided per face, metal anywhere on
-a region's skin turned it off for the whole region, so a shielded line whose ground
-planes were drawn said nothing at all while its side walls became the
-dielectric-air interface. A board's substrate is therefore named too, on the faces
-its ground and its trace leave bare - that is what going open means for a board,
-and the statement is a statement rather than a warning. A body of vacuum drawn
+No setting suppresses the statement. Metal on part of a region's skin does not
+silence the rest of it: a shielded line whose ground planes are drawn is still
+named on its side walls, which are the dielectric-air interface. A board's
+substrate is therefore named too, on the faces its ground and its trace leave
+bare. This is expected for an open board, and the statement is information, not
+a warning. A body of vacuum drawn
 round a radiator is named the same way.
 
 The clearance is stated against the thinnest body among the regions that stand in
-the reserved air, and not among every region drawn. The figure is there because the
+the reserved air, and not among every region drawn. The figure is stated because the
 field a line holds falls off over a distance its cross-section sets, so the body it
 is taken over has to be one the air reaches: a puck buried inside another body sets
 no such distance.
@@ -122,8 +121,13 @@ order is the impedance condition of the medium beside it: it relates the
 tangential electric and magnetic fields on the surface by the wave impedance of
 a plane wave meeting the surface squarely. Palace takes that impedance from the
 real permittivity of the element beside the face, so a lossy medium's loss is
-not in it. It absorbs such a wave exactly, and reflects
-a wave meeting the surface at a slant by an amount that grows with the angle.
+not in it: the first-order term is `GetInvImpedance()`
+(`palace/models/farfieldboundaryoperator.cpp:100-101`), which is
+$\sqrt{\mu^{-1} \varepsilon}$ formed from the real permittivity alone, the loss
+tangent being held apart in `mat_epsilon_imag`
+(`palace/models/materialoperator.cpp:312-318`, `:332-334`). It absorbs such a
+wave exactly, and reflects a wave meeting the surface at a slant by an amount
+that grows with the angle.
 
 A second-order condition adds a term in the tangential derivatives of the field
 that cancels part of that growth. Palace 0.18.1 adds the term in
@@ -193,15 +197,15 @@ where it is largest across the band, with the share it acts on. A port not drive
 sends a share through the surface that nothing measures, and its terms are not
 estimated.
 
-It is an estimate and not a bound. Set against the move between runs of one
-drawing at two clearances, the product with `R1` alone fell short where the open
-surface stood within a few substrate heights of a transmission line, where the
-surface stands in the field the line holds to its cross-section and changes the
-line's impedance by an amount no figure here states. It held between there and a
-few times farther, and was several times the move on a radiating dipole. Far
-from a line the move lay below what meshing the same drawing again moves. The
-estimate takes the larger of `R1` and `Rs`, so it is never below that product,
-and where `Rs` decides it is looser. The run also states `Clearance` as a
+It is an estimate and not a bound. An open surface close to a transmission line
+stands in the field the line holds to its cross-section and changes the line's
+impedance by an amount no figure here states, so there the move between runs of
+one drawing at two clearances can exceed the estimate. The dipole gate
+(`tests/test_acceptance_palace_dipole.py`) prints the estimate and holds it
+against nothing. Its release-tier test of a dipole in a medium prints the move
+between two clearances. The estimate takes the larger of `R1` and `Rs`, so it
+is never below the product with `R1` alone, and where `Rs` decides it is
+looser. The run also states `Clearance` as a
 multiple of the smallest extent of the thinnest drawn body, which is what the
 field a line holds falls off over.
 
@@ -234,11 +238,11 @@ depth in cells, the faces the structure stands clear of it on and how far, and t
 faces it runs out through. So a result of one drawing from each backend carries one
 record apiece, and the two are compared.
 
-They are **not** compared field by field, because no field of one means what the
+They are not compared field by field, because no field of one means what the
 same field of the other means: a condition on a surface and a layer of cells absorb
-differently, and one's order is not the other's depth. What both state is which
-faces they held open and how far the boundary stood from the structure, and those
-are the two the comparison makes. A run that recorded no outside - a closed study,
+differently, and one's order is not the other's depth. Both state which faces they
+held open and how far the boundary stood from the structure, and the comparison
+uses those two. A run that recorded no outside - a closed study,
 or a backend that records none - says nothing there, and its materials are still
 compared.
 

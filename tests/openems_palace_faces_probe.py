@@ -7,7 +7,7 @@ Run by ``test_openems_palace_faces`` under ``freecadcmd``::
 
     FACES_OUT=tests/_faces freecadcmd tests/openems_palace_faces_probe.py
 
-What lies beyond each face of the domain is the mesh policy's ``Padding``, and
+What lies beyond each face of the domain is the mesh policy's ``Boundary``, and
 each backend answers it: openEMS as the condition it writes on the face and the
 line it writes it on, Palace as the label the translation gives what stands
 there. Here both are asked of each drawing, and what each answered is written
@@ -19,7 +19,7 @@ solved.
 Palace's face is read off its translation. A wave port's face lying in the face
 of the domain, or standing inside it with the model on the far side, is the
 port, since the mesher leaves out what stands behind it. A lumped port's plane
-is a magnetic wall. An ``Air`` side of the reserved box absorbs. Whatever else
+is a magnetic wall. An ``Open`` side of the reserved box absorbs. Whatever else
 bounds the model is the wall, standing where the bound shapes end.
 
 ``manifest.json`` names what was written and is written last, so its existence
@@ -82,7 +82,7 @@ def solvers(doc, analysis):
 def padded(analysis, words):
     settings = [one for one in analysis.Group if kind_of(one) == "EMMeshPolicy"][0]
     for face, word in zip(FACES, words, strict=True):
-        setattr(settings, f"Padding{face}", word)
+        setattr(settings, f"Boundary{face}", word)
 
 
 def end_face(body, axis, at):
@@ -97,7 +97,7 @@ def end_face(body, axis, at):
 
 
 def guide(doc, shape, ends=None, axis=0):
-    """A guide drawn as the air inside it, every face Ends, a port on each end
+    """A guide drawn as the air inside it, every face PEC Wall, a port on each end
     face across ``axis`` at the coordinates ``ends`` names - both, where it names
     none."""
     body = doc.addObject("Part::Feature", "Guide")
@@ -109,7 +109,7 @@ def guide(doc, shape, ends=None, axis=0):
     analysis = createEMAnalysis(doc)
     analysis.FrequencyStart = "20 GHz"
     analysis.FrequencyStop = "26 GHz"
-    analysis.NumFrequencyPoints = 7
+    analysis.FrequencyPoints = 7
     vacuum = createEMMaterial("Vacuum")
     vacuum.MaterialType = "Dielectric"
     binding = createEMMaterialBinding("AirBinding")
@@ -120,13 +120,13 @@ def guide(doc, shape, ends=None, axis=0):
         port = createEMPortRectWaveguide(f"Port{number}")
         port.Label = f"Port{number}"
         port.Number = number
-        port.Excitation = True
+        port.Driven = True
         port.PropagationAxis = ("" if at == low else "-") + "XYZ"[axis]
         port.CrossSection = (body, [end_face(body, axis, at)])
         port.ReferencedTo = PORT_IMPEDANCE
         analysis.addObject(port)
     solvers(doc, analysis)
-    padded(analysis, ["Ends"] * 6)
+    padded(analysis, ["PEC Wall"] * 6)
     doc.recompute()
     return analysis
 
@@ -149,7 +149,7 @@ def wr42_example(doc):
 
 
 def one_port_stub(doc):
-    """A guide with one port, on its near end: the far end is the wall Ends
+    """A guide with one port, on its near end: the far end is the wall PEC Wall
     puts there, which ends a short-circuited stub."""
     return guide(doc, Part.makeBox(LENGTH, BROAD, NARROW), ends=(0.0,))
 
@@ -162,7 +162,7 @@ def one_port_stub_running_out(doc):
         if member.Label == "Port2":
             analysis.Group = [one for one in analysis.Group if one is not member]
             doc.removeObject(member.Name)
-    padded(analysis, ["Through", "Ends", "Ends", "Ends", "Ends", "Ends"])
+    padded(analysis, ["Through", "PEC Wall", "PEC Wall", "PEC Wall", "PEC Wall", "PEC Wall"])
     doc.recompute()
     return analysis
 
@@ -193,7 +193,7 @@ def post(side):
 
 def via(doc):
     """The strip with a via from the ground plane up to it cut out of the fill."""
-    analysis = strip(["Ends"] * 6)(doc)
+    analysis = strip(["PEC Wall"] * 6)(doc)
     fill = doc.getObject("Fill0")
     side = 0.02
     fill.Shape = fill.Shape.cut(
@@ -204,9 +204,9 @@ def via(doc):
 
 
 def port_inside_walled(doc):
-    """The shipped guide with every face Ends: a wall behind each port."""
+    """The shipped guide with every face PEC Wall: a wall behind each port."""
     analysis = wr42_example(doc)
-    padded(analysis, ["Ends"] * 6)
+    padded(analysis, ["PEC Wall"] * 6)
     doc.recompute()
     return analysis
 
@@ -453,6 +453,53 @@ def widening(doc):
     """The guide with its narrow side widened by 3 mm between 3 and 8 mm in."""
     step = Part.makeBox(5.0, BROAD, 3.0, FreeCAD.Vector(3.0, 0.0, NARROW))
     return guide(doc, Part.makeBox(LENGTH, BROAD, NARROW).fuse(step).removeSplitter())
+
+
+def housing_bound_to_a_dielectric(doc):
+    """The guide in a channel through a housing 2 mm thick round it and 5 mm
+    longer at each end, run out through both ends, with the housing bound to a
+    dielectric where its wall wants a conductor."""
+    analysis = guide(doc, Part.makeBox(LENGTH, BROAD, NARROW))
+    wall, beyond = 2.0, 5.0
+    outer = Part.makeBox(
+        LENGTH + 2 * beyond,
+        BROAD + 2 * wall,
+        NARROW + 2 * wall,
+        FreeCAD.Vector(-beyond, -wall, -wall),
+    )
+    channel = Part.makeBox(LENGTH + 2 * beyond, BROAD, NARROW, FreeCAD.Vector(-beyond, 0, 0))
+    housing = doc.addObject("Part::Feature", "Housing")
+    housing.Shape = outer.cut(channel)
+    air = createEMMaterial("Air")
+    air.MaterialType = "Dielectric"
+    binding = createEMMaterialBinding("HousingBinding")
+    binding.Material = air
+    binding.References = [(housing, [""])]
+    analysis.addObject(binding)
+    padded(analysis, ["Through", "Through", "PEC Wall", "PEC Wall", "PEC Wall", "PEC Wall"])
+    doc.recompute()
+    return analysis
+
+
+def pocket_in_the_guide_binding(doc):
+    """The shipped guide under a block of perfect conductor with a pocket in
+    it 8 to 12 mm in, the pocket a body of its own bound with the guide's air."""
+    analysis = wr42_example(doc)
+    shape = Part.makeBox(4.0, BROAD, 3.0, FreeCAD.Vector(8.0, 0.0, NARROW))
+    metal(
+        doc,
+        analysis,
+        "Block",
+        [Part.makeBox(LENGTH, BROAD, 3.0, FreeCAD.Vector(0, 0, NARROW)).cut(shape)],
+    )
+    pocket = doc.addObject("Part::Feature", "Pocket")
+    pocket.Shape = shape
+    doc.recompute()
+    for member in analysis.Group:
+        if kind_of(member) == "EMMaterialBinding" and member.Label == "GuideAirBinding":
+            member.References = [*member.References, (pocket, [""])]
+    doc.recompute()
+    return analysis
 
 
 def fin_along_the_guide(doc):
@@ -710,7 +757,7 @@ def pipe_of_sheets_beside_a_block(doc, roofed=True):
     analysis = createEMAnalysis(doc)
     analysis.FrequencyStart = "20 GHz"
     analysis.FrequencyStop = "26 GHz"
-    analysis.NumFrequencyPoints = 7
+    analysis.FrequencyPoints = 7
     metal(
         doc,
         analysis,
@@ -746,13 +793,13 @@ def pipe_of_sheets_beside_a_block(doc, roofed=True):
         port = createEMPortRectWaveguide(f"Port{number}")
         port.Label = f"Port{number}"
         port.Number = number
-        port.Excitation = True
+        port.Driven = True
         port.PropagationAxis = axis
         port.CrossSection = (plane, ["Face1"])
         port.ReferencedTo = PORT_IMPEDANCE
         analysis.addObject(port)
     solvers(doc, analysis)
-    padded(analysis, ["Air"] * 4 + (["Air"] * 2 if roofed else ["Ends", "Air"]))
+    padded(analysis, ["Open"] * 4 + (["Open"] * 2 if roofed else ["PEC Wall", "Open"]))
     doc.recompute()
     return analysis
 
@@ -767,7 +814,7 @@ def bound_as(doc, analysis, name, shapes, kind, conductivity=0.0, thickness=0.0)
         drawn.append(made)
     material = createEMMaterial(f"{name}Material")
     material.MaterialType = kind
-    if kind == "ConductingSheet":
+    if kind == "Conducting Sheet":
         material.Conductivity = conductivity
         material.Thickness = thickness
     binding = createEMMaterialBinding(f"{name}Binding")
@@ -812,7 +859,7 @@ def roof_through_to_a_pocket(conductivity):
         roof = quad(
             (0, 0, NARROW), (LENGTH, 0, NARROW), (LENGTH, BROAD, NARROW), (0, BROAD, NARROW)
         )
-        bound_as(doc, analysis, "Roof", [roof], "ConductingSheet", conductivity, 0.035)
+        bound_as(doc, analysis, "Roof", [roof], "Conducting Sheet", conductivity, 0.035)
         return analysis
 
     return make
@@ -1040,10 +1087,12 @@ DRAWINGS = {
     "wr42_example": wr42_example,
     "one_port_stub": one_port_stub,
     "one_port_stub_running_out": one_port_stub_running_out,
-    "strip_closed": strip(["Ends"] * 6),
-    "strip_open_above": strip(["Ends"] * 5 + ["Air"]),
-    "strip_open_beside": strip(["Ends", "Ends", "Air", "Air", "Ends", "Ends"]),
-    "strip_open_at_the_ends": strip(["Air", "Air", "Ends", "Ends", "Ends", "Ends"]),
+    "strip_closed": strip(["PEC Wall"] * 6),
+    "strip_open_above": strip(["PEC Wall"] * 5 + ["Open"]),
+    "strip_open_beside": strip(["PEC Wall", "PEC Wall", "Open", "Open", "PEC Wall", "PEC Wall"]),
+    "strip_open_at_the_ends": strip(
+        ["Open", "Open", "PEC Wall", "PEC Wall", "PEC Wall", "PEC Wall"]
+    ),
     "post_18um": post(0.018),
     "via_20um": via,
     "port_inside_walled": port_inside_walled,
@@ -1067,6 +1116,8 @@ DRAWINGS = {
     "part_within_the_probe_depth": part_at(1.0),
     "roof_cavity_before_the_reference_plane": referred(roof_cavity, 10.0),
     "widening_before_the_reference_plane": referred(widening, 10.0),
+    "housing_bound_to_a_dielectric": referred(housing_bound_to_a_dielectric, 10.0),
+    "pocket_in_the_guide_binding": referred(pocket_in_the_guide_binding, 10.0),
     "fin_along_the_guide": referred(fin_along_the_guide, 10.0),
     "slab_along_the_guide": referred(slab_along_the_guide, 10.0),
     "stacked_lower_first_with_an_iris": referred(stacked("lower first", True), 10.0),
@@ -1080,10 +1131,10 @@ DRAWINGS = {
     "roof_sheet_over_the_face_end": referred(roof_over(0.0, 3.0), 10.0),
     "roof_sheet_from_6mm_on": referred(roof_over(6.0, LENGTH), 10.0),
     "lossy_roof_sheet_over_the_face_end": referred(
-        roof_over(0.0, 3.0, "ConductingSheet", 5.8e7), 10.0
+        roof_over(0.0, 3.0, "Conducting Sheet", 5.8e7), 10.0
     ),
     "lossy_roof_sheet_from_6mm_on": referred(
-        roof_over(6.0, LENGTH, "ConductingSheet", 5.8e7), 10.0
+        roof_over(6.0, LENGTH, "Conducting Sheet", 5.8e7), 10.0
     ),
     "resistive_roof_over_a_pocket": referred(roof_through_to_a_pocket(1.0), 10.0),
     "copper_roof_over_a_pocket": referred(roof_through_to_a_pocket(5.8e7), 10.0),
@@ -1104,9 +1155,9 @@ DRAWINGS = {
         lambda doc: pipe_of_sheets_beside_a_block(doc, roofed=False), 10.0
     ),
     "part_drawn_as_its_surface": as_its_surface(part_in_the_guide, "Part"),
-    "strip_closed_on_a_fill_drawn_as_its_surface": as_its_surface(strip(["Ends"] * 6), "Fill0"),
+    "strip_closed_on_a_fill_drawn_as_its_surface": as_its_surface(strip(["PEC Wall"] * 6), "Fill0"),
     "strip_open_above_on_a_fill_drawn_as_its_surface": as_its_surface(
-        strip(["Ends"] * 5 + ["Air"]), "Fill0"
+        strip(["PEC Wall"] * 5 + ["Open"]), "Fill0"
     ),
     "hollow_sphere_drawn_as_its_surface": as_its_surface(hollow_sphere("unbound"), "Sphere"),
     "nested": nested(False),

@@ -57,11 +57,11 @@ from .spend import Spend
 #: the model is refused. Each pass lays the cell the interior realized last
 #: time, whichever way that cell missed the block it was given.
 #:
-#: Most models take one pass. The block's pitch is demanded at the seam, so an
-#: interior coarser than its block is inside the grading budget wherever the gap
-#: beside the seam rounds its cell count up, which is the ordinary case -
-#: ``absorber.rough_seams`` carries the arithmetic and names what reaches the other
-#: one. A seam inside the budget is a finished grid rather than a pass to
+#: The block's pitch is demanded at the seam, so an interior coarser than its
+#: block is inside the grading budget wherever the gap beside the seam rounds
+#: its cell count up, and the first pass finishes there -
+#: ``absorber.rough_seams`` carries the arithmetic and names what reaches the
+#: other case. A seam inside the budget is a finished grid rather than a pass to
 #: repeat.
 #:
 #: The count bounds the work and promises no convergence. A gap holds a whole
@@ -179,8 +179,8 @@ def domain(
         if upper[dim] <= lower[dim]:
             raise EnvelopeError(
                 f"the structure has no extent in {AXIS_NAMES[dim]}: it spans "
-                f"{lows[dim]:.4g} to {highs[dim]:.4g}, and neither face is "
-                f"padded outward, so there is nothing to mesh"
+                f"{lows[dim]:.4g} to {highs[dim]:.4g}, and neither face on that axis "
+                "is set to Open, so there is nothing to mesh"
             )
 
     return tuple(lower), tuple(upper)
@@ -291,7 +291,7 @@ def regions(
         if missing:
             raise EnvelopeError(
                 f"{label!r} lies entirely outside the meshed domain in "
-                f"{', '.join(missing)}; it would not be resolved at all"
+                f"{', '.join(missing)}, so it would not be modelled"
             )
 
         out.append(
@@ -483,14 +483,15 @@ def plan_mesh(
             break
         pitches = laid
     else:
+        # Each pass lays the block at the cell the interior realized on the pass
+        # before, and here the two never come within the growth ratio of each
+        # other. A lower MinElementSize lets the gap beside the block keep its
+        # cells rather than round them down.
         raise MeshError(
             f"the absorber does not meet the interior after {_ABSORBER_PASSES} "
-            f"passes: {'; '.join(rough)}. The block is laid at the cell the "
-            "interior realized last time, and here the two never come inside "
-            "max_ratio of each other. Widen max_ratio, lower min_cell so the "
-            "gap beside the block need not round its cells down, ask for fewer "
-            "absorber cells, or give the face air instead of declaring the "
-            "structure through it"
+            f"passes: {'; '.join(rough)}. Raise MaxGrowthRatio in the openEMS mesh settings, "
+            f"set its MinElementSize below {params.floor:g} mm, lower "
+            "PMLCells on the solver, or set the face to Open instead of Through"
         )
 
     validate(lines, params)
@@ -513,7 +514,12 @@ def _anchors(
     the absorber and again on every pass.
     """
     # Ports that need a line at an exact plane say so before meshing, rather
-    # than the grid being patched afterwards. See Port.required_lines.
+    # than the grid being patched afterwards. See Port.required_lines. Each is
+    # asked as though it were the driven port, because a sweep re-excites this
+    # one grid for every port in turn and the preview drives none. Asked as they
+    # stand, a flat lumped port would pin its plane in one run only, the run
+    # driving the next port would find no line on its plane, and a mirrored
+    # two-port would be meshed with one end pinned and the other not.
     forced: tuple[list[float], list[float], list[float]] = ([], [], [])
     for port in ports:
         # Clipped to the domain, like the wanted lines below, and for the
@@ -524,7 +530,7 @@ def _anchors(
         # where the mesher can only say "a line was required at -50". Nothing is
         # dropped in silence: `_check_required_lines_exist` reads the finished
         # grid and refuses a plane that did not reach it.
-        for dim, positions in enumerate(port.required_lines()):
+        for dim, positions in enumerate(port.required_lines(driven=True)):
             forced[dim].extend(
                 position for position in positions if bounds[0][dim] <= position <= bounds[1][dim]
             )
@@ -544,7 +550,8 @@ def _anchors(
     # either side of it and never on it. A line laid here would override that
     # for the one edge a port happens to be drawn against while the rest of the
     # same trace kept it, so the element would span something other than what
-    # the metal conducts.
+    # the metal conducts. The plane of a flat lumped port is the exception: it
+    # is a required line above, and the thirds rule gives way to it.
     #
     # Conductors only, and boxed ones. A dielectric's face is a preference
     # rather than an anchor, and the mesher is free to drop it where it crowds
@@ -709,11 +716,10 @@ def through_faces_past_the_structure(
                 found.append(
                     (
                         f"{AXIS_NAMES[dim]} grid",
-                        f"the {AXIS_NAMES[dim]} grid ends {overrun:.4g} past the "
-                        f"structure {past} it, at {edge:.4g} against "
-                        f"{limit:.4g}, on a face declared {THROUGH!r}. The "
-                        f"absorber there stands in empty space, so the structure "
-                        f"terminates inside its own PML and reflects",
+                        f"the {AXIS_NAMES[dim]} grid ends {overrun:.4g} mm past the "
+                        f"structure {past} it, at {edge:.4g} against {limit:.4g}, on a "
+                        "face set to Through, so the absorber there stands in empty "
+                        "space and the structure ends inside it and reflects",
                     )
                 )
     return found

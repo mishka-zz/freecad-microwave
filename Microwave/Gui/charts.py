@@ -41,12 +41,39 @@ class Series:
 
 
 @dataclass(frozen=True)
-class Chart:
-    """Everything one set of axes shows, and the text that labels it.
+class Selector:
+    """A choice offered above a chart: what it selects, the choices as
+    ``(text, value)``, and which of them the chart was built from."""
 
-    ``heading`` and ``footnote`` belong to the figure rather than to the axes.
-    The y-label and its ticks push the axes right, so a title placed on them
-    sits off the window's centre.
+    label: str
+    choices: tuple[tuple[str, object], ...]
+    chosen: object = None
+
+
+@dataclass(frozen=True)
+class Table:
+    """Rows of text on a chart's details tab: the column headings, each row's cells, and
+    the index in :attr:`Chart.series` of the curve each row stands for, whose
+    colour the row is marked with. ``None`` where a row has no curve drawn."""
+
+    columns: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+    series: tuple[int | None, ...]
+
+
+@dataclass(frozen=True)
+class Chart:
+    """Everything one set of axes shows, the text that labels it, and what is
+    read beside it rather than on it.
+
+    ``heading`` belongs to the figure rather than to the axes. The y-label and
+    its ticks push the axes right, so a title placed on them sits off the
+    window's centre.
+
+    The plot carries the curves, the heading and the legend. The details tab
+    carries ``notes`` and ``table``: what a reader reads once to know what the
+    curves stand on, rather than each time a curve is read. The warnings tab
+    carries ``warnings``, and is shown only while it holds one.
 
     ``x_unit`` and ``y_unit`` are the units a marker's readout is quoted in.
     They are kept apart from the labels because parsing a unit back out of
@@ -59,17 +86,25 @@ class Chart:
     x_unit: str = ""
     y_unit: str = ""
     heading: str = ""
-    footnote: str = ""
+    #: A line for each thing chosen that is not drawn or not drawn as asked,
+    #: on the warnings tab. Empty where everything asked is drawn.
+    warnings: tuple[str, ...] = ()
+    #: What the curves stand on and how they were derived, a paragraph each,
+    #: on the details tab.
+    notes: tuple[str, ...] = ()
+    #: The magnitude, in the chart's vertical unit, under which nothing is
+    #: drawn, where some drawn sample fell under it. The region under it is
+    #: shaded and named, so a curve there is not read as lying along it.
+    floor: float | None = None
     #: Lower limit for the horizontal axis, when the drawn range is narrower
     #: than the data. ``None`` leaves it to matplotlib.
     left: float | None = None
-    #: Choices for a selector above the chart, as ``(text, value)``. Empty when
-    #: the chart has one way of being read.
-    choices: tuple[tuple[str, object], ...] = field(default=())
-    #: The label beside the selector. It names what ``choices`` selects.
-    choice_label: str = ""
-    #: Which of ``choices`` this chart was built from.
-    chosen: object = None
+    #: The selectors above the chart, in order. Empty when the chart has one
+    #: way of being read.
+    selectors: tuple[Selector, ...] = field(default=())
+    #: Rows on the details tab, or ``None``. Text a reader reads curve by curve
+    #: is laid out here rather than in the notes.
+    table: Table | None = None
 
 
 def module():
@@ -83,16 +118,15 @@ def module():
         import Plot
     except ImportError as error:
         raise ChartUnavailable(
-            f"Charts are drawn by FreeCAD's own Plot module, and importing it "
-            f"failed: {error}. Everything else the workbench does - modelling, "
-            f"meshing, solving and Touchstone export - works without it, so the "
-            f"numbers are in the document either way."
+            f"Charts need FreeCAD's Plot module, which failed to import: {error}. "
+            "The results are in the document, and Export Touchstone writes them to a file."
         ) from error
     return Plot
 
 
-def figure(title: str):
-    """A new plot tab, or a refusal.
+def figure(title: str, icon: str = ""):
+    """A new plot tab, marked with the icon of the set named ``icon``, or a
+    refusal.
 
     ``Plot.figure`` returns ``None`` when there is no MDI area to put a tab in,
     which is every headless route. The guard therefore tests the window rather
@@ -101,30 +135,97 @@ def figure(title: str):
     window = module().figure(title)
     if window is None:
         raise ChartUnavailable(
-            "Charts are drawn into a tab beside the 3D view, and this FreeCAD "
-            "has no window to put one in. The numbers are in the document, and "
-            "Export Touchstone writes them to a file."
+            "Charts are drawn in a tab of the FreeCAD main window, and this session "
+            "has none. The results are in the document, and Export Touchstone writes "
+            "them to a file."
         )
-    # The heading and the note under it are two separate texts. Only a layout
-    # engine packs them as a block and re-packs them on a resize.
+    if icon:
+        _mark(window, icon)
+    # Only a layout engine keeps the heading and the axis labels clear of each
+    # other as the tab is resized.
     window.fig.set_layout_engine("constrained")
     # Save stays upstream's, because matplotlib binds each toolbar callback
     # into its ``QAction`` at construction and nothing here can wrap it.
     # ``Plot.save(path, figsize, dpi)`` is the route that takes a density.
     _revive_toolbar_actions(window.mpl_toolbar)
-    # The text wraps. A basis is longer than a tab is wide, and an unwrapped
-    # figure text runs off both edges rather than being clipped. The line the
-    # heading reserves holds the first line, and the rest reach into the axes'
-    # top margin.
-    window.footnote = window.fig.text(
-        0.5, 0.0, "", ha="center", va="top", fontsize="x-small", wrap=True
-    )
+    _tabs(window)
     window.markers = []
     window.theme = _theme_of_the_application()
     _paint_toolbar(window.mpl_toolbar, window.theme)
-    window.fig.canvas.mpl_connect("draw_event", lambda _event: _settle_footnote(window))
     window.fig.canvas.mpl_connect("button_press_event", lambda event: _clicked(window, event))
     return window
+
+
+def _mark(window, icon: str) -> None:
+    """Give ``window`` and the subwindow ``Mod/Plot`` puts it in the icon of
+    the set named ``icon``. The tab shows the subwindow's icon, and a window
+    taken out of the tabs shows its own; each is the application's until it is
+    set."""
+    from PySide import QtGui
+
+    from ..ViewProviders import icon as path_of
+
+    marked = QtGui.QIcon(path_of(icon))
+    window.setWindowIcon(marked)
+    holder = window.parentWidget()
+    if holder is not None:
+        holder.setWindowIcon(marked)
+
+
+#: What the window's tabs are called: the plot, what it stands on, and what
+#: is not drawn as asked, which the title counts.
+PLOT_TAB = "Chart"
+DETAILS_TAB = "Details"
+WARNINGS_TAB = "\u26a0 Warnings ({})"
+
+
+def _tabs(window) -> None:
+    """Put the canvas and its toolbar on a tab of their own, and tabs for the
+    details and the warnings beside it.
+
+    ``Mod/Plot`` lays its tab out as the canvas over the toolbar, and the two
+    move together, so the toolbar stays under the plot it drives. The details
+    are a column of text over the table, and the warnings a column of text.
+    Each scrolls where it is taller than the tab.
+    """
+    from PySide import QtWidgets
+
+    layout = window.layout()
+    plot = QtWidgets.QWidget()
+    column = QtWidgets.QVBoxLayout(plot)
+    column.setContentsMargins(0, 0, 0, 0)
+    for widget in (window.canvas, window.mpl_toolbar):
+        layout.removeWidget(widget)
+        column.addWidget(widget)
+    tabs = QtWidgets.QTabWidget(window)
+    tabs.addTab(plot, PLOT_TAB)
+    window.notes, window.details = _text_tab(tabs, DETAILS_TAB)
+    window.warnings, _ = _text_tab(tabs, WARNINGS_TAB.format(0))
+    window.warnings_tab = tabs.count() - 1
+    layout.addWidget(tabs)
+    window.tabs = tabs
+
+
+def _text_tab(tabs, title: str):
+    """A tab named ``title`` holding a column of text that scrolls, its text
+    and the column."""
+    from PySide import QtCore, QtWidgets
+
+    page = QtWidgets.QWidget()
+    rows = QtWidgets.QVBoxLayout(page)
+    text = QtWidgets.QLabel()
+    # A run's label is the user's text, and is shown as it was typed.
+    text.setTextFormat(QtCore.Qt.PlainText)
+    text.setWordWrap(True)
+    text.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+    text.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+    rows.addWidget(text)
+    rows.addStretch(1)
+    scroll = QtWidgets.QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setWidget(page)
+    tabs.addTab(scroll, title)
+    return text, rows
 
 
 def _toolbar_buttons(toolbar):
@@ -248,38 +349,10 @@ def _apply_theme(window) -> None:
     axes.tick_params(colors=theme.ink, which="both")
     for spine in axes.spines.values():
         spine.set_color(theme.ink)
-    for text in (axes.xaxis.label, axes.yaxis.label, window.footnote):
+    for text in (axes.xaxis.label, axes.yaxis.label):
         text.set_color(theme.ink)
     if getattr(window.fig, "_suptitle", None) is not None:
         window.fig._suptitle.set_color(theme.ink)
-
-
-#: How far the footnote is lifted into the blank line the heading reserved,
-#: as a fraction of the figure's height. The bottom of the heading's block is
-#: the bottom of that line, so anything hung below it lands in the axes.
-_FOOTNOTE_PAD = 0.004
-
-
-def _settle_footnote(window) -> None:
-    """Put the footnote under the heading, wherever the layout engine left it.
-
-    The footnote is a figure text, so the layout engine does not know about it
-    and reserves no room for it. The heading carries a blank second line to
-    reserve that room, and this function moves the footnote into it after each
-    layout. The heading's baseline moves with the tab's size, so this reads it
-    back on each draw rather than assuming it.
-
-    This asks for a redraw only when the text moved, so it does not recurse.
-    """
-    figure = window.fig
-    heading = getattr(figure, "_suptitle", None)
-    if heading is None or not window.footnote.get_text():
-        return
-    bottom = heading.get_window_extent(figure.canvas.get_renderer()).y0 / figure.bbox.height
-    wanted = bottom + _FOOTNOTE_PAD
-    if abs(window.footnote.get_position()[1] - wanted) > 1e-4:
-        window.footnote.set_position((0.5, wanted))
-        figure.canvas.draw_idle()
 
 
 #: Room above and below the curve when the vertical axis is fitted by hand, as
@@ -335,18 +408,23 @@ def draw(window, chart: Chart) -> None:
     # raises.
     window.marker_artists = []
     window.chart = chart
+    # ``Plot.plot`` calls ``Plot.update`` after each curve, which draws
+    # ``Mod/Plot``'s own legend wherever the flag stands - at the place and size
+    # it kept from the last one, and in the layout, which then moves the axes
+    # aside. The flag is down while the curves go on, and set below.
+    window.legend = False
 
     for line in chart.series:
         drawn = window.plot(line.x, line.y, line.name or None)
+        # Matplotlib's own figure options name a curve by its label, and an
+        # artist given none is called by its place among the axes' children.
+        drawn.setp("label", line.name or chart.y_label)
         if line.derived:
             drawn.setp("linestyle", "--")
 
     axes.set_xlabel(chart.x_label)
     axes.set_ylabel(chart.y_label)
-    # The blank second line reserves room for the footnote, which the layout
-    # engine cannot see. Without a footnote there is nothing to reserve.
-    window.fig.suptitle(f"{chart.heading}\n " if chart.footnote else chart.heading)
-    window.footnote.set_text(chart.footnote)
+    window.fig.suptitle(chart.heading)
     if chart.left is not None:
         axes.set_xlim(left=chart.left)
         _fit_vertically(axes, chart)
@@ -355,6 +433,8 @@ def draw(window, chart: Chart) -> None:
     _apply_theme(window)
     axes.grid(True, color=theme.ink, alpha=GRID_ALPHA)
     window.grid = True
+    if chart.floor is not None:
+        _shade_under(axes, chart, theme)
 
     # A single curve on axes that are already labelled gets no legend. The
     # legend is drawn on this chart's own axes rather than through
@@ -366,19 +446,85 @@ def draw(window, chart: Chart) -> None:
     if window.legend:
         # Every colour is named here. ``legend.facecolor`` inherits from the
         # rcParam ``axes.facecolor`` rather than from these axes.
-        axes.legend(
+        legend = axes.legend(
             [line.line for line in named],
-            [line.name for line in named],
+            [shortened(line.name) for line in named],
             loc="best",
             fontsize="small",
-            ncol=2,
+            ncol=1,
             facecolor=theme.axes,
             edgecolor=theme.ink,
             labelcolor=theme.ink,
         )
+        # The layout engine makes room for whatever an axes holds, a legend
+        # wider than the axes among it, and so would move the axes aside.
+        legend.set_in_layout(False)
 
     _draw_markers(window)
     window.canvas.draw()
+    window.notes.setText("\n\n".join(chart.notes))
+    _show_warnings(window, chart.warnings)
+    if chart.table is not None or getattr(window, "table", None) is not None:
+        _show_table(window, chart.table)
+
+
+def _show_warnings(window, lines: tuple[str, ...]) -> None:
+    """Put ``lines`` on the warnings tab and count them in its title, and
+    show the tab only while it holds one."""
+    window.warnings.setText("\n\n".join(lines))
+    window.tabs.setTabText(window.warnings_tab, WARNINGS_TAB.format(len(lines)))
+    window.tabs.setTabVisible(window.warnings_tab, bool(lines))
+
+
+#: The most letters a legend shows of a curve's name. A longer name is cut
+#: there and ends in an ellipsis, and the curve keeps its whole name.
+LEGEND_LETTERS = 64
+
+
+def shortened(name: str) -> str:
+    """``name`` as the legend shows it."""
+    return name if len(name) <= LEGEND_LETTERS else name[: LEGEND_LETTERS - 1] + "\u2026"
+
+
+#: How dark the region under a chart's floor is shaded, as a fraction of ink.
+FLOOR_ALPHA = 0.12
+
+
+def _shade_under(axes, chart: Chart, theme: Theme) -> None:
+    """Shade the region under ``chart.floor`` and name it, with room under it.
+
+    Nothing is drawn under the floor, so a chart whose curves lie wholly under
+    it would otherwise have no axis there to show the region on. The axis
+    reaches from a fifth of the span the drawn curves stand over the floor
+    under it to the highest drawn sample, counted from where the horizontal
+    range starts. Where no sample is drawn, the span is the floor's own size,
+    and the horizontal range is the curves' own.
+    """
+    floor = float(chart.floor)  # type: ignore[arg-type]
+    span = vertical_span(chart, axes.get_xlim()[0])
+    highest = None if span is None else span[1]
+    over = (highest - floor) if highest is not None and highest > floor else abs(floor) or 1.0
+    low, high = floor - _MARGIN * over * 4, floor + over * (1 + _MARGIN)
+    if span is None:
+        across = [np.asarray(line.x, dtype=float) for line in chart.series]
+        across = [x[np.isfinite(x)] for x in across if np.size(x)]
+        if any(x.size for x in across):
+            axes.set_xlim(
+                min(float(x.min()) for x in across if x.size),
+                max(float(x.max()) for x in across if x.size),
+            )
+    axes.axhspan(low, floor, color=theme.ink, alpha=FLOOR_ALPHA, linewidth=0)
+    axes.text(
+        0.01,
+        floor,
+        f"under {floor:g} {chart.y_unit}".rstrip(),
+        transform=axes.get_yaxis_transform(),
+        va="top",
+        ha="left",
+        fontsize="small",
+        color=theme.ink,
+    )
+    axes.set_ylim(low, high)
 
 
 #: How close a click has to land, in points, to take a marker off rather than
@@ -484,7 +630,11 @@ def _draw_markers(window) -> None:
         line = chart.series[series]
         x, y = float(line.x[sample]), float(line.y[sample])
         colour = _colour_of(window, series, theme)
-        (dot,) = window.axes.plot([x], [y], marker="o", markersize=5, color=colour, zorder=5)
+        # A marker is no curve, and the figure options leave out a line
+        # labelled so.
+        (dot,) = window.axes.plot(
+            [x], [y], marker="o", markersize=5, color=colour, zorder=5, label="_nolegend_"
+        )
         label = window.axes.annotate(
             marker_text(chart, series, sample),
             xy=(x, y),
@@ -503,6 +653,65 @@ def _draw_markers(window) -> None:
         window.marker_artists += [dot, label]
 
 
+def _show_table(window, table: Table | None) -> None:
+    """Put ``table`` on the details tab under the notes, or take the one there
+    away.
+
+    The table is made once a window: a redraw through a selector fills it
+    again. Each row is marked in the first column with the colour its curve was
+    drawn in, which is asked of the drawn line, as a marker's colour is. The
+    table is only as tall as its rows. A row is one line, and a table wider
+    than the tab scrolls sideways, with room kept for the scroll bar so that no
+    row is hidden under it.
+    """
+    from PySide import QtGui, QtWidgets
+
+    shown = getattr(window, "table", None)
+    if table is None or not table.rows:
+        if shown is not None:
+            shown.hide()
+        return
+    if shown is None:
+        shown = QtWidgets.QTableWidget(window)
+        shown.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        shown.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        shown.verticalHeader().setVisible(False)
+        shown.setWordWrap(False)
+        shown.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        # Under the notes and over the stretch that keeps both at the top.
+        window.details.insertWidget(1, shown)
+        window.table = shown
+    theme = getattr(window, "theme", None) or LIGHT
+    shown.clear()
+    shown.setColumnCount(len(table.columns) + 1)
+    shown.setRowCount(len(table.rows))
+    shown.setHorizontalHeaderLabels(["", *table.columns])
+    for row, (cells, series) in enumerate(zip(table.rows, table.series, strict=True)):
+        mark = QtWidgets.QTableWidgetItem("")
+        if series is not None:
+            mark.setBackground(QtGui.QColor(_colour_of(window, series, theme)))
+        shown.setItem(row, 0, mark)
+        for column, text in enumerate(cells, start=1):
+            shown.setItem(row, column, QtWidgets.QTableWidgetItem(text))
+    shown.resizeColumnsToContents()
+    header = shown.horizontalHeader()
+    # A theme pads a heading beyond what the header's own size hint counts, so
+    # each column is given room for its heading's text and two letters more
+    # on each side.
+    room = header.fontMetrics()
+    for column in range(1, shown.columnCount()):
+        letters = room.horizontalAdvance("M")
+        heading = room.horizontalAdvance(table.columns[column - 1]) + 4 * letters
+        shown.setColumnWidth(column, max(shown.columnWidth(column), heading))
+    shown.setColumnWidth(0, header.defaultSectionSize() // 3)
+    header.setStretchLastSection(True)
+    height = header.height() + 2 * shown.frameWidth()
+    height += shown.horizontalScrollBar().sizeHint().height()
+    height += sum(shown.rowHeight(row) for row in range(shown.rowCount()))
+    shown.setFixedHeight(height)
+    shown.show()
+
+
 def _colour_of(window, series: int, theme: Theme) -> str:
     """What matplotlib drew this curve in, or the theme's ink if it cannot say.
 
@@ -515,48 +724,101 @@ def _colour_of(window, series: int, theme: Theme) -> str:
         return theme.ink
 
 
-def render(chart: Chart, title: str, rebuild=None):
-    """Draw ``chart`` in a new tab called ``title``. Returns the window.
+def render(chart: Chart, title: str, rebuild=None, icon: str = "", documents=()):
+    """Draw ``chart`` in a new tab called ``title``, marked with the icon of
+    the set named ``icon``. Returns the window.
 
-    ``rebuild`` is called with one of :attr:`Chart.choices`' values and returns
-    the chart for it. With ``rebuild``, a selector goes above the plot. Without
-    it, the chart has one way of being read and carries no selector.
+    ``rebuild`` is called with the value chosen in each of
+    :attr:`Chart.selectors`, in order, and returns the chart for them. With
+    ``rebuild``, the selectors go above the plot. Without it, the chart has one
+    way of being read and carries none.
+
+    ``documents`` names the documents the chart draws from, and the tab closes
+    as the first of them does.
     """
-    window = figure(title)
-    if chart.choices and rebuild is not None:
-        _add_selector(window, chart, rebuild)
+    window = figure(title, icon)
+    if chart.selectors and rebuild is not None:
+        _add_selectors(window, chart, rebuild)
     draw(window, chart)
+    named = frozenset(name for name in documents if name)
+    if named:
+        _drawn_from.append((window, named))
     return window
 
 
-def _add_selector(window, chart: Chart, rebuild) -> None:
-    """A combo box above the plot that redraws through ``rebuild``."""
+#: Each open tab and the documents it draws from. ``Mod/Plot`` puts a tab in
+#: the main window's MDI area with no document behind it, so FreeCAD closes it
+#: with none; :func:`closed` does.
+_drawn_from: list = []
+
+
+def closed(document: str) -> None:
+    """Close each tab drawn from the document named ``document``, which is
+    closing, and forget each tab already closed."""
+    kept = []
+    for window, named in _drawn_from:
+        try:
+            holder = window.parentWidget()
+            if document in named:
+                (holder if holder is not None else window).close()
+                continue
+        except RuntimeError:
+            # Qt has deleted a tab the user closed, and its wrapper says so.
+            continue
+        kept.append((window, named))
+    _drawn_from[:] = kept
+
+
+def _fill(box, selector: Selector) -> None:
+    """Offer ``selector``'s choices in ``box``, with its choice made, saying
+    nothing to whoever listens to ``box``.
+
+    The choice is found among the selector's own values. A box finds a value
+    held as a Python object, a term's tuple among them, only where it is the
+    same object, and a chart built again holds an equal one.
+    """
+    box.blockSignals(True)
+    box.clear()
+    for text, value in selector.choices:
+        box.addItem(text, value)
+    values = [value for _, value in selector.choices]
+    if selector.chosen is not None and selector.chosen in values:
+        box.setCurrentIndex(values.index(selector.chosen))
+    box.blockSignals(False)
+
+
+def _add_selectors(window, chart: Chart, rebuild) -> None:
+    """A combo box for each selector above the plot, redrawing through
+    ``rebuild``. A choice can change what another selector offers, so each is
+    offered again as the new chart states it."""
     from PySide import QtWidgets
 
-    box = QtWidgets.QComboBox()
-    for text, value in chart.choices:
-        box.addItem(text, value)
-    if chart.chosen is not None:
-        found = box.findData(chart.chosen)
-        if found >= 0:
-            box.setCurrentIndex(found)
+    boxes = [QtWidgets.QComboBox() for _ in chart.selectors]
+    labels = [QtWidgets.QLabel(selector.label) for selector in chart.selectors]
+    for box, selector in zip(boxes, chart.selectors, strict=True):
+        _fill(box, selector)
 
     def chose(*_):
-        draw(window, rebuild(box.currentData()))
+        built = rebuild(*(box.currentData() for box in boxes))
+        for box, label, selector in zip(boxes, labels, built.selectors, strict=False):
+            _fill(box, selector)
+            label.setText(selector.label)
+        draw(window, built)
 
-    box.currentIndexChanged.connect(chose)
+    for box in boxes:
+        box.currentIndexChanged.connect(chose)
 
     bar = QtWidgets.QWidget(window)
-    # The bar is only as tall as the row inside it. ``Mod/Plot``'s canvas is
-    # ``Preferred`` rather than ``Expanding``, so a bar left free to grow
-    # shares the tab's spare height with it.
+    # The bar is only as tall as the row inside it, and the tabs under it take
+    # the rest of the height.
     bar.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
     row = QtWidgets.QHBoxLayout(bar)
     row.setContentsMargins(4, 4, 4, 0)
-    row.addWidget(QtWidgets.QLabel(chart.choice_label))
-    row.addWidget(box)
+    for box, label in zip(boxes, labels, strict=True):
+        row.addWidget(label)
+        row.addWidget(box)
     row.addStretch(1)
-    # The bar goes above the canvas. ``Mod/Plot`` lays the tab out as canvas
-    # then toolbar, so index 0 is the top of the tab and the toolbar stays at
-    # the bottom where its users expect it.
+    # The bar goes above the tabs, since a choice redraws the plot and the
+    # details alike. The window's layout holds the tabs alone, so index 0 is
+    # its top.
     window.layout().insertWidget(0, bar)

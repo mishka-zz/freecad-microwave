@@ -1,0 +1,7 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Run (the object): a group, drawn as a folder like the study, holding a response. -->
+  <path d="M5 17 a4 4 0 0 1 4-4 h13.5 l5 6 h32.5 a4 4 0 0 1 4 4 v22 a4 4 0 0 1 -4 4 h-51 a4 4 0 0 1 -4-4 z"
+        fill="#cfd8dc" stroke="#546e7a" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M12 28 H22 Q28 28 31 41 Q34 28 40 28 H52" stroke="#e8833a" stroke-width="4.5"
+        fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

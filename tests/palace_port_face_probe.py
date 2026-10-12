@@ -183,18 +183,18 @@ def build(doc, drawing, out):
     port = createEMPortRectWaveguide("Port1")
     port.Label = "Port1"
     port.Number = 1
-    port.Excitation = True
+    port.Driven = True
     port.PropagationAxis = axis
     port.CrossSection = (standing, [name])
     port.ReferencedTo = PORT_IMPEDANCE
     analysis.addObject(port)
     # No air outside the drawing. What bounds this problem is a condition on
     # the body's own faces, so every face of the domain ends where the
-    # structure does, and a face left saying Air is refused by name.
+    # structure does, and a face left saying Open is refused by name.
     settings = contents(analysis).settings
     for face_axis in "XYZ":
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{face_axis}{side}", "Ends")
+            setattr(settings, f"Boundary{face_axis}{side}", "PEC Wall")
     doc.recompute()
     return analysis, face
 

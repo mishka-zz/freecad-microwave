@@ -31,20 +31,29 @@ A negative share is more power accounted for than went in, which no model
 makes, so it is the measurement's. It is reported at the same bar, with other
 advice.
 
-An open run carries one more way out: the open surface of the air the adapter
-reserves. Palace measures the power through it as it does through a port's
-face. Where nothing dissipates, that power is subtracted from the share, so what
-is left unaccounted for is what left by neither the matrix, a port's face nor
-the open surface. The figure is formed from the same derivative of the field,
-and a mesh coarse at the surface reads it high, so such a run that accounts for
-more than went in is told to refine the mesh there.
+A lumped port's face is compared with nothing. Palace reads a lumped port's
+power from the voltage across it, the field along its direction averaged over
+the face (``LumpedPortData::GetVoltage`` in
+``palace/models/lumpedportoperator.cpp``), and the power through the face from
+the field's curl, and on a model that loses nothing the two disagree at every
+frequency by a share of the port's power. That share is the readings' and not
+the device's. So in a run through lumped ports the faces are not read, and the
+share is one less the column's power less what left through the open surface.
 
-Where the model dissipates, the heat is read as what went in through the faces
-less what left through the open surface, and subtracting both takes the open
-surface out again: the share compares the matrix with the ports' faces alone,
-exactly as in a closed run. An error in the power through the open surface then
-lands in the heat, which nothing reports, and the line says so rather than
-sending the user to the open surface.
+An open run is a run through lumped ports, since the adapter refuses a wave port
+in an open study, and the open surface of the air the adapter reserves is its
+one more way out. Palace measures the power through it as it does through a
+port's face, from the same derivative of the field, and a mesh coarse at the
+surface reads it high. So a share below zero there sends the user to refine the
+mesh at the open surface.
+
+Nothing in a run through lumped ports tells what its share is made of. Where the
+model dissipates it holds the heat and the solver's error together, and the run
+cannot separate them; where nothing dissipates it is the solver's error alone,
+and it grows with frequency and with how the port is drawn in a way no setting
+is known to remove. So it is stated as information, beside what the ports do
+not get back and what left through the open surface, to two figures and in
+decibels, and the line warns only of more power accounted for than went in.
 
 The share through the open surface is also what the surface's own reflection
 acts on. A wave the surface sends back toward port ``i`` from what port ``j``
@@ -58,16 +67,16 @@ and the product is stated as an estimate, at the sample where it is largest.
 from __future__ import annotations
 
 import math
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
 
 from .capabilities import HZ_PER_GHZ
 from .policy import percent, reflection
-from .read import Scattering
+from .read import RESISTANCE, Scattering
 
-__all__ = ["BAR", "Moved", "Shortfall", "moved", "moved_said", "said", "shortfalls"]
+__all__ = ["BAR", "Moved", "Shortfall", "moved", "moved_said", "said", "shortfalls", "WARNING"]
 
 #: The share of the driven port's power the matrix may leave unaccounted for
 #: before the run says so as a warning. It is the bar the Palace acceptance gates
@@ -84,23 +93,29 @@ class Shortfall:
     leaves the most.
 
     :param excitation: the driven port's number.
-    :param frequency: in Hz, the sample where the share is largest either way.
+    :param frequency: in Hz, the sample where the share is largest either way -
+        or, in a run through lumped ports, where it is lowest if that is past
+        :data:`BAR` below zero, and largest otherwise.
     :param share: of the watt that went in. Negative where more is accounted for
         than went in.
     :param port: the port whose face took the most of it, in the share's
-        direction.
+        direction. ``None`` in a run through lumped ports, whose faces are not
+        read.
     :param radiated: the share that left through the open surface at the same
         sample, and ``None`` where the run has no open surface.
     :param dissipates: whether the model dissipates, so that the heat was read
-        off the faces and the open surface does not enter ``share``.
+        off the faces - or, in a run through lumped ports, so that ``share`` is
+        the heat together with the solver's error.
+    :param lumped: whether the run's ports are lumped.
     """
 
     excitation: int
     frequency: float
     share: float
-    port: int
+    port: int | None
     radiated: float | None = None
     dissipates: bool = False
+    lumped: bool = False
 
 
 def shortfalls(answer: Scattering) -> tuple[Shortfall, ...]:
@@ -110,93 +125,137 @@ def shortfalls(answer: Scattering) -> tuple[Shortfall, ...]:
     flux = np.asarray(answer.flux, dtype=float)
     opened = answer.radiated is not None
     left = np.asarray(answer.radiated, dtype=float) if opened else np.zeros(flux.shape[::2])
+    lumped = RESISTANCE in answer.stated.values()
     for column, excitation in enumerate(answer.driven):
         radiated = left[:, column]
-        heat = -flux[:, :, column].sum(axis=1) - radiated if answer.dissipates else 0.0
+        faces = answer.dissipates and not lumped
+        heat = -flux[:, :, column].sum(axis=1) if faces else 0.0
         share = 1.0 - power[:, :, column].sum(axis=1) - heat - radiated
-        sample = int(np.argmax(np.abs(share)))
-        came_in = np.array([1.0 if out == excitation else 0.0 for out in answer.out])
-        taken = flux[sample, :, column] - power[sample, :, column] + came_in
-        row = int(np.argmax(taken * np.sign(share[sample])))
+        if not lumped:
+            sample = int(np.argmax(np.abs(share)))
+            came_in = np.array([1.0 if out == excitation else 0.0 for out in answer.out])
+            taken = flux[sample, :, column] - power[sample, :, column] + came_in
+            row = int(np.argmax(taken * np.sign(share[sample])))
+            port: int | None = int(answer.out[row])
+        else:
+            # The two sides are held to different bars, so the largest share
+            # either way can hide a smaller one past its own bar.
+            lowest = int(np.argmin(share))
+            sample = lowest if share[lowest] < -BAR else int(np.argmax(share))
+            port = None
         found.append(
             Shortfall(
                 excitation=int(excitation),
                 frequency=float(answer.frequency[sample]),
                 share=float(share[sample]),
-                port=int(answer.out[row]),
+                port=port,
                 radiated=float(radiated[sample]) if opened else None,
                 dissipates=bool(answer.dissipates),
+                lumped=lumped,
             )
         )
     return tuple(found)
 
 
-def said(
-    shortfall: Shortfall,
-    labels: Mapping[int, str],
-    *,
-    lumped: Collection[int] = (),
-) -> str:
-    """What the log says about one driven port's shortfall, a warning past :data:`BAR`.
+def said(shortfall: Shortfall, labels: Mapping[int, str]) -> str:
+    """What the log says about one driven port's shortfall, a warning past
+    :data:`BAR` - in a run through lumped ports, past it below zero only.
 
     :param labels: each port's label, by its number.
-    :param lumped: the numbers of the lumped ports. Where the port that took the
-        most is one, the line gives the share and no advice: the advice about a
-        wave port's face is not about it, and nothing measured says what moves a
-        lumped port's share.
     """
+    if shortfall.lumped:
+        return _lumped_said(shortfall, labels)
+    # A run through wave ports names the port whose face took the most.
+    assert shortfall.port is not None
     driving = labels[shortfall.excitation]
     at = f"{shortfall.frequency / HZ_PER_GHZ:.6g} GHz"
-    if shortfall.radiated is None:
-        through = ""
-    elif shortfall.dissipates:
-        through = (
-            f". The model dissipates, so the heat is read off the faces and the "
-            f"{_percent(shortfall.radiated)} through the open surface does not enter this "
-            "figure, which compares the matrix with the ports' faces alone"
-        )
-    else:
-        through = f", after the {_percent(shortfall.radiated)} that left through the open surface"
     if shortfall.share >= 0:
         line = (
             f"Driven from {driving!r}, the matrix leaves {_percent(shortfall.share)} of the "
-            f"power unaccounted for at {at}{through}"
+            f"power unaccounted for at {at}"
         )
-        took = f"Most of it left through {labels[shortfall.port]!r}"
+        # A wave port takes up part of any field reaching its face besides its
+        # own mode: the evanescent field a change in the guide leaves near it.
         advice = (
-            f"{took}, a lumped port"
-            if shortfall.port in lumped
-            else f"{took}. A wave port takes up part of "
-            "any field reaching its face besides its own mode: what a change in the guide "
-            "leaves near it. Draw the port farther from what changes the guide, or end the "
-            "band further below where the next mode propagates"
+            f"Most of it left through {labels[shortfall.port]!r}, which absorbs field "
+            "besides its own mode near a change in the guide. Draw the port farther from "
+            "what changes the guide, or end the band further below where the next mode "
+            "propagates"
         )
-    elif shortfall.radiated is None or shortfall.dissipates:
-        line = (
-            f"Driven from {driving!r}, the matrix and the heat the model dissipates account "
-            f"for {_percent(-shortfall.share)} more power than went in at {at}{through}"
-        )
-        advice = "No model makes power, so this is the measurement's. Refine the mesh"
     else:
         line = (
-            f"Driven from {driving!r}, the matrix, the heat the model dissipates and the "
-            f"{_percent(shortfall.radiated)} that left through the open surface account for "
-            f"{_percent(-shortfall.share)} more power than went in at {at}"
+            f"Driven from {driving!r}, the matrix and the heat the model dissipates account "
+            f"for {_percent(-shortfall.share)} more power than went in at {at}"
         )
-        advice = (
-            "No model makes power, so this is the measurement's. The power through the "
-            "open surface is read high where the mesh is coarse there: refine the mesh at "
-            "the open surface"
-        )
+        advice = "The excess is a measurement error. Refine the mesh"
     if abs(shortfall.share) <= BAR:
         return line
     return f"{WARNING}{line}. {advice}"
 
 
-def _percent(share: float) -> str:
-    """A share as a percentage to three figures. A fixed number of places would
-    round a share near the bar to nothing."""
-    return percent(share, 3)
+def _lumped_said(shortfall: Shortfall, labels: Mapping[int, str]) -> str:
+    """What the log says of one driven port's shortfall in a run through lumped
+    ports, whose faces are not read."""
+    driving = labels[shortfall.excitation]
+    at = f"{shortfall.frequency / HZ_PER_GHZ:.6g} GHz"
+    share, radiated = shortfall.share, shortfall.radiated
+    if not math.isfinite(share):
+        return (
+            f"{WARNING}Driven from {driving!r}, Palace returned no figure for the power "
+            f"through the open surface at {at}, so the power balance is unknown"
+        )
+    if share < 0:
+        if radiated is None:
+            line = (
+                f"Driven from {driving!r}, the matrix accounts for {_percent(-share)} more "
+                f"power than went in at {at}"
+            )
+            advice = "The excess is a measurement error. Refine the mesh"
+        else:
+            line = (
+                f"Driven from {driving!r}, the matrix and the {_percent(radiated)} that left "
+                f"through the open surface account for {_percent(-share)} more power than "
+                f"went in at {at}"
+            )
+            # Palace forms the power through the open surface from the curl of
+            # the field, which a coarse mesh there reads high.
+            advice = (
+                "The excess is a measurement error, and a coarse mesh at the open surface "
+                "reads the power through it high. Refine the mesh at the open surface"
+            )
+        return line if -share <= BAR else f"{WARNING}{line}. {advice}"
+    rest = (
+        "is dissipated in the model or is the solver's error, which this run cannot separate"
+        if shortfall.dissipates
+        else "is the solver's error, since nothing in the model dissipates"
+    )
+    if radiated is None:
+        return (
+            f"Driven from {driving!r}, {_rough(share)} of the power does not come back at "
+            f"the ports at {at}. It {rest}"
+        )
+    return (
+        f"Driven from {driving!r}, {_rough(share + radiated)} of the power does not come "
+        f"back at the ports at {at}: {_percent(radiated, 2)} left through the open surface, "
+        f"and the other {_rough(share)} {rest}"
+    )
+
+
+def _rough(share: float) -> str:
+    """A share to two figures, and the loss it is in decibels where it is one. A
+    third figure would be below what the solver reads."""
+    loss = -10.0 * math.log10(1.0 - share) if share < 1.0 else 0.0
+    if not loss > 0.0:
+        return _percent(share, 2)
+    loss = float(f"{loss:.2g}")
+    places = max(1 - math.floor(math.log10(loss)), 0)
+    return f"{_percent(share, 2)} ({loss:.{places}f} dB)"
+
+
+def _percent(share: float, figures: int = 3) -> str:
+    """A share as a percentage to three figures, or to ``figures``. A fixed number
+    of places would round a share near the bar to nothing."""
+    return percent(share, figures)
 
 
 @dataclass(frozen=True)
@@ -276,20 +335,19 @@ def moved(
 def moved_said(one: Moved, labels: Mapping[int, str]) -> str:
     """What the log says about the open surface for one driven port."""
     widest = (
-        "this share"
+        ""
         if one.across == one.excitation
-        else f"this share and the {_percent(one.widest)} {labels[one.across]!r} sent through it"
+        else f", counting the {_percent(one.widest)} {labels[one.across]!r} sent through it"
     )
+    # The estimate is the reflection times the root of this port's share and
+    # the widest share any driven port sent through the surface.
     line = (
         f"Driven from {labels[one.excitation]!r}, {_percent(one.radiated)} of the power left "
         f"through the open surface at {one.frequency / HZ_PER_GHZ:.6g} GHz. The surface "
-        f"reflects about {percent(one.reflection, 2)} of a radiated wave there, and the "
-        f"reflection times the root of {widest} estimates it moved the column's terms "
-        f"by {one.estimate:.2g}. It is an estimate and not a bound"
+        f"reflects about {percent(one.reflection, 2)} of a radiated wave there, so the "
+        f"column's terms move by about {one.estimate:.2g}{widest}. This is an estimate and "
+        "not a bound"
     )
     if one.unmeasured:
-        line += (
-            ". A port not driven sends an unmeasured share through the surface, and its "
-            "term in this column is not estimated"
-        )
+        line += ". The terms of ports not driven are not estimated"
     return line

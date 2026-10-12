@@ -13,6 +13,8 @@ lines that turn a box into a ``Shape`` - is a manual QA case. Everything that
 decides *where* the box is lives in ``port_box`` and is tested here.
 """
 
+import re
+
 import pytest
 
 from Microwave import portbox
@@ -99,7 +101,9 @@ class TestTheMicrostripBox:
         assert strip(measurement_distance=30.0, stated_length=45.0).length == 45.0
 
     def test_a_length_short_of_the_measurement_plane_is_refused(self):
-        with pytest.raises(portbox.BoxError, match="stop short of it"):
+        with pytest.raises(
+            portbox.BoxError, match=re.escape("Set Length to 0 to end the box there")
+        ):
             strip(measurement_distance=30.0, stated_length=20.0)
 
     def test_an_unset_probe_distance_is_refused(self):
@@ -109,17 +113,27 @@ class TestTheMicrostripBox:
             strip(measurement_distance=0.0)
 
     def test_a_negative_feed_offset_is_refused(self):
-        with pytest.raises(portbox.BoxError, match="outside the structure"):
+        with pytest.raises(
+            portbox.BoxError,
+            match=re.escape(
+                "FeedOffset is -5 mm, so the source sits outside the structure. Enter an "
+                "offset of 0 mm or more, measured inward from the picked face"
+            ),
+        ):
             strip(feed_offset=-5.0)
 
     def test_a_negative_length_is_refused(self):
-        with pytest.raises(portbox.BoxError, match="reverses the port"):
+        with pytest.raises(
+            portbox.BoxError, match=re.escape("Length is -5 mm. Enter a length of 0 mm or more")
+        ):
             strip(stated_length=-5.0)
 
     def test_an_excitation_axis_pointing_the_wrong_way_is_refused(self):
         """Refused in the shared module, so a port that would solve backwards
         does not draw either."""
-        with pytest.raises(portbox.BoxError, match="points the other way"):
+        with pytest.raises(
+            portbox.BoxError, match=re.escape("points the other way. Set ExcitationAxis to -Z")
+        ):
             strip(excitation_direction=1)
 
     def test_a_trace_lying_on_the_ground_has_no_gap(self):
@@ -195,9 +209,25 @@ class TestTheLumpedBox:
             )
 
     def test_coplanar_entities_have_no_gap(self):
-        with pytest.raises(portbox.BoxError, match="drives a voltage across a gap"):
+        with pytest.raises(portbox.BoxError, match="no gap along ExcitationAxis"):
             portbox.lumped(
                 self.SOURCE, ((10, -1.5, 1.5), (12, 1.5, 1.5)), excitation_axis=2, outline=None
+            )
+
+    def test_entities_meeting_along_a_line_make_no_port(self):
+        """Two points one above the other overlap across neither transverse axis."""
+        with pytest.raises(
+            portbox.BoxError,
+            match=re.escape(
+                "where SourceEntity and ReferenceEntity overlap is a line along Z. Select "
+                "faces, or edges that span the conductor's width"
+            ),
+        ):
+            portbox.lumped(
+                ((10, 0, 1.5), (10, 0, 1.5)),
+                ((10, 0, 0), (10, 0, 0)),
+                excitation_axis=2,
+                outline=None,
             )
 
 
@@ -286,7 +316,12 @@ class TestTheWaveguideBox:
         assert box.plane_at(box.measurement) == 3.0
 
     def test_no_length_and_no_fallback_is_refused(self):
-        with pytest.raises(portbox.BoxError, match="Length is unset"):
+        with pytest.raises(
+            portbox.BoxError,
+            match=re.escape(
+                "Length is 0 and the picked geometry has no extent to take it from. Set Length"
+            ),
+        ):
             portbox.rect_waveguide(
                 ((0, 0, 0), (10.7, 4.3, 0)),
                 propagation_axis=2,
@@ -355,7 +390,14 @@ class TestTheCoaxialBox:
     def test_probes_on_the_source_are_refused(self):
         """A coaxial port reads its impedance by differencing three probes
         downstream of the source, so zero is not a shorter version of that."""
-        with pytest.raises(portbox.BoxError, match="probes would sit on the source"):
+        with pytest.raises(
+            portbox.BoxError,
+            match=re.escape(
+                "Enter a positive distance, about 0.1 of a free-space wavelength at the "
+                "bottom of the band"
+            )
+            + "$",
+        ):
             self.built(measurement_distance=0.0)
 
     def test_a_box_stopping_short_of_its_own_probes_is_refused(self):
@@ -387,7 +429,7 @@ class TestTheDrawingIsTheSolversBox:
         the port with it - would stand inside the absorber."""
         port = lumped_port(1, trace(), ground())
         drawn = port_shape.port_box(port)
-        solved = self.built(port, PaddingXMin="Air", PaddingXMax="Air")
+        solved = self.built(port, BoundaryXMin="Open", BoundaryXMax="Open")
         assert drawn.start == pytest.approx(solved.start, abs=1e-9)
         assert drawn.stop == pytest.approx(solved.stop, abs=1e-9)
         assert drawn.propagation_axis == solved.propagation_axis
@@ -404,7 +446,7 @@ class TestTheDrawingIsTheSolversBox:
         solver drives as a slab, and the other way round would hide it."""
         port = lumped_pick(trace(), area=area)
         drawn = port_shape.port_box(port)
-        solved = self.built(port, PaddingXMin="Air", PaddingXMax="Air")
+        solved = self.built(port, BoundaryXMin="Open", BoundaryXMax="Open")
 
         assert drawn.start == pytest.approx(solved.start, abs=1e-9)
         assert drawn.stop == pytest.approx(solved.stop, abs=1e-9)
@@ -580,16 +622,48 @@ class TestAnUnfinishedPortHasNoBox:
     """
 
     def test_no_links_at_all(self):
-        port = microstrip_port(1, trace(), ground(), TraceEnd=None, GroundReference=None)
+        port = microstrip_port(1, trace(), ground(), TraceEnd=None, Ground=None)
         assert port_shape.port_box(port) is None
+        assert port_shape.why_not_drawn(port) == "TraceEnd is not picked"
+
+    def test_a_pick_naming_a_face_the_shape_does_not_have(self):
+        made = trace()
+        port = microstrip_port(1, made, ground(), TraceEnd=(made, ["Face9"]))
+        assert port_shape.port_box(port) is None
+        assert port_shape.why_not_drawn(port) == (
+            "TraceEnd names 'Trace' Face9, which has no shape"
+        )
+
+    def test_a_pick_shown_in_two_places_says_so(self):
+        """A pick with no one position is not a pick that names nothing."""
+        made = trace()
+
+        class Root:
+            Label = "Assembly"
+
+        made.Parents = [(Root(), "One.Trace."), (Root(), "Two.Trace.")]
+        port = microstrip_port(1, made, ground())
+        assert port_shape.port_box(port) is None
+        why = port_shape.why_not_drawn(port)
+        assert why.startswith("TraceEnd: ") and "more than one container" in why
 
     def test_an_axis_that_contradicts_the_geometry(self):
+        """Said in the words the box arithmetic refuses it in."""
         port = microstrip_port(1, trace(), ground(), ExcitationAxis="Z")
         assert port_shape.port_box(port) is None
+        with pytest.raises(portbox.BoxError) as refused:
+            port_shape._box(port)
+        assert port_shape.why_not_drawn(port) == str(refused.value)
 
     def test_both_axes_the_same(self):
         port = microstrip_port(1, trace(), ground(), PropagationAxis="Z")
         assert port_shape.port_box(port) is None
+        assert port_shape.why_not_drawn(port) == (
+            "PropagationAxis and ExcitationAxis are both along Z. Set them to different axes"
+        )
+
+    def test_a_port_that_is_drawn_says_nothing(self):
+        assert port_shape.why_not_drawn(microstrip_port(1, trace(), ground())) == ""
 
     def test_a_waveguide_referred_to_its_face_is_drawn_as_nothing(self):
         """The plane it is referred to is the face, so there is no depth to draw."""
@@ -599,6 +673,7 @@ class TestAnUnfinishedPortHasNoBox:
         port = next(obj for obj in doc.Objects if type(obj.Proxy).__name__ == "EMPortRectWaveguide")
         assert float(port.ReferenceDepth) == 0.0
         assert port_shape.port_box(port) is None
+        assert port_shape.why_not_drawn(port) == ""
 
     def test_one_referred_further_in_is_drawn_to_that_plane(self):
         from .test_openems_document_translation import waveguide_model
@@ -631,7 +706,9 @@ class TestAPortWithAShapeIsStillNotUserGeometry:
                 self.Object = obj
                 self.SubElementNames = []
 
-        assert references_from([Selected(self.port(doc))]) == []
+        from Microwave.Objects import createEMAnalysis
+
+        assert references_from([Selected(self.port(doc))], createEMAnalysis(doc)) == []
 
     def test_it_is_recognised_as_ours(self, doc):
         from Microwave.Objects.kinds import is_ours

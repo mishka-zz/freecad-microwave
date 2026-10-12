@@ -63,6 +63,9 @@ so each feature in the response has one cause. It starts at its own step,
 ``FREQ_STOP / POINTS``, which is what a step response needs and what
 ``Results.tdr`` refuses without.
 
+Its study carries an openEMS and a Palace solver, and either answers it as
+drawn. Select the one to run in the tree before pressing Run.
+
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
@@ -81,8 +84,11 @@ import FreeCAD
 
 from Microwave.Objects.analysis import createEMAnalysis, solver_of
 from Microwave.Objects.materials import createEMMaterial, createEMMaterialBinding
+from Microwave.Objects.mesh import createEMGmshMesh
 from Microwave.Objects.ports import createEMPortLumped
+from Microwave.Objects.solver import createEMSolverPalace
 from Microwave.Solvers.openems import document, preflight
+from Microwave.Solvers.palace import document as palace_document
 
 # Beside this file, so the shared stamp can be imported. freecadcmd runs a
 # script without putting its directory on the path.
@@ -209,7 +215,7 @@ def markup(analysis, board, plane, strips):
 
     copper = createEMMaterial("Copper")
     copper.Label = "Copper"
-    copper.MaterialType = "ConductingSheet"
+    copper.MaterialType = "Conducting Sheet"
     copper.Conductivity = COPPER_CONDUCTIVITY
     copper.Thickness = COPPER_THICKNESS
 
@@ -239,7 +245,7 @@ def markup(analysis, board, plane, strips):
         port.Number = number
         # Port 1 alone. The structure is its own mirror image, so the second
         # column would repeat the first.
-        port.Excitation = number == 1
+        port.Driven = number == 1
         port.Resistance = PORT_IMPEDANCE
         port.ReferenceImpedance = PORT_IMPEDANCE
         # The gap the resistor spans: from the trace's end edge down to the
@@ -251,12 +257,16 @@ def markup(analysis, board, plane, strips):
 
 
 def study(doc):
-    """The analysis, its solver and its mesh policy, all settings applied."""
+    """The analysis, its solvers and its mesh policy, all settings applied."""
     analysis = createEMAnalysis(doc)
+    # Palace answers this study as drawn, so it carries that backend's solver and
+    # tetrahedral mesh beside openEMS', as Add Palace Solver puts them in.
+    for made in (createEMSolverPalace(doc), createEMGmshMesh(doc)):
+        analysis.addObject(made)
     analysis.Label = "Stepped Low-Pass"
     analysis.FrequencyStart = f"{FREQ_STOP / POINTS} Hz"
     analysis.FrequencyStop = f"{FREQ_STOP} Hz"
-    analysis.NumFrequencyPoints = POINTS
+    analysis.FrequencyPoints = POINTS
 
     solver = solver_of(analysis)
     # A filter stores energy in its stopband and gives it back slowly, so the
@@ -286,6 +296,10 @@ def main(out):
         print(f"digest: {problem.digest()[:16]}")
         for finding in preflight.check(problem):
             print(f"  {finding}")
+
+    # Palace reads the same study, and refuses here what it cannot answer.
+    palace_document.problem(analysis)
+    print("palace: translates")
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     doc.saveAs(out)

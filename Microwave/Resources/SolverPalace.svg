@@ -1,7 +1,5 @@
-<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-  <rect x="8" y="8" width="48" height="48" rx="9" fill="none"
-        stroke="#37474f" stroke-width="5"/>
-  <path d="M32 19 L47 43 L17 43 Z" fill="#e8833a"/>
-  <path d="M32 19 L36 34 L47 43 M36 34 L17 43" fill="none" stroke="#37474f"
-        stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Solver (Palace): the solver frame, with the letter P. -->
+  <rect x="8" y="8" width="48" height="48" rx="9" fill="none" stroke="#607d8b" stroke-width="5"/>
+  <path d="M25 45 V19 H33 A7.5 7.5 0 0 1 33 34 H25" stroke="#e8833a" stroke-width="7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

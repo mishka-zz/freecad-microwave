@@ -10,6 +10,8 @@ fits inside the run it is given.
 
 from __future__ import annotations
 
+import math
+
 from .. import excitation
 from ..model import Problem
 from ..report import timestep_bound
@@ -19,18 +21,16 @@ from .finding import REFUSE, WARN, Finding
 def _check_reproducibility(problem: Problem) -> list[Finding]:
     if problem.termination.reproducible:
         return []
+    # openEMS tests the energy criterion only on a four-second wall-clock timer
+    # (openEMS/openems.cpp:1445), so a run shorter than that takes every step,
+    # and a longer one stops at the first test after the energy has fallen.
     return [
         Finding(
             WARN,
-            "termination",
-            f"energy termination is enabled (openEMS stops at a share of "
-            f"{problem.termination.end_criteria:g} of the peak), so this run is not "
-            "reproducible: openEMS tests that criterion only on a four-second "
-            "wall-clock timer (openEMS/openems.cpp:1445), so a run shorter than "
-            "that takes every step, and a longer one stops at the first test "
-            "after the energy has fallen, at a step count that depends on machine "
-            "load. Repeat the run and the numbers move. Set the solver's "
-            "EnergyDecay to 0 for anything that has to agree with itself twice",
+            "EnergyDecay",
+            f"it is {10 * math.log10(problem.termination.end_criteria):.3g} dB, so where "
+            "a run stops depends on machine load and a repeated run can give different "
+            "numbers. Set EnergyDecay to 0 for reproducible results",
         )
     ]
 
@@ -55,11 +55,10 @@ def _check_timestep_factor(problem: Problem) -> list[Finding]:
     return [
         Finding(
             WARN,
-            "timestep",
-            f"the timestep is scaled by {factor:g}, so {steps:,} steps cover "
-            f"{factor:g} times the simulated time they otherwise would. Raise "
-            f"MaxTimesteps to about {round(steps / factor):,} to keep the same "
-            "window, or the run may be cut off before the energy has decayed",
+            "TimestepFactor",
+            f"it is {factor:g}, so MaxTimesteps ({steps:,}) covers {factor:g} times the "
+            "simulated time it covers at 1, and the run may stop before the energy has "
+            f"decayed. To cover the same time, multiply MaxTimesteps by {1 / factor:.3g}",
         )
     ]
 
@@ -106,21 +105,18 @@ def _check_the_excitation_fits_the_run(problem: Problem) -> list[Finding]:
         return [
             Finding(
                 REFUSE,
-                "excitation",
-                f"{detail}. The run would stop "
-                f"{steps / needed:.0%} of the way through the pulse, which "
-                f"peaks at half, and still return a full S-matrix. Raise "
-                f"MaxTimesteps to at least "
-                f"{_PULSE_LENGTHS_WANTED * needed:,.0f}, or widen the band",
+                "MaxTimesteps",
+                f"{detail}, so the run would stop {max(steps / needed, 0.01):.0%} of the "
+                "way through the pulse and still return an S-matrix. Raise MaxTimesteps "
+                f"to at least {math.ceil(_PULSE_LENGTHS_WANTED * needed):,}, or widen the band",
             )
         ]
     return [
         Finding(
             WARN,
-            "excitation",
-            f"{detail}, so the run covers "
-            f"{steps / needed:.1f} excitation lengths. openEMS asks for "
-            f"{_PULSE_LENGTHS_WANTED}: the field has not finished being driven "
-            f"when the run stops",
+            "MaxTimesteps",
+            f"{detail}, so the run covers {steps / needed:.1f} excitation lengths "
+            f"of the {_PULSE_LENGTHS_WANTED} openEMS recommends. Raise MaxTimesteps to "
+            f"at least {math.ceil(_PULSE_LENGTHS_WANTED * needed):,}",
         )
     ]

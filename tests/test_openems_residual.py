@@ -597,6 +597,7 @@ class TestTheBarFollowsWhatIsBeingRead:
         """A message quoting the constant while the check used a scaled bar
         would send somebody after the wrong run length."""
         message = residual.unfinished({1: 1.0}, floor)
-        quoted = re.search(r"against the ([0-9.]+)%", message)
+        quoted = re.search(r"more than the ([0-9.]+)%", message)
         assert quoted, message
+        assert message.endswith(". Raise MaxTimesteps")
         assert float(quoted.group(1)) / 100 == pytest.approx(residual.WANTED * floor, rel=1e-6)

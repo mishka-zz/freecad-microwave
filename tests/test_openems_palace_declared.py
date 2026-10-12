@@ -56,6 +56,9 @@ def test_every_departure_is_named_in_one_refusal(restored, backend):
     assert said.startswith("TranslationError: ")
     assert f"{labels['policy']!r} has no Medium; " in said
     assert "carries ElementsPerWavelength 30.0, which this build does not declare" in said
-    assert "offers Air, Through for PaddingXMin where this build offers Air, Through, Ends" in said
+    assert (
+        "offers Open, Through for BoundaryXMin where this build offers Open, Through, PEC Wall"
+        in said
+    )
     assert f"{labels['port']!r} has no ReferenceDepth; carries Length 2.5 mm," in said
     assert f"{labels['material']!r} has no DispersionFrequency" in said

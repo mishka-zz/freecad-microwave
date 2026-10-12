@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import math
+import pathlib
 import sys
 import types
 from dataclasses import replace
@@ -923,7 +924,7 @@ class TestHowTheLossIsModelled:
         assert "an absorbing layer 8/0/8/8/0/8 cells deep" in line
 
     def test_a_face_the_ports_open_is_recorded_as_absorbing(self):
-        """An Ends face waveguide ports cover absorbs beyond the ports' plane, so
+        """A PEC Wall face waveguide ports cover absorbs beyond the ports' plane, so
         a domain whose only absorbing faces are those has an outside."""
         from Microwave.Results import modelled
         from Microwave.Solvers.openems import driver
@@ -983,6 +984,21 @@ class TestWhatASolveSaysAboutItsOwnRecords:
             if line.startswith(f"{driver.MARKER}CHECK")
         ]
         assert any(f" {problem.solids[0].label}: openEMS gave this " in line for line in said)
+
+    def test_a_run_records_the_steps_openems_says_it_took(self, fake_engine, tmp_path, monkeypatch):
+        """openEMS writes its step count only when asked to dump its statistics,
+        so the run asks, and the count reaches the record."""
+        from Microwave.Solvers.openems import driver
+
+        def run(self, sim_path, cleanup=False, **kw):
+            self.run_args = (sim_path, cleanup, kw)
+            if kw.get("dump_statistics"):
+                (pathlib.Path(sim_path) / driver.STATISTICS_NAME).write_text(
+                    "777\t% number of iterations\n"
+                )
+
+        monkeypatch.setattr(FakeFDTD, "Run", run)
+        assert self.solved(tmp_path)["provenance"]["timesteps"] == 777
 
     def test_a_run_openems_could_not_set_up_is_refused(self, fake_engine, tmp_path, monkeypatch):
         """``openEMS.Run`` prints the code ``SetupFDTD`` refused with and returns
@@ -1126,9 +1142,10 @@ class TestANumberEveryWaveNeedsThatIsNotANumberRefusesTheRun:
         with pytest.raises(driver.NotANumber) as raised:
             driver.solve(_two_port(), tmp_path)
 
-        assert str(raised.value).startswith(
-            f"port {number}'s {quantity} probe {self.named} recorded a value that is not "
-            f"a number at 1 of 4096 samples, the first at {self.at * 1e9:.6g} ns."
+        assert str(raised.value) == (
+            f"port {number}'s {quantity} probe {self.named} recorded an invalid value "
+            f"at 1 of 4096 samples, the first at {self.at * 1e9:.6g} ns, so the run "
+            "returns no S-parameters"
         )
         assert not (tmp_path / driver.RESULTS_NAME).exists()
         assert "max_timesteps" not in capsys.readouterr().out
@@ -1163,7 +1180,7 @@ class TestANumberEveryWaveNeedsThatIsNotANumberRefusesTheRun:
             driver.solve(_two_port(), tmp_path)
 
         assert str(raised.value) == (
-            "port 2 states no finite reference impedance at 5 frequency points from "
+            "port 2 has no finite reference impedance at 5 frequency points from "
             "1.54 to 8.74 GHz, so no S-parameter there can be normalised"
         )
         assert not (tmp_path / driver.RESULTS_NAME).exists()
@@ -1185,8 +1202,11 @@ class TestANumberEveryWaveNeedsThatIsNotANumberRefusesTheRun:
             driver.solve(problem, tmp_path)
 
         said = str(raised.value)
-        assert said.startswith("port 2 states no finite reference impedance at 51 frequency")
-        assert "a lumped port drives states none at any point" in said
+        assert said.startswith("port 2 has no finite reference impedance at 51 frequency")
+        assert said.endswith(
+            ". A microstrip port has none at any point in a run a lumped port drives. "
+            "Drive the microstrip port instead, or make both ports the same kind"
+        )
 
     def test_but_not_where_it_states_one_at_some_points(self, fake_engine, tmp_path, monkeypatch):
         """What was measured is none at every point, so a port missing some is
@@ -1503,10 +1523,9 @@ class TestAWaveguidePortIsReadAtItsOwnScales:
                 tmp_path, headers=(), problem=replace(problem, frequency=Frequency(on, 20e9, 41))
             )
         assert str(raised.value) == (
-            f"port 1 states no finite reference impedance at {on / 1e9:.9g} GHz, so no "
+            f"port 1 has no finite reference impedance at {on / 1e9:.9g} GHz, so no "
             "S-parameter there can be normalised. That point lies exactly on its TE10 "
-            "cutoff, where beta is zero and the impedance has no bound. Move the band so "
-            "no point falls on it"
+            "cutoff. Move the band so no point falls on it"
         )
 
         above = np.nextafter(on, np.inf)
@@ -1538,9 +1557,9 @@ class TestAWaveguidePortIsReadAtItsOwnScales:
         with pytest.raises(driver.NotANumber) as raised:
             self.solved(tmp_path, problem=replace(problem, frequency=Frequency(on, 20e9, 41)))
         assert str(raised.value).startswith(
-            f"port 1 states no finite reference impedance at {on / 1e9:.9g} GHz"
+            f"port 1 has no finite reference impedance at {on / 1e9:.9g} GHz"
         )
-        assert "exactly on the cutoff of the guide the grid holds" in str(raised.value)
+        assert "exactly on the cutoff of the guide as meshed" in str(raised.value)
 
     def test_every_port_left_as_read_names_the_one_that_could_not_be(self, fake_engine, tmp_path):
         guide = self.guide(second=True)
@@ -1927,8 +1946,10 @@ class TestAWaveguidePortIsReadAgainInsideItsBox:
         assert shares[1] == pytest.approx(2 * shares[0], rel=1e-9, abs=0.0)
         checks = self.checks(capsys)
         assert len(checks) == 2
-        assert all("severity=warn" in c and "largest part of it at port 1" in c for c in checks)
-        assert all("Draw the port farther" in c and "may be right" not in c for c in checks)
+        assert all("severity=warn" in c and "mostly at port 1" in c for c in checks)
+        assert all(
+            "Draw the port farther" in c and "may leave the matrix right" not in c for c in checks
+        )
 
     def test_a_difference_growing_toward_the_source_says_the_matrix_may_be_right(
         self, fake_engine, tmp_path, capsys, monkeypatch
@@ -1942,7 +1963,7 @@ class TestAWaveguidePortIsReadAgainInsideItsBox:
         )
         assert results["provenance"]["near_field"]["side"] == "behind"
         [check] = self.checks(capsys)
-        assert "grows with depth faster" in check and "may then be right" in check
+        assert "grows toward the source faster" in check and "may leave the matrix right" in check
 
     def test_a_port_not_driven_is_weighed_against_the_power_driven_in(
         self, fake_engine, tmp_path, monkeypatch
@@ -2046,9 +2067,11 @@ class TestAWaveguidePortIsReadAgainInsideItsBox:
         results = self.reading.solved(tmp_path, inside=())
         port = results["provenance"]["near_field"]["ports"]["1"]
         assert port["missed"] is True
-        assert port["reason"].startswith("it is not read 4 cells into its box: its probe file")
+        assert port["reason"].startswith(
+            "its plane 4 cells into its box cannot be read: its probe file"
+        )
         checks = self.checks(capsys)
-        assert len(checks) == 1 and "port 1 is not weighed" in checks[0]
+        assert len(checks) == 1 and "port 1 is not checked" in checks[0]
 
     @staticmethod
     def unreadable(monkeypatch, prefix):
@@ -2080,10 +2103,10 @@ class TestAWaveguidePortIsReadAgainInsideItsBox:
         assert "S11" in results["s_parameters"]
         port = results["provenance"]["near_field"]["ports"]["1"]
         assert port == {
-            "reason": "it is not read 4 cells into its box: inside_port_ut_1 not found",
+            "reason": "its plane 4 cells into its box cannot be read: inside_port_ut_1 not found",
             "missed": True,
         }
-        assert any("port 1 is not weighed" in c for c in self.checks(capsys))
+        assert any("port 1 is not checked" in c for c in self.checks(capsys))
 
     def test_a_shallower_plane_that_recorded_nothing_leaves_the_port_weighed_at_one(
         self, fake_engine, tmp_path, monkeypatch
@@ -2108,7 +2131,7 @@ class TestAWaveguidePortIsReadAgainInsideItsBox:
             "missed": True,
         }
         checks = self.checks(capsys)
-        assert len(checks) == 1 and "port 1 is not weighed" in checks[0]
+        assert len(checks) == 1 and "port 1 is not checked" in checks[0]
 
     def test_a_box_two_cells_deep_is_read_one_cell_in_and_cannot_place_the_change(
         self, fake_engine, tmp_path, capsys, monkeypatch
@@ -2773,7 +2796,7 @@ class TestTheMediumFillsEveryCellNoSolidCovers:
     def test_it_stops_at_a_face_the_domain_ends_on_where_ports_open_the_absorber(
         self, fake_engine, tmp_path
     ):
-        """The absorber beyond an Ends face carries on the guide behind the
+        """The absorber beyond a PEC Wall face carries on the guide behind the
         ports' plane, which openEMS reads as empty, so it is left to vacuum."""
         problem = _in_ptfe(_waveguide())
         params = dict(problem.grid.params, padding=[["0", "0"], ["0", "0"], ["0", "0"]])

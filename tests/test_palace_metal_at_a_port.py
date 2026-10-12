@@ -96,7 +96,8 @@ def refused(run_manifest, drawing):
 def test_a_sheet_dividing_a_ports_face_is_refused_naming_the_port_and_the_sheet(
     run_manifest, drawing
 ):
-    assert "divides, whose parts carry 2 modes" in refused(run_manifest, drawing)
+    assert "its face, divided by " in refused(run_manifest, drawing)
+    assert ", carries 2 modes" in refused(run_manifest, drawing)
 
 
 @pytest.mark.parametrize("drawing", APART)

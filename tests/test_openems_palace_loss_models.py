@@ -48,9 +48,9 @@ def filed(tmp_path_factory, interpreter):
     return manifest
 
 
-@pytest.mark.parametrize("backend", ["openEMS", "Palace"])
-def test_each_result_is_filed_under_its_backend(filed, backend):
-    assert filed[backend]["label"] == f"S-Parameters ({backend})"
+@pytest.mark.parametrize(("backend", "number"), [("openEMS", 1), ("Palace", 2)])
+def test_each_result_is_filed_in_a_run_of_its_backend(filed, backend, number):
+    assert filed[backend]["label"] == f"S-Parameters (run {number}, {backend})"
 
 
 def test_openems_states_the_loss_tangent_folded_at_the_centre_of_the_band(filed):
@@ -90,7 +90,9 @@ def test_the_first_filed_has_nothing_to_compare_with(filed):
 def test_the_second_filed_names_both_materials_the_two_modelled_otherwise(filed):
     said = [line for line in filed["Palace"]["beside"] if " is not one model" in line]
     assert sorted(line.split(" is not one model")[0] for line in said) == ["'Brass'", "'LossyFill'"]
-    assert all(": Palace solved " in line and ", and openEMS " in line for line in said)
+    assert all(
+        ": Run 2 (Palace) solved " in line and ", and Run 1 (openEMS) " in line for line in said
+    )
 
 
 def test_both_answers_are_filed_as_solved_from_one_drawing(filed):

@@ -4,9 +4,8 @@
 # Copy it next to your own catalogs to use it as a starting point - change the
 # [catalog] id if you do, or the copy will refuse to load beside this one.
 #
-# Nominal values, not datasheets. Every number here is a reasonable default for
-# a first pass; a board you are going to build is characterised by its own
-# laminate's numbers, from the fabricator who will make it.
+# Nominal values for a first pass. For a board you will build, use the values
+# of its laminate from the fabricator who makes it.
 
 schema = 1
 
@@ -14,7 +13,7 @@ schema = 1
 id = "generic"
 name = "Generic"
 version = "2026-07-30"
-description = "Common substrates and conductors at nominal values. Starting points for a first pass, not a substitute for your fabricator's datasheet."
+description = "Common substrates and conductors at nominal values, for a first pass. For a board you build, use the fabricator's datasheet."
 
 # --- substrates -------------------------------------------------------------
 
@@ -34,7 +33,7 @@ epsilon_r = 4.3
 loss_tangent = 0.025
 measured_at = 1.0e9
 color = "#218B22"
-description = "Nominal epoxy-glass laminate. FR4 is a flammability class, not a specification: permittivity spreads roughly 4.1 to 4.7 with weave and resin content, and falls with frequency."
+description = "Nominal epoxy-glass laminate. Permittivity varies from about 4.1 to 4.7 with weave and resin content, and falls with frequency."
 
 [[material]]
 id = "pvc"
@@ -44,7 +43,7 @@ epsilon_r = 2.9
 loss_tangent = 0.008
 measured_at = 1.0e6
 color = "#D8D8C0"
-description = "Rigid polyvinyl chloride. An enclosure and cable-jacket material rather than a microwave substrate, poorly characterised above a few hundred MHz."
+description = "Rigid polyvinyl chloride, for enclosures and cable jackets. Its values above a few hundred MHz are poorly known."
 
 [[material]]
 id = "ptfe"
@@ -68,14 +67,11 @@ description = "99.6% Al2O3 ceramic substrate."
 
 # --- conductors -------------------------------------------------------------
 #
-# Every conductor here carrying a conductivity is a sheet, and a sheet has to be
-# drawn as a flat face. In FDTD a trace is a surface: the thickness below is a
-# loss parameter feeding the surface impedance rather than geometry that reaches
-# the grid, and openEMS applies that impedance only to a shape spanning two axes.
-# Bind one of these to something drawn with thickness and it is refused, because
-# the engine would silently solve a perfect conductor instead. For a conductor
-# that has to be a solid - a machined wall, a curved foil - take one of the
-# perfect-conductor entries at the end and read the answer as lossless.
+# Each conductor here with a conductivity is a sheet: bind it to a flat face.
+# Its thickness sets the loss and is not drawn. Bound to a shape with thickness
+# it is refused, since openEMS would solve that shape as a perfect conductor.
+# For a solid conductor - a machined wall, a curved foil - use a perfect-conductor
+# entry at the end, and read the result as lossless.
 
 [[material]]
 id = "copper"

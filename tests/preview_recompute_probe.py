@@ -228,10 +228,8 @@ def _counted(path, out):
         if hasattr(found.solver, name) and not _fixed(found.solver, name):
             cases[name] = _case(doc, preview, partial(_bump, found.solver, name))
     if found.ports:
-        cases["Excitation"] = _case(doc, preview, partial(_bump, found.ports[0], "Excitation"))
-    cases["NumFrequencyPoints"] = _case(
-        doc, preview, partial(_bump, analysis, "NumFrequencyPoints")
-    )
+        cases["Driven"] = _case(doc, preview, partial(_bump, found.ports[0], "Driven"))
+    cases["FrequencyPoints"] = _case(doc, preview, partial(_bump, analysis, "FrequencyPoints"))
 
     cases["nothing at all"] = _case(doc, preview, lambda: None)
     # Membership moves the grid and no property announces it, so the study
@@ -290,15 +288,15 @@ def _counted(path, out):
     )
     # And the policy beside it, which is a different link. With only the grid
     # edited, dropping the policy from what Gui/openems_mesh_preview.py::_link
-    # records would leave this sweep green while a count across a substrate
-    # moved the grid and nothing said so.
+    # records would leave this sweep green while the room past a face moved the
+    # grid and nothing said so.
     cases["the mesh policy"] = _case(
         doc,
         preview,
         lambda: setattr(
             found.settings,
-            "MinElementsAcross",
-            int(found.settings.MinElementsAcross) + 2,
+            "Clearance",
+            float(found.settings.Clearance) + 1.0,
         ),
     )
     if solid is not None and hasattr(solid, "Length"):
@@ -306,12 +304,11 @@ def _counted(path, out):
             doc, preview, lambda: setattr(solid, "Length", float(solid.Length) + 0.1)
         )
     # Last, because it leaves the study holding something the drawing was not
-    # made from. A region created after Update Mesh is in no link list, so
+    # made from. A region created after Mesh is in no link list, so
     # nothing about it reaches the preview - not the addition, and not one
-    # later edit to its element size, across a save and until the next Update
-    # Mesh.
+    # later edit to its element size, across a save and until the next Mesh.
     cases["a region arriving"] = _case(
-        doc, preview, partial(analysis.addObject, mesh.createEMMeshRegion(doc))
+        doc, preview, partial(analysis.addObject, mesh.createEMMeshRegion(doc, found.recipe))
     )
     # And into a subgroup of the study, which is where the study hears
     # _GroupTouched rather than Group. Sorting objects into one is ordinary
@@ -320,7 +317,7 @@ def _counted(path, out):
     analysis.addObject(subgroup)
     openems_mesh_preview._mark_current(preview)
     cases["a region arriving in a subgroup"] = _case(
-        doc, preview, partial(subgroup.addObject, mesh.createEMMeshRegion(doc))
+        doc, preview, partial(subgroup.addObject, mesh.createEMMeshRegion(doc, found.recipe))
     )
 
     FreeCAD.closeDocument(doc.Name)

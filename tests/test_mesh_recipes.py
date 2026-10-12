@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -51,7 +52,20 @@ RETIRED_AIR_CELLS = tuple(f"AirCells{face}" for face in FACES)
 #: is a different accuracy on the two methods, and the two do not share a shape
 #: of dependence on it - so a user comparing them states the same numbers to
 #: both and reads the difference as the physics rather than as the settings.
-SHARED_BY_EVERY_RECIPE = ("ElementsPerWavelength", "EdgeRefinement", "MaxGrowthRatio")
+SHARED_BY_EVERY_RECIPE = (
+    "ElementsPerWavelength",
+    "EdgeRefinement",
+    "MaxGrowthRatio",
+    "MinElementsAcross",
+    "MinElementSize",
+)
+
+#: The defaults every recipe arrives at for the two bounds it states in
+#: elements rather than per wavelength.
+BOUNDS = {"MinElementsAcross": 9, "MinElementSize": 0.0}
+
+#: What lies beyond the structure, which is the problem's and so the policy's.
+DOMAIN = ("CurveTolerance", "Clearance", "Medium", *(f"Boundary{f}" for f in FACES))
 
 #: ``(factory, class, everything it carries, the value each arrives at, what it
 #: must not carry)``. The fourth column is every property rather than a sample:
@@ -61,21 +75,12 @@ KINDS = [
     (
         createEMMeshPolicy,
         EMMeshPolicy,
+        set(DOMAIN),
         {
-            "MinElementsAcross",
-            "CurveTolerance",
-            "MinElementSize",
-            "Clearance",
-            "Medium",
-            *(f"Padding{f}" for f in FACES),
-        },
-        {
-            "MinElementsAcross": 9,
             "CurveTolerance": 0.0,
-            "MinElementSize": 0.0,
             "Clearance": 0.0,
             "Medium": None,
-            **{f"Padding{face}": "Air" for face in FACES},
+            **{f"Boundary{face}": "Open" for face in FACES},
         },
         {*SHARED_BY_EVERY_RECIPE, *RETIRED_AIR_CELLS},
     ),
@@ -87,62 +92,44 @@ KINDS = [
             "ElementsPerWavelength": 20.0,
             "EdgeRefinement": 6.0,
             "MaxGrowthRatio": 1.3,
+            **BOUNDS,
         },
         # The air round the structure is a length on the policy. A count of
         # cells was this pipeline standing in for it.
-        {
-            "MinElementsAcross",
-            "CurveTolerance",
-            "MinElementSize",
-            "Clearance",
-            "Medium",
-            *RETIRED_AIR_CELLS,
-            *(f"Padding{f}" for f in FACES),
-        },
+        {*DOMAIN, *RETIRED_AIR_CELLS},
     ),
     (
         createEMGmshMesh,
         EMGmshMesh,
         {*SHARED_BY_EVERY_RECIPE, "ElementsPerTurn"},
         {
-            "ElementsPerWavelength": 20.0,
+            "ElementsPerWavelength": 4.0,
             "EdgeRefinement": 8.0,
             "ElementsPerTurn": 6,
             "MaxGrowthRatio": 1.6,
+            **BOUNDS,
         },
         # No air. This pipeline meshes bodies somebody drew, and what bounds an
         # open problem is a condition on a face of one of them.
-        {
-            "MinElementsAcross",
-            "CurveTolerance",
-            "MinElementSize",
-            "Clearance",
-            "Medium",
-            *RETIRED_AIR_CELLS,
-            *(f"Padding{f}" for f in FACES),
-        },
+        {*DOMAIN, *RETIRED_AIR_CELLS},
     ),
 ]
 
 #: What a refinement region carries. A length and a count at a place the user
-#: named are statements about the device, so the region is on the problem and
-#: both backends read it through one reader.
-REGION = ("Mode", "References", "ElementSize", "MinElementsAcross", "Enabled")
+#: named are counted in one pipeline's elements, so a region amends the recipe
+#: ``MeshSettings`` links, and both backends read it through one reader.
+REGION = ("MeshSettings", "Mode", "References", "ElementSize", "MinElementsAcross", "Enabled")
 
 KINDS.append(
     (
         createEMMeshRegion,
         EMMeshRegion,
         set(REGION),
-        {"Mode": "Refine", "ElementSize": 0.0, "MinElementsAcross": 0},
+        {"MeshSettings": None, "Mode": "Refine", "ElementSize": 0.0, "MinElementsAcross": 0},
         {
-            *SHARED_BY_EVERY_RECIPE,
+            *(name for name in SHARED_BY_EVERY_RECIPE if name != "MinElementsAcross"),
             *RETIRED_AIR_CELLS,
-            "CurveTolerance",
-            "MinElementSize",
-            "Clearance",
-            "Medium",
-            *(f"Padding{f}" for f in FACES),
+            *DOMAIN,
         },
     )
 )
@@ -221,10 +208,10 @@ class TestEachKindDeclaresItsOwnSurface:
         from Microwave.Solvers.openems import policy as fdtd
         from Microwave.Solvers.palace import policy as fem
 
-        offered = createEMMeshPolicy(doc).getEnumerationsOfProperty("PaddingXMin")
-        assert list(offered) == [objects.AIR, objects.THROUGH, objects.ENDS]
-        assert tuple(offered) == (fdtd.AIR_FACE, fdtd.THROUGH_FACE, fdtd.ENDS_FACE)
-        assert (fem.AIR, fem.ENDS) == (objects.AIR, objects.ENDS)
+        offered = createEMMeshPolicy(doc).getEnumerationsOfProperty("BoundaryXMin")
+        assert list(offered) == [objects.OPEN, objects.THROUGH, objects.PEC_WALL]
+        assert tuple(offered) == (fdtd.OPEN_FACE, fdtd.THROUGH_FACE, fdtd.PEC_WALL_FACE)
+        assert tuple(offered) == (fem.OPEN_FACE, fem.THROUGH, fem.PEC_WALL_FACE)
 
     def test_the_two_recipes_spell_their_shared_demands_the_same_way(self, doc):
         """Deliberate, and the reason is in ``SHARED_BY_EVERY_RECIPE``. What
@@ -351,7 +338,7 @@ class TestNoMeshPropertyIsANoOp:
         whose name merely begins with a prefix the adapter does build names
         from.
         """
-        invented = ["ThoroughlyImaginary", "Paddingfor"]
+        invented = ["ThoroughlyImaginary", "Boundaryfor"]
         assert _unread(invented, ADAPTERS / backend) == sorted(invented)
 
     def test_no_adapter_names_a_property_of_the_other_pipelines_recipe(self, doc):
@@ -398,12 +385,12 @@ class TestNoMeshPropertyIsANoOp:
     def test_that_net_sees_a_name_an_adapter_does_build(self, doc):
         """Its own guard, and the half that is easy to lose.
 
-        ``Padding{face}`` is built with an f-string, so a reader matching
+        ``Boundary{face}`` is built with an f-string, so a reader matching
         attributes alone would find it nowhere and pass whatever any adapter
         did with it. It is found in an adapter that builds it, which is what
         says the same read would be found in one that does not own it.
         """
-        faces = sorted(f"Padding{face}" for face in FACES)
+        faces = sorted(f"Boundary{face}" for face in FACES)
         assert _named(faces, ADAPTERS / "openems") == faces
         assert _named(["ThoroughlyImaginary"], ADAPTERS / "openems") == []
 
@@ -425,9 +412,11 @@ class TestAStudyWithoutItsRecipeIsRefusedByName:
 
         doc = model()
         removes(doc, "YeeGrid")
-        with pytest.raises(document.TranslationError, match="holds no Yee grid") as raised:
+        with pytest.raises(
+            document.TranslationError,
+            match=re.escape("holds no openEMS mesh settings. Press Add openEMS Solver to add them"),
+        ):
             document.problem(doc.Objects[0])
-        assert "Add openEMS Solver" in str(raised.value)
 
     def test_the_palace_adapter_names_the_command_that_adds_the_mesh(self):
         from Microwave.Solvers.errors import TranslationError
@@ -437,9 +426,9 @@ class TestAStudyWithoutItsRecipeIsRefusedByName:
 
         study, _ = guide()
         study.Group = [obj for obj in study.Group if kind(obj) != "EMGmshMesh"]
-        with pytest.raises(TranslationError, match="holds no Gmsh mesh") as raised:
+        with pytest.raises(TranslationError, match="holds no Palace mesh settings") as raised:
             contents(study)
-        assert "Add Palace Solver" in str(raised.value)
+        assert str(raised.value).endswith("Press Add Palace Solver to add one")
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +473,7 @@ class TestEachPropertyMovesTheOpenemsRun:
         from .test_openems_document_translation import mesh_settings
 
         params = self.params(
-            settings=mesh_settings(Clearance=4.5, **{f"Padding{face}": "Air" for face in FACES}),
+            settings=mesh_settings(Clearance=4.5, **{f"Boundary{face}": "Open" for face in FACES}),
         )
         assert [[float(face) for face in axis] for axis in params["padding"]] == [[4.5, 4.5]] * 3
 
@@ -505,7 +494,7 @@ class TestEachPropertyMovesTheOpenemsRun:
         """One face, because the fixture is a line: padded on every face, the
         absorber eats the board's own thickness and the mesher refuses it.
 
-        Each of the three values reaches the domain as its own thing. ``Ends``
+        Each of the three values reaches the domain as its own thing. ``PEC Wall``
         is air with no room in it - the domain stops on the structure and the
         absorber is added beyond - where ``Through`` takes the absorber out of
         the structure's own extent, and the mesher lays a different grid at the
@@ -516,9 +505,9 @@ class TestEachPropertyMovesTheOpenemsRun:
         air = self.params()["padding"][1][1]
         assert float(air) > 0.0
         assert self.params()["padding"][1] == [air, air]
-        through = self.params(settings=mesh_settings(PaddingYMin="Through", PaddingYMax="Air"))
+        through = self.params(settings=mesh_settings(BoundaryYMin="Through", BoundaryYMax="Open"))
         assert through["padding"][1] == ["through", air]
-        ends = self.params(settings=mesh_settings(PaddingYMin="Ends", PaddingYMax="Air"))
+        ends = self.params(settings=mesh_settings(BoundaryYMin="PEC Wall", BoundaryYMax="Open"))
         assert ends["padding"][1] == ["0", air]
 
     def test_a_padding_value_no_backend_knows_is_refused_by_name(self):
@@ -530,19 +519,19 @@ class TestEachPropertyMovesTheOpenemsRun:
 
         from .test_openems_document_translation import mesh_settings, model
 
-        doc = model(settings=mesh_settings(PaddingYMin="Snug"))
-        with pytest.raises(document.TranslationError, match="PaddingYMin is 'Snug'"):
+        doc = model(settings=mesh_settings(BoundaryYMin="Snug"))
+        with pytest.raises(document.TranslationError, match="BoundaryYMin is 'Snug'"):
             document.problem(doc.Objects[0])
 
     def test_the_count_across_a_dielectric_reaches_the_mesher(self):
-        from .test_openems_document_translation import mesh_settings
+        from .test_openems_document_translation import yee_grid
 
-        assert self.params(settings=mesh_settings(MinElementsAcross=15))["min_lines"] == 15
+        assert self.params(grid=yee_grid(MinElementsAcross=15))["min_lines"] == 15
 
     def test_the_floor_on_element_size_reaches_the_mesher(self):
-        from .test_openems_document_translation import mesh_settings
+        from .test_openems_document_translation import yee_grid
 
-        assert self.params(settings=mesh_settings(MinElementSize=0.004))["min_cell"] == (
+        assert self.params(grid=yee_grid(MinElementSize=0.004))["min_cell"] == (
             pytest.approx(0.004)
         )
 
@@ -615,9 +604,9 @@ class TestEachPropertyMovesThePalaceRun:
         assert asked.growth == pytest.approx(1.7)
 
     def test_the_floor_on_element_size_reaches_the_mesher(self):
-        from .test_palace_adapter import mesh_settings
+        from .test_palace_adapter import gmsh_mesh
 
-        assert self.asked(settings=mesh_settings(MinElementSize=0.01)).finest == 0.01
+        assert self.asked(recipe=gmsh_mesh(MinElementSize=0.01)).finest == 0.01
 
     def test_the_count_across_a_body_is_answered_with_the_size_it_reached(self):
         """No size on tetrahedra is a count, so the run says what it laid
@@ -628,8 +617,8 @@ class TestEachPropertyMovesThePalaceRun:
         from .test_palace_adapter import gmsh_mesh, mesh_settings
 
         (record,) = unlaid(
-            mesh_settings(MinElementsAcross=15),
-            gmsh_mesh(EdgeRefinement=1.0),
+            mesh_settings(),
+            gmsh_mesh(EdgeRefinement=1.0, MinElementsAcross=15),
             self.asked(),
             ["AirFill"],
             (),
@@ -657,14 +646,14 @@ class TestEachPropertyMovesThePalaceRun:
 
         from .test_palace_adapter import mesh_settings
 
-        settings = mesh_settings(PaddingYMax="Air")
+        settings = mesh_settings(BoundaryYMax="Open")
         assert opens(settings) == ("YMax",)
         assert self.asked(settings=settings) == self.asked()
 
     def test_a_study_left_at_the_defaults_is_open_rather_than_walled_in(self, doc):
         """Against the real document classes, because it is what a command makes.
 
-        Every face defaults to ``Air``, which describes a radiating structure. A
+        Every face defaults to ``Open``, which describes a radiating structure. A
         study answered by this backend alone holds no Yee grid at all, and it is
         open on every face: a domain the policy says is open, solved against a
         perfect conducting wall, is a clean run about another device.

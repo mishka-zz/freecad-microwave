@@ -87,24 +87,10 @@ would earn it is a characterised substrate, and there is not one.
 Where the tolerance comes from
 ------------------------------
 
-:data:`CORNER_TOLERANCE` is argued from the reference, never from the result,
-which is the rule the other gates here follow:
-
-- **The figure is published to two significant figures.** "2.5 GHz" is any
-  corner that rounds to 2.5, so the reference cannot locate itself better than
-  about a fiftieth however good the instrument was. That is the one of the three
-  which is arithmetic rather than judgement, and it is computed rather than
-  written down: see :data:`REFERENCE_HALF_WIDTH`.
-- **The laminate is nominal.** ``eps_r = 4.4`` and ``tan_d = 0.02`` are what FR4
-  is called, not what that sheet measured. How far the corner moves when the
-  permittivity does is no longer guessed at here either - it is solved for, and
-  printed on a ``GATE`` line.
-- **The narrow sections are 0.4 mm wide.** A normal etch tolerance is a
-  meaningful fraction of that, and those two sections carry the largest
-  electrical lengths in the filter.
-
-Added in quadrature those come to rather less than the tolerance set, which is
-deliberate: a gate that sits exactly on its own error budget fails on weather.
+From the reference, never from the result, and once for every backend:
+``tests/lowpass_reading.py`` argues :data:`CORNER_TOLERANCE` and derives
+:data:`REFERENCE_HALF_WIDTH`. How far the corner moves when the permittivity
+does is solved for here, and printed on a ``GATE`` line.
 
 The board the solver is given, and the board the paper dimensions
 ------------------------------------------------------------------
@@ -200,8 +186,14 @@ from Microwave.Solvers.openems.model import (
 )
 from Microwave.Solvers.openems.regions import MeshParams
 from Microwave.Solvers.openems.report import timestep_bound
-from tests import convergence, published, validation
+from tests import convergence, lowpass_reading, published, validation
 from tests.analytic import reference
+from tests.lowpass_reading import (
+    CORNER_TOLERANCE,
+    REFERENCE_HALF_WIDTH,
+    first_crossing,
+    passband_db,
+)
 
 pytestmark = pytest.mark.slow
 
@@ -262,16 +254,6 @@ FREQ_MIN = FREQ_MAX / POINTS
 #: :func:`test_the_response_had_finished_when_the_run_stopped` is what says
 #: whether this is enough, and is where it is set from.
 RECORD_SECONDS = 6.6e-9
-
-#: Argued in the module docstring, from the reference and not from the answer.
-CORNER_TOLERANCE = 0.05
-
-#: What the published corner is worth as an interval, in Hz. A figure printed to
-#: two places stands for every value that rounds to it, so the reference cannot
-#: locate itself better than half of its last digit however good the network
-#: analyser under it was. Derived, not declared: the count of figures is the
-#: transcription, and the width follows from it and from the figure itself.
-REFERENCE_HALF_WIDTH = 0.5 * 10.0 ** (np.floor(np.log10(PAPER.corner)) - (PAPER.corner_figures - 1))
 
 # Both resolutions derived, never written as constants: a constant
 # under-resolves silently the moment the permittivity, the band or the board
@@ -498,43 +480,9 @@ def matrix(solved) -> SParameters:
     return SParameters.from_runs([solved], reference=PAPER.system)
 
 
-#: The top of the passband, for the purpose of measuring a corner from it. Well
-#: below the corner and well clear of the first sample, so it is a stretch of
-#: response rather than one point of it.
-PASSBAND_TO = 1e9
-
-
 def transmission_db(matrix) -> tuple[np.ndarray, np.ndarray]:
     """Frequency in Hz and ``|S21|`` in dB, as the paper plots them."""
     return matrix.frequency, 20.0 * np.log10(np.abs(matrix.parameter(2, 1)))
-
-
-def passband_db(frequency, decibels) -> float:
-    """What the filter does where it is meant to be doing nothing.
-
-    The best of the band rather than its mean, which is what makes
-    :data:`PASSBAND_TO` a loose parameter instead of a tuned one: on a response
-    that only falls, the maximum is unchanged by how much of the roll-off's
-    shoulder the window happens to include, and a mean is not.
-    """
-    inside = decibels[frequency < PASSBAND_TO]
-    assert inside.size, f"no samples below {PASSBAND_TO / 1e9:g} GHz to call a passband"
-    return float(inside.max())
-
-
-def first_crossing(frequency, decibels, level) -> float:
-    """Where ``decibels`` first falls through ``level``, interpolated linearly.
-
-    Linear in dB against linear in frequency, which is what reading a corner off
-    a plotted response does.
-    """
-    below = np.flatnonzero(decibels <= level)
-    assert below.size, f"the response never reaches {level} dB"
-    index = int(below[0])
-    assert index > 0, f"the response starts below {level} dB; there is no corner in the sweep"
-    high, low = decibels[index - 1], decibels[index]
-    fraction = (high - level) / (high - low)
-    return float(frequency[index - 1] + fraction * (frequency[index] - frequency[index - 1]))
 
 
 def corner_of(result) -> float:
@@ -545,8 +493,7 @@ def corner_of(result) -> float:
     a proxy for it.
     """
     matrix = SParameters.from_runs([result], reference=PAPER.system)
-    frequency, decibels = transmission_db(matrix)
-    return first_crossing(frequency, decibels, passband_db(frequency, decibels) - 3.0)
+    return lowpass_reading.corner(*transmission_db(matrix))
 
 
 @pytest.fixture(scope="module")
@@ -625,27 +572,6 @@ def conducting_width(grid, drawn: float) -> float:
     intact is one the adapter would agree about.
     """
     return drawn * width_spanned(np.asarray(grid[1]), -drawn / 2, drawn / 2)
-
-
-def test_the_reference_interval_is_what_the_printed_figure_stands_for():
-    """:data:`REFERENCE_HALF_WIDTH` against the property it is meant to have.
-
-    The interval is the set of corners that would have been printed the way this
-    one was, so the test is a round trip through that printing: a value just
-    inside it rounds back to the published figure, and one just outside rounds to
-    a different figure. Asserting the property rather than the number means the
-    transcription and the arithmetic have to agree with each other, and neither
-    is restated here.
-    """
-
-    def printed(value: float) -> str:
-        return f"%.{PAPER.corner_figures - 1}e" % value
-
-    published_as = printed(PAPER.corner)
-    for reach in (0.999, -0.999):
-        assert printed(PAPER.corner + reach * REFERENCE_HALF_WIDTH) == published_as
-    for reach in (1.001, -1.001):
-        assert printed(PAPER.corner + reach * REFERENCE_HALF_WIDTH) != published_as
 
 
 @pytest.mark.parametrize("coarsen", COARSENINGS)

@@ -55,8 +55,11 @@ from ...portbox import AXIS_NAMES
 from .config import Filling, Sweep
 
 __all__ = [
+    "FLOORED",
     "OPEN",
+    "SETTLED",
     "SPACE",
+    "UNREFINED",
     "Bare",
     "Beside",
     "Coarsening",
@@ -69,6 +72,8 @@ __all__ = [
     "Joined",
     "LossyConductor",
     "LumpedFeed",
+    "Narrow",
+    "Narrowed",
     "Reserved",
     "Sealed",
     "Plane",
@@ -262,7 +267,8 @@ class Plane:
 
 @dataclass(frozen=True)
 class RegionMark:
-    """One thing a refinement region names, as the mesher is handed it.
+    """One thing a refinement region names, or one edge of a narrow sheet of
+    metal, as the mesher is handed it.
 
     The shape itself rather than a box round it, handed over as a mark: it is
     cut up with the drawing and claims nothing of it, and the region's size is
@@ -275,13 +281,31 @@ class RegionMark:
         holds a solid, two a face, one an edge, and nought only points.
     :param shape: the shape, where the drawing shows it.
     :param thinnest: the smallest side of the box round the shape, in
-        millimetres, which a count across the region is said against.
+        millimetres, which a count across the region is said against, and
+        nothing for an edge of a narrow sheet, which no count is said against.
     """
 
     name: str
     dimension: int
     shape: Any
     thinnest: float
+
+
+@dataclass(frozen=True)
+class Narrow:
+    """An edge of a sheet of metal that faces another edge of it across the
+    sheet or across a slot in it, as the mark it is handed over as.
+
+    :param rim: the label of the metal.
+    :param drawn: the label of the drawn object the edge lies on.
+    :param apart: how far off the nearest edge it faces stands, in millimetres.
+    :param mark: the edge.
+    """
+
+    rim: str
+    drawn: str
+    apart: float
+    mark: RegionMark
 
 
 @dataclass(frozen=True)
@@ -317,10 +341,10 @@ class Refinement:
 
 @dataclass(frozen=True)
 class CountAcross:
-    """The mesh policy's count of elements across each region, which no size
+    """The mesh settings' count of elements across each region, which no size
     here expresses.
 
-    :param subject: the mesh policy's label.
+    :param subject: the mesh settings' label.
     :param count: the count asked for.
     :param labels: the regions it is asked of.
     """
@@ -429,20 +453,20 @@ class Unrefining:
 
 @dataclass(frozen=True)
 class Floored:
-    """A refinement region whose size is below the policy's floor, laid at the
+    """A refinement region whose size is below the mesh settings' floor, laid at the
     floor.
 
     :param subject: the region's label.
     :param size: its element size, in millimetres.
-    :param policy: the mesh policy's label.
-    :param floor: the policy's floor, in millimetres.
+    :param settings: the label of the mesh settings stating the floor.
+    :param floor: the mesh settings' floor, in millimetres.
     :param places: the name of each thing the region names, as the mesh reports
         it.
     """
 
     subject: str
     size: float
-    policy: str
+    settings: str
     floor: float
     places: tuple[str, ...]
 
@@ -459,7 +483,7 @@ class Creases:
     :param wall: the rest of the boundary, whose creases carry none of it: the
         sides of a box, which the room stands inside.
     :param size: the size the refinement asks for at a rim, in millimetres.
-    :param floor: the policy's floor, which a rim is laid at where ``size`` is
+    :param floor: the mesh settings' floor, which a rim is laid at where ``size`` is
         below it.
     :param coarsened: the labels of the metal whose edges carry none of it because a
         coarsening settles them at or above the size everywhere. Each is said
@@ -476,8 +500,46 @@ class Creases:
 
 
 @dataclass(frozen=True)
+class Narrowed:
+    """Where the count across a narrow sheet of metal is laid at its edges, and
+    where it is not.
+
+    :param subject: the Gmsh mesh's label.
+    :param refinement: its ``EdgeRefinement``.
+    :param across: how many elements are asked across the distance two facing
+        edges stand apart.
+    :param rim: the size laid at the edges of metal, in millimetres, or the size
+        in the slowest region where ``refinement`` is one.
+    :param laid: each edge a size is laid at: its mark's name, how far apart it
+        stands, and the size.
+    :param unlaid: each drawn object holding edges that stand closer than the
+        count asks and carry no finer size, with the least distance apart, the
+        size its edges are laid at, and why: :data:`UNREFINED`,
+        :data:`SETTLED` or :data:`FLOORED`.
+    :param settled: the labels of the metal a coarsening settles, with the size.
+    :param bodies: each label of metal drawn as bodies whose box is narrower
+        across its middle side than the count asks, with that side.
+    """
+
+    subject: str
+    refinement: float
+    across: int
+    rim: float
+    laid: tuple[tuple[str, float, float], ...] = ()
+    unlaid: tuple[tuple[str, float, float, str], ...] = ()
+    settled: tuple[tuple[str, float], ...] = ()
+    bodies: tuple[tuple[str, float], ...] = ()
+
+
+#: Why an edge of a narrow sheet carries no finer size: ``EdgeRefinement`` lays
+#: none, a coarsening settles its metal, or the floor under every element is the
+#: size at the rim.
+UNREFINED, SETTLED, FLOORED = "unrefined", "settled", "floored"
+
+
+@dataclass(frozen=True)
 class Unreserved:
-    """A clearance stated on a study with no ``Air`` face, which reserves no
+    """A clearance stated on a study with no ``Open`` face, which reserves no
     free space for it to measure.
 
     :param subject: the mesh policy's label.
@@ -511,6 +573,7 @@ Unlaid = (
     | Unrefining
     | Floored
     | Creases
+    | Narrowed
     | Unreserved
     | Unfilled
 )
@@ -522,7 +585,7 @@ class Beside:
 
     The box is flush with the structure on every side the policy does not open,
     so what the drawing does not cover there is reserved air. That air carries
-    the condition the side carries: a perfect wall on an ``Ends`` side, and a
+    the condition the side carries: a perfect wall on a ``PEC Wall`` side, and a
     magnetic wall on a ``Through`` side, where it is the rest of a lumped port's
     plane.
 
@@ -594,11 +657,11 @@ class Reserved:
     """The room reserved round the structure, and the sides of it that are open.
 
     The room is a box round everything bound to a material, grown by the
-    clearance on each face the mesh policy says ``Air`` on and flush with the
+    clearance on each face the mesh policy says ``Open`` on and flush with the
     structure on every other. A study is open where it has such a face. Every
     part of the box no bound body stands in is the study's medium, handed over
     as the one region :data:`SPACE` at :data:`BACKGROUND_PRIORITY`, except the
-    room metal seals off from the model. Each ``Air`` side of the box is a
+    room metal seals off from the model. Each ``Open`` side of the box is a
     rectangle drawn from the corners of the part of the box the model lies in,
     which stops where the drawing reaches on each side the domain ends on, and
     the rectangles together are
@@ -678,7 +741,7 @@ class Bare:
         square millimetres.
     :param side: the side of the study the face lies toward, as
         ``{axis}{side}``, where it stands at the structure's own extreme along
-        that axis, and empty otherwise. Setting that side to ``Ends`` keeps the
+        that axis, and empty otherwise. Setting that side to ``PEC Wall`` keeps the
         face walled.
     """
 

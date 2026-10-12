@@ -8,17 +8,17 @@ from typing import Any
 
 import FreeCAD
 
-from ._vp_hook import ViewProviderRestored
+from ._vp_hook import SharesLabel, ViewProviderRestored
 
-#: What ``EMMeshPolicy.Padding{axis}{side}`` may say about a face of the domain.
+#: What ``EMMeshPolicy.Boundary{axis}{side}`` may say about a face of the domain.
 #: Each is a statement about the problem rather than about a method: what lies
 #: beyond the structure there. A backend that cannot build free space refuses
-#: :data:`AIR` and takes the other two. The adapters repeat these strings rather
+#: :data:`OPEN` and takes the other two. The adapters repeat these strings rather
 #: than importing them, because this module sits behind ``import FreeCAD``, and
-#: ``tests/test_openems_document_translation.py`` holds the copies to these.
-AIR = "Air"
+#: ``tests/test_mesh_recipes.py`` holds the copies to these.
+OPEN = "Open"
 THROUGH = "Through"
-ENDS = "Ends"
+PEC_WALL = "PEC Wall"
 
 
 class EMMeshRegion(ViewProviderRestored):
@@ -75,56 +75,71 @@ class EMMeshRegion(ViewProviderRestored):
     is laid at those edges where every face the metal's bindings name is
     coarsened, and a gap along them is meshed as the edges are.
 
-    This object is neutral, like every object in this layer. "Element" covers an
-    FDTD cell, a MoM segment and an FEM tetrahedron, and all three meshers size
-    locally. Each backend decides what to do with it.
+    A region amends one pipeline's recipe, the one ``MeshSettings`` names, and
+    only that pipeline reads it. One size is a different accuracy on each
+    method, so the same place refined for two backends is two regions, each
+    sized for its own. "Element" covers an FDTD cell, a MoM segment and an FEM
+    tetrahedron, so the words here are the same whichever recipe it amends.
     """
 
     def __init__(self, obj):
+        # A link from the region rather than a list on the recipe, so a region
+        # deleted takes nothing else with it. A recipe deleted leaves the link
+        # empty, and each adapter refuses a region that amends nothing.
+        obj.addProperty(
+            "App::PropertyLink",
+            "MeshSettings",
+            "Refinement",
+            "Mesh settings this region amends. Only the solver that reads them uses the region",
+        )
+
         obj.addProperty(
             "App::PropertyEnumeration",
             "Mode",
             "Refinement",
-            "Whether this makes the elements around its geometry finer, or lets"
-            " that geometry settle for coarser ones",
+            "Refine: elements at References no larger than ElementSize. Coarsen:"
+            " References settles for ElementSize in place of the finer size it asks for",
         )
         obj.Mode = ["Refine", "Coarsen"]
 
         # LinkSubList, matching EMMaterialBinding.References. A refinement
         # region is as likely to be aimed at a face as at a whole solid.
+        #
+        # A coarsening on a tetrahedral mesh is laid at the edges of a metal
+        # only where the coarsenings name every face that metal's bindings
+        # name, so the tooltip asks for every such face.
         obj.addProperty(
             "App::PropertyLinkSubList",
             "References",
             "Refinement",
-            "The geometry this is aimed at. Refining sizes it: a rectilinear"
-            " grid refines every line across its bounding box, and a tetrahedral"
-            " mesh sizes the geometry itself and grows away from it. Coarsening"
-            " lets what a material binding asks of it settle for ElementSize,"
-            " where the coarsenings name everything the bindings of that metal name",
+            "Geometry this region applies to. On openEMS, Refine refines every"
+            " grid line across its bounding box; on Palace it sizes the geometry"
+            " itself and grows away from it. To coarsen a metal on Palace, name"
+            " every face its material bindings name",
         )
 
         obj.addProperty(
             "App::PropertyLength",
             "ElementSize",
             "Refinement",
-            "Target element size. Refining, it must be finer than the global"
-            " size the backend's own recipe sets with ElementsPerWavelength;"
-            " coarsening, it is the size this geometry settles for",
+            "Element size at References. Refine: must be smaller than the size"
+            " ElementsPerWavelength sets in the mesh settings. Coarsen: the size"
+            " References settles for",
         )
         obj.ElementSize = 0.0
 
-        # Zero inherits EMMeshPolicy.MinElementsAcross. It takes that value but
-        # not that rule: the global count covers dielectrics only, so a region is
+        # Zero inherits MinElementsAcross from MeshSettings. It takes that value but
+        # not that rule: the settings' count covers dielectrics only, so a region is
         # also how a conductor gets a count when one is wanted. A 50 um bond
-        # layer and a 1.6 mm core also want different counts, which one global
-        # integer cannot express.
+        # layer and a 1.6 mm core also want different counts, which the one
+        # count on the settings cannot express.
         obj.addProperty(
             "App::PropertyInteger",
             "MinElementsAcross",
             "Refinement",
-            "Fewest elements across this region, on every axis it has extent on"
-            " (0 = inherit the global count). A count asks for resolution, so it"
-            " belongs to Refine only",
+            "Fewest elements across References on each axis it spans (0 = the"
+            " MinElementsAcross of the mesh settings). Refine only: leave it at 0"
+            " to Coarsen",
         )
         obj.MinElementsAcross = 0
 
@@ -138,6 +153,20 @@ class EMMeshRegion(ViewProviderRestored):
 
         obj.Proxy = self
 
+    def onChanged(self, obj, prop):
+        """Ask the tree to show the region under the settings it now amends.
+
+        The tree reads an object's children again only when a property of that
+        object changes, and this one changes the region alone.
+        """
+        if prop != "MeshSettings":
+            return
+        from .analysis import analysis_of, renest
+
+        study = analysis_of(obj)
+        if study is not None:
+            renest(study)
+
     def execute(self, obj):
         pass
 
@@ -148,21 +177,17 @@ class EMMeshRegion(ViewProviderRestored):
         return None
 
 
-class EMMeshPolicy(ViewProviderRestored):
-    """Mesh policy: what the device asks of any mesh, whatever lays it.
+class EMMeshPolicy(SharesLabel, ViewProviderRestored):
+    """Mesh policy: the problem every backend of the study solves.
 
-    Everything here is a demand about the problem. A count across a drawn
-    feature, a distance a curved surface may be solved from, a floor against a
-    sliver, and what lies beyond the structure on each face of the domain. None
-    of them names a primitive of a method's discretisation, so each is
-    answerable by every backend reading this object alone, in the unit it was
-    stated in, and each is refused or reported by name where a backend cannot
-    meet it.
-
-    "Element" rather than "cell" throughout. A cell is FDTD's word, a segment is
-    MoM's and a tetrahedron is FEM's, and all three backends read this object,
-    so it is not named after any one of them. Inside ``Solvers/openems/`` the
-    FDTD words are correct and are used.
+    Everything here is a statement about the problem: what lies beyond the
+    structure on each face of the domain, how far the medium reaches past it,
+    what fills it, and a distance a curved surface may be solved from. None
+    names a primitive of a method's discretisation, so each is answerable by
+    every backend reading this object alone, in the unit it was stated in, and
+    each is refused or reported by name where a backend cannot meet it. Every
+    backend of a study reads this one object, so two backends solve one problem
+    and their answers compare.
 
     What one meshing pipeline does about it is that pipeline's own object:
     ``EMYeeGrid`` for the rectilinear grid openEMS is solved on, ``EMGmshMesh``
@@ -175,25 +200,13 @@ class EMMeshPolicy(ViewProviderRestored):
     recipe. It is a length, and a count of cells was one pipeline standing in
     for it.
 
-    Local refinement is absolute rather than per wavelength, because it resolves
-    a feature, whose scale is millimetres, rather than the wave, whose scale is
-    lambda. See ``EMMeshRegion``.
+    A count of elements across a dielectric, a floor under every element and
+    the local refinements are each pipeline's own, on its recipe: each names
+    elements, and one number of elements is a different accuracy on each
+    method.
     """
 
     def __init__(self, obj):
-        # MSL_Losses.m spans its substrate with linspace(0, thickness, 10). A
-        # thin substrate carries the whole field, so one element across it
-        # states a different problem rather than approximating this one.
-        # Dielectrics only: a conductor has no field inside it to sample, and
-        # spanning a foil with this count sets the smallest element in the model.
-        obj.addProperty(
-            "App::PropertyInteger",
-            "MinElementsAcross",
-            "Mesh",
-            "Fewest elements through a dielectric with thickness",
-        )
-        obj.MinElementsAcross = 9
-
         # Zero asks for nothing. A curved surface reaches a solver as flat facets
         # whose chords lie off the arc, and the CAD kernel decides for itself how
         # close it comes to the drawing: wide bands of requests come back as one
@@ -213,61 +226,49 @@ class EMMeshPolicy(ViewProviderRestored):
             "App::PropertyLength",
             "CurveTolerance",
             "Mesh",
-            "How far a curved surface may be solved from where it was drawn"
-            " (0 = whatever the CAD kernel gives unasked). Costs facets, and"
-            " refuses if it cannot be reached",
+            "Largest distance a curved surface may be solved from where it was"
+            " drawn (0 = FreeCAD's own faceting). A smaller value costs facets, and"
+            " a run refuses one it cannot reach",
         )
         obj.CurveTolerance = 0.0
-
-        # Zero means derive it. This is a floor against degenerate geometry: a
-        # 1 um sliver from a CAD boolean sets the timestep for the whole
-        # simulation. It is not a way to shape the grid. Set anywhere near the
-        # element sizes, it starts refusing features the user is entitled to
-        # mesh.
-        obj.addProperty(
-            "App::PropertyLength",
-            "MinElementSize",
-            "Mesh",
-            "Hard floor on element size (0 = derive it from the edge size)",
-        )
-        obj.MinElementSize = 0.0
 
         # Per-face, and not inferred. What each value does to a domain made of
         # cells, and why a line needs Through, is in openems.policy._padding.
         #
         # Each says what is beyond the drawing on that face, and each backend
-        # answers it: Air is the medium reserved beyond the face, Through a
-        # structure running on without end, and Ends a perfect wall on the drawn
-        # face. Air is first, so it is the default, because a structure nobody
+        # answers it: Open is the medium reserved beyond the face, Through a
+        # structure running on without end, and PEC Wall a perfect wall on the
+        # drawn face. Open is first, so it is the default, because a structure nobody
         # has said anything about is one with room around it.
         for axis in ["X", "Y", "Z"]:
             for side in ["Min", "Max"]:
-                pname = f"Padding{axis}{side}"
+                pname = f"Boundary{axis}{side}"
                 obj.addProperty(
                     "App::PropertyEnumeration",
                     pname,
                     "Domain",
-                    f"What lies beyond the structure on {axis}{side}: Air for the"
-                    " medium running out to an absorber, Through for the structure"
-                    " running out through the absorber, Ends for a domain that stops"
-                    " where the structure does with a perfect wall on that face",
+                    f"What lies beyond the structure on its {axis}{side} side. Open:"
+                    " the medium, out to an absorber. Through: the structure runs on"
+                    " through the absorber. PEC Wall: the domain ends at the"
+                    " structure, with a perfect conductor on that face",
                 )
-                setattr(obj, pname, [AIR, THROUGH, ENDS])
+                setattr(obj, pname, [OPEN, THROUGH, PEC_WALL])
 
         # A length rather than a count of anything, because the distance is the
         # problem's and every backend that builds open space pads by it. Zero
         # derives it from the band, and Solvers/properties.py::clearance is the
         # rule and the calibration behind it. A face that wants no room at all
-        # is Ends, so zero is free to mean "derived".
+        # is PEC Wall, so zero is free to mean "derived". The derived distance
+        # stands the same share of a wavelength off at the top of every band, so
+        # it reflects a radiated wave by a fixed amount whatever the band, and a
+        # radiator wants more.
         obj.addProperty(
             "App::PropertyLength",
             "Clearance",
             "Domain",
-            "How far the medium reaches past the structure on each Air face"
-            " (0 = derived: 0.4 of the wavelength in the medium at the top of the"
-            " band). The derived value stands the same share of a wavelength off"
-            " at the top of every band, so it reflects a radiated wave by a fixed"
-            " amount whatever the band - a radiator wants more",
+            "Distance from the structure to each Open face of the domain (0 = 0.4"
+            " of the wavelength in the medium at the top of the band). Set a larger"
+            " value for a radiator",
         )
         obj.Clearance = 0.0
 
@@ -280,9 +281,8 @@ class EMMeshPolicy(ViewProviderRestored):
             "App::PropertyLink",
             "Medium",
             "Domain",
-            "The material filling every space no bound body fills, out to the"
-            " domain's faces and through the absorber (empty = vacuum). A"
-            " Dielectric; a body drawn and bound stands over it",
+            "Dielectric that fills all space no bound body fills, out to the"
+            " domain faces and through the absorber (empty = vacuum)",
         )
 
         obj.Proxy = self
@@ -297,7 +297,7 @@ class EMMeshPolicy(ViewProviderRestored):
         return None
 
 
-class EMMeshRecipe(ViewProviderRestored):
+class EMMeshRecipe(SharesLabel, ViewProviderRestored):
     """Base for one meshing pipeline's own settings. Not a kind of its own.
 
     A recipe holds the primitives of one method's discretisation: what only
@@ -316,7 +316,31 @@ class EMMeshRecipe(ViewProviderRestored):
     that is on purpose. A user comparing two backends on one drawing states the
     same numbers to both, and what differs is the accuracy each reaches at them
     rather than the words. Each tooltip names the pipeline that reads it.
+
+    A recipe holds in the tree the refinement regions that name it in
+    ``MeshSettings``, since each amends what the recipe lays.
     """
+
+    def add_element_bounds(self, obj, across, floor):
+        """The count across a dielectric and the floor under every element,
+        which every pipeline states and each reads as its own elements.
+        ``across`` and ``floor`` are the two tooltips, which say what this
+        pipeline does with each."""
+        # MSL_Losses.m spans its substrate with linspace(0, thickness, 10). A
+        # thin substrate carries the whole field, so one element across it
+        # misses that field rather than approximating it.
+        # Dielectrics only: a conductor has no field inside it to sample, and
+        # spanning a foil with this count sets the smallest element in the model.
+        obj.addProperty("App::PropertyInteger", "MinElementsAcross", "Mesh", across)
+        obj.MinElementsAcross = 9
+
+        # Zero means derive it. This is a floor against degenerate geometry: a
+        # sliver from a CAD boolean would otherwise set the smallest element in
+        # the model. It is not a way to shape the mesh. Set anywhere near the
+        # element sizes, it starts refusing features the user is entitled to
+        # mesh.
+        obj.addProperty("App::PropertyLength", "MinElementSize", "Mesh", floor)
+        obj.MinElementSize = 0.0
 
     def execute(self, obj):
         pass
@@ -383,6 +407,12 @@ class EMYeeGrid(EMMeshRecipe):
         )
         obj.MaxGrowthRatio = 1.3
 
+        self.add_element_bounds(
+            obj,
+            "Fewest cells across the thickness of each dielectric",
+            "Smallest cell allowed, so a sliver left by a boolean cannot set the cell"
+            " size (0 = derived from the cell size at conductor edges)",
+        )
         self.declare_what_moves_no_cell(obj)
 
         obj.Proxy = self
@@ -395,12 +425,11 @@ class EMGmshMesh(EMMeshRecipe):
     every axis and the size is laid as a field over the drawing, so a size asked
     for at one place reaches only as far as the growth below carries it.
 
-    No air. How far the medium stands off is ``Clearance`` on the policy, and
-    the Palace adapter refuses a face stated ``Air`` by name.
+    No air. How far the medium stands off is ``Clearance`` on the policy.
 
-    A count across a thickness is not here either, and it is on the policy
-    rather than gone: an element size here is the same along every axis, so the
-    run states the count it did not lay with the size the mesh reached.
+    ``MinElementsAcross`` asks for a count across a thickness, and an element
+    size here is the same along every axis, so the run states a count it did not
+    lay with the size the mesh reached.
 
     The refinement and the growth below are chosen together, and the other
     recipe's are not these: one number means a cell's neighbour there and the
@@ -426,13 +455,15 @@ class EMGmshMesh(EMMeshRecipe):
             "Mesh",
             "Elements per wavelength in the slowest material, at the top of the band",
         )
-        obj.ElementsPerWavelength = 20.0
+        # Fewer than the grid's, because an element carries a polynomial of the
+        # solver's order across itself where a Yee cell carries a constant, so
+        # its error falls with the order as well as with its size.
+        obj.ElementsPerWavelength = 4.0
         obj.addProperty(
             "App::PropertyFloat",
             "EdgeRefinement",
             "Mesh",
-            "How many times finer than bulk the elements are at an edge of metal the field is "
-            "singular along",
+            "How many times smaller than bulk the elements are at the sharp edges of metal",
         )
         obj.EdgeRefinement = 8.0
 
@@ -447,8 +478,8 @@ class EMGmshMesh(EMMeshRecipe):
             "App::PropertyInteger",
             "ElementsPerTurn",
             "Mesh",
-            "Elements round a full turn of a curved surface, where that is finer than the "
-            "wavelength asks (0 = size by the wavelength alone)",
+            "Elements per full turn of a curved surface, where that is finer than"
+            " ElementsPerWavelength asks (0 = size by the wavelength alone)",
         )
         obj.ElementsPerTurn = 6
 
@@ -481,6 +512,13 @@ class EMGmshMesh(EMMeshRecipe):
         )
         obj.MaxGrowthRatio = 1.6
 
+        self.add_element_bounds(
+            obj,
+            "Fewest elements across the thickness of each dielectric. The run does"
+            " not lay this count, and reports it beside the element size reached",
+            "Smallest element allowed, so a sliver left by a boolean cannot set the"
+            " element size (0 = derived from the element size in the slowest material)",
+        )
         self.declare_what_moves_no_cell(obj)
 
         obj.Proxy = self
@@ -506,7 +544,7 @@ def createEMYeeGrid(doc: Any = None) -> Any:
 
     obj = doc.addObject("App::FeaturePython", "EMYeeGrid")
     EMYeeGrid(obj)
-    obj.Label = "Yee Grid"
+    obj.Label = "Mesh Settings (openEMS)"
 
     from ._vp_hook import inject_view_provider
 
@@ -520,7 +558,7 @@ def createEMGmshMesh(doc: Any = None) -> Any:
 
     obj = doc.addObject("App::FeaturePython", "EMGmshMesh")
     EMGmshMesh(obj)
-    obj.Label = "Gmsh Mesh"
+    obj.Label = "Mesh Settings (Palace)"
 
     from ._vp_hook import inject_view_provider
 
@@ -528,31 +566,81 @@ def createEMGmshMesh(doc: Any = None) -> Any:
     return obj
 
 
-def references_from(selection: Iterable[Any]) -> list[tuple[Any, list[str]]]:
-    """What a link may be aimed at, out of whatever the user had picked.
+def references_from(selection: Iterable[Any], study: Any) -> list[tuple[Any, list[str]]]:
+    """What a link from inside ``study`` may be aimed at, out of whatever the
+    user had picked.
 
     Read by both objects that point at geometry: a refinement region and a
     material binding.
 
     Geometry only. A refinement region resolves a feature, and a material is
     what a solid is made of, so pointing either at a mesh policy or at a study
-    means nothing. Pointing one at its own analysis closes a cycle in FreeCAD's
-    dependency graph, because group membership is itself a link: container to
-    member, and member back to container. FreeCAD then prints "The graph must be
-    a DAG" and cannot order the recompute. Nothing warns, and the model quietly
-    stops settling.
+    means nothing.
+
+    Nothing that depends on ``study``. Group membership is itself a link, from
+    the study to each member, so a link from a member to an object that reaches
+    the study closes a cycle in FreeCAD's dependency graph. FreeCAD then prints
+    "The graph must be a DAG" and cannot order the recompute. Nothing warns,
+    and the model quietly stops settling. :func:`reaching` names what this
+    leaves out for that reason.
+
+    The picks of one object are gathered into one entry.
 
     A whole object is written ``[""]`` rather than ``[]``. FreeCAD silently
     drops a ``LinkSubList`` entry with an empty sub-element list on assignment,
     leaving the object referencing nothing.
     """
-    references: list[tuple[Any, list[str]]] = []
+    gathered: dict[int, tuple[Any, list[str]]] = {}
     for chosen in selection:
         obj = getattr(chosen, "Object", chosen)
-        if not _is_geometry(obj):
+        if not _is_geometry(obj) or _reaches(obj, study):
             continue
-        references.append((obj, list(getattr(chosen, "SubElementNames", ())) or [""]))
-    return references
+        names = gathered.setdefault(id(obj), (obj, []))[1]
+        names.extend(getattr(chosen, "SubElementNames", ()) or [""])
+    return [(obj, _whole_or_named(names)) for obj, names in gathered.values()]
+
+
+def _whole_or_named(names: list[str]) -> list[str]:
+    """One object's picks as one entry: ``[""]`` where it was picked whole,
+    which covers every element of it, and its elements otherwise."""
+    return [""] if "" in names else list(dict.fromkeys(names))
+
+
+def reaching(selection: Iterable[Any], study: Any) -> list[str]:
+    """The label of each object picked that reaches ``study``, which
+    :func:`references_from` leaves out, so a command can say why."""
+    return list(
+        dict.fromkeys(
+            str(obj.Label)
+            for obj in (getattr(chosen, "Object", chosen) for chosen in selection)
+            if _is_geometry(obj) and _reaches(obj, study)
+        )
+    )
+
+
+def cycle_note(labels: Iterable[str]) -> str:
+    """What a command says of the picks :func:`reaching` names."""
+    labels = list(labels)
+    named = ", ".join(repr(name) for name in labels)
+    if len(labels) == 1:
+        depends, it, was = "depends", "it", "it was"
+    else:
+        depends, it, was = "depend", "them", "they were"
+    return (
+        f"{named} {depends} on the study, so {was} left out of References: a link to "
+        f"{it} from inside the study makes a cycle FreeCAD cannot recompute"
+    )
+
+
+def _reaches(obj: Any, study: Any) -> bool:
+    """Whether ``obj`` depends on ``study``.
+
+    An object reaches a study through more than a group: an ``App::LinkGroup``
+    holds its members as links, a ``Part::Compound`` names its parts, and an
+    expression reads a property. ``OutListRecursive`` lists everything an
+    object reaches through any of those, in other documents as well.
+    """
+    return any(each is study for each in getattr(obj, "OutListRecursive", None) or ())
 
 
 def _is_geometry(obj: Any) -> bool:
@@ -560,22 +648,22 @@ def _is_geometry(obj: Any) -> bool:
 
     The ``Shape`` test alone is not enough. ``EMMeshPreview`` is a
     ``Part::FeaturePython``, so it has a shape, and it is a group member like
-    any other.
+    any other. A ``PartDesign::Body`` and an ``App::Part`` carry a ``Group``
+    beside their ``Shape``, and are drawn geometry.
     """
     from .kinds import is_ours
 
-    if is_ours(obj):
-        return False
-    if getattr(obj, "Group", None) is not None:
-        return False
-    return getattr(obj, "Shape", None) is not None
+    return not is_ours(obj) and getattr(obj, "Shape", None) is not None
 
 
-def createEMMeshRegion(doc: Any = None) -> Any:
+def createEMMeshRegion(doc: Any = None, settings: Any = None) -> Any:
+    """A refinement region amending ``settings``, unowned. The analysis files it
+    away."""
     doc = doc or FreeCAD.ActiveDocument
     obj = doc.addObject("App::FeaturePython", "EMMeshRegion")
     EMMeshRegion(obj)
     obj.Label = "Mesh Refinement"
+    obj.MeshSettings = settings
 
     from ._vp_hook import inject_view_provider
 

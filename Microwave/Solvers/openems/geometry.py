@@ -137,19 +137,20 @@ class Departure:
             # The line names no side. Where a wall moves in and a bore moves out
             # the two cancel, so which way the remainder points is a property of
             # the cancellation rather than of either surface.
+            # The figure is the difference between how far the surfaces moved.
+            # On a hollow shape it is smaller than either wall moved by about the
+            # ratio of the shape to its own wall.
             return (
-                f"{label} curves both ways, so what a volume can say about it is "
-                f"{abs(self.displaced):.4g} mm - the difference between however "
-                "far its surfaces moved, which is a lower bound on each of them "
-                "and says nothing about which way either went. On a hollow shape "
-                "it is smaller than either wall moved by about the ratio of the "
-                "shape to its own wall."
+                f"{label} curves both ways, so {abs(self.displaced):.4g} mm is only a "
+                "lower bound on how far each of its surfaces is solved from the "
+                "drawing, in either direction."
             )
         side = "inside" if self.displaced > 0.0 else "outside"
+        # A chord cuts the arc it stands for, and some facets cut deeper than
+        # the average.
         return (
             f"{label} is solved {abs(self.displaced):.4g} mm {side} the drawing, "
-            "averaged over the part of its surface that curves - a chord cuts "
-            "the arc it stands for, and some facets cut deeper than others."
+            "averaged over its curved surface. Some facets lie further off."
         )
 
 
@@ -372,9 +373,10 @@ def solid_boxes(
     shape = picks.placed(obj) if shape is None else shape
     if shape is None:
         raise TranslationError(
-            f"{_label(obj)!r} has no shape, so there is nothing to mesh. "
-            "Material bindings must reference solid geometry"
+            f"{_label(obj)!r} has no shape, so there is nothing to mesh. Bind the "
+            "material to an object that has one"
         )
+    _refuse_edges_beside(shape, _label(obj))
     if skin is None:
         # A dielectric drawn as a closed surface fills the volume inside it, and
         # taken as that solid it is cut into the boxes a solid is cut into.
@@ -382,18 +384,49 @@ def solid_boxes(
             filled = drawn.filling(shape)
         except drawn.Unmeasured as failed:
             raise TranslationError(
-                f"{_label(obj)!r} is drawn as closed surfaces, and the CAD kernel could "
-                f"not make a solid of them: {failed}. Check it with Part's Check geometry"
+                f"{_label(obj)!r} is drawn as closed surfaces, and FreeCAD could not make "
+                f"a solid of them: {failed}. Run Part > Check geometry on it"
             ) from None
+        # The drawing does not say whether such a face is meant as a volume or
+        # as a surface.
         if filled is not None and filled is not shape and drawn.loose(shape):
             raise TranslationError(
                 f"{_label(obj)!r} holds closed surfaces and faces that bound no volume, so "
-                "it is part volume and part surface. Which of the two a face is meant to "
-                "be cannot be read from the drawing. Bind them separately, or leave the "
+                "it is part volume and part surface. Bind them separately, or leave the "
                 "faces out"
             )
         shape = shape if filled is None else filled
     return _boxes_of(shape, _label(obj), skin, held_to)
+
+
+def _refuse_edges_beside(shape: Any, label: str) -> None:
+    """Refuse a shape holding edges or points of its own beside its faces.
+
+    A material fills an area or a volume, and the boxes a shape is cut into
+    hold its faces and solids alone, so an edge or a point beside them would be
+    left out of the run. A shape holding no face at all is refused as edges by
+    :func:`_cut_up`.
+    """
+    faces = getattr(shape, "Faces", None) or ()
+    if not faces:
+        return
+    edges, points = drawn.stray(shape)
+    if not edges and not points:
+        return
+    solids = list(getattr(shape, "Solids", None) or ())
+    if solids:
+        held = "a solid" if len(solids) == 1 else f"{len(solids)} solids"
+    else:
+        held = "a face" if len(faces) == 1 else f"{len(faces)} faces"
+    apart = " and ".join(
+        f"{len(found)} {name}{'' if len(found) == 1 else 's'}"
+        for found, name in ((edges, "edge"), (points, "point"))
+        if found
+    )
+    raise TranslationError(
+        f"{label!r} holds {held} and {apart} outside its faces. Edges and points carry "
+        "no material. Hide the object that draws them, or remove it from the compound"
+    )
 
 
 def _boxes_of(
@@ -429,19 +462,27 @@ def _boxes_of(
     """
     solids = list(getattr(shape, "Solids", None) or ())
 
+    # Every face has to belong to one of the solids, or decomposing would emit
+    # the solids and drop the rest without saying so, and one solid would be
+    # read as a surface left open by the faces beside it. A loose face in among
+    # them is a drawn sheet, and losing it is a run that completes and answers
+    # about a structure with no ground plane in it.
+    loose = len(drawn.outside(shape, solids)) if solids else 0
+    if loose:
+        faces = f"{loose} face{'' if loose == 1 else 's'}"
+        held = (
+            f"{len(solids)} solids and {faces} outside them"
+            if len(solids) > 1
+            else f"a solid and {faces} outside it"
+        )
+        # The drawing does not say whether such a face is meant as a volume or
+        # as a surface.
+        raise TranslationError(
+            f"{label!r} holds {held}, so it is part volume and part surface. "
+            "Bind them separately, or fuse them into one shape"
+        )
+
     if len(solids) > 1:
-        # Every face has to belong to one of the solids, or decomposing would
-        # emit the solids and drop the rest without saying so. A loose face in
-        # among them is a drawn sheet, and losing it is a run that
-        # completes and answers about a structure with no ground plane in it.
-        loose = len(shape.Faces) - sum(len(solid.Faces) for solid in solids)
-        if loose:
-            raise TranslationError(
-                f"{label!r} holds {len(solids)} solids and {loose} more faces that "
-                "belong to none of them, so it is part volume and part surface. "
-                "Which of the two a face is meant to be cannot be read from the "
-                "drawing. Bind them separately, or fuse them into one shape"
-            )
         # Each solid becomes its own primitive rather than one surface drawn over
         # all of them. A polyhedron has to be a manifold, which lumps meeting at
         # a single vertex are not and interpenetrating lumps are not either. The
@@ -471,7 +512,7 @@ def _boxes_of(
         raise TranslationError(
             f"{label!r} is flat in "
             f"{' and '.join(AXIS_NAMES[d] for d in flat)}, so it is a line or a "
-            "point. A region needs area"
+            "point, with no area for a material to fill"
         )
 
     # Whether a shape is an area or a volume is its own topology rather than the
@@ -486,13 +527,12 @@ def _boxes_of(
         # rather than straightened: the two readings differ everywhere, and the
         # drawing does not say which was meant.
         if float(shape.Volume) < 0.0:
+            # A validity check passes such a shape: the surface is sound and
+            # only its sense is turned around.
             raise TranslationError(
-                f"{label!r} is wound inside out: its faces point inward, so it "
-                "describes everything *except* the space it appears to occupy, "
-                f"and its volume reads {float(shape.Volume):g}. Nothing bounded "
-                "can be built from that. Rebuild it from a shape that is not "
-                "reversed - a validity check will not report this, since the "
-                "surface itself is sound and only its sense is turned around"
+                f"{label!r} is wound inside out: its faces point inward and its volume "
+                f"is {float(shape.Volume):g}. Rebuild it from a shape that is not "
+                "reversed; a validity check does not report this"
             )
         filled = extents[0] * extents[1] * extents[2]
         if filled > 0 and math.isclose(float(shape.Volume), filled, rel_tol=BOX_TOLERANCE):
@@ -576,9 +616,8 @@ def _triangulate_sheet(shape: Any, label: str, box: Box, flat: int) -> list[Piec
 
     if not faces:
         raise TranslationError(
-            f"{label!r} is a flat sheet that triangulates to nothing at all, so "
-            "there is no area to model. Check the shape for a face the kernel "
-            "could not read"
+            f"{label!r} is a flat sheet that FreeCAD triangulates to nothing, so there "
+            "is no area to model. Check the shape for a face FreeCAD could not read"
         )
     if _lost_too_much(covered, drawn):
         raise _no_longer_the_shape(label, "an area", covered, drawn)
@@ -755,11 +794,10 @@ def _no_longer_the_shape(
     label: str, measure: str, achieved: float, drawn: float
 ) -> TranslationError:
     return TranslationError(
-        f"{label!r} triangulates to {measure} of {achieved:.6g} against a drawn "
-        f"{drawn:.6g}, losing {abs(achieved - drawn) / drawn:.1%} of the shape, and "
-        "sharper requests did not close the gap. What would be solved here is a "
-        "different object from what was drawn. Check the shape for a "
-        "self-intersection or a face the kernel could not triangulate"
+        f"{label!r} triangulates to {measure} of {achieved:.6g} against {drawn:.6g} "
+        f"drawn, losing {abs(achieved - drawn) / drawn:.1%} of the shape even at the "
+        "finest triangulation tried. Check the shape for a self-intersection or a face "
+        "FreeCAD could not triangulate"
     )
 
 
@@ -771,8 +809,8 @@ def _departure(curved: Curvature, drawn: float, enclosed: float) -> Departure | 
     factor is exact rather than a fit. Over one facet the departure is a
     quadratic vanishing at the three vertices, which the surface passes through;
     the mean of such a quadratic over the triangle is ``3/4`` of its value at the
-    centroid, whatever the curvature. So the mean displacement is ``4/3`` of the
-    lost volume over the area.
+    centroid, whatever the curvature. So the displacement at a facet's centroid
+    is ``4/3`` of the lost volume over the area.
 
     The lost volume is divided by the area that curves rather than by the whole
     area. A flat face is triangulated exactly and contributes nothing to the
@@ -859,25 +897,20 @@ def _would_not_come_close(
     """
     if departure is None:
         reached = (
-            "the volume the kernel gives the drawing stopped agreeing with "
-            "which side of its surface the triangulation is on, so no distance "
-            "can be stated"
+            "its volume in FreeCAD contradicts its triangulation, so no distance can be stated"
         )
     elif departure.turns_both_ways:
-        reached = (
-            "its surfaces bend both ways, so what a volume can say about them is "
-            "a net of two opposite displacements and cannot show either one "
-            "reached a distance"
-        )
+        # The volume nets two opposite displacements, and cannot show either
+        # one reached a distance.
+        reached = "its surfaces bend both ways, so no distance can be shown"
     else:
-        reached = f"reached {abs(departure.displaced):.4g} mm"
+        reached = f"it is still {abs(departure.displaced):.4g} mm off"
+    # A swept, unevenly scaled or spline surface is re-fitted, and a hollow
+    # shape is measured as the difference of its two walls.
     return TranslationError(
-        f"{label!r} was asked to be solved within {held_to:.4g} mm of the shape "
-        f"drawn, and refining it to {facets} facets did not get there: {reached}. "
-        "Ask for a distance it can reach, or redraw the surface - a shape swept, "
-        "scaled unevenly or converted to a spline is re-fitted rather than "
-        "evaluated, and a hollow one is measured as the difference of its two "
-        "walls"
+        f"{label!r}: CurveTolerance on Mesh Policy asks for {held_to:.4g} mm, and "
+        f"{facets} facets did not reach it: {reached}. Raise CurveTolerance, or redraw "
+        "the surface"
     )
 
 
@@ -957,24 +990,22 @@ def _triangulate(
                 # The solid that failed is the one made here, so the drawing is
                 # the wrong place to send a reader looking.
                 raise TranslationError(
-                    f"{label!r} is drawn as a surface and the solid built off it "
-                    f"{skin:.4g} mm thick cannot be meshed: {error}"
+                    f"{label!r} is a surface, and the {skin:.4g} mm thick solid made "
+                    f"from it cannot be meshed: {error}"
                 ) from error
+        # openEMS lays a zero-thickness conductor as a polygon at one
+        # elevation, and a tilted or a curved one has no elevation to be laid at.
         if _encloses_nothing(shape, box):
             raise TranslationError(
-                f"{label!r} encloses no volume, so it is an area rather than a "
-                "region. An area is modelled only where it is flat on one of the "
-                "three axes, which this is not: openEMS lays a zero-thickness "
-                "conductor as a polygon at one elevation, and there is no "
-                "elevation to lay a tilted or a curved one at. Give this "
-                "thickness, or bind the material to the solid the face belongs to"
+                f"{label!r} encloses no volume and is not flat on one of the three "
+                "axes, so there is no plane to lay it in. Give it thickness, or bind "
+                "the material to the solid the face belongs to"
             )
+        # The fault is in the shape's own surface, not in a mesh taken from it.
         raise TranslationError(
-            f"{label!r} cannot be sent to openEMS as a solid: {fault}. This is "
-            "the shape's own surface, so the fault is in the geometry rather "
-            "than in the mesh taken from it - a shell left open, two lumps "
-            "touching at a point, or faces the kernel could not knit. Run Part "
-            "> Check geometry on it"
+            f"{label!r} is not a closed solid: {fault}. Run Part > Check geometry on "
+            "it, and look for an open shell, two lumps touching at a point, or faces "
+            "that do not join"
         )
 
     if _lost_too_much(enclosed, drawn):
@@ -1024,9 +1055,8 @@ def _thickened(shape: Any, label: str, skin: float) -> Any:
     perimeter = float(shape.Length)
     if area <= 0.0 or perimeter <= 0.0:
         raise TranslationError(
-            f"{label!r} is drawn as a surface and the kernel gives it no area to "
-            "sweep, so there is no sheet here to give a thickness to. Check the "
-            "shape for a face that never closed"
+            f"{label!r} is a surface with no area, so it cannot be given a thickness. "
+            "Check the shape for a face that never closed"
         )
 
     # Twice the area over the length of the boundary: the width of the strip
@@ -1037,14 +1067,12 @@ def _thickened(shape: Any, label: str, skin: float) -> Any:
     width = 2.0 * area / perimeter
     if skin > MOST_OF_A_SKIN * width:
         raise TranslationError(
-            f"{label!r} is drawn as a surface, so it carries no thickness, and "
-            f"the {skin:.4g} mm it would be given is more than "
-            f"{MOST_OF_A_SKIN:.0%} of the {width:.4g} mm it measures across. What "
-            "would be solved is a bar rather than the sheet that was drawn. That "
-            "thickness follows the cell the metal is meshed at, so either raise "
-            "ElementsPerWavelength or EdgeRefinement on the Yee grid until a cell "
-            "is small against this shape, or draw the conductor as a solid whose "
-            "thickness you chose"
+            f"{label!r} is a surface, and the {skin:.4g} mm thickness it would be given "
+            f"is more than {MOST_OF_A_SKIN:.0%} of the {width:.4g} mm it measures across, "
+            "so it would be solved as a bar rather than the sheet drawn. The thickness "
+            "follows the cell at conductor edges: raise ElementsPerWavelength or "
+            "EdgeRefinement in the openEMS mesh settings until that cell is small against "
+            "this shape, or draw the conductor as a solid of the thickness you want"
         )
 
     args = (skin, portbox.KERNEL_TOLERANCE)
@@ -1063,34 +1091,32 @@ def _thickened(shape: Any, label: str, skin: float) -> Any:
         # being reported as a shape to go and fix.
         raise
     except Exception as error:  # noqa: BLE001 - every kernel fault reads the same here
+        # A surface takes a thickness only where it stays clear of itself
+        # over that distance.
         raise TranslationError(
-            f"{label!r} is drawn as a surface and the kernel would not offset it "
-            f"into a solid {skin:.4g} mm thick: {error}. A surface can be given "
-            "thickness only where it stays clear of itself over that distance, "
-            "so a fold or a bend tighter than this defeats it. Draw the "
-            "conductor as a solid, or run Part > Check geometry to find a "
-            "surface that was never sound"
+            f"{label!r} is a surface, and FreeCAD would not offset it into a solid "
+            f"{skin:.4g} mm thick: {error}. A fold or a bend tighter than that thickness "
+            "prevents it. Draw the conductor as a solid, or run Part > Check geometry "
+            "on it"
         ) from error
 
     if not getattr(solid, "Solids", None):
         raise TranslationError(
-            f"{label!r} is drawn as a surface and offsetting it {skin:.4g} mm "
-            "produced no solid. Draw the conductor as a solid instead"
+            f"{label!r} is a surface, and offsetting it {skin:.4g} mm produced no "
+            "solid. Draw the conductor as a solid"
         )
 
     departure = abs(float(solid.Volume) / (area * skin) - 1.0)
     if departure > MOST_OF_A_SKIN:
         raise TranslationError(
-            f"{label!r} is drawn as a surface, so it carries no thickness, and "
-            f"the {skin:.4g} mm it would be given does not stay thin against the "
-            f"way it curves: the metal built off it comes to {departure:.0%} away "
-            f"from its area times that thickness, against {MOST_OF_A_SKIN:.0%} "
-            "allowed, which is that thickness measured against the radius this "
-            "shape turns through. What would be solved is a block rather than the "
-            "sheet that was drawn. The thickness follows the cell the metal is "
-            "meshed at, so either raise ElementsPerWavelength or EdgeRefinement on the "
-            "Yee grid until a cell is small against this shape, or draw the "
-            "conductor as a solid whose thickness you chose"
+            f"{label!r} is a surface, and the {skin:.4g} mm thickness it would be given "
+            "is too large for the radius this shape turns through: the metal made from "
+            f"it departs {departure:.0%} from its area times that thickness, against "
+            f"{MOST_OF_A_SKIN:.0%} allowed, so it would be solved as a block rather than "
+            "the sheet drawn. The thickness follows the cell at conductor edges: raise "
+            "ElementsPerWavelength or EdgeRefinement in the openEMS mesh settings until "
+            "that cell is small against this shape, or draw the conductor as a solid of "
+            "the thickness you want"
         )
     return solid
 
@@ -1289,7 +1315,7 @@ def _seams(boxes: Sequence[Box]) -> tuple[int, float]:
     """What a stack costs the grid: pieces first, then the thinnest of them.
 
     These are the two terms :func:`~.rectilinear._cost` weighs, for the same
-    reasons: every piece is a seam the mesher has to put a line on, and the
+    reasons: a seam in a dielectric is a plane the mesher puts a line on, and the
     thinnest piece sets how close two of those lines stand, which is a cell the
     whole domain pays for.
     """
@@ -1388,10 +1414,16 @@ def _contact(one: Box, other: Box) -> float:
 def _cut_up(shape: Any, label: str, box: Box, flat: int, area: float) -> list[Piece]:
     """A flat Manhattan shape, as the rectangles it is made of.
 
-    A shape carrying no face at all is walked as its own edges instead. It has
-    no area either, so it cannot be cut into anything that adds up, and the walk
-    is here so that the proof below reports it rather than an empty list.
+    A shape enclosing no area is refused first, whatever its outline. Drawn as
+    edges, as a sketch is, it holds nothing a material can fill, and no cut or
+    triangulation of it adds up to anything. A shape carrying no face is walked
+    as its own edges.
     """
+    if area <= 0.0:
+        raise TranslationError(
+            f"{label!r} encloses no area: it is drawn as edges, as a sketch is, and "
+            "edges carry no material. Make a face of it, or bind the body it outlines"
+        )
     walked = _outline_edges(getattr(shape, "Faces", ()) or ()) or list(shape.Edges)
     try:
         cut = _rectangles_of(walked, flat)
@@ -1419,19 +1451,14 @@ def _cut_up(shape: Any, label: str, box: Box, flat: int, area: float) -> list[Pi
         # the overlap once. No drawing explains an over-count.
         if laid < area:
             why = (
-                "It is short, and pieces laid over one another do that: each "
-                "reports its own area while the boundary they share encloses "
-                "the overlap once. Fuse them, or draw them apart"
+                "Pieces laid over one another cause this, since each reports its own "
+                "area. Fuse them, or draw them apart"
             )
         else:
-            why = (
-                "It is over, which no drawing accounts for, so this is a fault "
-                "in reading the shape rather than anything you drew"
-            )
+            why = "This is a fault in reading the shape, not in the drawing"
         raise TranslationError(
-            f"{label!r} was cut into {len(boxes)} rectangles covering "
-            f"{laid:.6g}, but the shape's own area is {area:.6g}. The cut is "
-            f"meant to be exact. {why}"
+            f"{label!r} was cut into {len(boxes)} rectangles covering {laid:.6g} mm^2, "
+            f"but its area is {area:.6g} mm^2. {why}"
         )
 
     return _cut_into(label, boxes, shape)
@@ -1539,7 +1566,7 @@ def _sub_box(link: Any, subject: str) -> Box:
     the flatness that matters to them along the axis it matters on.
     """
     if not link:
-        raise TranslationError(f"{subject} is unset; select the face it should be built from")
+        raise TranslationError(f"{subject} is unset. Select the face to build it from")
 
     obj, sub = link
     names = [sub] if isinstance(sub, str) else list(sub or ())

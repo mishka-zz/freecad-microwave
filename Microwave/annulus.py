@@ -70,8 +70,9 @@ def _circle(wire: Any, subject: str) -> tuple[float, tuple[float, float, float]]
     centre = getattr(curve, "Center", None)
     if radius is None or centre is None:
         raise AnnulusError(
-            f"{subject}: one of the face's boundaries is a "
-            f"{type(curve).__name__} rather than a circle. Select the annular "
+            f"{subject}: one of the face's boundaries is "
+            f"{'an edge with no curve' if curve is None else 'a ' + type(curve).__name__} "
+            "rather than a circle. Select the annular "
             "face between the inner conductor and the shield"
         )
     return float(radius), (float(centre.x), float(centre.y), float(centre.z))
@@ -82,21 +83,21 @@ def read(shape: Any, subject: str = "coaxial port") -> Annulus:
     wires = list(getattr(shape, "Wires", ()))
     if len(wires) != _BOUNDARIES:
         raise AnnulusError(
-            f"{subject}: what was picked has {len(wires)} boundaries, and a "
-            "ring has two - the shield's bore and the inner conductor. Select "
-            "the annular face between them"
+            f"{subject}: the picked face has {len(wires)} boundaries, so it is not a "
+            "ring. Select the annular face between the shield's bore and the inner "
+            "conductor"
         )
 
     (first_radius, first_centre), (second_radius, second_centre) = (
         _circle(wire, subject) for wire in wires
     )
 
+    # A coaxial line's impedance is the ratio of two radii about one axis.
     apart = max(abs(a - b) for a, b in zip(first_centre, second_centre))
     if apart > FLATNESS:
         raise AnnulusError(
-            f"{subject}: the two circles bounding the face are {apart:.4g} mm "
-            "apart, so the conductors are not concentric. A coaxial line's "
-            "impedance is the ratio of two radii about one axis"
+            f"{subject}: the centres of the two circles bounding the face are "
+            f"{apart:.4g} mm apart, so the conductors are not concentric"
         )
     if abs(first_radius - second_radius) <= FLATNESS:
         raise AnnulusError(

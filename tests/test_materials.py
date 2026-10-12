@@ -137,7 +137,9 @@ class TestBindingWhatWasPicked:
 
     def bind(self, doc, *objects):
         binding = createEMMaterialBinding("Binding")
-        return binding, fill_binding(binding, self.selection(*objects))
+        from Microwave.Objects import createEMAnalysis
+
+        return binding, fill_binding(binding, self.selection(*objects), createEMAnalysis(doc))
 
     def test_a_material_and_a_solid_are_told_apart(self, doc):
         """No order to obey: the material is the one that is a material."""
@@ -164,7 +166,9 @@ class TestBindingWhatWasPicked:
         chosen = type("Sel", (), {"Object": board, "SubElementNames": ("Face6",)})()
         binding = createEMMaterialBinding("Binding")
 
-        fill_binding(binding, [chosen])
+        from Microwave.Objects import createEMAnalysis
+
+        fill_binding(binding, [chosen], createEMAnalysis(doc))
 
         assert binding.References == [(board, ["Face6"])]
 
@@ -179,6 +183,36 @@ class TestBindingWhatWasPicked:
         binding, notes = self.bind(doc, material)
         assert binding.Material == material
         assert [note for note in notes if "geometry" in note]
+
+    def test_a_shape_that_reaches_the_study_is_named_rather_than_unpicked(self, doc):
+        """Left out of References, since a link to it would close a cycle, and
+        named: the shape was picked, and "no geometry was selected" is false."""
+        from Microwave.Objects import createEMAnalysis
+
+        study = createEMAnalysis(doc)
+        board = doc.addObject("Part::Box", "Substrate")
+        object.__setattr__(board, "OutListRecursive", [study])
+        binding = createEMMaterialBinding("Binding")
+        notes = fill_binding(binding, self.selection(createEMMaterial("FR4"), board), study)
+        assert binding.References == []
+        assert notes == [
+            "'Substrate' depends on the study, so it was left out of References: a link "
+            "to it from inside the study makes a cycle FreeCAD cannot recompute"
+        ]
+
+    def test_a_pick_inside_a_copy_is_named_rather_than_unpicked(self, doc):
+        """The pick was made, so "no geometry was selected" would be false."""
+        from Microwave.Objects import createEMAnalysis
+
+        binding = createEMMaterialBinding("Binding")
+        notes = fill_binding(
+            binding,
+            self.selection(createEMMaterial("FR4")),
+            createEMAnalysis(doc),
+            ["'Box' in 'Link'"],
+        )
+        assert [note for note in notes if "'Box' in 'Link'" in note]
+        assert not [note for note in notes if "no geometry" in note]
 
     def test_pressing_it_with_nothing_selected_says_both(self, doc):
         binding, notes = self.bind(doc)
@@ -197,7 +231,10 @@ class TestBindingWhatWasPicked:
 
         assert binding.Material is None
         assert binding.References == [(board, [""])]
-        assert [note for note in notes if "'FR4'" in note and "'Copper'" in note]
+        assert notes == [
+            "2 materials were selected ('FR4', 'Copper'), and a binding takes one. "
+            "Set Material in the property editor"
+        ]
 
 
 class TestPickingOneFromACatalog:
@@ -224,7 +261,7 @@ class TestPickingOneFromACatalog:
 
     def test_a_conducting_sheet_arrives_as_one(self):
         obj = create_from_entry(FreeCAD.ActiveDocument, CATALOG.get("copper"), CATALOG)
-        assert obj.MaterialType == "ConductingSheet"
+        assert obj.MaterialType == "Conducting Sheet"
         assert obj.Conductivity == 5.8e7
         assert obj.Thickness == 0.035
 

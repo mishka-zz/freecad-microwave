@@ -117,7 +117,7 @@ def study(doc, substrate, ground, trace):
     laminate.Color = (0.13, 0.55, 0.13)
 
     copper = createEMMaterial("Copper")
-    copper.MaterialType = "ConductingSheet"
+    copper.MaterialType = "Conducting Sheet"
     copper.Conductivity = COPPER_CONDUCTIVITY
     copper.Thickness = COPPER_THICKNESS
     copper.Color = (0.85, 0.55, 0.25)
@@ -136,7 +136,7 @@ def study(doc, substrate, ground, trace):
     port = createEMPortMicrostrip("Port1")
     port.MeasurementDistance = PROBE_DISTANCE
     port.TraceEnd = (trace, [end_edge(trace, -LENGTH / 2)])
-    port.GroundReference = (ground, ["Face1"])
+    port.Ground = (ground, ["Face1"])
     port.PropagationAxis = "X"
     port.ExcitationAxis = "-Z"
     analysis.addObject(port)
@@ -324,7 +324,7 @@ def mesh(analysis, display, **properties):
 
 
 def figure_padding(doc, analysis):
-    """What ``Air`` and ``Through`` do to the domain, on one board.
+    """What ``Open`` and ``Through`` do to the domain, on one board.
 
     The outline view, which is the domain and the absorber shell and nothing
     else: the question is where those two stand relative to the board, and every
@@ -337,9 +337,9 @@ def figure_padding(doc, analysis):
     settings = next(obj for obj in analysis.Group if type(obj.Proxy).__name__ == "EMMeshPolicy")
     height = None
 
-    for name, mode in (("domain-air.png", "Air"), ("domain-through.png", "Through")):
-        settings.PaddingXMin = mode
-        settings.PaddingXMax = mode
+    for name, mode in (("domain-air.png", "Open"), ("domain-through.png", "Through")):
+        settings.BoundaryXMin = mode
+        settings.BoundaryXMax = mode
         preview, report = mesh(analysis, "Outline")
         show(doc, {"Substrate", "Ground", "Trace", preview.Label})
         doc.getObject("Substrate").ViewObject.Transparency = 40
@@ -348,8 +348,8 @@ def figure_padding(doc, analysis):
         save(name, 1000, 520)
         print(f"  {mode}: {report.summary().splitlines()[2]}")
 
-    settings.PaddingXMin = "Air"
-    settings.PaddingXMax = "Air"
+    settings.BoundaryXMin = "Open"
+    settings.BoundaryXMax = "Open"
 
 
 def figure_grid(doc, analysis):

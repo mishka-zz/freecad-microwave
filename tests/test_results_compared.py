@@ -91,7 +91,12 @@ class TestWhatIsRefused:
             compare(line(), "openEMS", line(port_numbers=(1, 3)), "Palace")
 
     def test_two_drawings(self):
-        with pytest.raises(Incomparable, match="two different drawings"):
+        with pytest.raises(
+            Incomparable,
+            match="^what openEMS solved and what Palace solved are of two different drawings: "
+            "the geometry, a material, a port or what lies beyond the structure changed "
+            "between the two runs$",
+        ):
             compare(
                 line(provenance={DRAWING: "a"}),
                 "openEMS",

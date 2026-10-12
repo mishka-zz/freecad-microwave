@@ -1,14 +1,17 @@
 # Ports
 
 A port defines excitation sources and measurement reference planes for the
-simulation. In the 3D viewport, each port is represented by a bounding box
-containing the source plane and voltage/current probe planes.
+simulation. In the 3D viewport, a microstrip or lumped port is drawn as a box,
+and a microstrip port's box shows its source plane and its voltage and current
+probe plane inside it. A waveguide port with a `ReferenceDepth` is drawn as a
+box from the face it is launched on to the plane its S-parameters are referred
+to. At `ReferenceDepth` 0 that plane is the face picked, and the port draws
+nothing.
 
-On openEMS the displayed 3D bounding box reflects the exact volume and probe
-placement passed to the solver. On Palace a waveguide port is the face it
-stands on, and a lumped port the rectangles laid between its picks. Palace
-reads no probe planes. Verify port orientation and dimensions in the viewport
-before running the simulation.
+On openEMS the box is the volume and the planes passed to the solver. On Palace
+a waveguide port is the face it stands on, and a lumped port the rectangles
+laid between its picks. Palace reads no probe planes. Verify port orientation
+and dimensions in the viewport before running the simulation.
 
 ## Port types
 
@@ -25,14 +28,24 @@ Reference impedance behavior:
 - Waveguide ports are referenced to their own mode. openEMS states the
   analytic modal wave impedance. Palace states the power-voltage impedance
   where the port's face is a plain rectangle in a lossless model, and none
-  otherwise (see [Running](running.md#execution-model)).
+  otherwise (see
+  [The impedance of a wave port on Palace](#the-impedance-of-a-wave-port-on-palace)).
 
 ## Creating a port
 
-1. In the 3D viewport, select the required geometric faces or edges in the
+1. Draw the geometry, make the study, set its band and bind the conductors and
+   dielectrics to materials, as steps 1 to 5 of
+   [the standard simulation workflow](README.md#standard-simulation-workflow)
+   describe.
+2. In the 3D viewport, select the required geometric faces or edges in the
    order specified in the table below (hold `Ctrl` for multiple selections).
-2. Click **Add Microstrip Port**, **Add Lumped Port**, or **Add Waveguide
-   Port**.
+3. Click **Add Microstrip Port**, **Add Lumped Port**, or **Add Waveguide
+   Port** on the Microwave Ports toolbar.
+4. Inspect the port in the 3D viewport. A port drawn as nothing says why in
+   its read-only `Status` property - a pick that is not set or names nothing
+   drawn, two axes that cannot both hold, or a length the port's own box
+   refuses - and once as a warning each time the reason changes. A waveguide
+   port referred to its own face draws nothing on purpose and says nothing.
 
 The command infers propagation and excitation axes directly from the selected
 geometry. The wave enters through the selected trace cross-section and travels
@@ -45,7 +58,7 @@ Selection order defines polarity:
 |---|---|---|
 | **Microstrip** | Signal trace cross-section | Ground plane reference face or solid |
 | **Lumped** | Source terminal face or edge | Reference terminal face or edge across the gap |
-| **Waveguide** | Waveguide cross-section face | - |
+| **Waveguide** | Waveguide cross-section face | The guide's body, where the cross-section is a face drawn on its own (`Part::Plane`); either order |
 
 Cross-section selections accept solid faces (`Part::Box`) or 1D edges on
 zero-thickness planar sheets (`Part::Plane`).
@@ -54,17 +67,7 @@ For lumped ports, the element spans the transverse spatial overlap between
 the two selected picks across the excitation gap (not their geometric union).
 
 Avoid selecting the dielectric substrate. Port selections must be assigned to
-conductors (`PEC` or `ConductingSheet`).
-
-### Creation workflow
-
-1. Create geometry (trace, substrate, ground plane).
-2. Assign materials (`EMMaterialBinding`) to all conductors and dielectrics.
-3. Create the `EMAnalysis` container and specify the frequency range.
-   Microstrip ports calculate initial `MeasurementDistance` defaults from
-   the analysis band.
-4. Select geometric features in order and click the port command.
-5. Inspect the generated port bounding box in the 3D viewport.
+conductors (`PEC` or `Conducting Sheet`).
 
 ## Common port properties
 
@@ -72,7 +75,7 @@ conductors (`PEC` or `ConductingSheet`).
 | Property | Default | Description |
 |---|---|---|
 | `Number` | assigned | Matrix index (row/column) in the S-parameter matrix |
-| `Excitation` | true | Enables signal excitation. On openEMS each excited port requires one FDTD solve. Palace solves every excited port in one run |
+| `Driven` | true | Enables signal excitation. On openEMS each excited port requires one FDTD solve. Palace solves every excited port in one run |
 | `ReferencedTo` | Fixed impedance | Reference impedance definition for S-parameter normalization |
 | `ReferenceImpedance` | 50.0 | Normalization impedance in ohms when `ReferencedTo` is Fixed impedance |
 
@@ -81,10 +84,10 @@ A waveguide port is made with `ReferencedTo` set to Port impedance.
 `Number` is assigned sequentially at creation to the lowest unused index in
 the document. Existing ports are never renumbered.
 
-`Excitation` determines whether the port acts as a driven source. On openEMS
+`Driven` determines whether the port acts as a driven source. On openEMS
 an $N$-port network with $N$ excited ports requires $N$ independent FDTD
-simulation runs. Palace solves every excited port in one run. Set `Excitation` to `false` for ports that only record received transmission
-signals.
+simulation runs. Palace solves every excited port in one run. Set `Driven`
+to `false` for ports that only record received transmission signals.
 
 When a lumped port is excited, all microstrip ports in the study should also be
 excited. In such a run the microstrip port reports a non-finite reference
@@ -110,9 +113,9 @@ impedance.
 
 A fixed reference far from a port's own impedance can magnify whatever error
 the solve left. Between real impedances the factor is at most the VSWR of the
-reference against the port. A waveguide port is several hundred ohms, so a
-guide with every port referenced to 50 Ω can carry up to about ten times the
-solve's error. The log warns when the matrix as
+reference against the port. A waveguide port's impedance is several hundred
+ohms, so a guide with every port referenced to 50 Ω can carry several times
+the solve's error. The log warns when the matrix as
 reported can carry more than twice the solve's error, and names the ports whose
 reference is that far out. At its own impedance a port carries the solve's
 error unmagnified.
@@ -130,7 +133,7 @@ terminated as the run left them. The log warns when that can move a term of
 the matrix as reported by more than the bar a response still ringing is held
 to, and names the ports to drive. The figure is an absolute error in S: a
 stopband transmission smaller than it can be off by more than its own size. It
-is an upper bound, close for a lossless device and loose for a lossy one. A
+is an upper bound. A
 wave an undriven port did not read is left out of it.
 
 On Palace an undriven waveguide port absorbs its own mode, and an undriven
@@ -189,9 +192,13 @@ The voltage and current probes must be placed on a uniform line section,
 sufficiently far from source near-field evanescent modes and downstream
 discontinuities (such as stubs, steps, or bends).
 
-The default `MeasurementDistance` is initialized to 10% of the free-space
-wavelength at the lowest frequency ($\lambda_0 / 10$ at `FrequencyStart`),
-rounded up to the nearest millimetre.
+Where the document holds one study, a new microstrip port's
+`MeasurementDistance` is initialized to 10% of the free-space wavelength at
+that study's lowest frequency ($\lambda_0 / 10$ at `FrequencyStart`), rounded
+up to the nearest millimetre. The value is written when the port is made, and
+does not follow a later change to the band. Where the document holds no study
+or more than one, `MeasurementDistance` starts at 0, which pre-flight refuses:
+set it by hand.
 
 Evanescent feed modes attenuate exponentially over a distance proportional to
 the line cross-section dimensions. If `MeasurementDistance` is reduced
@@ -210,7 +217,7 @@ past a bar.
 
 ### Impedance extraction
 
-OpenEMS extracts characteristic transmission line impedance using three
+openEMS extracts characteristic transmission line impedance using three
 voltage probes and two current probes centered on the measurement plane.
 
 ---
@@ -253,7 +260,7 @@ plane, which would cause openEMS to drop the lumped element.
 
 Lumped ports are commonly used to terminate transmission lines with a matched
 load (e.g. 50 Ω):
-- For zero-thickness planar traces (`ConductingSheet`): Select the end edge
+- For zero-thickness planar traces (`Conducting Sheet`): Select the end edge
   of the trace, then the ground plane below.
 - For 3D volumetric traces (`Part::Box`): Select the bottom edge of the end
   face where the conductor meets the substrate, then the ground plane.
@@ -272,7 +279,7 @@ sheets cannot be the reference of one port.
 
 A line between two conductors driven to only one of them launches a field the
 line does not carry, and on a short line that field reaches the other port.
-Nothing checks for it.
+The workbench does not check for it.
 
 A rectangle is flat, so the source is an edge along an axis. A source face
 across the gap and a source edge at an angle to the axes are refused.
@@ -306,10 +313,12 @@ A rectangle inside the region, lying on no face of it, is taken. **Run** names
 what stands nearest it on each side of its plane and how far away.
 
 Where the study reserves air, the region's boundary is the box of reserved air
-round the structure: see [Open studies](running.md#open-studies). A rectangle lies on the
-boundary only where it lies in an `Ends` or `Through` side of that box.
+round the structure: see
+[Open studies on Palace](meshing.md#open-studies-on-palace). A rectangle lies
+on the boundary only where it lies in a `PEC Wall` or `Through` side of that
+box.
 
-On an `Ends` side the magnetic wall is the faces of the bodies drawn in that
+On a `PEC Wall` side the magnetic wall is the faces of the bodies drawn in that
 side, and the rectangle has to lie on one of them. The air beside those faces is
 the wall, so a rectangle whose side meets it is refused.
 
@@ -318,14 +327,42 @@ faces included, and **Run** states that air's area. The field a line holds in th
 air meets the side squarely, and a magnetic wall ends the line there as the
 port's plane does.
 
-An `Air` side of the box is not the wall, and **Run** names it as the open
+An `Open` side of the box is not the wall, and **Run** names it as the open
 surface where it stands nearest a rectangle. An open study is driven through
 lumped ports only, and a waveguide port in one is refused.
 
 `Resistance` 0 is refused on Palace: draw a short as a sheet bound to `PEC`.
-The S-parameters are referenced to `Resistance`. A `Fixed impedance` reference
-other than `Resistance` is refused. A study holding a lumped port and a
-waveguide port is refused.
+The S-parameters are referenced to `Resistance`, and a Touchstone export states
+it. A `Fixed impedance` reference other than `Resistance` is refused. A study
+holding a lumped port and a waveguide port is refused.
+
+In the mesh, each of a lumped port's rectangles is a group of its own,
+`<port> element <n>`, and the rest of the face a rectangle lies in is the group
+`rest of the face of <port>`, naming each port whose rectangles lie in it.
+
+After the band is solved, the log states for each driven port how much of its
+power does not come back at the ports, how much of that left through the open
+surface, and the rest, at the frequency where the rest is largest. Each share
+is given to two significant figures, and the total and the rest in decibels as
+well. Palace also
+measures the power through each port's face, and for a lumped port the
+workbench does not compare the two: the matrix is read from the field averaged
+along the rectangle and the power from the field's curl, and they disagree on a
+model that loses nothing.
+
+The rest is reported for information, without a warning. Where nothing dissipates, it is the
+solver's error, and it grows with frequency and with how the port is drawn and
+what its `Resistance` is. Where the model dissipates, it is the heat and the
+solver's error together, and the run cannot separate them: a dissipation no
+larger than the solver's share does not show. To see the solver's share on a
+board, solve the study again with every conducting sheet bound to `PEC` and
+every other `Conductivity` and every `LossTangent` zero, and read the rest that
+run states.
+
+Where the matrix and the open surface account for more power than went in by
+more than a tenth of a percent, the line names that frequency instead and is a
+warning, whether the model dissipates or not. The matrix is stored either way,
+with the figure in its provenance.
 
 ---
 
@@ -334,13 +371,22 @@ waveguide port is refused.
 Excites modal fields across the cross-section of a hollow rectangular
 waveguide.
 
-**Selection:** Waveguide interior cross-section face.
+**Selection:** Waveguide interior cross-section face. A face of the guide's own
+body says which way the guide runs from it. A face drawn on its own - a
+`Part::Plane` standing in the guide, as the shipped WR-42 example's ports do -
+says nothing, so select the guide's body with it: the port is launched toward
+the side the guide runs further on from the plane. A plane at the middle of the
+guide, or standing across none of it, leaves `PropagationAxis` to set by hand
+and says so. A guide drawn as its metal walls holds nothing where the wave
+runs: select the body of the medium inside it, or set the axis by hand. A
+face of a solid picked with another body keeps its own answer, and the body
+is an extra selection.
 
 <!-- defaults: EMPortRectWaveguide -->
 | Property | Default | Description |
 |---|---|---|
 | `Mode` | TE10 | Propagating modal field pattern |
-| `ReferenceDepth` | 0 | How far into the guide from the picked face the S-parameters are referred (0 = the face) |
+| `ReferenceDepth` | 0 | Distance into the guide from `CrossSection` to the plane the S-parameters are referred to (0 = `CrossSection` itself) |
 | `PropagationAxis` | inferred | Direction of wave propagation into the guide |
 | `ReferencedTo` | Port impedance | Reference impedance definition for S-parameter normalization |
 
@@ -353,27 +399,31 @@ port's own mode, which is exact only where the guide over that distance is a
 prism along its axis with walls of metal. The run sweeps the port's
 cross-section that far into the model and refuses the port where either fails:
 
-- A bound part or sheet holds of the sweep something other than its own section
-  at the face carried the whole distance. A part or an iris standing in the
-  guide does this however thin it is, down to what the CAD kernel can hold, and
-  so does a wall that stops short, as the roof over a cavity does. A slab of
-  dielectric or a fin of metal running the whole distance does not. A `PEC`
+- The guide changes within the sweep: a bound part or sheet inside the sweep
+  differs somewhere from its own cross-section at the face. A part running the
+  whole distance with the cross-section it has at the face passes. A part or
+  an iris standing in the guide fails however thin it is, down to what the CAD
+  kernel can hold, and so does a wall that stops short, as the roof over a
+  cavity does. A slab of dielectric or a fin of metal running the whole
+  distance passes. A `PEC`
   sheet lying on a side that is already a wall is the same wall and changes
-  nothing; a `ConductingSheet` there over part of the distance changes the
+  nothing; a `Conducting Sheet` there over part of the distance changes the
   wall's loss along the guide, and is refused.
 - A side of the sweep is not a wall: it opens into a bound part, as a pocket or
   a widening does, or onto what the backend does not make a wall. A wall is
-  what reflects: `PEC`, or a `ConductingSheet` letting through less than a
+  what reflects: `PEC`, or a `Conducting Sheet` letting through less than a
   thousandth of a wave meeting it, the rule Palace holds every conducting sheet
   to. On either backend a side with nothing bound beyond it is a wall only where
-  it lies on a face of the domain `Padding` makes a wall, and anywhere else it
+  it lies on a face of the domain `Boundary` makes a wall, and anywhere else it
   opens onto the medium the study fills undrawn room with.
 
-The run names the part and the depth. A port picking several faces is swept
-across all of them as one cross-section. On openEMS the distance is the deeper
-of the reference plane and the grid line it reads on, so a part standing within
-that line of the face is refused there even at `ReferenceDepth` 0, while Palace
-takes it; the message says how far the part has to move, and a finer mesh
+The run names the part and the depth. Where the guide opens into a bound part,
+the run also names that part's material, since a housing bound to a dielectric
+by mistake opens the guide as a pocket does. A port picking several faces is
+swept across all of them as one cross-section. On openEMS the distance is the
+deeper of the reference plane and the grid line it reads on, so a part standing
+within that line of the face is refused there even at `ReferenceDepth` 0, while
+Palace takes it; the message says how far the part has to move, and a finer mesh
 brings the line closer.
 
 On Palace, `PropagationAxis` also decides which side of the cross-section the
@@ -402,10 +452,11 @@ exactly one mode:
   The message names the port, the wave numbers, and the metal that divides the
   face where a sheet runs across it. Two unequal fins, a strip joined to a side
   wall, a square guide, and a band that reaches the guide's next mode all do
-  this. End the band below where the second mode propagates, or change the
+  this. End the band below the cutoff of the second mode, or change the
   cross-section. A face carrying no mode is refused too, which a band starting
-  below the guide's cutoff does at its bottom. In a very lossy filling the mode
-  run can miss the guide's own mode, and the message then says so.
+  below the guide's cutoff does at its bottom. In a very lossy filling the
+  Palace run that solves the face's modes can miss the guide's own mode, and the
+  message then says so.
 - A port whose mode loses power as it travels is refused where its face would
   reflect more than a four-thousandth of the power. Palace matches a wave port
   to the real part of its mode's wave number and drops the loss, so the face
@@ -429,8 +480,8 @@ cutoff. Draw the metal the guide has along the curve, or stand the ports apart.
 A face divided so that only one part carries a wave, or a fin off the floor
 that makes a ridged guide, carries one mode, and the run is solved. The log
 states each port's mode and how far the slowest-dying of the other modes Palace
-found travels before it falls by a factor of e. That mode is not always the
-slowest there is.
+found travels before it falls by a factor of e. The guide's slowest-dying mode
+can be one Palace did not find.
 
 A port standing near a change in the guide is solved, and the run says what it
 cost. A port's condition is matched to its own mode, so it takes up part of the
@@ -446,11 +497,11 @@ the most, and the matrix is stored either way, with the figure in its
 provenance. Draw each port where the guide runs uniform, and keep the band
 clear of the next cutoff.
 
-On a model that dissipates, the heat is read from the same power measurement,
-whose error is larger on a coarse mesh or at a low order. There the line can
-warn of more power than went in, and a small share a port took can go unseen.
-At the workbench's defaults, order 3 and twenty elements a wavelength, the
-error is far smaller.
+On a model that dissipates, the heat is read from the same power measurement.
+A coarse mesh or a low `Order` raises that measurement's error. There the line
+can warn of more power than went in, and a small share a port took can go
+unseen. Raise `ElementsPerWavelength` on the Palace mesh settings, or `Order` on
+the Palace solver, to lower it.
 
 Only TE modes are supported by openEMS waveguide ports. The mode index follows
 standard microwave conventions (`TE10` represents the dominant mode along the
@@ -469,8 +520,9 @@ Validation requirements:
   checks, naming the cutoff: below it the mode decays rather than travels, the
   port reads a reflection that means nothing, and moving it to the reference
   plane multiplies it by the decay. Start the band above the cutoff. Palace
-  refuses such a band before the driven run, because the mode run at the bottom
-  of the band finds no mode for its wave port to take there.
+  refuses such a band before the driven run, because the run that solves the
+  face's modes at the bottom of the band finds no mode for its wave port to take
+  there.
 
 On openEMS a waveguide port standing near a change in the guide reads part of
 the field the change leaves at its plane along with its mode. Nothing at the
@@ -501,14 +553,15 @@ The two planes also tell a field in front of the port from one behind it. A
 field dying away from the structure differs by less at the deeper plane,
 against the depths, than a field growing toward the source, which a guide
 changing behind the port, toward the absorber, leaves. Where the log says the
-difference grows with depth faster than a field dying away could, it names the
-causes on that side: a change behind the port, which leaves the matrix right;
+difference grows toward the source faster than a field from the structure
+could, it names the causes on that side: a change behind the port, which leaves
+the matrix right;
 the port's own source launching more than its mode, as it does where the box is
 not drawn on the guide's walls, which does not; and a port whose mode is near its
 cutoff. Where the two cannot be told apart, or the box holds one line
 between its source and its plane and gives one plane, the log says so.
 
-A run whose record was cut short is warned of for that, and not for this.
+A run whose record was cut short draws its own warning for that cause.
 Frequencies where a port's mode does not propagate are left out of the figure,
 and a run whose waveguide readings were left as openEMS returned them is not
 weighed, which that run's own warning says. The log also names a port whose
@@ -529,16 +582,59 @@ account for that much less, in a model that dissipates nothing and whose every
 absorbing face is closed. A face is closed where every electric edge on the
 plane the ports facing it read on is tied to metal, outside those ports'
 guides; where no port faces it, the plane is the absorber's inner one, which
-for Mur is one line in from the face. A face
-whose plane holds untied edges is still closed where no field driven at the
-ports can reach them, so a guide drawn as metal walls with air beyond them is
-found closed, and a slot in a wall between the ports' planes opens it. Either
-the ports read the waves wrong, and the column that run
-measures is off by at least the amount the log states beside the figure, a
-little under half of it, or, where they account for less, a mode besides a
-port's own propagates in its guide and carries power into the absorber. A port in a mode other than its guide's lowest always has
-the lowest beside it. The figure reads less where the error is out of phase
-with the column, and where two ports' errors cancel.
+for Mur is one line in from the face. A face whose plane holds untied edges is
+still closed where no field driven at the ports can reach them, so a guide
+drawn as metal walls with air beyond them is found closed, and a slot in a wall
+between the ports' planes opens it.
+
+A warning means one of these:
+
+- The ports read the waves wrong. The column that run measures is then off by
+  at least the amount the log states beside the figure, which is a little under
+  half the figure.
+- Where the ports account for less power, a mode besides a port's own can
+  propagate in its guide and carry power into the absorber. A port in a mode
+  other than its guide's lowest always has the lowest beside it.
+
+The figure reads less where the error is out of phase with the column, and
+where two ports' errors cancel.
+
+### The impedance of a wave port on Palace
+
+Each wave port is referenced to its own mode. Where the port's face is a
+rectangle with its sides along the axes, longer one way than the other, on one
+filling, with no metal on it but the region's own boundary, and nothing in the
+model dissipates, the workbench gives Palace a line across the narrow side at
+the middle of the broad one. Palace reads the mode's voltage `V` along it and
+states the port's power-voltage impedance, `|V|^2 / 2P` with `P` the power the
+mode carries. For TE10 in a guide of broad side `a` and narrow side `b` that is
+`2 (b/a)` times the wave impedance. The line runs upwards along the global axis
+at every port, which also fixes the sign of each port's mode. The stored result
+is referenced to those impedances, and a Touchstone export states them at each
+frequency point. Any other port states no impedance, the result carries no
+figure for it, and a Touchstone export is refused.
+
+openEMS states a guide port's wave impedance instead, so a Palace file and an
+openEMS file of one guide state different impedances for it, and do not cascade
+into each other.
+
+### Where a port stands on Palace
+
+This section is about waveguide ports. A waveguide port stands on a face where
+the region ends, or on a plane drawn across the region. For a plane, the mesh
+leaves out what stands behind it, on the side `PropagationAxis` points away
+from. A guide drawn for openEMS, running on past
+its port planes toward the absorber, is therefore solved between the planes,
+and **Mesh** and **Run** state each part left out and where it was. They refuse
+the drawing instead where a part behind a plane is not the port's face carried
+straight on with the materials in front of it: another material, a labelled
+face or point, a whole body, a change of cross-section, a part behind two
+ports, or a part in front of one port and behind another. A port on an end face
+whose `PropagationAxis` points out of the region is refused. A port on the face
+between two bodies of one region would leave out a whole body, and is refused.
+A straight guide whose only port faces the wrong way is the same shape as a
+shorter guide run on past its port, and is meshed as one: the statement of
+what was left out, and the mesh in the study, show it.
 
 ## Reported problems
 
@@ -549,34 +645,34 @@ with the column, and where two ports' errors cancel.
 | "stand apart along both X and Y" | Selected terminals are diagonal without axis alignment | Align terminals along coordinate axes |
 | "the probes would sit on the source" | `MeasurementDistance` is $\le 0$ | Increase measurement distance |
 | "the box would stop short of it" | Port `Length` is less than `FeedOffset + MeasurementDistance` | Increase port length or set to 0 |
-| "does not say which side of it" | Selected face cuts through a solid without clear orientation | Select outer boundary face |
+| "the inward direction along" | Selected face cuts through a solid without clear orientation | Select outer boundary face |
 | "the axis the wave travels" | On Palace, the port's face is curved, or at an angle to `PropagationAxis` | Select the guide's end face, or cut the guide flat and square where the port stands |
 | "meet along a curve no metal holds" | On Palace, two ports' faces touch, and each port's mode is solved with the other's face as a wall | Draw the metal the guide has along the curve, or stand the ports apart |
 | "pieces that do not touch there" | On Palace, metal on the port's face stands apart from the wall | Join the metal to the wall at the face, or end it short of it |
 | "modes at" | On Palace, the port's face carries more than one mode at an end of the band | End the band below the second mode, or change the cross-section |
-| "carrying no mode" | On Palace, the port's face carries no mode at an end of the band | Start the band above the guide's cutoff. Where the model holds a lossy filling, draw the port in a lossless one |
+| "carries no mode" | On Palace, the port's face carries no mode at an end of the band | Start the band above the guide's cutoff. Where the model holds a lossy filling, draw the port in a lossless one |
 | "as though the model did" | On Palace, the port's mode loses power as it travels, in a lossy filling or near cutoff between lossy walls, and the port reflects part of it | Draw the port where the guide loses less, or start the band further above its cutoff |
 | "unaccounted for" | On Palace, a port took up field besides its own mode: a change in the guide stands near it, or the band's top nears the next cutoff | Draw the port farther from the change, or end the band further below the next cutoff |
-| "unaccounted for" ... "a lumped port" | On Palace, the matrix of a study driven through lumped ports leaves part of the power unaccounted for, and most of it left through that port | The line states the share and no cause |
 | "meets along a side" | On Palace, a sheet of metal, or the wall once the mesh exists, lies along a side of a lumped port's rectangle, which shorts it | Keep the metal off the rectangle's sides. Where it is the wall, draw the rectangle clear of the edge of the region |
 | "runs along the edge of the region" | On Palace, a side of a lumped port's rectangle lies on the region's boundary outside its own plane, where the wall shorts it | Draw the rectangle clear of the edge of the region |
 | "both of whose ends lie on the region's boundary" | On Palace, both ends of a lumped port's rectangle lie on the region's boundary, which is a perfect conductor where no metal is drawn | A warning, and the run goes on. Where the two parts of the boundary are not meant to be one conductor, draw the region on past the metal at one end |
 | "past the side" | On Palace, part of a lumped port's rectangle stands outside the box the model lies in: round every shape bound to a material, grown by the clearance on each side open to free space, and ending where the drawing reaches on each side the study ends on. A conductor picked for the port is bound to nothing | Bind the conductor at each end of the element to a material, or pick conductors the study binds |
 | "which is open to free space" | On Palace, a lumped port's rectangle lies in a side of the reserved air open to free space, which carries the absorbing condition | Bind the conductor at each end of the element to a material, or pick conductors the study binds |
 | "meets metal at one end only" | On Palace, an end of a lumped port's rectangle meets no metal once the mesh exists | Select the conductor at each end of the gap |
-| "is a microstrip port, and this solver is driven here through" | On Palace, the study holds a microstrip port | Drive the study through lumped or waveguide ports, or run it on openEMS |
-| "This solver ranks a port's modes by wave number" | On Palace, a waveguide port's `Mode` is not `TE10` | Set `Mode` to `TE10` |
-| "A wave port here is reported against its own mode" | On Palace, a waveguide port's `ReferencedTo` is `Fixed impedance` | Set `ReferencedTo` to Port impedance |
+| "is a microstrip port, and Palace takes" | On Palace, the study holds a microstrip port | Drive the study through lumped or waveguide ports, or run it on openEMS |
+| "the workbench drives a waveguide port on Palace in TE10 only" | On Palace, a waveguide port's `Mode` is not `TE10` | Set `Mode` to `TE10` |
+| "Palace reports a wave port against its own mode only" | On Palace, a waveguide port's `ReferencedTo` is `Fixed impedance` | Set `ReferencedTo` to Port impedance |
 | "names 2 sub-elements" | On openEMS, a lumped port's `SourceEntity` or `ReferenceEntity` names more than one face or edge | Select one. A reference with several faces is taken on Palace |
 | "more power than went in" | On Palace, the matrix and the heat the model dissipates account for more power than the driven port sent in, which the mesh causes | Refine the mesh |
+| "that left through the open surface account for" ... "more power than went in" | On Palace, the matrix and the power through the open surface account for more power than the driven port sent in, and a coarse mesh at the open surface reads that power high | Refine the mesh at the open surface |
 | "more power than was driven in" | On openEMS, the waveguide ports give out more power than went in, which no passive model does: a port reads a field a change in the guide leaves near it | Draw the port farther from what changes the guide |
 | "less power than was driven in" | On openEMS, in a model that dissipates nothing and loses power only through its ports, the ports account for less than went in: a port reads a field a change in the guide leaves near it, or a mode besides a port's own carries power into the absorber | Draw the port farther from what changes the guide, or end the band below where a second mode propagates in the ports' guides |
-| "is not weighed for a field besides its mode" | On openEMS, a waveguide port's box holds no grid line between its source and its plane, or the plane inside it could not be read, for the reason given | Draw the box deeper, or where the guide runs uniform through it |
-| "planes inside their boxes predict" | On openEMS, the waves a waveguide port read differ from those planes inside its box predict, by enough for the matrix to be off by something of the order stated: a change in the guide stands near the port. Where the log says the difference grows with depth faster than a field dying away could, the change may stand behind the port and the matrix be right, or the port's box is not drawn on the guide's walls, or the port's mode is near its cutoff | Draw the port farther from the change, and its box on the guide's walls |
+| "is not checked for a field besides its mode" | On openEMS, a waveguide port's box holds no grid line between its source and its plane, or the plane inside it could not be read, for the reason given | Draw the box deeper, or where the guide runs uniform through it |
+| "planes inside their boxes predict" | On openEMS, the waves a waveguide port read differ from those planes inside its box predict, by enough for the matrix to be off by something of the order stated: a change in the guide stands near the port. Where the log says the difference grows toward the source faster than a field from the structure could, the change may stand behind the port and the matrix be right, or the port's box is not drawn on the guide's walls, or the port's mode is near its cutoff | Draw the port farther from the change, and its box on the guide's walls |
 | "left as openEMS returned it" | On openEMS, a waveguide port's reading could not be modelled, for the reason given, and every waveguide port in the run keeps the engine's own | Draw the guide empty and walled by solid metal at each port |
-| "can be off S by up to about" | On openEMS, ports not driven in a run sent back part of the wave reaching them, and a column read alone carries it, changed by any renormalisation to the reference asked for | Drive the ports the message says to drive, or declare the mirror on a symmetric two-port |
+| "can be off by up to about" | On openEMS, ports not driven in a run sent back part of the wave reaching them, and a column read alone carries it, changed by any renormalisation to the reference asked for | Set `Driven` to true on the ports the message names and run again, or set the study's `Symmetry` to Mirror on a symmetric two-port |
 | "magnify an error in the solve" | A port is reported against a fixed impedance far from its own, and renormalising there multiplies the error the solve left by up to the figure quoted | Set `ReferencedTo` to Port impedance on the ports named |
-| "the device's two are equal" | Two terms that are equal for every device a model can hold are not, so at least one is off by half the figure or more. A record still ringing causes it, and so does a port reading more than its line's wave: on openEMS a microstrip port on an open board, or a waveguide port near a change in its guide | Remove the cause the log names beside it: finish the record, or draw the waveguide port farther from the change. On an open board the figure stays, and it is a floor on the error of the terms named, not a bound |
-| "incident waves are in proportion" | On openEMS, something behind the ports reflects all of what reaches them, so no column can be told apart | Draw each guide or line running on unchanged from its port into the absorber |
-| No bounding box displayed in 3D | Missing geometry links, conflicting axes, or waveguide `ReferenceDepth = 0` | Set required links and check property editor |
+| "the two terms are equal for the device" | Two terms that are equal for every device a model can hold are not, so at least one is off by half the figure or more. A record still ringing causes it, and so does a port reading more than its line's wave: on openEMS a microstrip port on an open board, or a waveguide port near a change in its guide | Remove the cause the log names beside it: finish the record, or draw the waveguide port farther from the change. On an open board the figure stays, and it is a floor on the error of the terms named, not a bound |
+| "reflect all of what reaches them" | On openEMS, something behind the ports reflects all of what reaches them, so no column can be told apart | Draw each guide or line running on unchanged from its port into the absorber |
+| No bounding box displayed in 3D | Missing geometry links, or conflicting axes. A waveguide port at `ReferenceDepth` 0 draws no box, which is not a problem | Set required links and check property editor |
 

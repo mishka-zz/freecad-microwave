@@ -120,9 +120,8 @@ def _place(place: Place, mesh: Mesh, demand: Demand) -> str:
                 f"{place.label!r} holds no curve but a seam"
             )
         return (
-            f"Mesh: at {place.name!r} asked {place.size:.4g} mm: nothing is laid, since the "
-            f"room turns round no curve of {place.label!r} by more than half a turn: "
-            f"{reached.left} in all"
+            f"Mesh: at {place.name!r} asked {place.size:.4g} mm: nothing is laid, since "
+            f"none of the {reached.left} edges of {place.label!r} is a free or re-entrant edge"
         )
     if not reached.laid:
         if isinstance(place, AtRim):
@@ -170,8 +169,8 @@ def _place(place: Place, mesh: Mesh, demand: Demand) -> str:
     )
     if reached.left:
         line += (
-            f". Nothing is laid at the curves of {place.label!r} the room turns round by "
-            f"no more than half a turn: {reached.left} in all"
+            f". Nothing is laid at the {reached.left} edges of {place.label!r} that are "
+            "neither free nor re-entrant"
         )
     return line
 

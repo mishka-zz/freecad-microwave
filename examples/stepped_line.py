@@ -40,7 +40,7 @@ It also decides how the board ends. The line terminates in 50 ohm at both ends
 at every frequency, extrapolated DC included, so the domain is not pulled in
 over the structure: there is no absorber in the signal path and nothing for the
 low-frequency end of the trace to mistake for a discontinuity. Every face is
-left at ``Air``, as on both stepped low-pass boards.
+left at ``Open``, as on both stepped low-pass boards.
 
 What the sweep has to be
 ------------------------
@@ -60,6 +60,9 @@ One port is driven. This line is its own mirror image, so the second column of
 the matrix would repeat the first, and the velocity that puts millimetres on the
 distance axis comes from the transmission to port 2 in the same run.
 
+Its study carries an openEMS and a Palace solver, and either answers it as
+drawn. Select the one to run in the tree before pressing Run.
+
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
@@ -78,8 +81,11 @@ import FreeCAD
 
 from Microwave.Objects.analysis import createEMAnalysis, solver_of
 from Microwave.Objects.materials import createEMMaterial, createEMMaterialBinding
+from Microwave.Objects.mesh import createEMGmshMesh
 from Microwave.Objects.ports import createEMPortLumped
+from Microwave.Objects.solver import createEMSolverPalace
 from Microwave.Solvers.openems import document, preflight
+from Microwave.Solvers.palace import document as palace_document
 
 # Beside this file, so the shared stamp can be imported. freecadcmd runs a
 # script without putting its directory on the path.
@@ -177,7 +183,7 @@ def markup(analysis, board, plane, strips):
 
     copper = createEMMaterial("Copper")
     copper.Label = "Copper"
-    copper.MaterialType = "ConductingSheet"
+    copper.MaterialType = "Conducting Sheet"
     copper.Conductivity = COPPER_CONDUCTIVITY
     copper.Thickness = COPPER_THICKNESS
 
@@ -208,7 +214,7 @@ def markup(analysis, board, plane, strips):
         # Port 1 alone. Both are measured either way - the run reports what
         # arrives at port 2 as well as what comes back from port 1 - and the
         # second solve would buy a column this structure repeats.
-        port.Excitation = number == 1
+        port.Driven = number == 1
         port.Resistance = PORT_IMPEDANCE
         port.ReferenceImpedance = PORT_IMPEDANCE
         # The gap the resistor spans: from the trace's end edge down to the
@@ -221,14 +227,25 @@ def markup(analysis, board, plane, strips):
 
 
 def study(doc):
-    """The analysis, its solver and its mesh policy, all settings applied."""
+    """The analysis, its solvers and its mesh policy, all settings applied."""
     analysis = createEMAnalysis(doc)
+    # Palace answers this study as drawn, so it carries that backend's solver and
+    # tetrahedral mesh beside openEMS', as Add Palace Solver puts them in.
+    palace = createEMSolverPalace(doc)
+    # The line is several wavelengths long at the top of the band and rings at
+    # every frequency it is a whole number of half wavelengths long, so the
+    # adaptive sweep's reduced model takes more full solves to follow it than a
+    # short board does. A sweep that runs out of them is refused, naming this
+    # property.
+    palace.SweepSolves = 30
+    for made in (palace, createEMGmshMesh(doc)):
+        analysis.addObject(made)
     analysis.Label = "Stepped Line"
     # One step above DC and no lower, which leaves a single invented bin. See
     # the module docstring: this is what makes the study readable as a trace.
     analysis.FrequencyStart = f"{FREQ_STOP / POINTS} Hz"
     analysis.FrequencyStop = f"{FREQ_STOP} Hz"
-    analysis.NumFrequencyPoints = POINTS
+    analysis.FrequencyPoints = POINTS
 
     solver = solver_of(analysis)
     # Long enough that the reflections have died away where the series is
@@ -257,6 +274,10 @@ def main(out):
         print(f"digest: {problem.digest()[:16]}")
         for finding in preflight.check(problem):
             print(f"  {finding}")
+
+    # Palace reads the same study, and refuses here what it cannot answer.
+    palace_document.problem(analysis)
+    print("palace: translates")
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     doc.saveAs(out)

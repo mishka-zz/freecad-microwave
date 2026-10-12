@@ -1,0 +1,9 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Mesh (the command, either backend): a mesh in neutral slate, and the action badge. -->
+  <path d="M9 9 H55 V55 H9 Z M9 24.3 H55 M9 39.6 H55 M24.3 9 V55 M39.6 9 V55
+           M9 24.3 L24.3 9 M9 39.6 L39.6 9 M9 55 L55 9 M24.3 55 L55 24.3"
+        stroke="#78909c" stroke-width="2.6" fill="none" stroke-linecap="square"/>
+  <circle cx="46" cy="46" r="16" fill="#e8833a" stroke="#ffffff" stroke-width="3"/>
+  <path d="M46 37 A9 9 0 1 0 55 46" stroke="#ffffff" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+  <path d="M51 33 L56 39 L49 40 Z" fill="#ffffff"/>
+</svg>

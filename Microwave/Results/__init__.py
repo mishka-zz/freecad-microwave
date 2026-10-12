@@ -13,6 +13,6 @@ document object that stores a matrix is described in terms of one. That import
 costs numpy and the standard library, nothing more. :mod:`._skrf` is imported as
 a module but does not touch scikit-rf, which pulls in pandas and scipy, and
 matplotlib wherever it is installed. scikit-rf is imported the first time a
-matrix is assembled, written to Touchstone or turned into a ``Network``, and
-never on the way in or out of a document.
+matrix is assembled, written to or read from Touchstone, or turned into a
+``Network``, and never on the way in or out of a document.
 """

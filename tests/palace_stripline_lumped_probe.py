@@ -165,7 +165,7 @@ def build(doc, script, length, per_wavelength, resistances, edges=1.0):
     analysis.Label = "Stripline on Palace through lumped ports"
     analysis.FrequencyStart = f"{FREQ_START:g} Hz"
     analysis.FrequencyStop = f"{FREQ_STOP:g} Hz"
-    analysis.NumFrequencyPoints = POINTS
+    analysis.FrequencyPoints = POINTS
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [obj for obj in analysis.Group if obj is not member]
@@ -199,7 +199,7 @@ def build(doc, script, length, per_wavelength, resistances, edges=1.0):
         port.Number = number
         # Both driven, so the whole matrix is measured: S12 and S21 come from
         # different solves, and the de-embedding needs all four terms.
-        port.Excitation = True
+        port.Driven = True
         port.Resistance = resistance
         port.ReferencedTo = PORT_IMPEDANCE
         port.ExcitationAxis = "Z"
@@ -213,11 +213,11 @@ def build(doc, script, length, per_wavelength, resistances, edges=1.0):
         mesh.EdgeRefinement = edges
     # No air outside the drawing. What bounds this problem is a condition on
     # the body's own faces, so every face of the domain ends where the
-    # structure does, and a face left saying Air is refused by name.
+    # structure does, and a face left saying Open is refused by name.
     settings = contents(analysis).settings
     for axis in "XYZ":
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Ends")
+            setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
     doc.recompute()
     return analysis, solver
 

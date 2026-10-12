@@ -80,10 +80,9 @@ def _measurement_distance(obj: Any, ctx: _Context, subject: str) -> float:
         return distance
     wanted = portbox.clearance(ctx.frequency.start)
     raise TranslationError(
-        f"{subject}: MeasurementDistance is 0, so the probes would sit on the "
-        "source and read its near field rather than the line's mode. For this "
-        f"band it wants to be at least {wanted:g} mm - {portbox.CLEARANCE:g} "
-        f"free-space wavelengths at {ctx.frequency.start / 1e9:.4g} GHz"
+        f"{subject}: MeasurementDistance is {distance:g} mm, so the probes sit on the "
+        f"source and read its near field. Set MeasurementDistance to at least {wanted:g} mm "
+        f"({portbox.CLEARANCE:g} free-space wavelengths at {ctx.frequency.start / 1e9:.4g} GHz)"
     )
 
 
@@ -121,11 +120,13 @@ def _check_reaches_inward(subject: str, link: Any, axis: int, direction: int, wh
     if inward is None:
         return False
     if inward != direction:
+        # Spelt as the property editor offers the axis: ``X`` and ``-X``.
+        stated = f"{'' if direction > 0 else '-'}{AXIS_NAMES[axis]}"
+        opposite = f"{'-' if direction > 0 else ''}{AXIS_NAMES[axis]}"
         raise TranslationError(
-            f"{subject}: PropagationAxis is {AXIS_NAMES[axis]}"
-            f"{'+' if direction > 0 else '-'} but {_label(owner)!r} lies the "
-            f"other way from its {what}. The port would reach out of the "
-            "structure into open space, and would measure it"
+            f"{subject}: PropagationAxis is {stated}, but {_label(owner)!r} lies the "
+            f"other way from its {what}, so the port would reach out of the structure "
+            f"into open space. Set PropagationAxis to {opposite}"
         )
     return True
 
@@ -164,8 +165,7 @@ def _reference_impedance(obj: Any) -> float | None:
     value = _value(obj.ReferenceImpedance)
     if not math.isfinite(value) or value <= 0:
         raise TranslationError(
-            f"{_label(obj)!r}: ReferenceImpedance is {value:g}. The S-parameters "
-            "are reported against it, so it has to be a positive impedance"
+            f"{_label(obj)!r}: ReferenceImpedance is {value:g} ohm. Enter a positive impedance"
         )
     return value
 
@@ -184,9 +184,7 @@ def _resistance(obj: Any, name: str) -> float:
     resistance = _value(getattr(obj, name))
     if not resistance >= 0 or not math.isfinite(resistance):
         raise TranslationError(
-            f"{_label(obj)!r}: {name} is {resistance}. A negative resistance is "
-            "not a thing openEMS can build; set it to zero for a short, or "
-            "leave it positive"
+            f"{_label(obj)!r}: {name} is {resistance} ohm. Enter 0 or a positive resistance"
         )
     return resistance
 
@@ -229,15 +227,13 @@ def _conductor_for(link: Any, ctx: _Context, subject: str) -> str:
 
     if not found:
         raise TranslationError(
-            f"{subject}: {_label(owner)!r} has no material bound to it, so the "
-            "adapter cannot tell what the conductor is made of. Bind one before "
-            "running"
+            f"{subject}: {_label(owner)!r} has no material bound where the port sits. "
+            "Bind one with Bind Material to Shape"
         )
     if len(found) > 1:
         raise TranslationError(
-            f"{subject}: {_label(owner)!r} carries more than one material where "
-            f"this port sits ({', '.join(sorted(found))}). The port lays its "
-            "conductor in one of them and the document does not say which"
+            f"{subject}: {_label(owner)!r} carries more than one material where the port "
+            f"sits ({', '.join(sorted(found))}), so which one the port uses is not defined"
         )
     return found.pop()
 
@@ -260,20 +256,19 @@ def _microstrip(obj: Any, number: int, ctx: _Context) -> Port:
     if prop_axis == exc_axis:
         raise TranslationError(
             f"{subject}: PropagationAxis and ExcitationAxis are both "
-            f"{AXIS_NAMES[prop_axis]}. The wave travels along the trace and the "
-            "field points across to the ground plane; they cannot be the same"
+            f"{AXIS_NAMES[prop_axis]}. Set PropagationAxis along the trace and "
+            "ExcitationAxis from the trace to the ground plane"
         )
     width_axis = portbox.third_axis(prop_axis, exc_axis)
 
     trace = _sub_box(obj.TraceEnd, f"{subject}: TraceEnd")
-    ground = _sub_box(obj.GroundReference, f"{subject}: GroundReference")
+    ground = _sub_box(obj.Ground, f"{subject}: Ground")
 
     if not trace.is_flat(prop_axis):
         raise TranslationError(
             f"{subject}: TraceEnd spans {trace.extents[prop_axis]:.4g} mm along "
             f"{AXIS_NAMES[prop_axis]}, the propagation axis. Select the end face "
-            "of the trace - the one the wave enters through - not a face "
-            "running along it"
+            "of the trace, where the wave enters"
         )
     if trace.is_flat(width_axis):
         raise TranslationError(
@@ -285,10 +280,10 @@ def _microstrip(obj: Any, number: int, ctx: _Context) -> Port:
 
     conductor = _conductor_for(obj.TraceEnd, ctx, subject)
     if not _is_metal(ctx.materials[conductor]):
+        # The port lays its strip in the trace's material.
         raise TranslationError(
-            f"{subject}: the trace is bound to {conductor!r}, a "
-            f"{ctx.materials[conductor].kind}. A microstrip port lays its strip "
-            "in that material, and a dielectric strip carries no current"
+            f"{subject}: the trace is bound to {conductor!r}, a dielectric, so the "
+            "port's strip carries no current. Bind a conductor to the trace"
         )
 
     box = _box(
@@ -346,12 +341,11 @@ def _lumped(obj: Any, number: int, ctx: _Context) -> Port:
 
     for name, picked in (("SourceEntity", source), ("ReferenceEntity", reference)):
         if not picked.is_flat(exc_axis):
+            # A solid picked here builds the port from its outer face.
             raise TranslationError(
                 f"{subject}: {name} spans {picked.extents[exc_axis]:.4g} mm along "
-                f"{AXIS_NAMES[exc_axis]}, the axis the port drives across. That "
-                "is a solid, not the surface bounding the gap - the port would "
-                "be built from its outer face and reach through the conductor. "
-                "Select the face at the gap"
+                f"{AXIS_NAMES[exc_axis]}, the axis the port drives across, so the port "
+                "would reach through the conductor. Select the face at the gap"
             )
 
     box = _box(
@@ -392,10 +386,10 @@ def _check_one_pick(link: Any, name: str, subject: str) -> None:
     if len(names) > 1:
         raise TranslationError(
             f"{subject}: {name} names {len(names)} sub-elements, {', '.join(names)}, and "
-            "this solver lays a lumped port as one element across one gap. Select one "
+            "openEMS lays a lumped port as one element across one gap. Select one "
             "face or edge"
             + (
-                ", or solve the study on Palace, which lays one element for each face"
+                ", or run the study on Palace, which lays one element for each face"
                 if name == "ReferenceEntity"
                 else ""
             )
@@ -428,9 +422,8 @@ def _rect_waveguide(obj: Any, number: int, ctx: _Context) -> Port:
     for dim in range(DIMENSIONS):
         if dim != prop_axis and face.is_flat(dim):
             raise TranslationError(
-                f"{subject}: CrossSection has no extent along "
-                f"{AXIS_NAMES[dim]}; a waveguide port must span the whole "
-                "cross-section of the guide"
+                f"{subject}: CrossSection has no extent along {AXIS_NAMES[dim]}. "
+                "Select a face spanning the whole cross-section of the guide"
             )
 
     checked = _check_reaches_inward(
@@ -502,8 +495,7 @@ def _coaxial(obj: Any, number: int, ctx: _Context) -> Port:
     if len(named) > 1:
         raise TranslationError(
             f"{subject}: Annulus names {len(named)} sub-elements "
-            f"({', '.join(named)}). A coaxial port is built on one ring, and its "
-            "two radii have to come off the same one"
+            f"({', '.join(named)}). Select one ring"
         )
 
     face = _sub_box(obj.Annulus, f"{subject}: Annulus")
@@ -515,10 +507,8 @@ def _coaxial(obj: Any, number: int, ctx: _Context) -> Port:
     fill = _conductor_for(obj.Annulus, ctx, subject)
     if _is_metal(ctx.materials[fill]):
         raise TranslationError(
-            f"{subject}: Annulus is bound to {fill!r}, which is a conductor. "
-            "The ring a coaxial port is built on is the gap between the two "
-            "conductors - the end face of the dielectric filling the line, not "
-            "of the shield around it"
+            f"{subject}: Annulus is bound to {fill!r}, which is a conductor. Select the "
+            "end face of the dielectric between the inner conductor and the shield"
         )
 
     if not face.is_flat(prop_axis):
@@ -578,8 +568,8 @@ def _port_numbers(ports: Sequence[Any]) -> list[int]:
     unset = [_label(p) for p, n in zip(ports, numbers) if n < 1]
     if unset:
         raise TranslationError(
-            f"{', '.join(unset)}: port number is unset. Every port needs a "
-            "number - it indexes the S-matrix"
+            f"{', '.join(unset)}: port number is unset. Set Number to a unique value "
+            "of 1 or more; it indexes the S-matrix"
         )
 
     seen: dict[int, str] = {}
@@ -587,7 +577,7 @@ def _port_numbers(ports: Sequence[Any]) -> list[int]:
         if number in seen:
             raise TranslationError(
                 f"ports {seen[number]!r} and {_label(port)!r} are both numbered "
-                f"{number}; S{number}{number} would be ambiguous"
+                f"{number}, so S{number}{number} is ambiguous. Give each port its own Number"
             )
         seen[number] = _label(port)
 

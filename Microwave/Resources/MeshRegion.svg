@@ -1,8 +1,5 @@
-<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-  <path d="M9 9 H55 M9 24.3 H55 M9 39.6 H55 M9 55 H55 M9 9 V55 M24.3 9 V55 M39.6 9 V55 M55 9 V55" stroke="#3f8fd9" stroke-width="3" fill="none" stroke-linecap="square"/>
-  <rect x="30" y="30" width="26" height="26" fill="#e8833a" fill-opacity="0.18"/>
-  <path d="M30 37 H56 M30 44 H56 M30 51 H56 M37 30 V56 M44 30 V56 M51 30 V56"
-        stroke="#e8833a" stroke-width="2" fill="none"/>
-  <rect x="30" y="30" width="26" height="26" fill="none" stroke="#e8833a"
-        stroke-width="3.5"/>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Mesh Refinement: the neutral grid, with a region subdivided along the grid's own lines. -->
+  <path d="M9 9 L55 9 M9 24.3 L55 24.3 M9 39.6 L55 39.6 M9 55 L55 55 M9 9 L9 55 M24.3 9 L24.3 55 M39.6 9 L39.6 55 M55 9 L55 55 M9 24.3 L24.3 9 M9 39.6 L24.3 24.3 M9 55 L24.3 39.6 M24.3 24.3 L39.6 9 M24.3 39.6 L39.6 24.3 M24.3 55 L39.6 39.6 M39.6 24.3 L55 9 M39.6 39.6 L55 24.3 M39.6 55 L55 39.6" stroke="#78909c" stroke-width="2.6" fill="none" stroke-linecap="square"/>
+  <path d="M24.3 31.95 L55 31.95 M24.3 47.3 L55 47.3 M31.95 24.3 L31.95 55 M47.3 24.3 L47.3 55 M24.3 31.95 L31.95 24.3 M24.3 39.6 L31.95 31.95 M24.3 47.3 L31.95 39.6 M24.3 55 L31.95 47.3 M31.95 31.95 L39.6 24.3 M31.95 39.6 L39.6 31.95 M31.95 47.3 L39.6 39.6 M31.95 55 L39.6 47.3 M39.6 31.95 L47.3 24.3 M39.6 39.6 L47.3 31.95 M39.6 47.3 L47.3 39.6 M39.6 55 L47.3 47.3 M47.3 31.95 L55 24.3 M47.3 39.6 L55 31.95 M47.3 47.3 L55 39.6 M47.3 55 L55 47.3" stroke="#e8833a" stroke-width="2" fill="none" stroke-linecap="square"/>
 </svg>

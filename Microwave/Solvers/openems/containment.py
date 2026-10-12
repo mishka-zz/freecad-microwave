@@ -76,9 +76,9 @@ _CHUNK = 1 << 19
 #: Derived from the arithmetic rather than read off a shape: a double carries
 #: about sixteen figures, the cross product spends a few of them on its
 #: products and its subtraction, and this stands four decades clear of what is
-#: left. Measured over a bar turned into the grid, the answer does not move
-#: anywhere between four decades under this and ten decades over it, so it does
-#: not sit on a cliff. Nothing here brackets it from above.
+#: left. The threshold has only to separate that residue from a point genuinely
+#: off the line, and every value between the two gives the same answer, so it
+#: does not sit on a cliff. Nothing here brackets it from above.
 _A_TURN_IS_ZERO = 1e-12
 
 #: How far off a triangle's plane a point may be and still be on it, relative to

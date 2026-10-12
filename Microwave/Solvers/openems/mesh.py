@@ -506,33 +506,31 @@ def _check_sizing_region(
             f"{_DIM_NAMES[dim]} {domain_lower[dim]:g} to {domain_upper[dim]:g}"
             for dim in range(DIMENSIONS)
         )
+        # Past a Through face the grid is uniform and cannot be refined, and
+        # the grid is rectilinear, so a region out there would still refine a
+        # slab on each axis it does overlap.
         raise MeshError(
             f"refinement region {region.name!r} lies outside the meshed domain "
-            f"in {', '.join(missing)}. The domain is {extent}, which can be "
-            "smaller than the structure you drew - a THROUGH face pulls it in "
-            "so the absorber lands on the model. Past that wall the grid is "
-            "uniform and cannot be refined. The grid is also rectilinear, so a "
-            "region out there would still refine a slab on each axis it does "
-            "overlap, somewhere you are not looking"
+            f"in {', '.join(missing)}. The domain is {extent}, and a Through face "
+            "ends it inside the drawn structure"
         )
     if region.size > params.ceiling:
+        # A refinement box covers a slab through the model on each axis, so
+        # coarsening one would take resolution off whatever else lies level
+        # with it. Coarsen names the object instead.
         raise MeshError(
-            f"refinement region {region.name!r} asks for cells of "
-            f"{region.size:g}, which is coarser than the global "
-            f"{params.ceiling:g}. A refinement box refines only - it covers a "
-            "slab through the model on each axis, so coarsening one would take "
-            "resolution off whatever else lies level with it. To let a "
-            "particular object go, set that region's Mode to Coarsen, which "
-            "names the object instead; to coarsen the whole model, lower "
-            "ElementsPerWavelength on the Yee grid"
+            f"refinement region {region.name!r} asks for {region.size:g} mm cells, "
+            f"coarser than the largest cell of {params.ceiling:g} mm, and "
+            "Refine only refines. Set the region's Mode to Coarsen to let its object "
+            "go coarser, or lower ElementsPerWavelength in the openEMS mesh settings to "
+            "coarsen the whole model"
         )
     if region.size < params.floor:
         raise MeshError(
-            f"refinement region {region.name!r} asks for cells of "
-            f"{region.size:g}, below the cell floor of "
-            f"{params.floor:g}. The floor sets the timestep for the "
-            "whole simulation. Ask for less refinement, or lower "
-            "MinElementSize deliberately"
+            f"refinement region {region.name!r} asks for {region.size:g} mm cells, "
+            f"below the cell floor of {params.floor:g} mm, which sets the timestep "
+            "of the whole run. Ask for less refinement, or lower MinElementSize in "
+            "the openEMS mesh settings"
         )
 
 
@@ -579,10 +577,9 @@ def _fixed_positions(
     for position in forced:
         if not domain_lower <= position <= domain_upper:
             raise MeshError(
-                f"{_DIM_NAMES[dim]} axis: a grid line was required at "
-                f"{position:.6g}, which is outside the meshed domain "
-                f"({domain_lower:.6g} to {domain_upper:.6g}). Whatever needs it "
-                "would not be modelled at all"
+                f"{_DIM_NAMES[dim]} axis: a grid line is required at {position:.6g}, "
+                f"outside the meshed domain ({domain_lower:.6g} to {domain_upper:.6g}), "
+                "so whatever needs it would not be modelled"
             )
 
     mandatory: list[tuple[float, str]] = [
@@ -846,10 +843,11 @@ def _snap(
         if high - low < min_cell:
             raise MeshError(
                 f"{low_source} at {low:g} and {high_source} at {high:g} are "
-                f"{high - low:g} apart on the {_DIM_NAMES[dim]} axis, below the "
-                f"cell floor of {min_cell:g}. Both must lie on grid lines, so "
-                "this would set the timestep for the whole simulation. Move "
-                "them apart, merge them, or lower min_cell deliberately."
+                f"{high - low:g} mm apart on the {_DIM_NAMES[dim]} axis, below the "
+                f"cell floor of {min_cell:g} mm. Both need a grid line, so the cell "
+                "between them would set the timestep of the whole run. Move them "
+                "apart, merge them, or set MinElementSize in the openEMS mesh settings "
+                f"below {high - low:.4g} mm"
             )
 
     kept = [FixedLine(position, source, True) for position, source in anchors]
@@ -919,14 +917,14 @@ def _conductor_edges(
     Conductor edges drive resolution and the interior of a ground plane does not,
     so these are points rather than a span, and a face with no edge on it is not
     refined at all. :func:`~.metal._edge_to_resolve` decides, and
-    :func:`_fixed_positions` asks it about the same plane. A sheet is the one
+    :func:`_asked_by` asks it about the same plane. A sheet is the one
     shape where the two act differently, and they have to. A sheet has no
     thickness to be an edge of, and its plane is where the metal is, so it is
     pinned there whatever covers it.
 
     A relaxed region is the second place they differ, and only in what they do
     with the answer. This function still asks, at a size the region chose, while
-    :func:`_fixed_positions` declines the thirds rule outright. Without the
+    :func:`_asked_by` declines the thirds rule outright. Without the
     demand a relaxed conductor would ask for nothing at all and rise to the cap,
     which would leave the size the user typed meaning nothing.
 
@@ -1084,9 +1082,9 @@ def _validate(
         offending = int(np.argmin(spacings))
         where = float(array[offending] + spacings[offending] / 2.0)
         raise MeshError(
-            f"{name} axis has a cell of {smallest:.6g} {sources.spanning(where)}, "
-            f"below the floor of {params.floor:.6g}; this would dictate the "
-            "timestep for the whole simulation"
+            f"{name} axis has a cell of {smallest:.6g} mm {sources.spanning(where)}, "
+            f"below the cell floor of {params.floor:.6g} mm, which sets the timestep "
+            "of the whole run"
         )
 
     limit = params.max_ratio[dim] * (1.0 + 1e-6)
@@ -1096,8 +1094,8 @@ def _validate(
         raise MeshError(
             f"{name} axis violates smoothness at {array[worst + 1]:.6g}, "
             f"{sources.spanning(float(array[worst + 1]))}: adjacent cells of "
-            f"{spacings[worst]:.6g} and {spacings[worst + 1]:.6g} differ by "
-            f"{np.max(ratios):.3f}, limit is {params.max_ratio[dim]}"
+            f"{spacings[worst]:.6g} and {spacings[worst + 1]:.6g} mm differ by "
+            f"{np.max(ratios):.3f}, above MaxGrowthRatio {params.max_ratio[dim]}"
         )
 
     _validate_absorber(array, spacings, name, params.absorber[dim])
@@ -1117,9 +1115,10 @@ def _validate(
     for line in sources.lines:
         if not np.any(array == line.position):
             nearest = float(array[int(np.argmin(np.abs(array - line.position)))])
+            # openEMS discretises a plane only where a line equals its position
+            # exactly.
             raise MeshError(
                 f"{name} axis lost a required grid line at {float(line.position)!r} "
-                f"({line.source}); the nearest line is at {nearest!r}. The object "
-                "there would not be modelled: a plane is discretised only where a "
-                "line equals its position exactly"
+                f"({line.source}); the nearest line is at {nearest!r}, so the object "
+                "there would not be modelled"
             )

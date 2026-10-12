@@ -1,27 +1,33 @@
 # SPDX-FileCopyrightText: 2026 Mike Volokhov
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-"""Bringing a result and a drawing together, which is the only reason
+"""Bringing a result and what its run kept together, which is the only reason
 ``Gui/views.py`` exists.
 
 A step response comes back against time. Putting it on a board needs a velocity;
 a velocity needs the distance between two reference planes; and a result object
-holds no geometry at all. So the numbers and the drawing have to meet somewhere,
+holds no geometry at all. So the numbers and the ports have to meet somewhere,
 and what is asserted here is that the meeting is a *measurement* - the delay out
-of this study's own transmission term, over a length off this document's own
-ports - and never a velocity factor assumed from a permittivity.
+of this table's own transmission term, over a length between the ports its run
+kept - and never a velocity factor assumed from a permittivity, nor a length
+read off the drawing as it stands.
 
 The line is synthetic and its velocity is declared, so the figure that comes
 back can be compared against the number that went in. The ports are real
 ``portbox`` boxes built from real fake geometry, so the separation is derived
-the way it is in a document and not typed in.
+the way a run keeps it and not typed in.
 """
+
+import dataclasses
 
 import numpy as np
 import pytest
 
 from Microwave.Gui import views
-from Microwave.Results.sparameters import ResultError, SParameters
+from Microwave.Objects.kinds import kind_of
+from Microwave.Objects.port_shape import reference_box
+from Microwave.Results.overlay import Table
+from Microwave.Results.sparameters import ResultError
 
 from .test_openems_document_translation import Obj, Shape
 from .test_tdr import SECTION, V, against, line, measured, reflected, through
@@ -59,7 +65,7 @@ def end_face(name, x):
 def port(number, x, plane, **overrides):
     properties = dict(
         Number=number,
-        Excitation=True,
+        Driven=True,
         Resistance=50.0,
         ReferenceImpedance=50.0,
         ReferencedTo="Fixed impedance",
@@ -72,47 +78,6 @@ def port(number, x, plane, **overrides):
     return Obj("EMPortLumped", f"Port{number}", **properties)
 
 
-class Analysis(Obj):
-    """A study whose ``Group`` is exactly what it was handed."""
-
-    def __init__(self, *held):
-        super().__init__("EMAnalysis", "Study")
-        self.Group = list(held)
-
-
-class Document:
-    def __init__(self, *objects):
-        self.Objects = list(objects)
-        for obj in self.Objects:
-            obj.Document = self
-
-
-def study(*ports):
-    """``(holder, document)`` for an analysis holding ``ports`` and a result."""
-    holder = Obj("EMSParameters", "SParameters")
-    analysis = Analysis(holder, *ports)
-    return holder, Document(analysis, holder, *ports)
-
-
-def two_port(**overrides):
-    """The ordinary case: a uniform line drawn end to end, solved both ways."""
-    plane = ground()
-    holder, _ = study(port(1, 0.0, plane), port(2, LENGTH, plane))
-    return holder
-
-
-@pytest.fixture
-def matrix():
-    return through(sections=SECTIONS)
-
-
-@pytest.fixture(autouse=True)
-def stored(monkeypatch, matrix):
-    """``views`` reads the matrix through ``Objects.results.load``, which has
-    its own tests. What is under test here is everything after it."""
-    monkeypatch.setattr(views, "load", lambda _holder: matrix)
-
-
 def guide_port(number, x, axis, depth):
     """A waveguide port on a cross-section at ``x``, referred ``depth`` in."""
     face = Shape((x, 0.0, 0.0), (x, 10.7, 4.3))
@@ -121,7 +86,7 @@ def guide_port(number, x, axis, depth):
         "EMPortRectWaveguide",
         f"Port{number}",
         Number=number,
-        Excitation=True,
+        Driven=True,
         ReferenceImpedance=50.0,
         ReferencedTo="Port impedance",
         ReferenceDepth=depth,
@@ -131,40 +96,98 @@ def guide_port(number, x, axis, depth):
     )
 
 
+def kept(result, *ports, name="Run 1 (openEMS)"):
+    """``result`` as a run keeps it: each port's box and kind, as the run's
+    snapshot holds them."""
+    boxes = {}
+    for obj in ports:
+        box = reference_box(obj)
+        if box is not None:
+            boxes[str(obj.Number)] = dataclasses.asdict(box)
+    members = [{"kind": kind_of(obj), "Number": obj.Number} for obj in ports]
+    return Table(result, name, {"ports": boxes, "members": members})
+
+
+def two_port(result=None):
+    """The ordinary case: a uniform line drawn end to end, solved both ways."""
+    plane = ground()
+    return kept(
+        through(sections=SECTIONS) if result is None else result,
+        port(1, 0.0, plane),
+        port(2, LENGTH, plane),
+    )
+
+
 class TestAGuideIsMeasuredBetweenItsReferencePlanes:
     """A waveguide port referred to its own face draws nothing, and its
     reference plane is still the face."""
 
     @pytest.mark.parametrize("depth", [0.0, 2.0])
     def test_the_length_runs_between_the_planes_its_answer_is_referred_to(self, depth):
-        holder, _ = study(guide_port(1, 0.0, "X", depth), guide_port(2, LENGTH, "-X", depth))
-        boxes = views.port_boxes(holder)
+        table = kept(
+            through(sections=SECTIONS),
+            guide_port(1, 0.0, "X", depth),
+            guide_port(2, LENGTH, "-X", depth),
+        )
+        boxes = views.boxes(table)
         first, second = (boxes[number].probe_point()[0] for number in (1, 2))
         assert (first, second) == (pytest.approx(depth), pytest.approx(LENGTH - depth))
+
+
+class TestAGuideHasNoLowPassTrace:
+    def test_its_port_is_refused_saying_so(self):
+        table = kept(through(sections=SECTIONS), guide_port(1, 0.0, "X", 0.0))
+        said = views.guide_refusal(table, 1)
+        assert "it is a waveguide port, which carries nothing below its cutoff" in said
+        assert "near DC" not in said
+
+    def test_only_the_port_that_is_a_guide_is_refused(self):
+        plane = ground()
+        table = kept(
+            through(sections=SECTIONS), port(1, 0.0, plane), guide_port(2, LENGTH, "-X", 0.0)
+        )
+        assert views.guide_refusal(table, 1) == ""
+        assert views.guide_refusal(table, 2)
+
+    def test_a_guide_port_is_not_offered_where_its_band_would_draw(self):
+        """A guide swept from near DC would transform; its run says it is a
+        guide, so the menu does not offer what the chart refuses."""
+        plane = ground()
+        table = kept(
+            through(sections=SECTIONS), guide_port(1, 0.0, "X", 0.0), port(2, LENGTH, plane)
+        )
+        assert views.traceable_ports(table) == [2]
+
+    def test_a_port_that_is_not_a_guide_is_not(self):
+        assert views.guide_refusal(two_port(), 1) == ""
+
+    def test_a_table_no_run_kept_says_nothing_either_way(self):
+        assert views.guide_refusal(Table(through(sections=SECTIONS), "a.s2p"), 1) == ""
 
 
 class TestWhichPortsCanBeOffered:
     """The menu asks this, so an entry that refuses when pressed must not exist."""
 
-    def test_a_study_solved_both_ways_offers_both(self, matrix):
-        assert views.traceable_ports(matrix) == [1, 2]
+    def test_a_study_solved_both_ways_offers_both(self):
+        assert views.traceable_ports(Table(through(sections=SECTIONS), "t")) == [1, 2]
 
     def test_a_port_nobody_drove_is_not_offered(self):
         """One solve drives one port, so this is the ordinary two-port sweep."""
-        assert views.traceable_ports(reflected(line([50.0, 75.0, 50.0]))) == [1]
+        assert views.traceable_ports(Table(reflected(line([50.0, 75.0, 50.0])), "t")) == [1]
 
     def test_a_port_reported_against_what_it_measured_is_offered(self):
         """The microstrip-port study, which is the commonest thing to draw a
         line's impedance from and had no entry to press at all."""
         own = against(line([50.0, 75.0, 50.0]), measured())
-        assert views.traceable_ports(own) == [1]
+        assert views.traceable_ports(Table(own, "t")) == [1]
 
-    def test_it_asks_the_transform_rather_than_repeating_its_conditions(self, matrix):
+    def test_it_asks_the_transform_rather_than_repeating_its_conditions(self):
         """Whatever is offered can be drawn. A second copy of the rule is the
         one that eventually disagrees, and it would disagree by refusing here."""
         from Microwave.Results import tdr
 
-        for number in views.traceable_ports(matrix):
+        matrix = through(sections=SECTIONS)
+        for number in views.traceable_ports(Table(matrix, "t")):
             assert tdr.step_response(matrix, number).port == number
 
 
@@ -174,116 +197,155 @@ class TestTheDistanceAxisIsMeasured:
         group delay read off a phase slope over a known length can give. The
         number is *not* assumed from a permittivity anywhere - delete the phase
         measurement and no plausible constant reproduces it."""
-        view = views.impedance_view(two_port(), 1)
-        assert view.speed == pytest.approx(V, rel=1e-3)
-        assert view.without_distance == ""
+        assert views.velocity(two_port(), 1) == pytest.approx(V, rel=1e-3)
 
-    def test_it_scales_with_the_length_that_was_drawn(self):
+    def test_it_scales_with_the_length_the_run_kept(self):
         """The velocity is a length over a delay, and the delay comes out of the
-        matrix - so moving the far port and nothing else has to move the answer
-        in proportion. That is what separates a measurement from a constant: any
-        speed assumed from a permittivity would read the same both times.
+        matrix - so a run that kept its far port at half the distance, and
+        nothing else, has to halve the answer. That is what separates a
+        measurement from a constant.
 
         Drawn shorter rather than longer, so the answer stays inside the speed
         of light and the assertion is on the arithmetic rather than on the
         guard that refuses a superluminal one."""
         plane = ground()
-        shortened, _ = study(port(1, 0.0, plane), port(2, LENGTH / 2, plane))
-        assert views.impedance_view(shortened, 1).speed == pytest.approx(
-            views.impedance_view(two_port(), 1).speed / 2, rel=1e-9
+        shortened = kept(
+            through(sections=SECTIONS), port(1, 0.0, plane), port(2, LENGTH / 2, plane)
+        )
+        assert views.velocity(shortened, 1) == pytest.approx(
+            views.velocity(two_port(), 1) / 2, rel=1e-9
         )
 
     def test_it_reads_the_same_from_either_end_of_a_uniform_line(self):
         """No reference and no error bar: a line drawn symmetrically has one
         velocity, and which port is asked cannot be part of the answer."""
-        first = views.impedance_view(two_port(), 1)
-        second = views.impedance_view(two_port(), 2)
-        assert first.speed == pytest.approx(second.speed, rel=1e-9)
-
-    def test_the_trace_is_the_one_that_was_asked_for(self):
-        view = views.impedance_view(two_port(), 2)
-        assert view.trace.port == 2
-        assert view.trace.reference == 50.0
-
-    def test_the_study_names_the_chart(self, matrix):
-        matrix.provenance["title"] = "Board A"
-        assert views.impedance_view(two_port(), 1).title == "Board A"
+        table = two_port()
+        assert views.velocity(table, 1) == pytest.approx(views.velocity(table, 2), rel=1e-9)
 
 
 class TestWithoutADistanceAxis:
+    def test_a_snapshot_this_build_does_not_read(self):
+        """The axis is lost and the chart is not."""
+        table = Table(through(sections=SECTIONS), "Run 1", {"ports": {"1": {"start": 0}}})
+        with pytest.raises(views.ViewError, match="this version cannot read"):
+            views.velocity(table, 1)
+
     """None of these is an error. The trace against time is the measurement and
-    distance is a convenience over it, so what a study that cannot support one
+    distance is a convenience over it, so what a table that cannot support one
     gets is the chart it can have and the reason for the one it cannot."""
 
-    def carrying(self, holder, number=1):
-        view = views.impedance_view(holder, number)
-        assert view.speed is None
-        assert view.without_distance
-        assert view.trace.port == number, "the trace itself must survive"
-        return view.without_distance
+    def reason(self, table, number=1):
+        with pytest.raises((views.ViewError, ResultError)) as refused:
+            views.velocity(table, number)
+        return str(refused.value)
 
-    def test_a_result_outside_any_analysis(self):
-        """A result dragged out of its group. Its numbers are intact and its
-        ports are not findable."""
-        holder = Obj("EMSParameters", "SParameters")
-        Document(holder)
-        assert "not inside an analysis" in self.carrying(holder)
+    def test_a_table_no_run_kept(self):
+        """A Touchstone file brought in. Its numbers are intact and it holds no
+        geometry."""
+        said = self.reason(Table(through(sections=SECTIONS), "line.s2p"))
+        assert said == (
+            "cannot measure a velocity: no run kept this table, so its port "
+            "positions are unknown. A table read from a file holds no geometry"
+        )
 
     def test_more_than_two_ports(self):
         """A length belongs to a pair, and which pair is not a question the
-        drawing answers."""
+        ports answer."""
         plane = ground()
-        holder, _ = study(port(1, 0.0, plane), port(2, LENGTH, plane), port(3, LENGTH / 2, plane))
-        assert "3 ports" in self.carrying(holder)
+        table = kept(
+            through(sections=SECTIONS),
+            port(1, 0.0, plane),
+            port(2, LENGTH, plane),
+            port(3, LENGTH / 2, plane),
+        )
+        assert self.reason(table).endswith(
+            "Only a two-port line gives a distance axis; read this table against time"
+        )
 
     def test_one_port_alone(self):
-        """A one-port study measures no transmission, so there is no delay to
+        """A one-port run measures no transmission, so there is no delay to
         divide a length into even though there is a perfectly good trace."""
-        holder, _ = study(port(1, 0.0, ground()))
-        assert self.carrying(holder)
+        said = self.reason(kept(through(sections=SECTIONS), port(1, 0.0, ground())))
+        assert "one port" in said
+        assert said.endswith("A distance axis needs a second port at the far end of the line")
 
     def test_the_port_being_traced_has_no_box(self):
-        """A port not configured enough to draw. The adapter says what is wrong
-        with it when a solve is asked for; a chart is not the place to raise it
-        a second time, so what is lost is the axis and not the chart."""
+        """A port not configured enough to draw kept no box."""
         plane = ground()
         unfinished = port(1, 0.0, plane, SourceEntity=(None, []))
-        holder, _ = study(unfinished, port(2, LENGTH, plane))
-        assert "no box in the document" in self.carrying(holder)
+        table = kept(through(sections=SECTIONS), unfinished, port(2, LENGTH, plane))
+        assert "no box in what its run kept" in self.reason(table)
 
     def test_a_sweep_too_coarse_to_unwrap(self):
-        """The refusal comes out of ``tdr.velocity`` rather than from here, and
-        it arrives as a missing axis rather than as a missing chart."""
+        """The refusal comes out of ``tdr.velocity`` rather than from here."""
         far = 1e4 * LENGTH
         plane = ground(reach=far)
-        holder, _ = study(port(1, 0.0, plane), port(2, far, plane))
-        assert "not a speed" in self.carrying(holder)
+        table = kept(through(sections=SECTIONS), port(1, 0.0, plane), port(2, far, plane))
+        assert "not a physical speed" in self.reason(table)
 
 
-class TestWhenThereIsNoTraceAtAll:
-    """Distance degrades; a trace does not. Every one of these is a refusal
-    ``Results/tdr.py`` makes by name, and each names what to change."""
+class TestTheTableOfAHolder:
+    def test_a_matrix_no_run_holds_carries_no_snapshot(self, monkeypatch):
+        from Microwave.Gui import results
+        from Microwave.Objects import results as stored
 
-    def test_a_port_nobody_drove(self, monkeypatch):
-        monkeypatch.setattr(views, "load", lambda _holder: reflected(line([50.0, 75.0])))
-        with pytest.raises(ResultError, match="nobody drove it"):
-            views.impedance_view(two_port(), 2)
+        matrix = through(sections=SECTIONS)
+        monkeypatch.setattr(stored, "load", lambda _holder: matrix)
+        monkeypatch.setattr(results, "run_of", lambda _holder: None)
+        monkeypatch.setattr(results, "source", lambda _holder: "line.s2p")
+        table = views.table_of(object())
+        assert (table.result, table.name, table.snapshot) == (matrix, "line.s2p", {})
 
-    def test_a_reference_that_holds_no_number(self, monkeypatch, matrix):
-        """A dispersive reference is moved onto a real one; one that is not a
-        number has nothing to move onto, and would reach the transform as a
-        matrix of ``nan`` and come back as a chart of nothing."""
-        blank = np.full(matrix.reference.shape, np.nan, dtype=complex)
-        monkeypatch.setattr(
-            views,
-            "load",
-            lambda _holder: SParameters(
-                frequency=matrix.frequency,
-                s=matrix.s,
-                port_numbers=matrix.port_numbers,
-                reference=blank,
-                measured_impedance=matrix.measured_impedance,
-            ),
-        )
-        with pytest.raises(ResultError, match="states no impedance"):
-            views.impedance_view(two_port(), 1)
+    def test_a_run_s_matrix_carries_what_the_run_kept(self, monkeypatch):
+        from Microwave.Gui import results
+        from Microwave.Objects import results as stored
+
+        matrix = through(sections=SECTIONS)
+        monkeypatch.setattr(stored, "load", lambda _holder: matrix)
+        monkeypatch.setattr(results, "run_of", lambda _holder: "run")
+        monkeypatch.setattr(results, "source", lambda _holder: "Run 1 (openEMS)")
+        monkeypatch.setattr(results, "asked_of", lambda run: {"ports": {}, "of": run})
+        assert views.table_of(object()).snapshot == {"ports": {}, "of": "run"}
+
+    def test_it_names_the_document_holding_it(self, monkeypatch):
+        """A chart closes with the document its tables were read from."""
+        from types import SimpleNamespace
+
+        from Microwave.Gui import results
+        from Microwave.Objects import results as stored
+
+        monkeypatch.setattr(stored, "load", lambda _holder: through(sections=SECTIONS))
+        monkeypatch.setattr(results, "run_of", lambda _holder: None)
+        monkeypatch.setattr(results, "source", lambda _holder: "line.s2p")
+        holder = SimpleNamespace(Document=SimpleNamespace(Name="Unnamed1"))
+        assert views.table_of(holder).document == "Unnamed1"
+        assert views.table_of(object()).document == ""
+
+
+def test_a_blank_reference_is_refused_by_the_transform():
+    """Distance degrades; a trace does not. A reference that is not a number
+    has nothing to move a reflection onto."""
+    from Microwave.Results import tdr
+    from Microwave.Results.sparameters import SParameters
+
+    matrix = through(sections=SECTIONS)
+    blank = SParameters(
+        frequency=matrix.frequency,
+        s=matrix.s,
+        port_numbers=matrix.port_numbers,
+        reference=np.full(matrix.reference.shape, np.nan, dtype=complex),
+        measured_impedance=matrix.measured_impedance,
+    )
+    with pytest.raises(ResultError, match="states no impedance"):
+        tdr.step_response(blank, 1)
+
+
+@pytest.mark.parametrize("snapshot", ({"ports": [1, 2]}, {"ports": {"1": "box"}}))
+def test_a_snapshot_of_another_shape_loses_the_axis(snapshot):
+    with pytest.raises(views.ViewError):
+        views.velocity(Table(through(sections=SECTIONS), "Run 1", snapshot), 1)
+
+
+def test_members_of_another_shape_say_nothing_about_a_guide():
+    table = Table(through(sections=SECTIONS), "Run 1", {"members": [None, "abc", 3]})
+    assert views.guide_refusal(table, 1) == ""

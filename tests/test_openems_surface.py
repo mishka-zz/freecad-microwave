@@ -124,6 +124,83 @@ class TestOrientationIsRefused:
         assert set(used.values()) == {2}
 
 
+def _joined(*shells):
+    """Several triangle sets as one, each shell's indices moved past the last."""
+    vertices: list = []
+    faces: list = []
+    for points, triangles in shells:
+        faces.extend(tuple(index + len(vertices) for index in face) for face in triangles)
+        vertices.extend(points)
+    return tuple(vertices), tuple(faces)
+
+
+def _box(low, high, inward=False):
+    """A box from two corners, wound as the cube is, or turned in."""
+    corners = tuple(
+        tuple(high[dim] if (vertex[dim] == 1.0) else low[dim] for dim in range(3))
+        for vertex in CUBE_VERTICES
+    )
+    faces = CUBE_FACES if not inward else tuple((a, c, b) for a, b, c in CUBE_FACES)
+    return corners, faces
+
+
+def _octahedron(centre, reach, inward=False):
+    """An octahedron, wound outward or turned in. Its box holds points the
+    octahedron does not, near each of the box's corners."""
+    x, y, z = centre
+    points = (
+        (x + reach, y, z),
+        (x - reach, y, z),
+        (x, y + reach, z),
+        (x, y - reach, z),
+        (x, y, z + reach),
+        (x, y, z - reach),
+    )
+    faces = tuple(
+        (a, b, c) if (sa * sb * sc) > 0 else (a, c, b)
+        for a, sa in ((0, 1), (1, -1))
+        for b, sb in ((2, 1), (3, -1))
+        for c, sc in ((4, 1), (5, -1))
+    )
+    if inward:
+        faces = tuple((a, c, b) for a, b, c in faces)
+    return points, faces
+
+
+class TestHollowBodiesAreWoundShellByShell:
+    """A shell bounding a void is wound against the shell holding it, and a
+    shell's nesting is what says which way it should be wound."""
+
+    def test_the_octahedron_is_wound_outward(self):
+        assert winding(*_octahedron((0.0, 0.0, 0.0), 1.0)) == 1.0
+
+    def test_a_void_in_the_material_beside_another_void_s_box_corner_passes(self):
+        """The small void stands inside the octahedral void's box and outside
+        the octahedron, so it is a void in the material and wound inward."""
+        vertices, faces = _joined(
+            _box((0.0, 0.0, 0.0), (10.0, 10.0, 10.0)),
+            _octahedron((5.0, 5.0, 5.0), 3.0, inward=True),
+            _box((7.0, 7.0, 7.0), (7.6, 7.6, 7.6), inward=True),
+        )
+        assert surface_fault(vertices, faces) is None
+
+    def test_a_void_wound_as_material_is_refused(self):
+        vertices, faces = _joined(
+            _box((0.0, 0.0, 0.0), (10.0, 10.0, 10.0)),
+            _octahedron((5.0, 5.0, 5.0), 3.0, inward=True),
+            _box((7.0, 7.0, 7.0), (7.6, 7.6, 7.6)),
+        )
+        assert "is wound against the rest" in surface_fault(vertices, faces)
+
+    def test_a_lump_inside_a_void_is_wound_as_material(self):
+        vertices, faces = _joined(
+            _box((0.0, 0.0, 0.0), (10.0, 10.0, 10.0)),
+            _octahedron((5.0, 5.0, 5.0), 3.0, inward=True),
+            _box((4.8, 4.8, 4.8), (5.2, 5.2, 5.2)),
+        )
+        assert surface_fault(vertices, faces) is None
+
+
 class TestANonManifoldVertexIsRefused:
     def test_two_tetrahedra_sharing_one_corner(self):
         """Every directed edge used once, wound consistently, and still not a
@@ -149,7 +226,7 @@ class TestANonManifoldVertexIsRefused:
         )
         fault = surface_fault(vertices, faces)
         assert fault is not None
-        assert "more than one separate sheet" in fault
+        assert fault == "two separate sheets of the surface meet at vertex 0 and nowhere else"
 
 
 class TestDegenerateInput:

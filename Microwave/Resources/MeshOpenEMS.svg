@@ -1,0 +1,4 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny">
+  <!-- Mesh (openEMS): the rectilinear grid openEMS lays, graded toward an edge. -->
+  <path d="M9 9 H55 M9 14 H55 M9 20.5 H55 M9 29 H55 M9 40.5 H55 M9 55 H55 M9 9 V55 M14 9 V55 M20.5 9 V55 M29 9 V55 M40.5 9 V55 M55 9 V55" stroke="#3f8fd9" stroke-width="3" fill="none" stroke-linecap="square"/>
+</svg>

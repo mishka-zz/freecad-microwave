@@ -217,7 +217,7 @@ class Gate:
 
 
 #: Every acceptance gate, in the order a reader should meet them: the exact
-#: references first, then the identities, then the two scored against a
+#: references first, then the identities, then those scored against a
 #: reference that carries an error of its own.
 #:
 #: ``test_gate_report`` holds this against the files on disk in both
@@ -445,6 +445,21 @@ GATES = (
             "an idealisation cannot - and it is the one gate whose reference is an "
             "instrument, so the term it cannot establish is a real laminate nobody "
             "characterised rather than an omission"
+        ),
+    ),
+    Gate(
+        name="palace_lowpass",
+        reference="a board somebody else fabricated and measured",
+        activity=VALIDATION,
+        criterion=DECLARED,
+        isolates=(
+            "a shipped document solved on the second backend with nothing edited, "
+            "against an instrument rather than a closed form: an open board, lumped "
+            "ports and a lossy laminate at once. The board is the paper's as drawn, "
+            "since the mesh conforms to the drawn widths, and the gate holds that "
+            "neither the narrow sections twice as finely across, nor one order lower, "
+            "nor an open surface twice as far off moves the corner by half the last "
+            "digit the published figure is printed to"
         ),
     ),
 )

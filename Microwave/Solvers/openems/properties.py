@@ -22,7 +22,7 @@ from contextlib import contextmanager
 # ``X``, ``Y``, ``Z`` - the document's spelling, from portbox, rather than the
 # envelope's lowercase one from model. Everything the adapter names an axis for
 # is document-facing: a message about PropagationAxis, whose value the user sees
-# as "X", or a property name like PaddingXMin. With model's copy the messages
+# as "X", or a property name like BoundaryXMin. With model's copy the messages
 # would spell an axis differently from the property they name. The lowercase
 # copy stays in model, where it spells envelope keys. It is re-exported here so
 # that the modules translating a subject share one spelling.
@@ -107,5 +107,5 @@ def _axis(name: str, subject: str) -> tuple[int, int]:
         return _AXES[name]
     except KeyError:
         raise TranslationError(
-            f"{subject}: {name!r} is not an axis; expected one of {sorted(_AXES)}"
+            f"{subject}: {name!r} is not an axis. Set it to one of {', '.join(_AXES)}"
         ) from None

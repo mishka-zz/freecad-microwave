@@ -38,11 +38,10 @@ from Microwave.Objects.materials import (  # noqa: E402
     createEMMaterial,
     createEMMaterialBinding,
 )
-from Microwave.Objects.mesh import createEMGmshMesh  # noqa: E402
-from Microwave.Objects.solver import createEMSolverPalace  # noqa: E402
 from Microwave.Solvers import gmsh_meshing  # noqa: E402
 from Microwave.Solvers.openems import document, write  # noqa: E402
 from Microwave.Solvers.openems import run as openems_run  # noqa: E402
+from Microwave.Solvers.palace import document as palace_document  # noqa: E402
 from Microwave.Solvers.palace import pipeline  # noqa: E402
 from Microwave.Solvers.palace import run as palace_run  # noqa: E402
 
@@ -93,7 +92,7 @@ def build(doc):
 
     analysis = WR42.study(doc)
     analysis.Label = "Lossy WR-42"
-    analysis.NumFrequencyPoints = POINTS
+    analysis.FrequencyPoints = POINTS
     WR42.markup(analysis, air, planes)
     for member in analysis.Group:
         material = getattr(member, "Material", None)
@@ -104,7 +103,7 @@ def build(doc):
 
     brass = createEMMaterial("Brass")
     brass.Label = "Brass"
-    brass.MaterialType = "ConductingSheet"
+    brass.MaterialType = "Conducting Sheet"
     brass.Conductivity = 1.57e7
     # Thin against a cell and thick against the skin depth, which is what a
     # sheet is to both backends.
@@ -114,12 +113,11 @@ def build(doc):
     binding.References = [(septum, [""])]
     analysis.addObject(binding)
 
-    palace = createEMSolverPalace(doc)
+    # The example's study carries the Palace solver and its mesh.
+    found = palace_document.contents(analysis)
+    palace, tetrahedra = found.solver, found.recipe
     # The lowest order, for the reason the band is sampled at a few points.
     palace.Order = 1
-    analysis.addObject(palace)
-    tetrahedra = createEMGmshMesh(doc)
-    analysis.addObject(tetrahedra)
     # The same number on each pipeline, for the reason the comment on the
     # constant gives: the two backends answer one document.
     grid = document.contents(analysis).recipe
@@ -155,7 +153,8 @@ def on_openems(analysis, out):
         found.append(openems_run.run(write.write(problem, directory)))
     matrix = glue.assemble(glue.load_runs(found), reference=glue.reference_for(analysis))
     matrix = glue.stamped(matrix, drawn)
-    return glue.record(analysis, matrix), glue.beside(analysis, matrix)
+    holder = glue.record(analysis, matrix)
+    return holder, glue.beside(analysis, matrix, glue.source(holder))
 
 
 def on_palace(analysis, out):
@@ -165,7 +164,8 @@ def on_palace(analysis, out):
         analysis, os.path.join(out, "palace"), 1, on_output=lambda line: print(line, flush=True)
     )
     matrix = glue.stamped(glue.from_palace(answer, title=analysis.Label), drawn)
-    return glue.put(analysis, matrix), glue.beside(analysis, matrix)
+    holder = glue.put(analysis, matrix)
+    return holder, glue.beside(analysis, matrix, glue.source(holder))
 
 
 def main(out):

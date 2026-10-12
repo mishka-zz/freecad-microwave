@@ -51,7 +51,7 @@ def facts():
 
         print("imported=yes")
         print(f"has_show_matrix={hasattr(plot_s_params, 'show_matrix')}")
-        print(f"has_show_trace={hasattr(plot_tdr, 'show_trace')}")
+        print(f"has_show_traces={hasattr(plot_tdr, 'show_traces')}")
 
         try:
             charts.module()
@@ -92,7 +92,7 @@ def test_the_entry_points_still_exist(facts):
     defines its entry point only in the working case turns a missing chart into
     a missing panel."""
     assert facts["has_show_matrix"] == "True"
-    assert facts["has_show_trace"] == "True"
+    assert facts["has_show_traces"] == "True"
 
 
 def test_drawing_refuses_at_the_call_and_says_what_is_missing(facts):

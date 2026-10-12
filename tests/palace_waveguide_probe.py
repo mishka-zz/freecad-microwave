@@ -149,7 +149,7 @@ HOLE = (0.5, 0.5)
 SEALED = "is left out of the model"
 
 #: What the run says of a label of metal the room turns round no edge of.
-UNTURNED = "nothing is laid, since the room turns round no curve of"
+UNTURNED = "nothing is laid, since none of the"
 WALLED = "of the reserved air is a perfect conductor"
 
 
@@ -194,7 +194,7 @@ def build(doc, cut=False, gap=0.0, binding_label=None):
     analysis.Label = "WR-42 on Palace"
     analysis.FrequencyStart = FREQ_START
     analysis.FrequencyStop = FREQ_STOP
-    analysis.NumFrequencyPoints = POINTS
+    analysis.FrequencyPoints = POINTS
 
     # A study is created with the backend whose route from a drawing to a
     # result is complete, and this document's ports stand where that backend
@@ -229,7 +229,7 @@ def build(doc, cut=False, gap=0.0, binding_label=None):
         port.Number = number
         # Both are driven, so the whole matrix is measured rather than half of
         # it assumed by reciprocity - which is one of the things scored.
-        port.Excitation = True
+        port.Driven = True
         port.PropagationAxis = "X" if at == 0.0 else "-X"
         port.CrossSection = (ends[at][0], [ends[at][1]])
         port.ReferencedTo = PORT_IMPEDANCE
@@ -239,11 +239,11 @@ def build(doc, cut=False, gap=0.0, binding_label=None):
     mesh.ElementsPerWavelength = ELEMENTS_PER_WAVELENGTH
     # No air outside the drawing. What bounds this problem is a condition on
     # the body's own faces, so every face of the domain ends where the
-    # structure does, and a face left saying Air is refused by name.
+    # structure does, and a face left saying Open is refused by name.
     settings = contents(analysis).settings
     for axis in "XYZ":
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Ends")
+            setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
 
     doc.recompute()
     return analysis, solver
@@ -301,7 +301,7 @@ def walls(doc):
         port = createEMPortRectWaveguide(f"Port{number}")
         port.Label = f"Port{number}"
         port.Number = number
-        port.Excitation = True
+        port.Driven = True
         port.PropagationAxis = "X" if number == 1 else "-X"
         port.CrossSection = (plane, ["Face1"])
         port.ReferencedTo = PORT_IMPEDANCE
@@ -323,10 +323,8 @@ def example(doc):
     analysis = script.study(doc)
     script.markup(analysis, air, planes)
 
-    solver = createEMSolverPalace(doc)
-    analysis.addObject(solver)
-    analysis.addObject(createEMGmshMesh(doc))
-    analysis.NumFrequencyPoints = POINTS
+    solver = contents(analysis).solver
+    analysis.FrequencyPoints = POINTS
     contents(analysis).recipe.ElementsPerWavelength = ELEMENTS_PER_WAVELENGTH
     for port in analysis.Group:
         if kind_of(port) == "EMPortRectWaveguide":

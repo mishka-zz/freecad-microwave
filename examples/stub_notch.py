@@ -48,6 +48,9 @@ first, so port 2 could be left undriven and the run would cost one solve
 instead of two. This example drives both ports, so the agreement between the
 two columns is visible in the plot rather than assumed.
 
+Its study carries an openEMS solver alone. Its ports are microstrip ports,
+which Palace does not drive, so Palace refuses the study.
+
 Run it with FreeCAD's own interpreter, which is not the one that owns the
 openEMS bindings::
 
@@ -134,7 +137,7 @@ def geometry(doc):
     """What the user draws: a board, a ground plane, a line and a stub.
 
     Both conductors are faces rather than solids, as in ``microstrip_50ohm.py``
-    - zero-thickness sheets carrying a ConductingSheet material.
+    - zero-thickness sheets carrying a Conducting Sheet material.
 
     The stub is a second sheet rather than a corner cut into one, and that is a
     preference now: translation cuts an L into the rectangles it is made of by
@@ -193,7 +196,7 @@ def markup(analysis, board, plane, strip, stub):
 
     copper = createEMMaterial("Copper")
     copper.Label = "Copper"
-    copper.MaterialType = "ConductingSheet"
+    copper.MaterialType = "Conducting Sheet"
     copper.Conductivity = COPPER_CONDUCTIVITY
     copper.Thickness = COPPER_THICKNESS
 
@@ -219,7 +222,7 @@ def markup(analysis, board, plane, strip, stub):
         port.Number = number
         # Both ports are excited, so both columns of the S-matrix are
         # measured: the run solves the structure once per excited port.
-        port.Excitation = True
+        port.Driven = True
         # A bare voltage source. The line runs out through the absorber, so
         # there is nothing for a reflection off the feed to come back from, and
         # an undamped source gives a cleaner incident wave. ReferenceImpedance
@@ -229,7 +232,7 @@ def markup(analysis, board, plane, strip, stub):
         port.FeedOffset = FEED_OFFSET
         port.MeasurementDistance = PROBE_DISTANCE
         port.TraceEnd = (strip, [trace_end(strip, x)])
-        port.GroundReference = (plane, ["Face1"])
+        port.Ground = (plane, ["Face1"])
         # Into the structure from the end this port sits on, so the two are
         # opposite. The excitation axis is not: the field points from trace to
         # ground at both ends.
@@ -251,7 +254,7 @@ def study(doc):
     # The DFT is taken over the same time series whatever this is, so points are
     # nearly free, and a resonance is the one feature that a coarse sweep can
     # miss between samples.
-    analysis.NumFrequencyPoints = 401
+    analysis.FrequencyPoints = 401
 
     solver = solver_of(analysis)
     # Two floors, and the higher one wins. Numerically the sweep has stopped
@@ -269,8 +272,8 @@ def study(doc):
     # both ends, so the lines run out through it. Give them air instead and they
     # radiate off an open circuit, and every S-parameter is contaminated by the
     # reflection off it.
-    settings.PaddingXMin = "Through"
-    settings.PaddingXMax = "Through"
+    settings.BoundaryXMin = "Through"
+    settings.BoundaryXMax = "Through"
     return analysis
 
 

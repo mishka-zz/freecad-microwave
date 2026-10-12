@@ -35,8 +35,10 @@ than how often one was drawn.
 The sweep runs both ways round, banded in v and again banded in u, and the
 cheaper answer wins. A comb cut across its fingers gives one rectangle per
 finger and one for the spine; cut along them it gives one per finger. Every
-extra rectangle is a seam, and every seam is grid the user pays for on every
-timestep of every run.
+extra rectangle is a seam. In a dielectric a seam is a plane the mesher puts a
+line on, which the user pays for on every timestep of every run. In metal the
+mesher meshes the pieces as the shape they came from, and a seam costs the work
+of grouping them again.
 """
 
 from __future__ import annotations
@@ -160,8 +162,9 @@ def rectangles(edges: Sequence[Segment], *, tolerance: float) -> list[Rect]:
 def _cost(cut: Sequence[Rect]) -> tuple[int, float]:
     """How much grid a cut will cost: pieces first, then the thinnest piece.
 
-    Pieces count because each new seam is a plane the mesher has to put a line
-    on. The tie-break matters too. Two cuts of the same shape into the same
+    Pieces count because a seam in a dielectric is a plane the mesher puts a
+    line on, and a seam in metal is a piece the mesher groups again. The
+    tie-break matters too. Two cuts of the same shape into the same
     number of rectangles can differ in whether one of them is a sliver, and a
     sliver is two of those lines a sliver apart - one cell that small divides
     the timestep for the whole domain. The cut with the widest thinnest piece

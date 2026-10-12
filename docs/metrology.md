@@ -4,20 +4,41 @@ Workbench numerical accuracy is verified against closed-form analytic
 solutions, canonical benchmark structures, and published physical
 measurements.
 
-To generate an updated accuracy report from the acceptance test suite:
+To generate an updated accuracy report from the acceptance test suite, run
+this from the repository root under the Python that owns the openEMS bindings:
 
 ```bash
 python3 -m tests.gate_report
 ```
 
-Options:
-- `--out <file.md>`: Exports the report directly to markdown.
-- `--only <gate_name>`: Runs an individual acceptance gate.
+The report runs each gate file in turn and puts each figure under the claim it
+answers. Options:
+- `--out <file.md>`: Writes the report to that file instead of to standard
+  output.
+- `--only <name>`: Runs one gate, named by its backend and structure, such as
+  `--only openems_waveguide` or `--only palace_lowpass`. Repeat the option to
+  run several.
 
-Alternative test command:
+The exit status says what the report is worth:
+
+| Status | Meaning |
+|---|---|
+| `0` | Every gate solved and passed. |
+| `1` | Anything else: a gate failed, was refused, passed without printing a figure, ran in part or never reported. |
+| `2` | `--only` named a gate that does not exist. Nothing is run. |
+| `3` | No gate measured anything. The machine lacks what the gates solve with. |
+
+The gates also run under pytest:
+
 ```bash
-python3 -m pytest -m slow -s | grep GATE
+python3 -m pytest -m slow -s
 ```
+
+Each gate prints what it measured on lines beginning `GATE`, followed by the
+structure it solved. The rest of the line is the gate's own: one line can carry
+several figures, and many state what a figure is held against beside it.
+Piping the run through `grep GATE` keeps those lines and hides the `UNREACHED`
+line and pytest's exit status, so read the exit status of the run itself.
 
 openEMS gates need the openEMS Python bindings. Palace gates draw their device
 under `freecadcmd`, and need Palace and a Python that can import `gmsh`. A gate
@@ -58,6 +79,15 @@ measurements:
 - Fabricated microstrip filter prototypes (compared with physical VNA
   measurements).
 
+On Palace:
+- The fabricated stepped-impedance low-pass, solved from
+  `examples/stepped_lowpass_measured.FCStd` as shipped, against the same two
+  measured figures and tolerance as on openEMS: the corner measured from the
+  passband, and the stopband floor. The gate also solves the board with its
+  narrow sections twice as finely across, one order lower, and with its open
+  surface twice as far off, and holds that none of these moves the corner by
+  half the last digit the published figure is printed to.
+
 Validation comparisons incorporate both numerical discretization errors and
 measurement uncertainty in the reference standard.
 
@@ -66,13 +96,13 @@ Verifies fundamental electromagnetic properties without external reference
 data:
 - S-parameter matrix reciprocity ($S_{ij} = S_{ji}$ in passive isotropic
   media).
-- Energy conservation on lossless structures ($|S_{11}|^2 + |S_{21}|^2 = 1$,
-  verified within $5 \cdot 10^{-4}$ on a vacuum waveguide with PEC walls).
+- Energy conservation on lossless structures ($|S_{11}|^2 + |S_{21}|^2 = 1$
+  on a vacuum waveguide with PEC walls).
 - Passivity bounds (verifying that passive structures do not amplify power;
   held within loose bounds on radiating microstrip to catch matrix
-  normalization inflation, and bounded within 5% on shielded TEM lines).
+  normalization inflation, and within tighter bounds on shielded TEM lines).
 - Spatial invariance (verifying that rotating or shifting geometry along
-  Cartesian axes yields identical results).
+  Cartesian axes moves the answer by less than the gate's tolerance).
 - On Palace, power conservation on a strip dipole in free space: what the
   matrix reflects and what leaves through the open surface account for what
   went in.
@@ -83,8 +113,7 @@ data:
 
 ## Metrology evaluation methods
 
-Acceptance gates apply rigorous statistical and numerical procedures to
-evaluate convergence:
+Acceptance gates use these procedures:
 
 - **Grid refinement sequences (Eça & Hoekstra)**: Solves structures across a
   sequence of geometrically refined grids ($h_1 > h_2 > h_3$) to estimate the
@@ -99,14 +128,9 @@ evaluate convergence:
 
 ## Instrument systematic effects (openEMS)
 
-Certain openEMS benchmark gates evaluate known systematic effects introduced by
-discrete numerical probe formulations:
-- Voltage and current probe plane spatial displacement on lumped ports.
-- Resonator Q-factor and frequency loading from internal field sampling
-  probes.
-
-These systematic tolerances ensure that numerical artifacts remain bounded
-and predictable across software revisions.
+openEMS builds a lumped port as two conducting plates joined by a resistance,
+so the port is metal in the field it measures. The cavity gate bounds how far
+the port that feeds the cavity moves the resonance it reads.
 
 ## Benchmark example models
 
@@ -115,10 +139,4 @@ and predictable across software revisions.
 - `examples/stepped_lowpass_measured.FCStd`:
   Stepped-impedance microstrip low-pass filter benchmarked against published
   VNA measurements.
-
-For curved conductors, Yee grid discretization introduces staircase
-approximations. The openEMS adapter automatically applies 0.5-cell geometric
-offsets to minimize radial bias (see [Drawing the
-device](geometry.md#where-a-curved-conductor-ends-up) and
-[CurveTolerance](meshing.md#curvetolerance)).
 

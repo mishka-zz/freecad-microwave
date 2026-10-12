@@ -9,10 +9,10 @@ Whether FreeCAD reads the copy that way, draws the object, and keeps it through
 a save is asked of a real FreeCAD by ``tests/test_palace_mesh_shown.py``.
 """
 
-import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from Microwave.Gmsh.vocabulary import Label
@@ -23,7 +23,7 @@ from Microwave.Objects.kinds import kind_of
 from Microwave.Objects.materials import createEMMaterialBinding
 from Microwave.Objects.mesh import createEMGmshMesh
 from Microwave.Objects.preview import CURRENT, OUT_OF_DATE
-from Microwave.Objects.results import SOLVED_ON, createEMSParameters
+from Microwave.Objects.results import SOLVED_ON
 
 
 class Read:
@@ -87,7 +87,7 @@ class TestReadingTheCopy:
         ("groups", "complaint"),
         [
             (["1", "2"], "no group came back for 'wall'"),
-            (["1", "2", "3", "4"], "groups the mesher did not write: ['4']"),
+            (["1", "2", "3", "4"], "groups Gmsh did not write: ['4']"),
             (["1", "2", "3", "3"], "two groups under one number"),
             (["Guide_Air", "2", "3"], "no group came back for 'Guide Air'"),
         ],
@@ -103,7 +103,10 @@ class TestReadingTheCopy:
         reader["mesh"] = Read(["1"])
         with pytest.raises(fem_mesh.Unshown) as raised:
             fem_mesh.read(mesher_answer(**{f"Port{breaks}1": (2, 1)}))
-        assert "line break" in str(raised.value)
+        assert str(raised.value).endswith(
+            "contain a line break, which FreeCAD loses when it saves the document. "
+            "Remove the line break from the label"
+        )
 
     def test_nothing_is_renamed_when_the_copy_is_refused(self, reader):
         reader["mesh"] = Read(["1", "2"])
@@ -157,13 +160,46 @@ class TestPuttingItInTheStudy:
         for name in (MADE_FOR, STATUS, DIGEST, IDENTITY):
             assert "Output" in made.getPropertyStatus(name), name
 
+    def test_it_is_built_from_its_own_backends_regions_and_from_none_of_the_others(self, doc):
+        from Microwave.Objects.mesh import createEMMeshRegion
+
+        analysis = createEMAnalysis(doc)
+        gmsh = createEMGmshMesh(doc)
+        analysis.addObject(gmsh)
+        (grid,) = [one for one in analysis.Group if kind_of(one) == "EMYeeGrid"]
+        ours, theirs = createEMMeshRegion(doc, gmsh), createEMMeshRegion(doc, grid)
+        analysis.addObject(ours)
+        analysis.addObject(theirs)
+        linked = fem_mesh.built_from(analysis)
+        assert any(one is ours for one in linked)
+        assert not any(one is theirs for one in linked)
+
     def test_a_mesh_of_a_study_that_moved_while_it_was_made_is_put_in_out_of_date(self, doc):
         analysis = createEMAnalysis(doc)
         key = fem_mesh.inputs(analysis)
         analysis.FrequencyStop = 20e9
         made = fem_mesh.put(analysis, "Palace", "a mesh", key=key)
         assert made.Status == OUT_OF_DATE
-        assert made.Label == "Mesh (Palace) - out of date"
+        assert made.Label == "Mesh (Palace)", "the tree says it by an overlay, not the label"
+
+    def test_a_label_the_user_wrote_is_carried_to_the_mesh_that_replaces_it(self, doc):
+        analysis = createEMAnalysis(doc)
+        fem_mesh.put(analysis, "Palace", "first").Label = "Coarse"
+        assert fem_mesh.put(analysis, "Palace", "second").Label == "Coarse"
+
+    def test_a_label_beginning_as_the_workbench_s_is_the_workbench_s(self, doc):
+        """A mesh saved while the workbench still marked a stale mesh by its
+        label is replaced under the plain label."""
+        analysis = createEMAnalysis(doc)
+        fem_mesh.put(analysis, "Palace", "first").Label = "Mesh (Palace) - out of date"
+        assert fem_mesh.put(analysis, "Palace", "second").Label == "Mesh (Palace)"
+
+    def test_it_carries_the_proxy_that_redraws_its_icon(self, doc):
+        from Microwave.Objects.fem_mesh import FemMeshProxy
+
+        made = fem_mesh.put(createEMAnalysis(doc), "Palace", "a mesh")
+        assert isinstance(made.Proxy, FemMeshProxy)
+        assert made.Proxy.allowDuplicateLabel(made)
 
     def test_a_mesh_given_no_key_is_put_in_out_of_date(self, doc):
         analysis = createEMAnalysis(doc)
@@ -248,34 +284,37 @@ class TestPuttingItInTheStudy:
         fem_mesh.record(analysis, "Palace", "a mesh")
         assert doc.transactions == [("Store Mesh", "commit")]
 
-    def test_recording_it_marks_the_result_beside_it_in_the_same_step(self, doc, monkeypatch):
-        """So that undoing the mesh takes the mark with it."""
+    def test_recording_it_is_one_undo_step_and_marks_no_run(self, doc):
+        """A run keeps the mesh it was solved on in its matrix's record, and a
+        mark written into a label would land on every older run."""
+        from Microwave.Gui import results as glue
+
         analysis = createEMAnalysis(doc)
-        result = filed(doc, analysis, "Palace", solved_on="first")
+        result = glue.put(analysis, solved_on_mesh("first"))
+        run = glue.run_of(result)
+        labels = (run.Label, result.Label)
         doc.transactions.clear()
-        marked = []
-        pair = fem_mesh.pair
-
-        def pairing(*args):
-            marked.append(doc._open)
-            return pair(*args)
-
-        monkeypatch.setattr(fem_mesh, "pair", pairing)
-        _, said = fem_mesh.record(analysis, "Palace", "a mesh", identity="second")
-        assert marked == ["Store Mesh"]
-        assert result.Label == "S-Parameters (Palace) - not solved on the mesh shown"
-        assert said == "'S-Parameters (Palace)' was not solved on the mesh shown."
+        made = fem_mesh.record(analysis, "Palace", "a mesh", identity="second")
+        assert doc.transactions == [("Store Mesh", "commit")]
+        assert made in analysis.Group
+        assert (run.Label, result.Label) == labels
 
 
-def filed(doc, analysis, solver, solved_on=None):
-    """A result ``solver`` filled in ``analysis``, labelled as a run labels it,
-    and recording the mesh it was solved on where ``solved_on`` says one."""
-    result = createEMSParameters(doc)
-    said = {"solver": solver, **({SOLVED_ON: solved_on} if solved_on is not None else {})}
-    result.Provenance = json.dumps(said)
-    result.Label = f"S-Parameters ({solver})"
-    analysis.addObject(result)
-    return result
+def solved_on_mesh(identity):
+    """A Palace matrix recording that it was solved on the mesh ``identity``."""
+    from Microwave.Results.sparameters import SParameters
+
+    return fem_mesh.solved_on(
+        SParameters(
+            frequency=np.array([1e9, 2e9]),
+            s=np.zeros((2, 1, 1), dtype=complex),
+            port_numbers=(1,),
+            reference=np.full((2, 1), 50.0),
+            measured_impedance=np.full((2, 1), 50.0 + 0j),
+            provenance={"solver": "Palace"},
+        ),
+        identity,
+    )
 
 
 class TestWhetherItStillDescribesTheStudy:
@@ -300,7 +339,7 @@ class TestWhetherItStillDescribesTheStudy:
         old.MeshedFor = "Palace"
         analysis.addObject(old)
         assert fem_mesh.staleness(analysis, "Palace") == (
-            "the mesh records nothing of what it was made from"
+            "the mesh does not record what it was made from"
         )
 
     def test_the_mark_is_taken_at_its_word(self, doc, monkeypatch):
@@ -366,7 +405,7 @@ class TestTheKey:
             setattr(analysis, name, float(getattr(analysis, name)) * 1.5)
             assert fem_mesh.inputs(analysis) != before, name
 
-    @pytest.mark.parametrize("name", ["NumFrequencyPoints", "SmallestResponse"])
+    @pytest.mark.parametrize("name", ["FrequencyPoints", "ResponseFloor"])
     def test_what_the_study_declares_as_moving_no_cell_does_not_move_it(self, doc, name):
         analysis = createEMAnalysis(doc)
         before = fem_mesh.inputs(analysis)
@@ -395,78 +434,7 @@ class TestTheKey:
         assert fem_mesh.inputs(analysis) == before
 
 
-class TestAResultBesideTheMesh:
-    def test_a_result_solved_on_the_mesh_shown_is_left_as_it_is(self, doc):
-        analysis = createEMAnalysis(doc)
-        fem_mesh.put(analysis, "Palace", "a mesh", identity="same")
-        result = filed(doc, analysis, "Palace", solved_on="same")
-        assert fem_mesh.pair(analysis, "Palace") == ""
-        assert result.Label == "S-Parameters (Palace)"
-
-    def test_a_result_solved_on_another_mesh_says_so_and_stops_once_it_is_not(self, doc):
-        analysis = createEMAnalysis(doc)
-        result = filed(doc, analysis, "Palace", solved_on="first")
-        fem_mesh.put(analysis, "Palace", "a mesh", identity="second")
-        assert fem_mesh.pair(analysis, "Palace")
-        assert result.Label == "S-Parameters (Palace) - not solved on the mesh shown"
-        fem_mesh.put(analysis, "Palace", "a mesh", identity="first")
-        assert fem_mesh.pair(analysis, "Palace") == ""
-        assert result.Label == "S-Parameters (Palace)"
-
-    @pytest.mark.parametrize(("solved_on", "shown"), [(None, "a"), ("a", ""), ("", "")])
-    def test_what_records_no_mesh_is_not_said_to_be_on_the_mesh_shown(self, doc, solved_on, shown):
-        analysis = createEMAnalysis(doc)
-        result = filed(doc, analysis, "Palace", solved_on=solved_on)
-        fem_mesh.put(analysis, "Palace", "a mesh", identity=shown)
-        assert fem_mesh.pair(analysis, "Palace")
-        assert result.Label.endswith(" - not solved on the mesh shown")
-
-    def test_a_study_showing_no_mesh_shows_none_a_result_was_solved_on(self, doc):
-        analysis = createEMAnalysis(doc)
-        result = filed(doc, analysis, "Palace", solved_on="first")
-        assert fem_mesh.pair(analysis, "Palace")
-        assert result.Label == "S-Parameters (Palace) - not solved on the mesh shown"
-
-    def test_every_result_the_backend_filled_is_marked(self, doc):
-        """A copy of one dragged in from another study among them."""
-        analysis = createEMAnalysis(doc)
-        results = [filed(doc, analysis, "Palace", solved_on=f"run {n}") for n in (1, 2)]
-        fem_mesh.put(analysis, "Palace", "a mesh", identity="run 1")
-        assert fem_mesh.pair(analysis, "Palace")
-        assert [result.Label for result in results] == [
-            "S-Parameters (Palace)",
-            "S-Parameters (Palace) - not solved on the mesh shown",
-        ]
-
-    def test_a_backend_that_shows_no_mesh_and_records_none_is_left_alone(self, doc):
-        analysis = createEMAnalysis(doc)
-        result = filed(doc, analysis, "openEMS")
-        assert fem_mesh.pair(analysis, "openEMS") == ""
-        assert result.Label == "S-Parameters (openEMS)"
-
-    def test_a_label_freecad_numbered_to_keep_it_unique_is_marked_and_unmarked(self, doc):
-        """A second study's result comes back numbered, and so may the label
-        written for it."""
-        analysis = createEMAnalysis(doc)
-        result = filed(doc, analysis, "Palace", solved_on="first")
-        result.Label = "S-Parameters (Palace)001"
-        fem_mesh.put(analysis, "Palace", "a mesh", identity="second")
-        fem_mesh.pair(analysis, "Palace")
-        assert result.Label == "S-Parameters (Palace) - not solved on the mesh shown"
-        result.Label = "S-Parameters (Palace) - not solved on the mesh shown001"
-        fem_mesh.put(analysis, "Palace", "a mesh", identity="first")
-        fem_mesh.pair(analysis, "Palace")
-        assert result.Label == "S-Parameters (Palace)"
-
-    def test_another_backends_result_and_a_label_somebody_wrote_are_left_alone(self, doc):
-        analysis = createEMAnalysis(doc)
-        theirs = filed(doc, analysis, "openEMS")
-        mine = filed(doc, analysis, "Palace", solved_on="first")
-        mine.Label = "Filter, rev B"
-        fem_mesh.put(analysis, "Palace", "a mesh", identity="second")
-        assert fem_mesh.pair(analysis, "Palace")
-        assert (theirs.Label, mine.Label) == ("S-Parameters (openEMS)", "Filter, rev B")
-
+class TestAMatrixRecordsItsMesh:
     def test_a_matrix_records_the_mesh_it_was_solved_on_beside_what_it_had(self):
         @dataclass(frozen=True)
         class Matrix:

@@ -70,7 +70,7 @@ def cross_section_axis(face: Box, body: Box, subject: str) -> int:
     """The axis a cross-section cuts the shape it belongs to across.
 
     This is not the axis the face is flat along. Copper is often drawn as a
-    zero-thickness sheet - ``ConductingSheet`` is a material kind - and the end
+    zero-thickness sheet - ``Conducting Sheet`` is a material kind - and the end
     face of a sheet trace is flat along the axis it cuts across and along the
     axis the sheet has no thickness in. The body separates the two, because the
     trace is long in the first and flat in the second.
@@ -84,13 +84,12 @@ def cross_section_axis(face: Box, body: Box, subject: str) -> int:
         return across[0]
     if not across:
         raise SetupError(
-            f"{subject} has thickness along every axis its shape does, so it is "
-            "a solid rather than a cross-section. Select the face the wave "
-            "passes through"
+            f"{subject} spans every axis its body spans, so it is not a "
+            "cross-section. Select the face the wave passes through"
         )
     named = " and ".join(AXIS_NAMES[axis] for axis in across)
     raise SetupError(
-        f"{subject} cuts across both {named}, so it is an edge rather than a face. Select the face"
+        f"{subject} is flat along both {named}, so it is an edge, not a face. Select the face"
     )
 
 
@@ -105,11 +104,37 @@ def inward(pick: Link, axis: int, subject: str) -> int:
     direction = picks.inward(pick, axis)
     if direction is None:
         raise SetupError(
-            f"{subject} does not say which side of it the shape it belongs to "
-            f"is on along {AXIS_NAMES[axis]}, so there is no inward direction "
-            "to read. Select an end face, and set the axis by hand if it is one"
+            f"the inward direction along {AXIS_NAMES[axis]} cannot be read at "
+            f"{subject}. Select an end face. If it is one, set PropagationAxis by hand"
         )
     return direction
+
+
+def runs_from(pick: Pick, guide: Any, axis: int, subject: str) -> int:
+    """Which way along ``axis`` a guide drawn apart from its cross-section runs
+    from it: toward the side it runs further on.
+
+    A face drawn on its own carries no material to step into, and one standing
+    inside the guide has guide on both sides. The guide's far end is where the
+    wave goes, and the end it is launched from is the short run behind it.
+    :func:`Microwave.drawn.runs` measures each, and a plane outside the guide,
+    or one in its middle, is refused rather than guessed at.
+    """
+    below, above = drawn.runs(picks.element(*pick), picks.placed(guide), axis)
+    name = AXIS_NAMES[axis]
+    if max(below, above) <= FLATNESS:
+        # A guide drawn as its walls has no body inside them.
+        raise SetupError(
+            f"the body picked with {subject} lies on neither side of it along {name}. "
+            "Select the body of the medium the wave runs in, not the walls, or set "
+            "PropagationAxis by hand"
+        )
+    if abs(above - below) <= FLATNESS:
+        raise SetupError(
+            f"{subject} is at the middle of the guide along {name}, so the direction "
+            "of the wave is unknown. Set PropagationAxis by hand"
+        )
+    return 1 if above > below else -1
 
 
 def separating_axis(first: Box, second: Box, exclude: int | None, subject: str) -> int:
@@ -138,12 +163,10 @@ def separating_axis(first: Box, second: Box, exclude: int | None, subject: str) 
     if len(apart) == 1:
         return apart[0]
     if not apart:
-        raise SetupError(
-            f"{subject} overlap on every axis, so there is no gap between them to drive across"
-        )
+        raise SetupError(f"{subject} overlap on every axis, so there is no gap to drive across")
     named = " and ".join(AXIS_NAMES[axis] for axis in apart)
     raise SetupError(
-        f"{subject} stand apart along both {named}, so which one the field crosses is ambiguous"
+        f"{subject} stand apart along both {named}, so the direction of the field is ambiguous"
     )
 
 
@@ -236,8 +259,8 @@ def picks_from(selection: Iterable[Any]) -> list[Pick]:
     Order is the only disambiguation. Nothing in the geometry says which of two
     metal faces is the trace and which is the ground, and a rule invented to
     guess would be wrong on the first board that broke it. The commands document
-    the order and this function preserves it, including across a pick of two
-    faces on one solid, which arrives as a single selection entry.
+    the order and this function preserves it, including across two faces of one
+    solid.
     """
     chosen: list[Pick] = []
     for entry in selection:
@@ -285,7 +308,7 @@ def _fill(
         # Silence here would be the same fault as a no-op property. The user
         # picked something and it went nowhere.
         notes.append(
-            f"{len(chosen) - len(links)} extra selection(s) ignored - this port "
+            f"{len(chosen) - len(links)} extra selection(s) ignored. This port "
             f"takes {len(links)}: {', '.join(links)}"
         )
     try:
@@ -309,7 +332,7 @@ def fill_microstrip(port: Any, chosen: Sequence[Pick]) -> list[str]:
         )
         return {"PropagationAxis": propagation, "ExcitationAxis": excitation}
 
-    return _fill(port, chosen, ["TraceEnd", "GroundReference"], infer)
+    return _fill(port, chosen, ["TraceEnd", "Ground"], infer)
 
 
 def fill_lumped(port: Any, chosen: Sequence[Pick]) -> list[str]:
@@ -322,28 +345,68 @@ def fill_lumped(port: Any, chosen: Sequence[Pick]) -> list[str]:
 
 
 def fill_waveguide(port: Any, chosen: Sequence[Pick]) -> list[str]:
-    """Pick the guide's cross-section. Returns what it could not do."""
-
-    def infer(chosen: Sequence[Pick]) -> dict[str, str]:
-        obj, name = chosen[0]
-        return {
-            "PropagationAxis": waveguide_axis(
-                _link(chosen[0]), from_shape(obj, name), from_shape(obj)
-            )
-        }
-
-    return _fill(port, chosen, ["CrossSection"], infer)
+    """Pick the guide's cross-section, and the guide's body with it where the
+    cross-section is a face drawn on its own. Returns what it could not do."""
+    return _fill_section(port, chosen, "CrossSection", "the cross-section", waveguide_axis)
 
 
 def fill_coaxial(port: Any, chosen: Sequence[Pick]) -> list[str]:
-    """Pick the ring between the conductors. Returns what it could not do."""
+    """Pick the ring between the conductors, and the line's body with it where
+    the ring is a face drawn on its own. Returns what it could not do."""
+    return _fill_section(port, chosen, "Annulus", "the annulus", coaxial_axis)
+
+
+def _fill_section(
+    port: Any,
+    chosen: Sequence[Pick],
+    link: str,
+    subject: str,
+    axis_of: Callable[[Link, Box, Box], str],
+) -> list[str]:
+    """Fill a port launched through one cross-section.
+
+    A face of a solid says by itself which way the solid lies from it. A face
+    drawn on its own - a ``Part::Plane``, a sheet - says nothing, and the body
+    it stands across is picked with it, in either order: the cross-section is
+    the pick holding no solid and the body the one holding one.
+    """
+    bodies = [pick for pick in chosen if _is_body(pick)]
+    sections = [pick for pick in chosen if pick not in bodies]
+    # A face of a solid answers by itself, and a body picked beside it is
+    # another selection rather than the guide it already stands in.
+    guide = (
+        bodies[0][0]
+        if len(bodies) == 1 and sections and not _is_body((sections[0][0], ""))
+        else None
+    )
+    if guide is None:
+        sections = [*sections, *bodies]
 
     def infer(chosen: Sequence[Pick]) -> dict[str, str]:
         obj, name = chosen[0]
-        return {
-            "PropagationAxis": coaxial_axis(
-                _link(chosen[0]), from_shape(obj, name), from_shape(obj)
+        face = from_shape(obj, name)
+        if guide is not None:
+            axis = cross_section_axis(face, from_shape(guide), subject)
+            return {"PropagationAxis": axis_label(axis, runs_from(chosen[0], guide, axis, subject))}
+        own = from_shape(obj)
+        if not _is_body((obj, "")) and not any(
+            extent(face, axis) <= FLATNESS < extent(own, axis) for axis in range(DIMENSIONS)
+        ):
+            raise SetupError(
+                f"{subject} is a face with no body, so the direction of the wave is "
+                "unknown. Select the body it stands across together with it"
             )
-        }
+        return {"PropagationAxis": axis_of(_link(chosen[0]), face, own)}
 
-    return _fill(port, chosen, ["Annulus"], infer)
+    return _fill(port, sections, [link], infer)
+
+
+def _is_body(pick: Pick) -> bool:
+    """Whether a pick is a whole shape holding a solid."""
+    obj, name = pick
+    if name:
+        return False
+    try:
+        return bool(getattr(picks.placed(obj), "Solids", None))
+    except picks.Unplaced:
+        return False

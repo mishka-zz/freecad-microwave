@@ -57,9 +57,11 @@ def test_an_edit_to_the_drawing_moves_the_digest(moved, edit):
         "the grid's density",
         "the tetrahedra's density",
         "the order",
-        "the policy's demand on a mesh",
+        "the policy's demand on a curve",
+        "the grid's count across a dielectric",
         "a port's referencing",
         "a port's excitation",
+        "a port's status",
     ],
 )
 def test_an_edit_to_how_it_is_solved_shown_or_referenced_does_not(moved, edit):

@@ -101,7 +101,7 @@ def build(doc, drawing):
     analysis = createEMAnalysis(doc)
     analysis.Label = f"Lossy port on Palace ({drawing})"
     analysis.FrequencyStart, analysis.FrequencyStop = BAND
-    analysis.NumFrequencyPoints = POINTS
+    analysis.FrequencyPoints = POINTS
     for member in list(analysis.Group):
         if kind_of(member) in ("EMSolverOpenEMS", "EMYeeGrid"):
             analysis.Group = [obj for obj in analysis.Group if obj is not member]
@@ -129,7 +129,7 @@ def build(doc, drawing):
         port = createEMPortRectWaveguide(f"Port{number}")
         port.Label = f"Port{number}"
         port.Number = number
-        port.Excitation = number == 1
+        port.Driven = number == 1
         port.PropagationAxis = "X" if at == 0.0 else "-X"
         port.CrossSection = (guide, [ends[at]])
         port.ReferencedTo = PORT_IMPEDANCE
@@ -139,11 +139,11 @@ def build(doc, drawing):
     mesh.ElementsPerWavelength = ELEMENTS_PER_WAVELENGTH
     # No air outside the drawing. What bounds this problem is a condition on
     # the body's own faces, so every face of the domain ends where the
-    # structure does, and a face left saying Air is refused by name.
+    # structure does, and a face left saying Open is refused by name.
     settings = contents(analysis).settings
     for axis in "XYZ":
         for side in ("Min", "Max"):
-            setattr(settings, f"Padding{axis}{side}", "Ends")
+            setattr(settings, f"Boundary{axis}{side}", "PEC Wall")
     doc.recompute()
     return analysis
 

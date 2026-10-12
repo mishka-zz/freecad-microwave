@@ -190,7 +190,7 @@ class TestItReportsRatherThanGuesses:
         import Microwave.Solvers.openems.verify as verify
 
         monkeypatch.setattr(verify, "MAX_ROUNDS", 1)
-        with pytest.raises(RuntimeError, match="did not settle"):
+        with pytest.raises(RuntimeError, match="too large for the connectivity check"):
             connectivity(rasterise(uniform(12), slab((0.0,) * 3, (1.0,) * 3)))
 
 

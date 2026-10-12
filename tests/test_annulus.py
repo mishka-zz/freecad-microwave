@@ -18,6 +18,8 @@ centre; a square plate with a round hole answers two wires of which one is four
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from Microwave import annulus
@@ -95,7 +97,13 @@ class TestWhatIsNotARing:
             annulus.read(Face(Wire(Edge(Circle(3.5)))))
 
     def test_a_solid_offers_more_than_two(self):
-        with pytest.raises(annulus.AnnulusError, match="4 boundaries"):
+        with pytest.raises(
+            annulus.AnnulusError,
+            match=re.escape(
+                "4 boundaries, so it is not a ring. Select the annular face between "
+                "the shield's bore and the inner conductor"
+            ),
+        ):
             annulus.read(Face(*[Wire(Edge(Circle(1.0))) for _ in range(4)]))
 
     def test_a_plate_with_a_round_hole_is_refused_on_its_rim(self):
@@ -109,6 +117,10 @@ class TestWhatIsNotARing:
     def test_a_boundary_that_is_not_a_circle_is_named_by_what_it_is(self):
         with pytest.raises(annulus.AnnulusError, match="Line rather than a circle"):
             annulus.read(Face(Wire(Edge(Line())), Wire(Edge(Circle(1.0)))))
+
+    def test_an_edge_with_no_curve_is_named_as_one(self):
+        with pytest.raises(annulus.AnnulusError, match="is an edge with no curve rather than"):
+            annulus.read(Face(Wire(Edge(None)), Wire(Edge(Circle(1.0)))))
 
     def test_conductors_that_are_not_concentric_are_refused(self):
         """An eccentric line has no single ``ln(b/a)``, so the impedance a port

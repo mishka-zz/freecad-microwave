@@ -164,7 +164,9 @@ class TestTheSurfaceItAsksAbout:
         found = check((self.lumps(gap=0.9),), pitch=1.0)
         assert len(found) == 1
         assert "is drawn as 2 pieces and the grid holds it as 1 piece" in found[0].message
-        assert "shorts together" in found[0].message, "the message describes the other fault"
+        assert "shorted pieces together" in found[0].message, (
+            "the message describes the other fault"
+        )
 
     def test_and_the_two_directions_are_not_described_alike(self):
         """Metal arriving in more lumps than it was drawn in is a conductor the
@@ -172,8 +174,12 @@ class TestTheSurfaceItAsksAbout:
         both is wrong about one of them."""
         joined = check((self.lumps(gap=0.9),), pitch=1.0)[0].message
         severed = check((conductor(1.4),), pitch=1.3)[0].message
-        assert "electrically open" in severed and "electrically open" not in joined
-        assert "shorts together" in joined and "shorts together" not in severed
+        assert "carry no current" in severed and "carry no current" not in joined
+        assert "shorted pieces together" in joined and "shorted pieces together" not in severed
+        assert severed.endswith(". Refine the grid where the object runs")
+        assert joined.endswith(
+            ". Refining the grid reopens a closed gap and recovers a missing piece"
+        )
 
     def test_and_fewer_lumps_than_drawn_does_not_assert_which_of_them_it_is(self):
         """Fewer lumps on the grid than in the drawing has more than one cause,
@@ -182,8 +188,8 @@ class TestTheSurfaceItAsksAbout:
         and no fault. Naming one would be a wrong fact stated calmly about the
         others."""
         message = check((self.lumps(gap=0.9),), pitch=1.0)[0].message
-        assert "shorts together" in message
-        assert "no sample point lands in it" in message
+        assert "shorted pieces together" in message
+        assert "too small for any sample point to land in" in message
         assert "drawn overlapping" in message
 
     def test_two_lumps_the_grid_joins_with_no_growth_at_all_are_reported(self):
@@ -201,8 +207,8 @@ class TestTheSurfaceItAsksAbout:
         found = conductors.check(model)
         assert len(found) == 1
         assert "is drawn as 2 pieces and the grid holds it as 1 piece" in found[0].message
-        assert "shorts together" in found[0].message
-        assert "share a node" in found[0].message, (
+        assert "shorted pieces together across a gap narrower than a cell" in found[0].message
+        assert "grow" not in found[0].message, (
             "the message blames the growth for a join made with no growth in it"
         )
 
@@ -283,6 +289,7 @@ class TestTwoConductorsTheRunHasAsOne:
         assert found[0].subject == "Here and There"
         assert "are drawn with a gap between them" in found[0].message
         assert "shorted together" in found[0].message
+        assert found[0].message.endswith(". Refine the grid across the gap, or draw the gap wider")
 
     def test_and_the_same_pair_handed_over_ungrown_is_not(self):
         """Which says the finding above is the growth and not the two balls
@@ -309,7 +316,8 @@ class TestTwoConductorsTheRunHasAsOne:
         )
         found = conductors.check(model)
         assert len(found) == 1
-        assert "share a node" in found[0].message
+        assert "the grid closes it" in found[0].message
+        assert "grow" not in found[0].message
 
     def test_a_pair_the_grid_keeps_clear_is_not_reported(self):
         """Or the cases above would pass on a check that reported every drawing
@@ -443,7 +451,8 @@ class TestWhatAPairCosts:
         monkeypatch.setattr(conductors, "BUDGET", 1)
         found = [f for f in check(two_balls(gap=0.9), pitch=1.0) if len(f.subjects) == 2]
         assert len(found) == 1
-        assert "has not been established" in found[0].message
+        assert "have not been checked" in found[0].message
+        assert found[0].message.endswith(". A coarser triangulation lets the pair be checked")
         assert found[0].subject == "Here and There"
 
     def test_the_budget_is_what_decides_that(self):
@@ -451,7 +460,7 @@ class TestWhatAPairCosts:
         the budget biting and not the pair being unanswerable."""
         found = [f for f in check(two_balls(gap=0.9), pitch=1.0) if len(f.subjects) == 2]
         assert len(found) == 1
-        assert "has not been established" not in found[0].message
+        assert "have not been checked" not in found[0].message
 
     def test_the_window_reaches_one_line_past_the_lines_the_two_share(self):
         """The edge that carries a conductor into the gap is its outermost one,
@@ -590,13 +599,14 @@ class TestWhatItDeclinesToLookAt:
         monkeypatch.setattr(conductors, "BUDGET", 1)
         found = check((conductor(1.4),), pitch=1.3)
         assert len(found) == 1
-        assert "has not been established" in found[0].message
+        assert "has not been checked" in found[0].message
+        assert found[0].message.endswith(". A coarser triangulation lets it be checked")
         assert "Trace" in found[0].subject
 
     def test_the_budget_is_what_decides_that(self):
         """The same conductor at the shipped budget is answered, so the case
         above is the budget biting and not the shape being unanswerable."""
-        assert "has not been established" not in check((conductor(1.4),), pitch=1.3)[0].message
+        assert "has not been checked" not in check((conductor(1.4),), pitch=1.3)[0].message
 
 
 class TestASheetIsAskedTheSameQuestion:
@@ -679,7 +689,7 @@ class TestItLooksOnlyWhereTheConductorIs:
                 conductors._lines(model, conductors._window(model, solid.lower, solid.upper))
             )
         )
-        said = int(re.search(r"covers (\d+) grid", conductors.check(model)[0].message).group(1))
+        said = int(re.search(r"over (\d+) grid", conductors.check(model)[0].message).group(1))
         assert said > as_drawn, "the budget was priced on a window it is not going to sample"
 
     def test_and_it_is_bounded_by_the_metal_the_run_has(self):

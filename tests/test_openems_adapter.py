@@ -483,7 +483,8 @@ class TestWhatAModuleSaysItOffers:
     another module imports and this list omits leaves the list describing less
     than the module offers, so a reader looking for the surface finds an
     incomplete one. This holds the direction that can be established
-    mechanically: what is imported must be declared.
+    mechanically: what is imported must be declared, whether by name or as an
+    attribute of the module imported whole.
 
     The other direction is left alone. A name reached only by a test is still
     part of what the module offers, and a rule that dropped it would make the
@@ -524,6 +525,8 @@ class TestWhatAModuleSaysItOffers:
         taken = collections.defaultdict(set)
         for name, tree in trees.items():
             package = name.rsplit(".", 1)[0] if modules[name].name != "__init__.py" else name
+            # A module imported whole, by the name this one reaches it under.
+            whole = {}
             for node in ast.walk(tree):
                 if not isinstance(node, ast.ImportFrom):
                     continue
@@ -534,8 +537,19 @@ class TestWhatAModuleSaysItOffers:
                     target = f"{base}.{node.module}" if node.module else base
                 else:
                     target = node.module or ""
-                if target in modules and target != name:
-                    taken[target] |= {alias.name for alias in node.names}
+                for alias in node.names:
+                    if f"{target}.{alias.name}" in modules:
+                        whole[alias.asname or alias.name] = f"{target}.{alias.name}"
+                    elif target in modules and target != name:
+                        taken[target].add(alias.name)
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in whole
+                    and whole[node.value.id] != name
+                ):
+                    taken[whole[node.value.id]].add(node.attr)
 
         missing = {
             name: sorted(taken[name] - names)
@@ -1352,7 +1366,7 @@ class TestAThroughFaceLandsOnTheStructure:
 
     def test_a_grid_running_past_the_structure_is_refused(self):
         """A grid ending 1.9 mm past the substrate, which nothing else notices."""
-        with pytest.raises(MeshError, match=r"x grid ends 1.892 past the structure"):
+        with pytest.raises(MeshError, match=r"x grid ends 1.892 mm past the structure"):
             self.check(self.lines_ending_at(-51.892, 50.0))
 
     def test_the_upper_face_is_policed_too(self):
@@ -1366,7 +1380,7 @@ class TestAThroughFaceLandsOnTheStructure:
     def test_the_message_names_the_axis_and_the_distance(self):
         with pytest.raises(MeshError) as raised:
             self.check(self.lines_ending_at(-53.0, 50.0))
-        assert "the x grid ends 3 past the structure below it" in str(raised.value)
+        assert "the x grid ends 3 mm past the structure below it" in str(raised.value)
         assert "-53 against -50" in str(raised.value)
 
     def test_an_under_reserving_domain_is_caught_through_the_real_path(self, monkeypatch):
@@ -1570,7 +1584,14 @@ class TestAThroughFaceLandsOnTheStructure:
         )
         with pytest.raises(MeshError, match=r"absorber does not meet the interior") as raised:
             plan.plan_grid((SUBSTRATE, GROUND), (PORT,), MATERIALS, PARAMS, PADDING)
-        assert "the x axis lower face lays 1 against a block of 1.4" in str(raised.value)
+        assert "the x axis lower face lays a 1 mm cell against a 1.4 mm absorber block" in str(
+            raised.value
+        )
+        assert str(raised.value).endswith(
+            "Raise MaxGrowthRatio in the openEMS mesh settings, set its MinElementSize below "
+            f"{PARAMS.floor:g} mm, lower PMLCells on the solver, or set the face to Open "
+            "instead of Through"
+        )
 
     def test_the_driver_route_refuses_it_too(self):
         """Refusing while meshing covers the workbench and misses the driver.
@@ -1913,7 +1934,10 @@ class TestEnvelope:
         """openEMS answers an invalid factor with one line on stderr and a
         full-size step, so accepting it here would leave the user's fix for a
         diverging run silently undone."""
-        with pytest.raises(EnvelopeError, match="timestep_factor"):
+        with pytest.raises(
+            EnvelopeError,
+            match=re.escape(f"timestep_factor is {factor:g}. Enter a value above 0 and at most 1"),
+        ):
             build_problem(timestep_factor=factor)
 
     def test_the_factor_moves_the_digest(self):
@@ -2172,7 +2196,8 @@ class TestPreflight:
         fat = Material(name="Foil", kind="conducting_sheet", conductivity=5.8e7, thickness=35.0)
         problem = build_problem(materials=(MATERIALS[0], MATERIALS[1], fat))
         blocking = preflight.refusals(preflight.check(problem))
-        assert any("smallest cell" in f.message for f in blocking)
+        said = [f.message for f in blocking if "smallest cell" in f.message]
+        assert said and said[0].endswith(". Model it as a solid, or check the units of Thickness")
 
         with pytest.raises(preflight.UnsupportedModel, match="Foil"):
             preflight.refuse_if_blocked(preflight.check(problem))
@@ -2209,6 +2234,9 @@ class TestPreflight:
         said = next(f for f in warnings if "non-finite" in f.message)
         assert said.subject == "port 1"
         assert "lumped port 2" in said.message
+        assert said.message.endswith(
+            ". Drive the microstrip port instead, or make both ports the same kind"
+        )
 
     def test_it_names_the_port_the_way_every_other_check_does(self):
         """``Port.name``, which is the label when there is one. Spelling it
@@ -2252,6 +2280,9 @@ class TestPreflight:
         said = next(f for f in warnings if "same space" in f.message)
         assert said.subject == "Ground copy"
         assert "'Ground'" in said.message
+        assert said.message.endswith(
+            ". Delete the spare, or move it if they are meant to be separate"
+        )
 
     def test_it_is_a_warning_because_the_engine_copes(self):
         assert not preflight.refusals(self._coincident())
@@ -2309,6 +2340,7 @@ class TestPreflight:
             if f.subject == GROUND.label
         )
         assert "bound to both 'Metal' and 'FR4'" in said.message
+        assert said.message.endswith(". Bind the geometry once")
 
     def test_one_material_under_two_names_is_a_warning(self):
         """What the engine is handed decides, not what each is called, so two
@@ -2384,7 +2416,10 @@ class TestPreflight:
             if "cells per wavelength" in f.message
         ]
         assert len(refused) == 1
-        assert refused[0].subject == "grid"
+        assert refused[0].subject == "openEMS mesh"
+        assert refused[0].message.endswith(
+            ". Mesh the model again for this band, or lower the top of the band"
+        )
 
     def test_a_coarse_policy_reaches_the_floor_through_the_mesher(self):
         """The policy's own way in.
@@ -2496,6 +2531,7 @@ class TestPreflight:
         assert [f.severity for f in refused] == [preflight.REFUSE]
         assert "skin depths" in refused[0].message
         assert "2.11" in refused[0].message, "it should say where the limit is"
+        assert refused[0].message.endswith(". Model it as a solid, or lower the top of the band")
 
     def test_the_sheet_fit_is_reached_by_the_dispatcher(self):
         """The guard beside it refuses the same sheet first, so every other test
@@ -2529,12 +2565,18 @@ class TestPreflight:
         findings = preflight.check(build_problem(materials=(MATERIALS[0], MATERIALS[1], bare)))
         assert [f.severity for f in findings] == [preflight.REFUSE]
         assert "perfect conductor" in findings[0].message
-        assert "reaches nothing" in findings[0].message
+        assert findings[0].message.endswith(
+            ". Enter the metal's thickness, or set MaterialType to PEC"
+        )
 
     def test_energy_termination_is_flagged_as_irreproducible(self):
         problem = build_problem(termination=Termination(30000, 1e-4))
         warnings = [f for f in preflight.check(problem) if f.severity == preflight.WARN]
-        assert any("reproducible" in f.message for f in warnings)
+        said = [f.message for f in warnings if f.subject == "EnergyDecay"]
+        assert said == [
+            "it is -40 dB, so where a run stops depends on machine load and a repeated "
+            "run can give different numbers. Set EnergyDecay to 0 for reproducible results"
+        ]
         # A warning, not a refusal: it is a legitimate interactive choice.
         assert not preflight.refusals(preflight.check(problem))
 
@@ -2544,8 +2586,10 @@ class TestPreflight:
         a truncated transform rather than an error."""
         problem = build_problem(timestep_factor=0.5, termination=Termination(max_timesteps=30000))
         warnings = [f for f in preflight.check(problem) if f.severity == preflight.WARN]
-        message = next(f.message for f in warnings if f.subject == "timestep")
-        assert "60,000" in message, "it should say what would restore the window"
+        message = next(f.message for f in warnings if f.subject == "TimestepFactor")
+        assert message.endswith(". To cover the same time, multiply MaxTimesteps by 2"), (
+            "it should say what would restore the window"
+        )
         assert not preflight.refusals(preflight.check(problem))
 
     def _excitation(self, band, steps):
@@ -2565,21 +2609,34 @@ class TestPreflight:
         going. A 2.4-2.5 GHz band at the shipped 30,000 steps stops at its peak.
         """
         blocking = preflight.refusals(self._excitation((2.4e9, 2.5e9), 30_000))
-        assert any(f.subject == "excitation" for f in blocking)
-        assert any("through the pulse" in f.message for f in blocking)
+        assert any(f.subject == "MaxTimesteps" for f in blocking)
+        said = [f.message for f in blocking if "through the pulse" in f.message]
+        assert said and said[0].endswith(", or widen the band")
+        assert ". Raise MaxTimesteps to at least " in said[0]
 
     def test_a_run_shorter_than_three_excitations_warns(self):
         """openEMS' own threshold - three excitation lengths is what it asks for."""
-        findings = [f for f in self._excitation((1e9, 10e9), 2_000) if f.subject == "excitation"]
+        findings = [f for f in self._excitation((1e9, 10e9), 2_000) if f.subject == "MaxTimesteps"]
         assert [f.severity for f in findings] == [preflight.WARN]
+        said = findings[0].message
+        assert re.search(
+            r" excitation lengths of the 3 openEMS recommends\. "
+            r"Raise MaxTimesteps to at least [\d,]+$",
+            said,
+        )
+        # The length is stated rounded to a whole step, and the figure asked for
+        # is three of the unrounded length, rounded up.
+        length = int(re.search(r"excitation is ([\d,]+) timesteps", said)[1].replace(",", ""))
+        asked = int(re.search(r"at least ([\d,]+)$", said)[1].replace(",", ""))
+        assert 3 * (length - 0.5) <= asked <= 3 * (length + 0.5) + 1
 
     def test_a_band_that_fits_says_nothing(self):
-        assert not [f for f in self._excitation((1e9, 10e9), 30_000) if f.subject == "excitation"]
+        assert not [f for f in self._excitation((1e9, 10e9), 30_000) if f.subject == "MaxTimesteps"]
 
     def test_the_default_timestep_factor_says_nothing(self):
         """A warning on every ordinary run is a warning people stop reading."""
         findings = preflight.check(build_problem())
-        assert not [f for f in findings if f.subject == "timestep"]
+        assert not [f for f in findings if f.subject == "TimestepFactor"]
 
     def _at_the_edge(self):
         near_edge = Port(**{**PORT.to_dict(), "measurement_shift": 0.0})
@@ -2596,6 +2653,10 @@ class TestPreflight:
         message = next(f.message for f in blocking if "absorber" in f.message)
         assert "8 cells and 8 mm deep at x=min" in message
         assert "sits 8 mm inside it" in message
+        assert message.endswith(
+            ". Move the port further in, or make the absorber thinner: raise "
+            "ElementsPerWavelength in the openEMS mesh settings, or lower PMLCells"
+        )
 
     def test_the_end_named_is_the_end_it_fell_off(self):
         """Both ends carry an absorber, so naming the wrong one is invisible
@@ -2664,14 +2725,18 @@ class TestPreflight:
             )
         )
         message = next(f.message for f in blocking if "outside the grid" in f.message)
-        assert "does not move a rect_waveguide plane onto the grid" in message
-        assert "returns 0/0" in message
+        assert "does not move a waveguide plane onto the grid" in message
+        assert "the run returns no result" in message
         assert "snaps" not in message
 
     def test_a_nonsense_boundary_is_refused(self):
         problem = build_problem(boundary=("PML_8",) * 5 + ("SPONGE",))
         blocking = preflight.refusals(preflight.check(problem))
-        assert any("SPONGE" in f.message for f in blocking)
+        said = [f.message for f in blocking if "SPONGE" in f.message]
+        assert said == [
+            "'SPONGE' is not an openEMS boundary condition. Use PML_<n> or one of "
+            "['MUR', 'PEC', 'PMC']"
+        ]
 
     def test_mur_and_pec_are_accepted(self):
         problem = build_problem(boundary=("PML_8", "PML_8", "MUR", "MUR", "PEC", "MUR"))
@@ -2697,8 +2762,12 @@ class TestPreflight:
         said = self._absorber(("PML_24",) + ("PML_8",) * 5)
         assert len(said) == 1
         assert said[0].severity == preflight.WARN
-        assert said[0].subject == "boundary xmin"
+        assert said[0].subject == "XMin face"
         assert "24" in said[0].message and "8" in said[0].message
+        assert said[0].message.endswith(
+            ". Both come from PMLCells when the workbench writes a run, so this one "
+            "was written some other way. Write it again from the document"
+        )
 
     def test_a_boundary_shallower_than_the_reservation_is_reported_too(self):
         said = self._absorber(("PML_4",) + ("PML_8",) * 5)
@@ -2716,7 +2785,12 @@ class TestPreflight:
         over, which for this adapter's drive is never."""
         said = self._mur(("MUR", "MUR") + ("PML_8",) * 4)
         assert [f.severity for f in said] == [preflight.WARN]
-        assert [f.subject for f in said] == ["boundary xmin and boundary xmax"]
+        assert [f.subject for f in said] == ["XMin face and XMax face"]
+        assert said[0].message == (
+            "it is a Mur boundary and port 1 touches it, so the wall reflects for the "
+            "whole run. Set Absorber to PML on the openEMS solver, or move the port "
+            "away from this face"
+        )
 
     def test_a_mur_wall_the_port_does_not_reach_says_nothing(self):
         """The same boundary on the axes the port is narrow across. Nothing can
@@ -2732,7 +2806,7 @@ class TestPreflight:
         short = dataclasses.replace(PORT, stop=(0.0, 1.5, 0.0), measurement_shift=20.0)
         problem = build_problem(ports=(short,), boundary=("MUR", "MUR") + ("PML_8",) * 4)
         said = [f for f in preflight.check(problem) if "Mur" in f.message]
-        assert [f.subject for f in said] == ["boundary xmin"]
+        assert [f.subject for f in said] == ["XMin face"]
 
     def _guide_problem(
         self, mode="TE10", band=(20e9, 26e9), section=(10.7, 4.3), fill=1.0, stray=None
@@ -2791,7 +2865,10 @@ class TestPreflight:
         """The adapter leaves ``ref_index`` at 1, so a filled guide reported as
         an empty one puts Z_ref badly out and breaks the power balance."""
         blocking = preflight.refusals(preflight.check(self._guide_problem(fill=2.0)))
-        assert any("filled with" in f.message for f in blocking)
+        said = [f.message for f in blocking if "filled with" in f.message]
+        assert said and said[0].endswith(
+            ". Model the guide empty, or use a lumped or microstrip port"
+        )
 
     def test_an_empty_guide_is_not(self):
         findings = preflight.check(self._guide_problem(fill=1.0))
@@ -2817,7 +2894,12 @@ class TestPreflight:
         error, no refusal, and a plot.
         """
         blocking = preflight.refusals(preflight.check(self._guide_problem("TE01")))
-        assert any("cuts off at 34.8596 GHz" in f.message for f in blocking)
+        said = [f.message for f in blocking if "cuts off at 34.8596 GHz" in f.message]
+        assert said == [
+            "TE01 cuts off at 34.8596 GHz in this 10.7 x 4.3 mm guide, above the top of "
+            "the band at 26 GHz, so no mode propagates. Check the guide dimensions and "
+            "the band"
+        ]
 
     def test_the_dominant_mode_in_its_own_band_says_nothing(self):
         findings = preflight.check(self._guide_problem("TE10"))
@@ -2831,6 +2913,7 @@ class TestPreflight:
         cutoff = [f for f in findings if "cuts off" in f.message]
         assert [f.severity for f in cutoff] == [preflight.REFUSE]
         assert "Start the band above" in cutoff[0].message
+        assert re.search(r"\. Start the band above [\d.]+ GHz$", cutoff[0].message)
 
     @pytest.mark.parametrize("width", [10.7, 10.0])
     def test_a_band_started_above_the_cutoff_stated_starts_above_the_cutoff(self, width):
@@ -2884,7 +2967,7 @@ class TestPreflight:
         guide = self._guide_problem("TE10", band=(10e9, 20e9))
         on, above = self._on_the_cutoff(guide.ports[0], guide.length_unit)
         apart = 2.0**30
-        named = f"exactly at the band's point {on / 1e9:.9g} GHz"
+        named = f"exactly at {on / 1e9:.9g} GHz, a point of the band"
 
         (first,), _ = self._said(guide, on, 20e9)
         assert first.severity == preflight.REFUSE and named in first.message
@@ -2893,6 +2976,7 @@ class TestPreflight:
         assert inside.severity == preflight.REFUSE and named in inside.message
         (top,), _ = self._said(guide, 10e9, on)
         assert top.severity == preflight.REFUSE and named in top.message
+        assert top.message.endswith(". Move the band so that no point falls on the cutoff")
         assert self._said(guide, above, 20e9)[0] == []
 
     def test_the_cutoff_is_that_of_the_port_the_engine_is_handed(self):
@@ -2921,7 +3005,7 @@ class TestPreflight:
         on, above = self._on_the_cutoff(placed, drawn.length_unit)
         (refused,), _ = self._said(drawn, on, 20e9)
         assert refused.severity == preflight.REFUSE
-        assert f"exactly at the band's point {on / 1e9:.9g} GHz" in refused.message
+        assert f"exactly at {on / 1e9:.9g} GHz, a point of the band" in refused.message
         assert self._said(drawn, above, 20e9)[0] == []
 
     def test_the_orientation_the_guide_is_drawn_in_does_not_change_it(self):
@@ -2975,7 +3059,11 @@ class TestPreflight:
         problem = self._lumped_problem(2.0)
         thin = dataclasses.replace(problem.ports[0], stop=(8.0, 8.0, 6.1))
         blocking = preflight.refusals(preflight.check(dataclasses.replace(problem, ports=(thin,))))
-        assert any("snap to the single grid line" in f.message for f in blocking)
+        said = [f.message for f in blocking if "snap to the single grid line" in f.message]
+        assert said and said[0].endswith(
+            ", so openEMS drops the element and the run returns no result. Refine the "
+            "mesh across z, or widen the gap"
+        )
 
     def test_a_gap_of_several_cells_is_not(self):
         findings = preflight.check(self._lumped_problem(2.0))
@@ -3000,6 +3088,10 @@ class TestPreflight:
             for f in preflight.refusals(preflight.check(dataclasses.replace(problem, ports=(far,))))
         ]
         assert any("entirely outside the grid" in m for m in messages)
+        assert any(
+            m.endswith(". Extend the mesh to cover the port, or move the port onto the structure")
+            for m in messages
+        )
         assert not [m for m in messages if "snap" in m]
 
     def _coaxial_problem(self, inner: float, cell: float = 1.0):
@@ -3025,7 +3117,10 @@ class TestPreflight:
         probes, the current loops and the excitation shell - so a gap the grid
         does not reach into is a port that drives nothing and reads nothing."""
         blocking = preflight.refusals(preflight.check(self._coaxial_problem(4.9)))
-        assert any("grid line(s) fall across it" in f.message for f in blocking)
+        said = [f.message for f in blocking if "grid line(s) fall across it" in f.message]
+        assert said and re.search(
+            r", so the port drives and reads nothing\. Refine the mesh across [xyz]$", said[0]
+        )
 
     def test_an_annulus_several_cells_wide_is_not(self):
         findings = preflight.check(self._coaxial_problem(1.0))
@@ -3043,7 +3138,11 @@ class TestPreflight:
         The bore here is 5 mm, so a mean circumference of about 19 mm."""
         findings = preflight.check(self._coaxial_at(2.0))
 
-        assert any("mean circumference of its bore" in f.message for f in findings)
+        said = [f.message for f in findings if "mean circumference of its bore" in f.message]
+        assert said and said[0].endswith(
+            ", so higher-order modes from the feed make the impedance read high. Raise "
+            "MeasurementDistance on the port"
+        )
 
     def test_probes_well_down_the_line_are_not(self):
         findings = preflight.check(self._coaxial_at(28.0))
@@ -3152,6 +3251,9 @@ class TestVerticesTheEngineCannotTellApart:
         assert any(f.subject == "Trace" for f in blocking)
         said = next(f for f in blocking if f.subject == "Trace")
         assert "single-precision" in said.message
+        assert said.message.endswith(
+            ". Draw the feature coarser, or make the whole domain smaller, absorber margin included"
+        )
 
     def test_and_the_run_stops_on_it(self):
         problem = build_problem(solids=(SUBSTRATE, GROUND, self.pinched()))
@@ -3241,6 +3343,9 @@ class TestAThicknessNobodyDrew:
         said = self._findings()
         assert [f.subjects for f in said] == [("Reflector",)]
         assert "0.5 mm" in said[0].message
+        assert said[0].message.endswith(
+            ". If it is meant to be a solid, close it so it carries the thickness you drew"
+        )
 
     def test_it_is_a_substitution_rather_than_a_warning(self):
         """Nothing is wrong yet, and colouring it as a fault would train people
@@ -3313,7 +3418,7 @@ class TestAnUncheckedDirectionCrossesTheEnvelope:
         answer - and a warning on every hand-written envelope would be a
         warning nobody can act on."""
         findings = preflight.check(build_problem())
-        assert not any("nothing has checked it" in f.message for f in findings)
+        assert not any("nothing has checked that direction" in f.message for f in findings)
 
 
 class TestARelaxedSolidCrossesTheEnvelope:
@@ -3398,7 +3503,10 @@ class TestLossQuotedOutsideTheBand:
         warned = self._warnings(self._lossy(0.0))
         assert len(warned) == 1
         assert warned[0].severity == preflight.WARN
-        assert "no record" in warned[0].message
+        assert "nothing records the frequency" in warned[0].message
+        assert warned[0].message.endswith(
+            ". Set MeasuredAt to the frequency the loss tangent was measured at"
+        )
 
     @pytest.mark.parametrize("above", [False, True])
     def test_the_threshold_is_the_two_octaves_it_says_it_is(self, above):
@@ -3486,7 +3594,8 @@ class TestABandWiderThanOneConductivity:
         assert warned[0].severity == preflight.WARN
         assert "runs down to 100 MHz" in warned[0].message
         assert "is 50.5 times the declared one" in warned[0].message
-        assert "at 5.05 GHz alone" in warned[0].message
+        assert "only at 5.05 GHz" in warned[0].message
+        assert warned[0].message.endswith(". Solve a narrower band, or split this one into studies")
 
     def test_and_that_the_top_of_the_band_is_short_of_loss_rather_than_over(self):
         """Both ends are wrong by the same amount of loss and only one of them
@@ -3751,19 +3860,20 @@ class TestTheMarkerStreamIsTheContract:
         return path
 
     def test_markers_are_parsed_and_other_lines_pass_through(self, tmp_path):
+        """What the driver prints passes through between two blank lines."""
         stub = self.interpreter(tmp_path, "OPENEMS:STARTED\nbuilding the mesh\nOPENEMS:DONE\n")
 
         items = list(run.stream(self.envelope(tmp_path), interpreter=stub))
 
         assert [i.name for i in items if isinstance(i, run.Marker)] == ["STARTED", "DONE"]
-        assert [i for i in items if not isinstance(i, run.Marker)] == ["building the mesh"]
+        assert [i for i in items if not isinstance(i, run.Marker)] == ["", "building the mesh", ""]
 
     def test_a_run_that_never_reports_done_fails_even_when_it_exits_zero(self, tmp_path):
         """A solve killed mid-flight - OOM, a crash in a native library -
         exits without DONE. Exit code alone did not catch it."""
         stub = self.interpreter(tmp_path, "OPENEMS:STARTED\nOPENEMS:SOLVER_STARTED\n")
 
-        with pytest.raises(run.SolverFailed, match="never reported DONE"):
+        with pytest.raises(run.SolverFailed, match="before the run finished"):
             list(run.stream(self.envelope(tmp_path), interpreter=stub))
 
     def test_a_stale_results_file_is_not_returned_as_this_run_s_answer(self, tmp_path):
@@ -3780,6 +3890,16 @@ class TestTheMarkerStreamIsTheContract:
         stub = self.interpreter(tmp_path, "OPENEMS:STARTED\n")
 
         with pytest.raises(run.SolverFailed):
+            run.run(envelope, interpreter=stub)
+
+    def test_a_finished_run_naming_no_results_is_not_answered_by_the_file_beside_it(self, tmp_path):
+        """DONE says the run finished, and only the RESULTS line says which file
+        is its answer. The file in the directory can be a previous solve's."""
+        envelope = self.envelope(tmp_path)
+        (tmp_path / run.RESULTS_NAME).write_text('{"from": "an earlier solve"}')
+        stub = self.interpreter(tmp_path, "OPENEMS:STARTED\nOPENEMS:DONE\n")
+
+        with pytest.raises(run.SolverFailed, match="without naming its results"):
             run.run(envelope, interpreter=stub)
 
     def test_an_error_marker_is_reported_verbatim(self, tmp_path):
@@ -3846,7 +3966,10 @@ class TestWhatTheEngineSays:
         assert complaints == []
         (said,) = stated
         assert said.startswith(f"openEMS said: {STRIP_UNDER_THE_PORT} ")
-        assert "the run names above each body none of whose pieces was" in said
+        assert said.endswith(
+            "Part of that material got no cell. A body that got none at all is named "
+            "above, with what covers it."
+        )
 
     def test_a_material_named_like_a_port_is_still_a_material(self):
         """A material takes the label it was given, and nothing refuses one
@@ -3931,7 +4054,7 @@ class TestWhatTheEngineSays:
     def test_a_run_whose_engine_warned_of_a_wrong_model_fails_in_its_words(self, tmp_path):
         stub = self.interpreter(tmp_path, *QUIET, unused("port_excite_1"))
         envelope = TestTheMarkerStreamIsTheContract.envelope(None, tmp_path)
-        with pytest.raises(run.SolverFailed, match="the answer cannot be taken") as failed:
+        with pytest.raises(run.SolverFailed, match="the results cannot be used") as failed:
             list(run.stream(envelope, interpreter=stub))
         assert unused("port_excite_1") in str(failed.value)
 
@@ -4022,8 +4145,10 @@ class TestEveryBodyIsLaid:
             ("Fill", Property("Vacuum", air), [air]),
             ("Strip", Property("PEC", drawn, strip), [drawn]),
         )
-        assert said.startswith("Strip: openEMS gave this PEC body no cell, and a box a port")
-        assert "spans it and was laid" in said
+        assert said == (
+            "Strip: openEMS gave this PEC body no cell, and a box laid by a port, of PEC, "
+            "spans it, so the cells it took from this body are PEC"
+        )
 
     def test_a_body_under_another_of_an_alike_metal_is_named_with_that_body(self):
         """Two copies of a sheet, or of a box in two metals of one kind: one took
@@ -4040,22 +4165,26 @@ class TestEveryBodyIsLaid:
         (said,) = self.unlaid(
             ("Patch", Property("PEC", patch, Piece(2, True, self.TRACE)), [patch])
         )
-        assert "no primitive it laid spans it" in said
-        assert "the model solved is without it" in said
+        assert said == (
+            "Patch: openEMS gave this PEC body no cell, and no body that got cells spans "
+            "it, so the model solved lacks it unless the bodies around it took its cells. "
+            "Draw it on a grid line, or refine the mesh across it"
+        )
 
     def test_what_spans_a_body_is_a_primitive_that_was_laid(self):
         drawn = Piece(1, False, self.TRACE)
         (said,) = self.unlaid(
             ("Strip", Property("PEC", drawn, Piece(2, False, self.TRACE)), [drawn])
         )
-        assert "no primitive it laid spans it" in said
+        assert "no body that got cells spans it" in said
 
     def test_a_surface_s_single_precision_corners_are_spanned_by_a_box_flush_with_them(self):
         """CSXCAD keeps a surface's vertices as ``float`` (``CSPrimPolyhedron.h``)."""
         rounded = [[-60.0, -1.4500000476837158, 1.0], [60.0, 1.4500000476837158, 1.0]]
         drawn = Piece(1, False, rounded, "Polyhedron")
         (said,) = self.unlaid(("Via", Property("PEC", drawn, Piece(2, True, self.TRACE)), [drawn]))
-        assert "spans it and was laid" in said
+        assert said.startswith("Via: openEMS gave this PEC body no cell, and a ")
+        assert "spans it, so the cells it took from this body are" in said
 
     def test_a_sheet_some_of_whose_triangles_were_laid_is_laid(self):
         half = [[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]]
@@ -4077,6 +4206,48 @@ class TestAnInterpreterIsVerifiedByImporting:
 
     def test_a_missing_path_is_rejected_rather_than_raising(self):
         assert run.has_bindings("/nonexistent/python") is False
+
+
+class TestTheInterpreterARunStarts:
+    """Check verifies the Python Run starts openEMS with. A configured one is
+    launched as given, so it is verified alone, and a search answers only where
+    none is configured."""
+
+    @staticmethod
+    def answering(path):
+        """A stand-in for a Python, which answers every probe that it imports
+        the bindings."""
+        path.write_text(f"#!/bin/sh\necho {run._PROBE_TOKEN}\n")
+        path.chmod(0o755)
+        return path
+
+    def test_a_configured_interpreter_is_the_answer_and_no_search_is_made(
+        self, tmp_path, monkeypatch
+    ):
+        def searched(cancel=None):
+            raise AssertionError("a configured interpreter was searched past")
+
+        monkeypatch.setattr(run, "find_interpreter", searched)
+        configured = self.answering(tmp_path / "configured")
+        assert run.interpreter_for(configured) == configured
+
+    def test_a_configured_interpreter_that_cannot_import_is_refused_by_name(
+        self, tmp_path, monkeypatch
+    ):
+        """The search would find the one the environment names, and Run would
+        still start the configured one."""
+        monkeypatch.setenv(run.INTERPRETER_ENV_VAR, str(self.answering(tmp_path / "found")))
+        with pytest.raises(run.EngineNotFound) as raised:
+            run.interpreter_for("/bin/echo")
+        assert str(raised.value) == (
+            "SolverPython is /bin/echo, which cannot import openEMS and CSXCAD. Set "
+            "SolverPython to a Python that can, or clear it to search"
+        )
+
+    def test_none_configured_is_answered_by_the_search(self, tmp_path, monkeypatch):
+        found = self.answering(tmp_path / "found")
+        monkeypatch.setenv(run.INTERPRETER_ENV_VAR, str(found))
+        assert run.interpreter_for("") == found
 
 
 def _alive(pid: int) -> bool:
@@ -4220,8 +4391,8 @@ class TestARunCanBeStopped:
         assert not _alive(pid)
 
     def test_a_request_that_arrives_first_starts_no_process_at_all(self, tmp_path):
-        """The interpreter does not exist, so starting one would raise
-        ``FileNotFoundError``. Getting ``Cancelled`` is the proof."""
+        """The interpreter does not exist, so starting one would fail.
+        Getting ``Cancelled`` is the proof."""
         cancel = run.Cancellation()
         cancel.cancel()
 
@@ -4233,6 +4404,12 @@ class TestARunCanBeStopped:
                     cancel=cancel,
                 )
             )
+
+    def test_an_interpreter_that_cannot_be_started_is_the_solver_failing(self, tmp_path):
+        """A configured path is launched as given, so one that is no program
+        is said by name, as a failure of the run rather than of the workbench."""
+        with pytest.raises(run.SolverFailed, match="/nonexistent/python"):
+            list(run.stream(self.envelope(tmp_path), interpreter="/nonexistent/python"))
 
     def test_a_request_that_lands_while_the_process_starts_still_reaches_it(self, tmp_path):
         """The window ``watching`` closes. A stop can be asked for after the
@@ -4298,7 +4475,7 @@ class TestARunCanBeStopped:
         cancel.cancel()
 
         with pytest.raises(run.Cancelled):
-            run.find_interpreter(self.slow_interpreter(tmp_path), cancel=cancel)
+            run.interpreter_for(self.slow_interpreter(tmp_path), cancel=cancel)
 
 
 class TestALargeGridIsSaidOutLoud:
@@ -4333,7 +4510,10 @@ class TestALargeGridIsSaidOutLoud:
     def test_a_grid_past_the_threshold_warns(self):
         found = self._severities(30_000_000)
         assert [f.severity for f in found] == [preflight.WARN]
-        assert "MaxGrowthRatio" in found[0].message
+        assert found[0].message.endswith(
+            ", so the run is long. If that is not intended, lower ElementsPerWavelength "
+            "in the openEMS mesh settings"
+        )
 
     def test_a_grid_past_the_mesher_s_own_ceiling_is_refused(self):
         """Only an envelope nobody meshed can be this big - and then neither
@@ -4341,7 +4521,10 @@ class TestALargeGridIsSaidOutLoud:
         cells = int(MAX_GRID_BYTES / BYTES_PER_CELL * 2)
         found = self._severities(cells)
         assert [f.severity for f in found] == [preflight.REFUSE]
-        assert "refuses to build" in found[0].message
+        assert found[0].message.endswith(
+            ", past the 8 GiB limit the workbench meshes to, so the workbench did not "
+            "make this grid"
+        )
 
 
 class TestAnAxisTooShortForItsAbsorber:
@@ -4379,11 +4562,12 @@ class TestAnAxisTooShortForItsAbsorber:
         """The same comparison the mesher raises on, so the two agree about
         which grids are legal."""
         findings = preflight.refusals(preflight.check(self._problem(lines)))
-        axis = [f for f in findings if f.subject == "x domain"]
+        axis = [f for f in findings if f.subject == "x axis"]
         assert axis, [f.subject for f in findings]
         assert f"{lines} lines" in axis[0].message
         assert "8 absorber cells" in axis[0].message
-        assert "needs 18" in axis[0].message
+        assert "need 18 lines" in axis[0].message
+        assert axis[0].message.endswith(". Lower PMLCells, or mesh this axis more finely")
 
     def test_an_axis_with_room_is_not_refused(self):
         """Asked at the first count that fits, which is where the predicate has
@@ -4395,7 +4579,7 @@ class TestAnAxisTooShortForItsAbsorber:
             problem = self._problem(lines)
             assert not preflight.absorber._absorber_covers_the_axis(problem.grid, 0)
             refused = preflight.refusals(preflight.check(problem))
-            assert [f for f in refused if f.subject == "x domain"] == []
+            assert [f for f in refused if f.subject == "x axis"] == []
 
     @pytest.mark.parametrize("lines", COVERED)
     def test_the_checks_that_measure_against_the_absorber_still_speak(self, lines):
@@ -4410,6 +4594,9 @@ class TestAnAxisTooShortForItsAbsorber:
         findings = preflight.refusals(preflight.check(self._problem(lines)))
         ports = [f for f in findings if f.subject == "port 1" and "absorber" in f.message]
         assert all("covers this axis end to end" in f.message for f in ports)
+        assert all(
+            f.message.endswith(". Lower PMLCells, or mesh this axis more finely") for f in ports
+        )
         for what in ("its feed sits at", "its measurement plane sits at"):
             assert any(f.message.startswith(what) for f in ports), (
                 f"nothing refused the port's {what.split()[1]}: {[f.message for f in ports]}"
@@ -4468,7 +4655,7 @@ class TestTheBoundaryAndTheMeshAgreeOnDepth:
 
     def test_a_disagreement_is_reported(self):
         said = self._said(self._problem((8, 8, 8), ("PML_4", *("PML_8",) * 5)))
-        assert [f.subject for f in said] == ["boundary xmin"]
+        assert [f.subject for f in said] == ["XMin face"]
         assert "asks for 4 cells of PML and the mesh set aside 8" in said[0].message
 
     def test_a_reservation_of_nothing_is_reported_and_not_exempt(self):
@@ -4479,8 +4666,51 @@ class TestTheBoundaryAndTheMeshAgreeOnDepth:
         nothing, while openEMS attenuates the field at that wall regardless.
         """
         said = self._said(self._problem((0, 8, 8), ("PML_8",) * 6))
-        assert [f.subject for f in said] == ["boundary xmin and boundary xmax"]
+        assert [f.subject for f in said] == ["XMin face and XMax face"]
         assert "the mesh set aside 0 at that face of x" in said[0].message
+
+
+class TestAPortsPlaneMustStandClearOfTheAbsorber:
+    """A flat lumped port's plane is where it excites and measures. Fed from a
+    trace's end it is flat along the trace, not along the axis its current
+    runs on, so the plane can stand in the absorber at the board's edge."""
+
+    def _said(self, flat, at):
+        """The refusals of a lumped port flat across ``flat`` at ``at``, in a
+        grid absorbing eight cells deep at every face."""
+        excitation, propagation = (flat + 2) % 3, (flat + 1) % 3
+        start, stop = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+        start[flat] = stop[flat] = at
+        start[propagation], stop[propagation] = -1.5, 1.5
+        start[excitation], stop[excitation] = 0.0, 1.6
+        port = _lumped(
+            start=tuple(start),
+            stop=tuple(stop),
+            propagation_axis=propagation,
+            excitation_axis=excitation,
+        )
+        axis = np.linspace(-50.0, 50.0, 101)
+        grid = MeshGrid(x=axis, y=axis, z=axis, params={"pml_cells": 8, "padding": None})
+        problem = build_problem(grid=grid, ports=(port,))
+        return [f.message for f in preflight.refusals(preflight.check(problem))]
+
+    @pytest.mark.parametrize("flat", range(3))
+    def test_a_plane_in_the_absorber_is_refused_naming_where_it_stands(self, flat):
+        name = "xyz"[flat]
+        said = [one for one in self._said(flat, -46.0) if one.startswith("its plane")]
+        assert len(said) == 1, said
+        assert f"its plane sits at {name}=-46, inside the absorber" in said[0]
+        assert f"deep at {name}=min" in said[0]
+
+    def test_a_plane_past_the_grid_is_said_not_to_be_moved(self):
+        """The excitation is the one primitive openEMS does not snap, so a
+        plane past the edge of the grid drives nothing rather than moving."""
+        [said] = [one for one in self._said(0, -55.0) if one.startswith("its plane")]
+        assert "openEMS does not move a lumped plane onto the grid" in said
+
+    @pytest.mark.parametrize("flat", range(3))
+    def test_a_plane_clear_of_it_is_not(self, flat):
+        assert not [one for one in self._said(flat, -30.0) if "absorber" in one]
 
 
 class TestTheAbsorberMustLeaveAModel:
@@ -4519,7 +4749,7 @@ class TestTheAbsorberMustLeaveAModel:
         return build_problem(grid=grid, materials=self.VACUUM)
 
     def _domain_findings(self, problem):
-        return [f for f in preflight.check(problem) if f.subject.endswith("domain")]
+        return [f for f in preflight.check(problem) if f.subject.endswith(" axis")]
 
     def _blocks(self, problem, dim=0):
         """What the absorber covers at each end, off the finished grid."""
@@ -4545,8 +4775,12 @@ class TestTheAbsorberMustLeaveAModel:
 
     def test_an_absorber_that_covers_most_of_the_model_is_reported(self):
         findings = self._domain_findings(self._problem(self.CROWDED))
-        assert [f.subject for f in findings] == ["x domain"]
+        assert [f.subject for f in findings] == ["x axis"]
         assert "of the structure outside it" in findings[0].message
+        assert findings[0].message.endswith(
+            " Draw more structure, raise ElementsPerWavelength in the openEMS mesh "
+            "settings, or lower PMLCells. A coarser mesh makes the absorber deeper"
+        )
 
     def test_it_warns_rather_than_refuses(self):
         """A long line measured only in the middle is legitimate. What decides
@@ -4561,8 +4795,9 @@ class TestTheAbsorberMustLeaveAModel:
         problem = self._problem(self.CROWDED)
         low, high = self._blocks(problem)
         message = self._domain_findings(problem)[0].message
-        assert f"covers {low:.4g} mm at x=min and {high:.4g} mm at x=max" in message
-        assert "of a 100 mm model" in message
+        assert f" cells over {low:.4g} mm at x=min and " in message
+        assert f" cells over {high:.4g} mm at x=max of the 100 mm structure" in message
+        assert "of the 100 mm structure" in message
 
     def test_what_it_reports_is_what_the_grid_carries(self):
         """What removes model and what absorbs have to be one block. A
@@ -4580,8 +4815,11 @@ class TestTheAbsorberMustLeaveAModel:
         meshes and warns, and a coarser one never gets here at all - the
         absorber takes the whole axis and meshing refuses it by name."""
         assert self._domain_findings(self._problem(self.CROWDED))
-        with pytest.raises(MeshError, match="consume the whole x axis"):
+        with pytest.raises(MeshError, match="consume the whole x axis") as raised:
             self._problem(8.0)
+        assert str(raised.value).endswith(
+            ". Lower PMLCells on the openEMS solver, or set BoundaryXMin or BoundaryXMax to Open"
+        )
 
     def test_only_the_ends_that_absorb_are_counted(self):
         """An axis can be THROUGH at one end and padded outward at the other,
@@ -4593,7 +4831,7 @@ class TestTheAbsorberMustLeaveAModel:
         )
         low, _ = self._blocks(problem)
         message = self._domain_findings(problem)[0].message
-        assert f"covers {low:.4g} mm at x=min of a 100 mm model" in message
+        assert f"takes 30 cells over {low:.4g} mm at x=min of the 100 mm structure" in message
         assert "x=max" not in message and "-" not in message.split("of a")[0]
 
     def test_a_feed_inside_the_absorber_is_described_against_the_interior(self):
@@ -4614,7 +4852,7 @@ class TestTheAbsorberMustLeaveAModel:
         """Its domain is larger than the structure by design, so its share is
         above one and means nothing. y and z are padded eight caps outward here."""
         subjects = [f.subject for f in self._domain_findings(self._problem(self.CROWDED))]
-        assert "y domain" not in subjects and "z domain" not in subjects
+        assert "y axis" not in subjects and "z axis" not in subjects
 
     def test_an_axis_with_no_absorber_is_not_described(self):
         problem = self._problem(self.CROWDED, pml_cells=(0, 8, 8))
@@ -4787,6 +5025,10 @@ class TestAPortMustReachTheGrid:
 
         assert [f.subject for f in refusals] == ["port 1"]
         assert f"hanging 0.5 mm past x={end}" in refusals[0].message
+        assert refusals[0].message.endswith(
+            ". Draw the port inside the grid. If the absorber leaves too little grid, "
+            "raise ElementsPerWavelength in the openEMS mesh settings, or lower PMLCells"
+        )
 
     def test_a_microstrip_is_lenient_only_along_the_propagation_axis(self):
         """``MSLPort`` re-derives itself from the grid on that axis and no other.
@@ -5224,6 +5466,15 @@ class TestNoNumberReachesTheEngineUnchecked:
         """Each is a number, and the driver hands openEMS their sum."""
         with pytest.raises(EnvelopeError, match="more than a double holds"):
             Material(name="X", kind="lossy_dielectric", kappa=1e308, conductivity=1.7e308)
+
+    def test_a_conducting_sheet_with_no_conductivity_says_what_to_enter(self):
+        with pytest.raises(EnvelopeError) as raised:
+            Material(name="Foil", kind="conducting_sheet", conductivity=0.0)
+        assert str(raised.value) == (
+            "material 'Foil': Conductivity is 0 S/m, and a Conducting Sheet needs more "
+            "than 0. Enter a positive value, or set MaterialType to PEC for a lossless "
+            "conductor"
+        )
 
     def test_a_lossy_dielectric_carries_a_conductivity_of_its_own(self):
         assert Material(name="X", kind="lossy_dielectric", conductivity=0.02).conductivity == 0.02
@@ -5692,7 +5943,7 @@ class TestSilentWrongAnswers:
         )
         findings = preflight.ports._check_required_lines_exist(port, grid)
         assert [f.severity for f in findings] == [preflight.REFUSE, preflight.REFUSE]
-        assert all("0/0" in f.message for f in findings)
+        assert all("the run returns no result" in f.message for f in findings)
 
     def test_an_unfoldable_axis_is_refused_rather_than_flattened(self):
         """Halves with different cell counts must not be averaged together.
@@ -5997,6 +6248,10 @@ class TestSilentWrongAnswers:
 
         assert [f.subject for f in refused if f.subject == "Upper trace"] == ["Upper trace"]
         assert "Foil" in message, "the refusal must name the material, not only the solid"
+        assert message.endswith(
+            ". Draw the conductor as a flat face, since a conducting sheet carries its "
+            "thickness in the material's Thickness, or bind it to a PEC material"
+        )
 
     @pytest.mark.parametrize("spanned", [0, 1, 3])
     def test_a_conducting_sheet_that_does_not_span_a_surface_is_refused(self, spanned):
@@ -6037,7 +6292,7 @@ class TestSilentWrongAnswers:
         problem = build_problem(solids=(SUBSTRATE, GROUND, flat))
 
         assert not any(
-            "surface-impedance model only to a shape" in str(f) for f in preflight.check(problem)
+            "surface-impedance model only to a face" in str(f) for f in preflight.check(problem)
         )
 
     def test_a_solid_conductor_that_is_not_a_sheet_is_untouched(self):
@@ -6174,6 +6429,10 @@ class TestASheetInTheBoundary:
         (refusal,) = self.refused(self.across(boundary, index))
         assert refusal.subject == "Iris"
         assert f"'Foil' sheet lies in the {side} boundary" in str(refusal)
+        assert refusal.message.endswith(
+            ". Leave air between the sheet and that side of the domain, or bind it to a "
+            "PEC material"
+        )
 
     @pytest.mark.parametrize(
         "boundary, index", [("PEC", 1), ("PEC", -2), ("MUR", 2), ("MUR", -3), ("PML_8", 9)]
@@ -6432,6 +6691,38 @@ class TestAnExcitationIsNotSnapped:
         left it, which is what :meth:`model.Port.element_lines` is for."""
         assert _lumped(excite=False).required_lines() == ([], [], [])
 
+    def test_a_termination_asked_as_the_source_answers_as_one(self):
+        """What the mesher asks of every port, since each is the source of
+        some run on the same grid."""
+        assert _lumped(excite=False).required_lines(driven=True) == _lumped().required_lines()
+
+    def test_the_grid_pins_every_port_whichever_is_driven(self):
+        """A sweep re-excites one grid for every port in turn, so the grid
+        carries the plane of each port as though it were the driven one. Two
+        flat ports stand at the two ends of a trace. The trace's ends are
+        conductor edges, which the thirds rule lays lines either side of and
+        not on, so a line there is the port's alone."""
+        board = Solid(material="FR4", lower=(-50.0, -15.0, 0.0), upper=(50.0, 15.0, 1.6))
+        strip = Solid(material="Copper", lower=(-50.0, -1.5, 1.6), upper=(50.0, 1.5, 1.6))
+        materials = (
+            Material(name="FR4", kind="dielectric", epsilon=4.4),
+            Material(name="Copper", kind="pec"),
+        )
+        far = dict(number=2, start=(50.0, -1.5, 1.6), stop=(50.0, 1.5, 0.0))
+        grids = [
+            plan.plan_grid(
+                [board, strip],
+                [_lumped(excite=driving == 1), _lumped(**far, excite=driving == 2)],
+                materials,
+                MeshParams(metal_res=0.5, dielectric_res=1.0, min_lines=6, pml_cells=8),
+                padding=((8, 8), (8, 8), (8, 8)),
+            )
+            for driving in (1, 2)
+        ]
+        for axis in ("x", "y", "z"):
+            assert np.array_equal(getattr(grids[0], axis), getattr(grids[1], axis)), axis
+        assert {-50.0, 50.0} <= set(grids[0].x)
+
     def test_what_it_asks_for_is_what_the_mesh_contains(self):
         """End to end, because the request is worth nothing if the mesher drops
         it: this is the whole route from the port to the grid it is solved on."""
@@ -6460,7 +6751,10 @@ class TestAnExcitationIsNotSnapped:
         findings = preflight.ports._check_required_lines_exist(port, grid)
         assert [f.severity for f in findings] == [preflight.REFUSE]
         assert "x=-50" in findings[0].message
-        assert "0/0" in findings[0].message
+        assert findings[0].message.endswith(
+            ", so the port drives nothing and the run returns no result. Mesh the "
+            "model again, or move the port onto a grid line"
+        )
 
 
 class TestTheElementIsTheBoxSnapped:
@@ -6608,7 +6902,10 @@ class TestAnExcitationWithExtentStillHasToCatchALine:
         assert [f.severity for f in findings] == [preflight.REFUSE]
         assert "y=-1.5 to 1.5" in findings[0].message
         assert "nearest grid line is at -2" in findings[0].message
-        assert "0/0" in findings[0].message
+        assert findings[0].message.endswith(
+            ", so the port drives nothing and the run returns no result. Refine the "
+            "mesh across y, or add a Mesh Refinement over the port"
+        )
 
     def test_a_box_holding_a_line_is_not(self):
         assert self.sampled(_lumped(start=(-50.0, -3.0, 1.6), stop=(-50.0, 3.0, 0.0))) == []
@@ -6895,6 +7192,11 @@ class TestAnElementSnappedOffItsMetal:
         assert [f.severity for f in findings] == [preflight.REFUSE]
         assert "z=1.6 end" in findings[0].message
         assert "snaps to 1.5" in findings[0].message
+        assert findings[0].message.endswith(
+            ". Mesh the model again, which puts a grid line on each conductor face, or "
+            "give the conductor enough thickness across z for the grid to hold a cell "
+            "edge inside it"
+        )
 
     def test_an_end_the_grid_moved_off_a_solid_is_not(self):
         """The same displacement against a conductor with thickness, which is
@@ -7511,6 +7813,10 @@ class TestAConductorTheGridDoesNotBuildAsDrawn:
             self._trace(width=self._across(4)[0]), grid=self._grid(params={"cap": ceiling})
         )
         quoted = float(re.search(r"global ([\d.eE+-]+) mm", said[0].message).group(1))
+        assert said[0].message.endswith(
+            ". Give it a Mesh Refinement with MinElementsAcross set and ElementSize at the "
+            f"global {quoted:g} mm, so that only the width is refined"
+        )
 
         assert quoted <= ceiling, "the mesher refuses anything above the ceiling"
         assert quoted > 0.999 * ceiling, "shortened, not thrown away"
@@ -7542,6 +7848,7 @@ class TestAConductorTheGridDoesNotBuildAsDrawn:
         said = self._said(self._trace(width=self._across(4)[0]), grid=self._grid(params={}))
         assert said and "MinElementsAcross" in said[0].message
         assert "global" not in said[0].message
+        assert said[0].message.endswith(". Give it a Mesh Refinement with MinElementsAcross set")
 
     def test_without_a_policy_the_grid_says_what_a_thickness_is(self):
         """Which axes are widths is decided against the size laid at metal, and
@@ -7699,3 +8006,43 @@ class TestAConductorTheGridDoesNotBuildAsDrawn:
         # so it is what this grid genuinely fails to build; the stack is not.
         said = self._said(*stack, grid=MeshGrid(x=lines.x, y=lines.y, z=lines.z, params={}))
         assert [finding.subjects for finding in said] == [("Ground",)]
+
+
+class TestWhatEndedARun:
+    """openEMS stops at MaxTimesteps exactly, or short of it on EnergyDecay or an
+    abort. The steps a run took say which of the two it was."""
+
+    #: What ``openEMS::DumpStatistics`` writes, figures and all, as a run of the
+    #: shipped guide wrote it.
+    STATISTICS = (
+        "51272\t% number of cells\n"
+        "6.613038617671562e-13\t% timestep (s)\n"
+        "{steps}\t% number of iterations\n"
+        "4.189359964294934e-09\t% total numerical time (s)\n"
+        "4.00274\t% simulation time (s)\n"
+        "81146444.6853905\t% speed (cells/s)\n"
+    )
+
+    def test_the_steps_are_read_off_the_statistics(self, tmp_path):
+        from Microwave.Solvers.openems import driver
+
+        (tmp_path / driver.STATISTICS_NAME).write_text(self.STATISTICS.format(steps=6335))
+        assert driver.steps_taken(tmp_path) == 6335
+
+    def test_a_run_without_statistics_took_steps_nobody_knows(self, tmp_path):
+        from Microwave.Solvers.openems import driver
+
+        assert driver.steps_taken(tmp_path) is None
+
+    @pytest.mark.parametrize(
+        ("provenance", "stopped"),
+        [
+            ({"end_criteria": 1e-9, "max_timesteps": 4000, "timesteps": 4000}, "cap"),
+            ({"end_criteria": 1e-9, "max_timesteps": 4000, "timesteps": 2500}, "early"),
+            ({"end_criteria": 1e-9, "max_timesteps": 4000}, None),
+            ({"end_criteria": 0.0, "max_timesteps": 4000, "timesteps": 4000}, None),
+        ],
+    )
+    def test_a_result_says_what_ended_it(self, provenance, stopped):
+        result = read.Results(np.array([1e9]), 1, {}, {}, provenance)
+        assert result.stopped == stopped

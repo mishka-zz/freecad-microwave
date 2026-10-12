@@ -21,27 +21,28 @@ In openEMS, PML conductivity grading is normalized across the specified physical
 depth (`openEMS/FDTD/extensions/operator_ext_upml.cpp:30`). Consequently, total
 integrated absorption does not depend on the physical layer thickness in
 millimetres. The profile rises by a fixed factor per cell, so more cells do not
-sample it more finely; what they buy is a lower conductivity at the first cell,
+sample it more finely. More cells lower the conductivity at the first cell,
 because the normalization divides by that factor raised to the cell count. The
 step a wave meets on entering is therefore smaller, and the numerical reflection
 at the interface falls.
 
 ## Which faces absorb
 
-The condition on each face is read off the mesh policy's `Padding` for that
-face, by `Solvers/openems/policy.py::_boundary`. `Air` and `Through` absorb,
-and `Ends` is a perfect electric wall, which is also what a backend building no
-absorber puts on every face it does not open. The exception is an `Ends` face
+The condition on each face is read off the mesh policy's `Boundary` for that
+face, by `Solvers/openems/policy.py::_boundary`. `Open` and `Through` absorb,
+and `PEC Wall` is a perfect electric wall, which is also what a backend building no
+absorber puts on every face it does not open. The exception is a `PEC Wall` face
 that rectangular waveguide ports stand across, whole: the wave leaves through
 the port there, and a wall behind the port would send it back, so the face
-absorbs. What the solver object states is how every absorbing face absorbs -
-`Absorber`, a PML `PMLCells` deep or Mur's condition - and nothing per face.
+absorbs. The solver object states how every absorbing face absorbs: `Absorber`, a PML
+`PMLCells` deep or Mur's condition. It states nothing per face.
 
 A port stands on a face where its plane lies within `FLATNESS` of the
 structure's extent there. Several ports' cross-sections are taken together, so
 guides side by side that fill a face cover it. openEMS takes one condition for a
-whole face (`SetBoundaryCond` takes six words), so a face the ports cover in part
-has no condition that is the drawing, and it is refused rather than given either.
+whole face (`SetBoundaryCond` takes one word per face,
+`openEMS/python/openEMS/openEMS.pyx:283-297`), so no single condition describes a
+face the ports cover in part, and the adapter refuses such a face.
 
 `pml_cells` is per face. openEMS lays a wall on the outermost line of its axis,
 so a block laid beyond a wall face would move the wall off the drawing: a
@@ -50,22 +51,23 @@ short a block past where it was drawn. So a wall face gets no block, and each
 absorbing face gets its own. The envelope holds one count for an axis whose two
 faces agree and a pair for one whose faces differ.
 
-## Boundary padding: Air, Through and Ends
+## Boundary padding: Open, Through and PEC Wall
 
-Domain boundaries are configured per face using one of three methods:
+Each face of the domain takes one of these values of the mesh policy's
+`Boundary{X,Y,Z}{Min,Max}` property for that face:
 
-1. **Air padding (a length)**:
-   Specifies the length of air between the CAD geometry and the absorber, which
-   is the mesh policy's `Clearance` in millimetres. The domain extends outward by
-   exactly that length, whatever the grid's density. This padding is required
-   for radiating structures (e.g. antennas) where near fields must decay before
-   reaching absorbing boundaries. A `Clearance` of 0 derives the length from the
-   band: 0.4 of the wavelength in the study's medium at the top of it. The
-   medium is laid as one box of its material under every solid, reaching past
-   the grid, so every cell no solid covers, the absorber's included, is the
-   medium.
+1. **Open**:
+   The medium reaches past the CAD geometry to the absorber by the mesh
+   policy's `Clearance`, a length in millimetres shared by every `Open` face.
+   The domain extends outward by exactly that length, whatever the grid's
+   density. This padding is required for radiating structures (e.g. antennas)
+   where near fields must decay before reaching absorbing boundaries. A
+   `Clearance` of 0 derives the length from the band: 0.4 of the wavelength in
+   the study's medium at the top of it. The medium is laid as one box of its
+   material under every solid, reaching past the grid, so every cell no solid
+   covers, the absorber's included, is the medium.
 
-2. **Through Boundaries (`THROUGH`)**:
+2. **Through**:
    Adds zero outward padding. Geometry extends directly through the boundary into
    the absorbing layer. This represents infinitely extending waveguiding
    structures (e.g. microstrip lines or waveguides) without generating end-face
@@ -73,7 +75,7 @@ Domain boundaries are configured per face using one of three methods:
    the CAD geometry boundary, and the PML layer is placed inward within the
    outer extent.
 
-3. **Ends (`Ends`)**:
+3. **PEC Wall**:
    Adds zero outward padding and takes nothing from the structure. The domain
    stops on the CAD geometry and the face is a wall on the outermost line, so no
    cell is laid outside it, whatever the opposite face does. Where waveguide
@@ -106,38 +108,38 @@ standard mesh grading ratio (`max_ratio`). If the ratio between the interior cel
 and the absorber cell exceeds `max_ratio`:
 1. The absorber cell pitch adopts the realized interior edge cell size.
 2. The interior domain is re-clipped and re-meshed.
-3. The loop is bounded by a pass count, and the bound is on the work rather
-   than a promise of convergence. A gap holds a whole number of cells, so the
-   map from a block to the cell the interior lays beside it is a step function
-   and a model can fall into an orbit it never leaves. Such a model is refused
-   by name: whichever pass the count stopped on is an arbitrary one, and
-   handing back its grid would read as the grid the model asked for.
+3. A pass count bounds the loop. It limits the work and does not guarantee
+   convergence. A gap holds a whole number of cells, so the map from a block to
+   the cell the interior lays beside it is a step function, and a model can
+   cycle between grids without settling. The mesher refuses such a model by
+   name, because the grid from the last pass is arbitrary and is not the grid
+   the model asked for.
 
-## Treatment of cut edges at THROUGH boundaries
+## Treatment of cut edges at Through faces
 
-When a face is declared `THROUGH`, geometry terminating at that boundary represents
+When a face is declared `Through`, geometry terminating at that boundary represents
 an artificial cross-section cut of an infinitely continuing structure.
 
 Any sharp edges, sliced shell boundaries, or perimeter corners lying exactly on a
-`THROUGH` plane are non-physical artifacts of the CAD model boundary. Resolving
+`Through` plane are non-physical artifacts of the CAD model boundary. Resolving
 these fictitious cut edges would place unnecessarily fine cells inside the
 absorbing layer, drastically reducing the FDTD time step via the Courant limit.
 
 Consequently:
 - Sizing demands originating from geometry that does not extend inward past a
-  `THROUGH` boundary are discarded.
+  `Through` face are discarded.
 - The bulk material resolution of solids extending through the boundary is
   preserved for the interior.
 
-What is discarded is only what sits on the declared plane itself, which is the
-artificial cut. Anything real standing near that wall is not discarded, and this
-is what declaring a face `THROUGH` costs. The block is a fixed number of cells
+Only demands that sit on the declared plane, the artificial cut, are
+discarded. A real feature near that face is kept, and this is the cost of
+declaring a face `Through`. The block is a fixed number of cells
 at one pitch, and that pitch is the finest size the sizing field asks for
 anywhere within the block's own depth. A feature inside that band therefore does
 not get coarsened by the block - it drives every cell of the block down to its
 own demand, and the block collapses to a shallow fine one rather than deepening.
-That is the right trade for a line running out through the wall, whose
-cross-section the interior already resolves, and the wrong one for a model that
-should not have declared the face `THROUGH`. Nothing downstream computes the
-absorber's depth from the policy for this reason; the checks that care about it
-read the finished grid.
+This suits a line running out through the face, whose cross-section the
+interior already resolves. It does not suit a model with a feature near a face
+that should not be `Through`. For this reason no later stage computes the
+absorber's depth from the policy, and the checks that need it read the finished
+grid.

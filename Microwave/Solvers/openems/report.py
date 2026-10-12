@@ -322,7 +322,7 @@ class MeshReport:
         finest cell and the mesher returns at once with a grid far larger than
         asked for.
 
-        The check lives here rather than in pre-flight because Update Mesh never
+        The check lives here rather than in pre-flight because Mesh never
         reaches pre-flight. It meshes, draws, and prints this report. The cell
         count is in the summary either way, and a number in a log is not a
         warning.
@@ -331,10 +331,9 @@ class MeshReport:
         if used < LARGE_GRID_BYTES:
             return None
         return (
-            f"this grid is {used / 1024**3:,.1f} GiB of operator and field, "
-            "which is a long run rather than a wrong one - but if it was not "
-            "meant, MaxGrowthRatio on the Yee grid, PMLCells and FeedOffset are "
-            "what move it fastest"
+            f"this grid is {used / 1024**3:,.1f} GiB of operator and field, so the "
+            "run is long. If that is not intended, lower ElementsPerWavelength in the "
+            "openEMS mesh settings"
         )
 
     @property
@@ -434,7 +433,7 @@ class MeshReport:
         scaled = f" x {self.timestep_factor:g}" if self.timestep_factor != 1.0 else ""
         lines.append(
             f"timestep about {self.timestep:.4g} s "
-            f"(vacuum CFL estimate{scaled}; openEMS' own step lands either side)"
+            f"(vacuum CFL estimate{scaled}; openEMS' own step may be above or below it)"
         )
         lines.append(
             f"smallest cell {self.smallest.size:.4g} mm on {self.smallest.axis}, "
@@ -468,17 +467,19 @@ class MeshReport:
             )
         for gap in self.coarsely_walked:
             lines.append(
-                f"  {gap.source} was walked every {gap.spaced:.4g} mm, and between "
-                f"stations the grid is held to {gap.between:.4g} mm rather than "
-                f"{gap.asked:.4g} mm"
+                f"  {gap.source} was sampled every {gap.spaced:.4g} mm, so between "
+                f"samples a cell may reach {gap.between:.4g} mm where "
+                f"{gap.asked:.4g} mm was asked for"
             )
         for source, offered in self.unmeasured:
             lines.append(
-                f"  ! {source} answered none of its {offered} station(s), so "
-                "nothing it would have asked for was measured"
+                f"  ! {source} could not be measured at any of its {offered} sample "
+                "point(s), so it sets no cell size"
             )
         for source, answered, offered in self.partly_measured:
-            lines.append(f"  ! {source} answered {answered} of its {offered} stations")
+            lines.append(
+                f"  ! {source} could be measured at {answered} of its {offered} sample points"
+            )
         return "\n".join(lines)
 
 

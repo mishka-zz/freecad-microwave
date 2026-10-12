@@ -36,9 +36,10 @@ are refused by that backend's own translation.
 import FreeCAD
 
 from ._vp_hook import ViewProviderRestored
-from .fem_mesh import BUILT_FROM, age, made_for, pair_all
-from .kinds import is_ours, kind_of, solver_kinds
+from .fem_mesh import BUILT_FROM, age, made_for
+from .kinds import is_ours, kind_of, recipe_kinds, solver_kinds
 from .preview import OUT_OF_DATE
+from .runs import RUN
 from .staleness import FREECADS_OWN
 
 #: Values of ``EMAnalysis.Symmetry``. The first is the default: a result then
@@ -72,8 +73,8 @@ class EMAnalysis(ViewProviderRestored):
     #: declaring one thing in one place is worth more than the calls saved by
     #: an exception.
     MOVES_NO_CELL = (
-        "NumFrequencyPoints",
-        "SmallestResponse",
+        "FrequencyPoints",
+        "ResponseFloor",
         "Symmetry",
     )
 
@@ -82,23 +83,23 @@ class EMAnalysis(ViewProviderRestored):
             "App::PropertyFrequency",
             "FrequencyStart",
             "Analysis",
-            "Start of the band being characterised",
+            "Lowest frequency of the band the study is solved over",
         )
         obj.FrequencyStart = "1.0 GHz"
         obj.addProperty(
             "App::PropertyFrequency",
             "FrequencyStop",
             "Analysis",
-            "End of the band being characterised",
+            "Highest frequency of the band the study is solved over",
         )
         obj.FrequencyStop = "10.0 GHz"
         obj.addProperty(
             "App::PropertyInteger",
-            "NumFrequencyPoints",
+            "FrequencyPoints",
             "Analysis",
-            "How many points the results are reported at",
+            "Number of frequency points in the results",
         )
-        obj.NumFrequencyPoints = 501
+        obj.FrequencyPoints = 501
 
         # This is a statement about the device, so it sits here beside the band
         # rather than on a solver: what the structure is cannot depend on which
@@ -118,8 +119,9 @@ class EMAnalysis(ViewProviderRestored):
             "App::PropertyEnumeration",
             "Symmetry",
             "Analysis",
-            "Symmetry of the device, used to derive the S-matrix terms a single"
-            " solve cannot measure",
+            "Mirror: a two-port whose identical ports are mirror images of each"
+            " other. The S-parameters of a port not driven are then taken from"
+            " the driven one",
         )
         obj.Symmetry = [NO_SYMMETRY, MIRROR_SYMMETRY]
 
@@ -142,11 +144,12 @@ class EMAnalysis(ViewProviderRestored):
         # See ``Solvers/properties.WANTED``.
         obj.addProperty(
             "App::PropertyFloat",
-            "SmallestResponse",
+            "ResponseFloor",
             "Analysis",
-            "Smallest response this study reads, in dB (0 = full scale)",
+            "Lowest response level the results are read at, in dB: 0 for full"
+            " scale, negative for a stopband or a notch",
         )
-        obj.SmallestResponse = 0.0
+        obj.ResponseFloor = 0.0
 
         self.declare_what_moves_no_cell(obj)
 
@@ -171,13 +174,19 @@ class EMAnalysis(ViewProviderRestored):
         cell here moves no element either, since no mesher reads it. The band
         sizes both and is not among them.
 
-        Restore is left alone. FreeCAD fires this for every property of every
+        A change of the group asks the tree to read again what each member
+        holds in it, on an edit, an undo and a redo alike: see :func:`renest`.
+        On restore no member has a view to ask yet.
+
+        Restore is left alone otherwise. FreeCAD fires this for every property of every
         object it reads back, and a file's own preview describes the document
         that file holds. So are an undo and a redo, which put back each mark
         with the edit it was written for. Replayed, the group changes before the
         links of a mesh it holds come back, and a comparison made in between
         would mark a mesh that matches.
         """
+        if prop == "Group":
+            renest(obj)
         document = getattr(obj, "Document", None)
         if document is None or getattr(document, "Restoring", False):
             return
@@ -187,7 +196,6 @@ class EMAnalysis(ViewProviderRestored):
             if _the_meshed_membership_moved(obj):
                 mark_preview_stale(obj)
             mark_meshes_stale(obj, _meshes_whose_membership_moved(obj))
-            _pair_results(obj)
             return
         if prop in type(self).MOVES_NO_CELL or prop in FREECADS_OWN:
             return
@@ -258,7 +266,8 @@ def analysis_of(obj):
     """The analysis holding ``obj``, or ``None``.
 
     Nested groups are followed. A user may sort a study's ports into a subgroup,
-    and those ports stay part of the study.
+    and those ports stay part of the study. So are runs, since a matrix a run
+    holds is still the study's answer.
     """
     if obj is None:
         return None
@@ -274,28 +283,38 @@ def analysis_of(obj):
 
 
 def members(group, seen=None):
-    """Everything in a group, following nested groups once each.
+    """Everything in a group, following nested groups once each, and stopping
+    at a run.
 
-    The one definition for the GUI layer. ``seen`` guards against a cycle. A
-    document is a file a user can edit, and a cycle here is an infinite loop
-    inside a GUI callback, which hangs FreeCAD with nothing in the log to say
-    why. ``seen`` holds identities rather than names, because two documents may
-    hold objects called ``EMPortLumped`` and neither should hide the other.
+    The one definition for the GUI layer. A run is a member and what it holds is
+    not: a run records a solve that happened, and nothing it holds is part of
+    what the study asks now. See ``Objects/runs.py``.
+
+    ``seen`` guards against a cycle. A document is a file a user can edit, and a
+    cycle here is an infinite loop inside a GUI callback, which hangs FreeCAD
+    with nothing in the log to say why. ``seen`` holds identities rather than
+    names, because two documents may hold objects called ``EMPortLumped`` and
+    neither should hide the other.
     """
-    seen = set() if seen is None else seen
+    return _walk(group, set() if seen is None else seen, into_runs=False)
+
+
+def _walk(group, seen, into_runs):
     found = []
     for member in getattr(group, "Group", None) or ():
         if id(member) in seen:
             continue
         seen.add(id(member))
         found.append(member)
-        if getattr(member, "Group", None) is not None:
-            found.extend(members(member, seen))
+        if getattr(member, "Group", None) is not None and (into_runs or kind_of(member) != RUN):
+            found.extend(_walk(member, seen, into_runs))
     return found
 
 
 def _holds(group, obj):
-    return any(member is obj for member in members(group))
+    """Whether ``obj`` stands anywhere in ``group``, inside a run as well, so a
+    result a run holds still names its study."""
+    return any(member is obj for member in _walk(group, set(), into_runs=True))
 
 
 def find_preview(analysis):
@@ -345,6 +364,7 @@ NOT_MESHED_FROM = (
     "EMGmshMesh",
     "EMMaterial",
     "EMMeshPreview",
+    "EMRun",
     "EMSParameters",
     "EMSolverPalace",
 )
@@ -355,6 +375,14 @@ def _what_the_grid_is_laid_from(objects):
     return _built_from(objects, NOT_MESHED_FROM)
 
 
+def left_out(obj, excluded):
+    """Whether ``obj`` is of a kind in ``excluded``, or a refinement region
+    amending a recipe of such a kind - which is another pipeline's to read."""
+    if kind_of(obj) == "EMMeshRegion":
+        return kind_of(getattr(obj, "MeshSettings", None)) in excluded
+    return kind_of(obj) in excluded
+
+
 def _built_from(objects, excluded):
     """The names among ``objects`` that a study owns and are not ``excluded``.
 
@@ -362,7 +390,7 @@ def _built_from(objects, excluded):
     binding points at does not count as membership: it is in a mesh's link list
     and never in the study's group. So is a mesh FreeCAD draws.
     """
-    return {obj.Name for obj in objects if is_ours(obj) and kind_of(obj) not in excluded}
+    return {obj.Name for obj in objects if is_ours(obj) and not left_out(obj, excluded)}
 
 
 def _the_meshed_membership_moved(analysis):
@@ -370,20 +398,19 @@ def _the_meshed_membership_moved(analysis):
 
     ``Gui/openems_mesh_preview.py::_link`` records that set on the preview,
     and it is rebuilt there and nowhere else. So a port dragged out of the
-    study, or a refinement region created after the last Update Mesh, moves
+    study, or a refinement region created after the last Mesh, moves
     the grid and reaches the preview through no link at all - the object is in
     no list, and every later edit to it is invisible for the same reason,
-    across a save and until the next Update Mesh. Comparing the two sets walks
+    across a save and until the next Mesh. Comparing the two sets walks
     the group and translates nothing.
 
     Nested groups are followed, because ``members`` and ``contents`` follow
     them. What is left out is on :data:`NOT_MESHED_FROM`.
 
-    A file written before this comparison existed can hold a member the drawing
-    was never linked from, and it reopens saying the drawing matches: nothing
-    re-checks membership on open, and the study is told only when something
-    changes. The panel derives the key whenever it opens, which is what reports
-    that file.
+    Nothing re-checks membership when a file opens. A study saved holding a
+    member its preview was never linked from reopens saying the drawing
+    matches, and is told only when something changes. The panel derives the key
+    whenever it opens, which is what reports such a study.
     """
     preview = find_preview(analysis)
     if preview is None:
@@ -402,6 +429,7 @@ def _the_meshed_membership_moved(analysis):
 NOT_FEM_MESHED_FROM = (
     "EMMaterial",
     "EMMeshPreview",
+    "EMRun",
     "EMSParameters",
     "EMSolverOpenEMS",
     "EMSolverPalace",
@@ -438,18 +466,8 @@ def mark_meshes_stale(analysis, meshes):
         except Exception as error:  # pragma: no cover - the panel still has the key
             label = getattr(analysis, "Label", "")
             FreeCAD.Console.PrintWarning(
-                f"Microwave: could not age the mesh in {label!r}: {error}\n"
+                f"Microwave: could not mark the mesh in {label!r} out of date: {error}\n"
             )
-
-
-def _pair_results(analysis):
-    """Say on each result whether the study still shows the mesh it was solved
-    on, since a mesh deleted, dragged out or copied in changes which it shows.
-    Failures are swallowed, for the reason :func:`mark_preview_stale` gives."""
-    try:
-        pair_all(members(analysis))
-    except Exception as error:  # pragma: no cover - the panel says it again
-        FreeCAD.Console.PrintWarning(f"Microwave: could not mark a result: {error}\n")
 
 
 def mark_preview_stale(analysis):
@@ -467,7 +485,9 @@ def mark_preview_stale(analysis):
         if preview is not None:
             preview.Status = OUT_OF_DATE
     except Exception as error:  # pragma: no cover - the panel still has the key
-        FreeCAD.Console.PrintWarning(f"Microwave: could not age the mesh preview: {error}\n")
+        FreeCAD.Console.PrintWarning(
+            f"Microwave: could not mark the mesh preview out of date: {error}\n"
+        )
 
 
 def find_analysis(doc, selection=()):
@@ -493,13 +513,12 @@ def find_analysis(doc, selection=()):
         return found[0]
     if not found:
         raise NoAnalysis(
-            "this document has no EM analysis, so there is nothing for a new "
-            "object to belong to. Create one first"
+            "this document has no EM analysis to add to. Create one with Create EM Analysis"
         )
     names = ", ".join(_label(obj) for obj in found)
     raise NoAnalysis(
-        f"this document holds {len(found)} analyses ({names}). Select the one "
-        "you mean - or anything inside it - before adding to it"
+        f"this document holds {len(found)} analyses ({names}). Select the one to "
+        "add to, or an object inside it, and try again"
     )
 
 
@@ -517,6 +536,35 @@ def solvers_in(analysis):
     """
     wanted = solver_kinds()
     return [member for member in members(analysis) if kind_of(member) in wanted]
+
+
+def companions(solver):
+    """What ``solver`` brings to its study and no other member reads: its
+    backend's mesh settings, each refinement region amending them, and each
+    mesh made from them - the regions and meshes first, the settings last.
+
+    The study's mesh policy is every backend's, and a run is a result, so
+    neither is among them. A region amending the settings is one wherever it is
+    filed in the study, since a region left amending nothing is refused by every
+    backend.
+    """
+    study = analysis_of(solver)
+    wanted = getattr(getattr(solver, "Proxy", None), "RECIPE", None)
+    if study is None or wanted is None:
+        return []
+    held = members(study)
+    recipes = [member for member in held if kind_of(member) == wanted]
+    amending = [
+        member
+        for member in held
+        if any(getattr(member, "MeshSettings", None) is recipe for recipe in recipes)
+        or any(
+            linked is recipe
+            for linked in getattr(member, "MeshedFrom", ()) or ()
+            for recipe in recipes
+        )
+    ]
+    return amending + recipes
 
 
 def solver_of(analysis):
@@ -543,6 +591,98 @@ class NoSolver(LookupError):
     """No solver could be chosen to run. The message says what to do about it."""
 
 
+class NoSettings(LookupError):
+    """No mesh settings could be chosen for a refinement region to amend. The
+    message says what to do about it."""
+
+
+def settings_to_amend(analysis, selection=()):
+    """The mesh settings a new refinement region in ``analysis`` amends.
+
+    The selection first, as :func:`solver_to_run` reads it: a solver of this
+    study, its mesh settings, a mesh made from them or a region amending them
+    names that backend's settings, and a selection naming two backends names
+    none. Then the settings of the study's only solver. Anything else raises
+    :class:`NoSettings` naming what is there, since a region on the backend
+    nobody meant refines nothing the user looks at.
+    """
+    held = members(analysis)
+    recipes = [member for member in held if kind_of(member) in recipe_kinds()]
+
+    def recipe_of_kind(kind):
+        return next((recipe for recipe in recipes if kind_of(recipe) == kind), None)
+
+    def named_by(chosen):
+        if any(chosen is recipe for recipe in recipes):
+            return chosen
+        if not any(chosen is member for member in held):
+            return None
+        if kind_of(chosen) == "EMMeshRegion":
+            linked = getattr(chosen, "MeshSettings", None)
+            return linked if any(linked is recipe for recipe in recipes) else None
+        if kind_of(chosen) in solver_kinds():
+            return recipe_of_kind(getattr(chosen.Proxy, "RECIPE", None))
+        for linked in getattr(chosen, "MeshedFrom", None) or ():
+            if any(linked is recipe for recipe in recipes):
+                return linked
+        return None
+
+    picked = []
+    for chosen in selection:
+        found = named_by(chosen)
+        if found is not None and not any(found is one for one in picked):
+            picked.append(found)
+    label = _label(analysis)
+    if len(picked) == 1:
+        return picked[0]
+    if picked:
+        names = ", ".join(repr(_label(recipe)) for recipe in picked)
+        raise NoSettings(
+            f"The selection names {names} of {label!r}, and a refinement region "
+            "refines the mesh of one solver. Select the solver, mesh settings or "
+            "mesh of one solver only"
+        )
+    solvers = solvers_in(analysis)
+    if not solvers:
+        raise NoSettings(
+            f"{label!r} holds no solver, so a refinement region has no mesh to "
+            "refine. Add one with Add openEMS Solver or Add Palace Solver"
+        )
+    if len(solvers) > 1:
+        names = ", ".join(repr(_label(solver)) for solver in solvers)
+        raise NoSettings(
+            f"{label!r} holds {names}, and a refinement region refines the mesh of "
+            "one of them. Select that solver together with the geometry, and add "
+            "the region again"
+        )
+    (solver,) = solvers
+    found = recipe_of_kind(getattr(solver.Proxy, "RECIPE", None))
+    if found is None:
+        raise NoSettings(
+            f"{label!r} holds {_label(solver)!r} but not its mesh settings. "
+            "Add the same solver again to restore them"
+        )
+    return found
+
+
+def renest(analysis):
+    """Ask the tree to read again the children of ``analysis`` and of each
+    member of it that holds children in it.
+
+    The tree reads an object's children again only when a property of that
+    object changes (``src/Gui/Tree.cpp``), so a mesh joining the study would
+    stand at the document's root rather than under the solver it was made for,
+    and a region turned to other settings would stay under the first.
+    ``ShowInTree`` is a property of the view and counts as a change, and
+    setting it to what it holds changes no object of the document. There is no
+    view without the interface, and nothing to ask.
+    """
+    for member in [analysis, *(getattr(analysis, "Group", ()) or ())]:
+        view = getattr(member, "ViewObject", None)
+        if getattr(getattr(view, "Proxy", None), "claimChildren", None) is not None:
+            view.ShowInTree = view.ShowInTree
+
+
 def solver_to_run(analysis, selection=()):
     """The solver a Run opens the panel for.
 
@@ -563,15 +703,15 @@ def solver_to_run(analysis, selection=()):
     label = _label(analysis)
     if picked:
         names = ", ".join(repr(_label(solver)) for solver in picked)
-        raise NoSolver(f"{names} of {label!r} are all selected. Select the one to run")
+        raise NoSolver(f"{names} of {label!r} are all selected. Select only the one to run")
     if len(found) == 1:
         return found[0]
     if not found:
         raise NoSolver(
-            f"{label!r} holds no solver, so there is nothing to run. Add one - "
-            "Add openEMS Solver or Add Palace Solver"
+            f"{label!r} holds no solver. Add one with Add openEMS Solver or Add Palace Solver"
         )
     names = ", ".join(repr(_label(solver)) for solver in found)
     raise NoSolver(
-        f"{label!r} holds {names}. Select the one to run in the tree, or double-click it"
+        f"{label!r} holds the solvers {names}. Select the one to run in the tree, "
+        "or double-click it"
     )

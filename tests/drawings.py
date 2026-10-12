@@ -32,7 +32,16 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["COAX_RADIUS", "Drawing", "MESHED", "REFUSED", "UNMESHED", "drawings", "ends"]
+__all__ = [
+    "COAX_RADIUS",
+    "Drawing",
+    "EITHER",
+    "MESHED",
+    "REFUSED",
+    "UNMESHED",
+    "drawings",
+    "ends",
+]
 
 #: The mesher is required to write a mesh for this drawing.
 MESHED = "meshed"
@@ -44,6 +53,11 @@ REFUSED = "refused"
 #: Gmsh is asked and there is no mesh of the drawing. The mesher is required to
 #: say so rather than hand back the file that was written anyway.
 UNMESHED = "unmeshed"
+
+#: One platform's build of a Gmsh release fills the drawing and another's does
+#: not. The mesher is required to answer as for :data:`UNMESHED`, or to hand
+#: back a mesh that fills the drawing.
+EITHER = "either"
 
 #: How much of a curved body a straight-sided mesh of it is short of, where the
 #: element asked for is the order of the body's own radius. Every element lies
@@ -75,7 +89,8 @@ class Drawing:
         the builder that wants it, so this module needs no kernel.
     :param subject: what this drawing is here to say, in a few words. It goes
         into the failure message.
-    :param expect: :data:`MESHED`, :data:`REFUSED` or :data:`UNMESHED`.
+    :param expect: :data:`MESHED`, :data:`REFUSED`, :data:`UNMESHED` or
+        :data:`EITHER`.
     :param complaint: a word the refusal has to contain, where the drawing is
         here for one particular refusal. A drawing can be wrong in more ways
         than one, and a case that only asks "was it refused" passes on the
@@ -1392,7 +1407,7 @@ def drawings() -> tuple[Drawing, ...]:
             "stands in, so nothing says which of them keeps what they share",
             declares=(("air", 3), ("post", 3), ("walls", 2)),
             expect=REFUSED,
-            complaint="claim one piece",
+            complaint="all claim one volume of the drawing",
             leaves=("post",),
             tags=("leaves",),
         ),
@@ -1421,11 +1436,11 @@ def drawings() -> tuple[Drawing, ...]:
         Drawing(
             "cone_on_its_apex",
             _cone_on_its_apex,
-            "a cone standing on its apex, whose surface Gmsh fails to mesh near the "
+            "a cone standing on its apex, whose surface Gmsh can fail to mesh near the "
             "apex at an element far coarser than the cone, sized round each turn",
             declares=(("air", 3), ("cone", 3), ("walls", 2)),
-            expect=UNMESHED,
-            complaint="It stopped at a surface of 'air', 'cone' at (",
+            expect=EITHER,
+            complaint="it stopped at a surface of 'air', 'cone' at (",
             priority=(("cone", 1),),
             element_order=2,
             curved=True,
@@ -1549,7 +1564,7 @@ def drawings() -> tuple[Drawing, ...]:
             "so nothing says which keeps what they share",
             declares=(("air", 3), ("left", 3), ("right", 3), ("walls", 2)),
             expect=REFUSED,
-            complaint="claim one piece",
+            complaint="all claim one volume of the drawing",
             priority=(("left", 1), ("right", 1)),
             leaves=("left", "right"),
             tags=("leaves",),
@@ -1968,7 +1983,7 @@ def drawings() -> tuple[Drawing, ...]:
             "questions are asked in, where a tag alone reaches nothing the user drew",
             declares=(("air", 3), ("walls", 2), ("wire", 1), ("probe", 1)),
             expect=REFUSED,
-            complaint="at dimension 1",
+            complaint="all claim one curve of the drawing",
             tags=("contest",),
         ),
         Drawing(
@@ -2018,7 +2033,7 @@ def drawings() -> tuple[Drawing, ...]:
             "bounds nothing",
             declares=(("air", 3), ("walls", 2), ("port", 2)),
             expect=REFUSED,
-            complaint="bound nothing",
+            complaint="that bound no volume",
             tags=("outside",),
         ),
         Drawing(
@@ -2197,7 +2212,7 @@ def drawings() -> tuple[Drawing, ...]:
             "added nodes on the drawn surface turns elements inside out",
             declares=(("air", 3), ("walls", 2)),
             expect=UNMESHED,
-            complaint="turned inside out",
+            complaint="inside-out elements",
             element_order=2,
             curved=True,
             coarsest=30.0,
@@ -2225,7 +2240,7 @@ def drawings() -> tuple[Drawing, ...]:
             "because there is nothing for them to bound",
             declares=(("air", 3), ("walls", 2)),
             expect=REFUSED,
-            complaint="bound nothing",
+            complaint="that bound no volume",
             tags=("ordeal", "invalid"),
         ),
         Drawing(

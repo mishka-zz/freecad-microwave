@@ -34,6 +34,20 @@ from .kinds import classes, kind_of
 #: not one, and a feature's material reads back as the address of an object.
 ADDED = 21
 
+#: The status FreeCAD gives a property it does not save. FreeCAD adds one such
+#: property of its own to a group whose shape it has been asked for, the shape
+#: it builds from the group's members and caches, so a property marked so is
+#: FreeCAD's and not the workbench's (``src/App/Property.h``,
+#: ``PropNoPersist``; ``src/Mod/Part/App/PartFeature.cpp``).
+UNSAVED = 22
+
+
+def added(obj: Any, name: str) -> bool:
+    """Whether ``name`` is a property added to ``obj`` that FreeCAD saves, which
+    every property this workbench declares is."""
+    status = obj.getPropertyStatus(name)
+    return ADDED in status and UNSAVED not in status
+
 
 @dataclass(frozen=True)
 class Declared:
@@ -49,7 +63,7 @@ def held(obj: Any) -> dict[str, Declared]:
     return {
         name: Declared(obj.getTypeIdOfProperty(name), _choices(obj, name))
         for name in obj.PropertiesList
-        if ADDED in obj.getPropertyStatus(name)
+        if added(obj, name)
     }
 
 

@@ -32,10 +32,16 @@ Before evaluating the sizing field, coordinates along each axis are classified:
   displaced. For example, zero-thickness PEC sheets require grid lines passing
   through their planes to align tangential electric field components correctly
   (`Operator::CalcPEC_Range`, `openEMS/FDTD/operator.cpp:2029`). Opposing
-  conductor faces and simulation domain
-  boundaries are likewise treated as anchors. When two anchors are separated by
-  less than the minimum cell floor, the geometry is unmeshable and the mesher
-  refuses it by name.
+  conductor faces and simulation domain boundaries are likewise treated as
+  anchors. So are the planes a port names: a lumped port's plane on every axis
+  it is flat across, a lumped element's own faces where no boxed conductor
+  already stands on them, a waveguide port's excitation and probe planes, and a
+  microstrip port's feed and measurement planes. A lumped port's plane is
+  pinned for every lumped port, driven or not: one grid serves every run of a
+  sweep, so `_anchors` in `Solvers/openems/plan.py` asks each port for the
+  lines it requires as the driven port (`Port.required_lines`). When two
+  anchors are separated by less than the minimum cell floor, the geometry is
+  unmeshable and the mesher refuses it by name.
 - **Preferences**: Desired coordinates (such as dielectric boundaries) that align
   with grid lines when convenient, but may be omitted if they conflict with
   anchors or cause excessive cell refinement. openEMS averages dielectric
@@ -103,11 +109,11 @@ Coarsening cannot be implemented by adding terms to a lower envelope. Instead,
 coarsening constraints floor the demands of specified geometry before those demands
 are added to the polyline, allowing cells to expand up to the floored value.
 
-The second direction of a mesh region takes that shape. It floors what the
-geometry it names asks for, so the terms that geometry would have contributed
-arrive already relaxed, and the envelope, the grading and the placement are
-unchanged. The field holds no maximum at all, so nothing downstream has to
-reconcile a maximum with a minimum.
+A mesh region that coarsens works this way. It floors the demands of the
+geometry it names, so the terms that geometry contributes arrive already
+relaxed, and the envelope, the grading and the placement are unchanged. The
+field holds no maximum, so no later stage has to reconcile a maximum with a
+minimum.
 
 Because the rectilinear mesh is generated independently along each Cartesian axis,
 a spatial bounding box projects across the entire computational domain as three
@@ -128,15 +134,15 @@ gives:
 
 Consequently, to achieve a growth factor `ratio` between adjacent cells, the
 slope must be set to `g = ln(ratio)` rather than `ratio - 1`. Setting
-`g = ratio - 1` overshoots by a factor of `exp(r-1)/r`, violating mesh
+`g = ratio - 1` overshoots by a factor of `exp(ratio-1)/ratio`, violating mesh
 smoothness limits.
 
-## Placing the lines
+The mesher sets the slope slightly below `ln(ratio)` (`_GRADING_HEADROOM` in
+`Microwave/Solvers/openems/regions.py`). A gap holds a whole number of cells, so
+the cells laid are the field scaled to that count, and the margin leaves room
+for every cell to land between the floor and the cap.
 
-For each gap between two fixed positions, the mesher integrates `1/h` across it.
-That integral `N` is the number of cells the gap wants. The mesher rounds up to
-`n = ceil(N)`, then places the lines by inverting the cumulative integral at `n`
-equally spaced values.
+## Placing the lines
 
 Lines are placed such that each cell spans an identical increment of normalized
 metric length:
@@ -237,8 +243,9 @@ To guarantee exact grid symmetry:
    field rather than on discrete line positions. The mesher verifies that the sizing
    field is identical under reflection across the center plane at all demand knots.
 2. **Center fold operation**: When symmetry is verified, every line is paired
-   with its mirror and both move to their common midpoint. Each line is averaged with its mirror, $(u + v) / 2$, which is exact
-   only for a domain centred on zero; elsewhere a few parts in $10^{15}$
-   survive. That is beneath notice on a cell boundary and fatal on an anchor, so
-   the anchors are written back verbatim afterwards, and the fold is rejected if
+   with its mirror and both move to their common midpoint, $(u + v) / 2$. The
+   average is exact only for a domain centred on zero. Elsewhere it can differ
+   from the exact midpoint in the last bits of a double. That error is harmless
+   on a cell boundary and moves an anchor off the coordinate it must hold, so
+   the anchors are written back verbatim afterwards. The fold is rejected if
    any line moved by more than a small fraction of the smallest cell.

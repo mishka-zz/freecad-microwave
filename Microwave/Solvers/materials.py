@@ -122,9 +122,8 @@ def _table(material: Any) -> tuple[DispersionPoint, ...]:
     )
     if len({len(column) for column in columns}) != 1:
         raise TranslationError(
-            f"{label(material)!r}: its table holds "
-            f"{', '.join(str(len(column)) for column in columns)} frequencies, "
-            "permittivities and loss tangents, which cannot be read as rows. "
-            "Re-create the material from its catalog and bind it again"
+            f"{label(material)!r}: the columns of its catalog table hold "
+            f"{', '.join(str(len(column)) for column in columns)} values, so they do not "
+            "form a table. Re-create the material from its catalog and bind it again"
         )
     return tuple(DispersionPoint(*map(float, row)) for row in zip(*columns, strict=True))

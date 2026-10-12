@@ -7,6 +7,7 @@ about it."""
 
 import cmath
 import math
+import re
 
 import pytest
 
@@ -64,10 +65,15 @@ class TestWhatMayBeTheMedium:
         chosen = laminate()
         assert media.linked(*_policy(Medium=chosen)) is chosen
 
-    @pytest.mark.parametrize("declared", ["PEC", "ConductingSheet", "FrequencyDependentDielectric"])
+    @pytest.mark.parametrize(
+        "declared", ["PEC", "Conducting Sheet", "Frequency Dependent Dielectric"]
+    )
     def test_anything_else_a_material_can_be_is_refused_naming_both(self, declared):
-        said = f"'MeshSettings': Medium links 'FR4', a {declared}"
-        with pytest.raises(TranslationError, match=said):
+        said = (
+            f"'MeshSettings': Medium links 'FR4', a {declared}, and a medium is a "
+            "Dielectric. Link a dielectric material, or clear the link for vacuum"
+        )
+        with pytest.raises(TranslationError, match=re.escape(said)):
             media.linked(*_policy(Medium=laminate(MaterialType=declared)))
 
     def test_a_link_to_what_is_not_a_material_is_refused(self):
@@ -84,8 +90,22 @@ class TestWhatMayBeTheMedium:
         )
         assert found.slowing == 8.6
 
+    @pytest.mark.parametrize(
+        ("stated", "said"),
+        [
+            (dict(LossTangent=-1.0), "LossTangent is -1. Enter a finite value of 0 or more"),
+            (dict(Conductivity=-1.0), "Conductivity is -1 S/m. Enter a finite value of 0 or more"),
+        ],
+    )
+    def test_a_value_that_is_not_a_loss_is_refused_by_the_medium_named(self, stated, said):
+        with pytest.raises(TranslationError, match=re.escape(f"Medium 'FR4': {said}")):
+            media.medium(*_policy(Medium=laminate(**stated)), 1e9)
+
     def test_a_value_that_carries_no_wave_is_refused_by_the_medium_named(self):
-        with pytest.raises(TranslationError, match="Medium 'FR4': a relative permeability of 0"):
+        with pytest.raises(
+            TranslationError,
+            match=re.escape("Medium 'FR4': Permeability is 0. Enter a finite value above 0"),
+        ):
             media.medium(*_policy(Medium=laminate(Permeability=0.0)), 1e9)
 
 

@@ -17,8 +17,10 @@ to run without it. One module keeps the drawing and the envelope from answering
 differently about one port.
 
 Nothing here imports FreeCAD. It asks a shape for ``getElement``, ``Faces``,
-``Edges``, ``Vertexes``, ``Solids``, ``Volume``, ``common`` and ``translated``,
-and a document object for ``Shape``, ``Parents`` and ``getSubObject``.
+``Edges``, ``Vertexes``, ``Solids``, ``Volume``, ``common``, ``translated``,
+``transformGeometry`` and ``isNull``, and a document object for ``Shape``,
+``Placement``, ``Parents``, ``getSubObject``, ``getSubObjectList``,
+``LinkedObject``, ``ElementList`` and ``Label``.
 ``translated`` takes a coordinate triple as readily as a vector. Measured under
 1.1.1: an edge answers no faces, and a face answers itself.
 
@@ -30,7 +32,8 @@ of each container above it is left out. :func:`placed` asks the tree instead.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, NamedTuple
 
 from .portbox import DIMENSIONS, KERNEL_TOLERANCE
 
@@ -52,6 +55,10 @@ def placed(obj: Any) -> Any:
     1.1.1, where ``getGlobalPlacement`` leaves a link group's placement out. An
     object standing in no container is shown where its own ``Shape`` is.
 
+    A container answers no shape along a path that ends at it, measured under
+    1.1.1. Its own ``Shape`` is then moved by every container above it, as
+    :func:`local` moves the other way.
+
     :raises Unplaced: see :func:`_place`.
     """
     shape = getattr(obj, "Shape", None)
@@ -61,7 +68,11 @@ def placed(obj: Any) -> Any:
     if place is None:
         return shape
     root, path = place
-    return root.getSubObject(path)
+    shown = root.getSubObject(path)
+    if shown is not None:
+        return shown
+    above = root.getSubObject(path, retType=3).multiply(obj.Placement.inverse())
+    return shape.transformGeometry(above.toMatrix())
 
 
 def local(obj: Any, shape: Any) -> Any:
@@ -91,8 +102,10 @@ def _place(obj: Any) -> tuple[Any, str] | None:
 
     ``Parents`` names every such pair, and not all of them are places:
 
-    * a path through a link - an ``App::Link``, an element of a link array - is
-      a copy the link shows, and the object stands where it was drawn;
+    * a path through a link - an ``App::Link``, a link group's member shown by
+      another link - is a copy the link shows, and the object stands where it
+      was drawn. An element of a link array is the array's own, and the path
+      from the array to it is where it stands;
     * a root in another open document is that document's drawing;
     * a body lists a feature once for each way it claims it, along one path, so
       a place is the root and the path rather than the entry, and the root is
@@ -112,22 +125,103 @@ def _place(obj: Any) -> tuple[Any, str] | None:
     if len(places) > 1:
         shown = sorted(f"{_label(root)}.{path}" for root, path in places.values())
         raise Unplaced(
-            f"{_label(obj)!r} stands in more than one container - {', '.join(shown)} - "
-            "so where it is meant is not something the drawing says. Keep it in one"
+            f"{_label(obj)!r} stands in more than one container ({', '.join(shown)}), so "
+            "its place is ambiguous. Keep it in one"
         )
     ((root, path),) = places.values()
     return root, path
 
 
 def _through_a_link(root: Any, path: str) -> bool:
-    """Whether the path from ``root`` passes through a link on its way down.
+    """Whether the path from ``root`` passes through the copy a link shows on
+    its way down, as :func:`_through_a_copy` reads it.
 
     A link is what carries ``LinkedObject``, which a link group, a part and a
     body do not.
     """
     along = getattr(root, "getSubObjectList", None)
-    chain = along(path)[:-1] if along else [root]
-    return any(getattr(step, "LinkedObject", None) is not None for step in chain)
+    if along is None:
+        return getattr(root, "LinkedObject", None) is not None
+    return _through_a_copy(list(along(path)))
+
+
+def _through_a_copy(chain: list[Any]) -> bool:
+    """Whether a chain of objects from a root down steps from a link into the
+    copy it shows.
+
+    An array link lists its own elements in ``ElementList``, measured under
+    1.1.1, and a step from it to one of those is not into a copy.
+    """
+    return any(
+        getattr(step, "LinkedObject", None) is not None
+        and not any(below is each for each in getattr(step, "ElementList", None) or ())
+        for step, below in zip(chain, chain[1:], strict=False)
+    )
+
+
+class Selected(NamedTuple):
+    """One pick, on the object that owns it, with the element it names or none
+    for the whole object - the form a ``Gui.Selection`` entry takes."""
+
+    Object: Any
+    SubElementNames: tuple[str, ...]
+
+
+def resolved(
+    selection: Iterable[Any], document: str | None = None
+) -> tuple[list[Selected], list[str]]:
+    """Each pick on the object that owns it, and each pick made inside a copy.
+
+    ``selection`` is ``Gui.Selection.getCompleteSelection(0)``. It leaves each
+    pick on the top object it was made through, with the path down to it, one
+    entry to a pick in the order picked, measured under 1.1.1. The default
+    resolution drops the path, and ``getSelectionEx`` gathers the picks under
+    each top object, which loses the order between objects. A port reads its
+    faces off that order, so each pick here is its own entry, in the order
+    picked.
+
+    The selection spans every open document (``Gui/Selection/Selection.cpp``,
+    ``getCompleteSelection``), and a link cannot reach into another, so only
+    the picks in ``document`` are kept where it is named.
+
+    A pick made inside the copy a link shows resolves to the original, where it
+    was drawn, so a link to it would name geometry the user did not pick. Each
+    such pick is named rather than kept, as the original's label inside the top
+    object's. Elsewhere the pick lands on the last object along the path, with
+    the element at the path's end, which is what the default gives. An object
+    that cannot list the path keeps it whole, which :func:`element` refuses by
+    name.
+    """
+    picked: list[Selected] = []
+    copies: list[str] = []
+    for entry in selection:
+        if document is not None and getattr(entry, "DocumentName", document) != document:
+            continue
+        top = getattr(entry, "Object", entry)
+        for sub in tuple(getattr(entry, "SubElementNames", ()) or ()) or ("",):
+            along = getattr(top, "getSubObjectList", None)
+            if not sub or along is None:
+                picked.append(Selected(top, (sub,) if sub else ()))
+                continue
+            chain = list(along(sub))
+            if _through_a_copy(chain):
+                copies.append(f"{_label(chain[-1])!r} in {_label(top)!r}")
+                continue
+            name = sub.rsplit(".", 1)[-1]
+            picked.append(Selected(chain[-1], (name,) if name else ()))
+    return picked, copies
+
+
+def copy_note(labels: Iterable[str]) -> str:
+    """What a command says of the picks :func:`resolved` names."""
+    labels = list(dict.fromkeys(labels))
+    named = ", ".join(labels)
+    was = "was" if len(labels) == 1 else "were"
+    return (
+        f"{named} {was} picked inside the copy a link shows and left out, since such a "
+        "pick names the original rather than the copy. Pick the original, or the link "
+        "itself"
+    )
 
 
 def element(obj: Any, name: str = "") -> Any:

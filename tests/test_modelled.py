@@ -13,6 +13,7 @@ run filed beside another backend's answer.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -304,28 +305,33 @@ class TestWhereAUserReadsIt:
         holder = store(createEMSParameters(doc), matrix())
         holder._props.pop("Modelled")
         kept = list(holder.ScatteringReal)
-        with pytest.raises(ResultError, match="'S-Parameters' has no Modelled: it was saved"):
+        with pytest.raises(
+            ResultError,
+            match=re.escape(
+                "'S-Parameters' has no Modelled, because an earlier version of the workbench "
+                "saved it. Delete it and run again. To keep it, export it with Export "
+                "Touchstone first"
+            ),
+        ):
             store(holder, with_records(matrix(points=2), "Palace", HELD))
         assert list(holder.ScatteringReal) == kept
 
     def test_a_result_of_a_lossless_model_states_nothing(self, doc):
         assert list(store(createEMSParameters(doc), matrix()).Modelled) == []
 
-    def test_the_line_under_the_chart_states_it_after_the_reference(self):
-        footnote = chart_text(with_records(matrix(), "openEMS", FOLDED)).footnote
-        assert footnote.startswith("Referenced to ")
-        assert footnote.endswith(". Loss: 'FR4' loss tangent folded at 5 GHz")
+    def test_the_chart_s_basis_states_it_after_the_reference(self):
+        basis = chart_text(with_records(matrix(), "openEMS", FOLDED)).basis
+        assert basis.startswith("Referenced to ")
+        assert basis.endswith(". Loss: 'FR4' loss tangent folded at 5 GHz")
 
-    def test_a_line_too_long_for_the_chart_points_at_the_property_instead(self):
-        from Microwave.Gui.plot_s_params import LONGEST_BASIS
-
+    def test_a_long_basis_is_stated_whole(self):
+        """The basis is read on the details tab, which has room for it."""
         many = [FOLDED] * 8
-        footnote = chart_text(with_records(matrix(), "openEMS", *many)).footnote
-        assert len(footnote) <= LONGEST_BASIS
-        assert footnote.endswith("Loss: as the result's Modelled property states for each material")
+        basis = chart_text(with_records(matrix(), "openEMS", *many)).basis
+        assert basis.endswith(". Loss: " + modelled.brief(many))
 
     def test_a_chart_of_a_lossless_model_says_nothing_of_loss(self):
-        assert "Loss" not in chart_text(matrix()).footnote
+        assert "Loss" not in chart_text(matrix()).basis
 
     def test_a_touchstone_header_states_it_whole_on_comment_lines(self, tmp_path):
         runs = series_resistor(50.0, 50.0, 10.0)
@@ -356,6 +362,7 @@ class TestWhereAUserReadsIt:
             radiated=None,
             dissipates=True,
             modelled=(HELD, FACES),
+            stated={},
         )
         assert glue.from_palace(answer).provenance["modelled"] == [HELD, FACES]
 
@@ -387,7 +394,7 @@ class TestRunsOfOneMatrix:
         runs = series_resistor(50.0, 50.0, 10.0)
         runs[0].provenance = dict(runs[0].provenance, modelled=[FOLDED])
         runs[1].provenance = dict(runs[1].provenance, modelled=[CONDUCTING])
-        with pytest.raises(ResultError, match="describe different models"):
+        with pytest.raises(ResultError, match="modelled its lossy materials differently"):
             SParameters.from_runs(runs)
 
     def test_runs_given_it_alike_keep_the_record(self):

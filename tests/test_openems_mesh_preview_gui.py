@@ -110,11 +110,11 @@ class TestStaleness:
 
     def test_no_preview_at_all(self):
         doc = model()
-        assert "no mesh preview" in openems_mesh_preview.staleness(doc.Objects[0])
+        assert openems_mesh_preview.staleness(doc.Objects[0]) == "no mesh yet"
 
     def test_a_preview_that_was_never_built(self):
         _, study, _ = with_preview(preview_object(Digest=""))
-        assert "never built" in openems_mesh_preview.staleness(study)
+        assert openems_mesh_preview.staleness(study) == "the mesh was never built"
 
     def test_a_preview_matching_the_document_is_current(self):
         doc = model()
@@ -198,7 +198,7 @@ class TestStaleness:
 
     def test_a_touch_held_by_a_failed_dependency_is_passed_over(self):
         """A body stays touched while a sketch in it fails, used or not, and
-        Update Mesh cannot clear that."""
+        Mesh cannot clear that."""
         sketch = inputs(name="Sketch", State=["Touched", "Invalid"])
         study, _ = self.pending(State=["Touched"], OutListRecursive=[sketch])
         assert openems_mesh_preview.staleness(study) is openems_mesh_preview.CURRENT
@@ -234,7 +234,9 @@ class TestStaleness:
         digest = document.grid_inputs_digest(doc.Objects[0])
         _, study, _ = with_preview(preview_object(Digest=digest))
         grid(study).EdgeRefinement = 0.1
-        assert "no longer translates" in openems_mesh_preview.staleness(study)
+        assert openems_mesh_preview.staleness(study) == (
+            "the study has errors, so the mesh cannot be checked. Press Check to see them"
+        )
 
 
 class TestTheStudyOwnsThePreview:
@@ -248,7 +250,7 @@ class TestTheStudyOwnsThePreview:
     list instead, the way FreeCAD's group property does.
 
     What the fault costs: ``find_preview`` looks in the group, so it never
-    finds the orphan - every press of Update Mesh makes another preview, each
+    finds the orphan - every press of Mesh makes another preview, each
     drawing over the last, and deleting the study leaves all of them behind.
     That is exactly the fault the group design was introduced to end.
     """
@@ -299,7 +301,7 @@ class TestTheStudyOwnsThePreview:
             "Analysis",
             FrequencyStart=1e9,
             FrequencyStop=10e9,
-            NumFrequencyPoints=201,
+            FrequencyPoints=201,
             Group=list(owned),
         )
         return Document(study, board, plane, strip, *owned), study
@@ -314,11 +316,11 @@ class TestTheStudyOwnsThePreview:
         openems_mesh_preview.refresh(study)
         openems_mesh_preview.refresh(study)
         previews = [obj for obj in doc.Objects if type(obj.Proxy).__name__ == "EMMeshPreview"]
-        assert len(previews) == 1, "Update Mesh drew a second preview over the first"
+        assert len(previews) == 1, "Mesh drew a second preview over the first"
 
 
-class TestUpdateMeshIsOneUndoStep:
-    """Without a transaction, Ctrl-Z after Update Mesh does not fail to undo -
+class TestMeshIsOneUndoStep:
+    """Without a transaction, Ctrl-Z after Mesh does not fail to undo -
     it undoes *something else*.
 
     Untransacted, the mesh stays on screen and the material created just before
@@ -329,13 +331,13 @@ class TestUpdateMeshIsOneUndoStep:
     def test_the_drawing_is_wrapped_in_one(self, fake_part):
         doc, study, preview = with_preview()
         openems_mesh_preview.refresh(study)
-        assert doc.transactions == [("Update Mesh", "commit")]
+        assert doc.transactions == [("Mesh", "commit")]
 
     def test_the_label_is_what_the_edit_menu_offers(self, fake_part):
-        """It reads back as "Undo Update Mesh", so it names what goes away."""
+        """It reads back as "Undo Mesh", so it names what goes away."""
         doc, study, preview = with_preview()
         openems_mesh_preview.refresh(study)
-        assert doc.transactions[0][0] == "Update Mesh"
+        assert doc.transactions[0][0] == "Mesh"
 
     def test_the_preview_is_created_inside_it(self, fake_part, monkeypatch):
         """Opening and committing around *nothing* is not the fix.
@@ -381,14 +383,14 @@ class TestUpdateMeshIsOneUndoStep:
             "Analysis",
             FrequencyStart=1e9,
             FrequencyStop=10e9,
-            NumFrequencyPoints=201,
+            FrequencyPoints=201,
             Group=list(owned),
         )
         Document(study, board, plane, strip, *owned)
 
         openems_mesh_preview.refresh(study)
 
-        assert opened_when == ["Update Mesh"], (
+        assert opened_when == ["Mesh"], (
             "the preview was created outside the transaction, so undoing the "
             "mesh would not remove it"
         )
@@ -420,13 +422,13 @@ class TestUpdateMeshIsOneUndoStep:
         )
         with pytest.raises(RuntimeError):
             openems_mesh_preview.refresh(study)
-        assert doc.transactions == [("Update Mesh", "abort")]
+        assert doc.transactions == [("Mesh", "abort")]
 
 
 class TestRedrawIsOneUndoStepToo:
     """``redraw`` is the other caller of ``set_segments`` and rewrites the same
     Shape. Untransacted, one change of Display rewrites the whole drawing with
-    no undo entry, so Ctrl-Z reaches past it and removes the entire Update Mesh
+    no undo entry, so Ctrl-Z reaches past it and removes the entire Mesh
     step while Display stays where the user just put it. FreeCAD's own
     AutoTransaction covers an edit made through the property editor; nothing
     covers a macro or the Python console.
@@ -437,7 +439,7 @@ class TestRedrawIsOneUndoStepToo:
         openems_mesh_preview.refresh(study)
         doc.transactions.clear()
         assert openems_mesh_preview.redraw(preview) is True
-        assert doc.transactions == [("Redraw Mesh Preview", "commit")]
+        assert doc.transactions == [("Redraw Mesh", "commit")]
 
     def test_a_preview_with_no_grid_opens_none(self, fake_part):
         """``redraw`` returns False; it must not leave an undo entry for a
@@ -602,7 +604,7 @@ class TestRefresh:
 
     @pytest.mark.parametrize("factor", [0.0, -1.0, 2.0])
     def test_a_factor_the_engine_would_ignore_is_refused_rather_than_drawn(self, fake_part, factor):
-        """Update Mesh must not accept any float here and print the result.
+        """Mesh must not accept any float here and print the result.
 
         Zero and negative factors produce a timestep that is not one, and a
         factor above 1 reports more than the vacuum CFL bound - each captioned
@@ -887,7 +889,7 @@ class TestTheStaleMarker:
 class TestTheReportScoresWhatWasMeasured:
     """The one wire between a chord's count and anybody being told about it.
 
-    ``document.mesh`` carries what was read off the geometry, and *Update Mesh*
+    ``document.mesh`` carries what was read off the geometry, and *Mesh*
     hands it to the report; between them the verdict on a triangulated layer has
     nowhere to come from. Neither end is exercised by meshing a document of
     boxes, because a box tells the mesher where its faces are and is never
@@ -931,7 +933,7 @@ class TestTheReportScoresWhatWasMeasured:
         )
         _, report = openems_mesh_preview.refresh(study)
         assert report.unmeasured == (("'Reflector' rim curving", 1),)
-        assert "answered none of its 1 station(s)" in report.summary()
+        assert "could not be measured at any of its 1 sample point(s)" in report.summary()
 
     def test_and_update_mesh_scores_the_grid_against_it(self, fake_part, monkeypatch):
         import dataclasses
